@@ -55,10 +55,6 @@ func (t TokenSet) Valid() bool {
 	return t.AccessToken != "" && time.Now().Before(t.ExpiresAt.Add(-30*time.Second))
 }
 
-func ExchangeCode(code, verifier, redirect string) (TokenSet, error) {
-	return ExchangeCodeWithConfig(CurrentOAuthConfig(), code, verifier, redirect)
-}
-
 func ExchangeCodeWithConfig(config OAuthConfig, code, verifier, redirect string) (TokenSet, error) {
 	config, err := normalizeOAuthConfig(config)
 	if err != nil {

@@ -94,8 +94,6 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 	content := responsesMessageContentBlocks(msg["content"])
 	if len(content) > 0 {
 		output = append(output, map[string]any{"type": "message", "id": "msg_" + uuid.NewString(), "role": "assistant", "status": "completed", "content": content})
-	} else if len(calls) > 0 {
-		output = append(output, map[string]any{"type": "message", "id": "msg_" + uuid.NewString(), "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": toolPlanSummaryFromMaps(calls), "annotations": []any{}}}})
 	}
 	for _, raw := range calls {
 		tc, _ := raw.(map[string]any)

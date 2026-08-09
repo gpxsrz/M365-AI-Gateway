@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"sort"
 	"strings"
 )
@@ -24,16 +23,6 @@ type Artifact struct {
 	FileToken          string          `json:"-"`
 	PublicURL          string          `json:"url,omitempty"`
 	Raw                json.RawMessage `json:"-"`
-}
-
-func (a Artifact) upstreamDownloadURL() string {
-	if strings.TrimSpace(a.CodeResultFileURL) != "" {
-		return a.CodeResultFileURL
-	}
-	if strings.TrimSpace(a.CodeResultImageURL) != "" {
-		return a.CodeResultImageURL
-	}
-	return a.DownloadURL
 }
 
 type Attribution struct {
@@ -472,22 +461,4 @@ func CanonicalAttributionSummary(attribution Attribution) map[string]any {
 		out["displayData"] = attribution.DisplayData
 	}
 	return out
-}
-
-func validateCanonicalArtifact(artifact Artifact) error {
-	for name, value := range map[string]string{
-		"referenceId":        artifact.ReferenceID,
-		"filename":           artifact.Filename,
-		"mimeType":           artifact.MIMEType,
-		"codeResultImageUrl": artifact.CodeResultImageURL,
-		"downloadUrl":        artifact.DownloadURL,
-		"webUrl":             artifact.WebURL,
-		"pollUrl":            artifact.PollURL,
-		"fileToken":          artifact.FileToken,
-	} {
-		if len(value) > maxGeneratedArtifactURLBytes && strings.HasSuffix(strings.ToLower(name), "url") {
-			return fmt.Errorf("%s exceeds canonical artifact limit", name)
-		}
-	}
-	return nil
 }

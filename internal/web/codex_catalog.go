@@ -4,8 +4,6 @@ package web
 
 import (
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
 )
 
@@ -132,13 +130,6 @@ func configuredModelSpecs(mappings []modelMapping) []modelSpec {
 	return modelSpecsFromRoutes(catalogRouteDefinitions(mappings))
 }
 
-func positiveEnvInt(name string, fallback int) int {
-	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
-	if err == nil && v > 0 {
-		return v
-	}
-	return fallback
-}
 func configuredModelLimits() modelLimits {
 	return configuredModelLimitsForSettings(currentSettings())
 }

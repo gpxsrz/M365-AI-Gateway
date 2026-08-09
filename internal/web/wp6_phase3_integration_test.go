@@ -162,6 +162,44 @@ func TestWP6ToolCheckpointPreservesAssistantImages(t *testing.T) {
 	}
 }
 
+func TestWP6ImageOnlyToolCheckpointMatchesReturnedContent(t *testing.T) {
+	const image = "data:image/png;base64,V1A2"
+	calls := []detectedToolCall{{ID: "call-image", Type: "function", Name: "lookup", Arguments: []byte(`{"q":"image"}`)}}
+	result := chathub.Result{Images: []string{image}}
+
+	recorder := httptest.NewRecorder()
+	if err := writeToolResponse(recorder, "chatcmpl-image", "test", false, calls, result); err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	returned, _ := openAIChoice(response)
+	checkpoint := assistantToolCheckpointMessage(calls, result, false)
+	returnedJSON, _ := json.Marshal(returned["content"])
+	checkpointJSON, _ := json.Marshal(checkpoint.Content)
+	if !bytes.Equal(returnedJSON, checkpointJSON) {
+		t.Fatalf("returned content %s does not match checkpoint %s", returnedJSON, checkpointJSON)
+	}
+}
+
+func TestWP6StreamedWhitespaceToolPreambleKeepsExactCheckpointContent(t *testing.T) {
+	calls := []detectedToolCall{{ID: "call-space", Type: "function", Name: "lookup", Arguments: []byte(`{}`)}}
+	message := assistantToolCheckpointMessageWithContent(calls, "  ", nil)
+	if message.Content != "  " {
+		t.Fatalf("streamed whitespace content was not preserved exactly: %#v", message.Content)
+	}
+}
+
+func TestWP6ToolCheckpointDoesNotInventPreamble(t *testing.T) {
+	calls := []detectedToolCall{{ID: "call-1", Type: "function", Name: "lookup", Arguments: []byte(`{"query":"one"}`)}}
+	message := assistantToolCheckpointMessage(calls, chathub.Result{}, true)
+	if message.Content != nil {
+		t.Fatalf("tool checkpoint invented visible preamble: %#v", message.Content)
+	}
+}
+
 func TestWP6ChatCompletionsExactPrefixSendsSystemAndOnlyNewDelta(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "checkpoints.json")
 	chat := &checkpointIntegrationChat{results: []chathub.Result{
@@ -793,7 +831,7 @@ func TestWP6StreamingResponsesCommitsOpaqueCursorAtTerminal(t *testing.T) {
 	}
 }
 
-func TestWP6ToolCallAndResultAdvanceOneExactConversation(t *testing.T) {
+func TestWP6HermesReloadedToolResultNameKeepsExactConversation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "checkpoints.json")
 	chat := &checkpointIntegrationChat{results: []chathub.Result{
 		{Text: `{"calls":[{"name":"lookup","arguments":{"query":"delta"}}]}`, ConversationID: "conversation-tool-chat", SessionID: "session-1"},
@@ -822,7 +860,7 @@ func TestWP6ToolCallAndResultAdvanceOneExactConversation(t *testing.T) {
 		t.Fatalf("assistant=%#v", assistant)
 	}
 	callID, _ := assistant.ToolCalls[0]["id"].(string)
-	secondMessages := append(append([]oaiMsg{}, firstMessages...), assistant, oaiMsg{Role: "tool", ToolCallID: callID, Content: "TOOL-RESULT-DELTA"})
+	secondMessages := append(append([]oaiMsg{}, firstMessages...), assistant, oaiMsg{Role: "tool", Name: "lookup", ToolCallID: callID, Content: "TOOL-RESULT-DELTA"})
 	recorder = httptest.NewRecorder()
 	server.openaiChat(recorder, phase3Request(http.MethodPost, "/v1/chat/completions", mustJSON(oaiReq{Model: "gpt-5.6-sol", Messages: secondMessages})))
 	if recorder.Code != http.StatusOK {
@@ -845,7 +883,9 @@ func TestWP6ToolCallAndResultAdvanceOneExactConversation(t *testing.T) {
 	if err := json.Unmarshal(secondEncoded, &secondAssistant); err != nil {
 		t.Fatal(err)
 	}
-	thirdMessages := append(append([]oaiMsg{}, secondMessages...), secondAssistant, oaiMsg{Role: "user", Content: "AFTER-TOOL-USER"})
+	reloadedMessages := append([]oaiMsg{}, secondMessages...)
+	reloadedMessages[len(reloadedMessages)-1].Name = ""
+	thirdMessages := append(append(reloadedMessages, secondAssistant), oaiMsg{Role: "user", Content: "AFTER-TOOL-USER"})
 	recorder = httptest.NewRecorder()
 	server.openaiChat(recorder, phase3Request(http.MethodPost, "/v1/chat/completions", mustJSON(oaiReq{Model: "gpt-5.6-sol", Messages: thirdMessages})))
 	if recorder.Code != http.StatusOK {

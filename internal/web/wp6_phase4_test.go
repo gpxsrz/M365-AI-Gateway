@@ -312,7 +312,7 @@ func TestWP6ProtocolResponseMappersKeepMultipleCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	output, _ := response["output"].([]any)
-	if len(output) != 3 || output[1].(map[string]any)["call_id"] != "call_a" || output[2].(map[string]any)["call_id"] != "call_b" {
+	if len(output) != 2 || output[0].(map[string]any)["call_id"] != "call_a" || output[1].(map[string]any)["call_id"] != "call_b" {
 		t.Fatalf("Responses output=%#v", output)
 	}
 	anthropicRecorder := httptest.NewRecorder()

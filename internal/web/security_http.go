@@ -13,7 +13,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://unpkg.com")
 		if r.URL.Path == "/" || r.URL.Path == "/debug" || strings.HasPrefix(r.URL.Path, "/api/admin/debug/") || strings.HasPrefix(r.URL.Path, "/api/auth/") || r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Pragma", "no-cache")
@@ -35,7 +35,7 @@ func (s *Server) debugPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveWebFile(w http.ResponseWriter, r *http.Request, name string) {
-	raw, err := localizedAdministrationTemplate(name)
+	raw, err := os.ReadFile(name)
 	if err != nil {
 		http.Error(w, "管理介面無法使用", http.StatusInternalServerError)
 		return

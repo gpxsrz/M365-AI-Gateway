@@ -1,9 +1,6 @@
 package web
 
-import (
-	"encoding/json"
-	"strings"
-)
+import "strings"
 
 // toolProgress is transport metadata for a client-side long-running tool.
 // It is intentionally not an oaiMsg: progress must never satisfy a pending
@@ -30,9 +27,4 @@ func parseToolProgress(v map[string]any) (toolProgress, bool) {
 		return toolProgress{}, false
 	}
 	return p, true
-}
-
-func progressJSON(p toolProgress) []byte {
-	b, _ := json.Marshal(p)
-	return b
 }

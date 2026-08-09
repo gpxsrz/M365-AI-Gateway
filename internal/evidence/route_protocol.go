@@ -17,11 +17,7 @@ const (
 
 type ProtocolClassification string
 
-const (
-	ProtocolExposedAndSupported           ProtocolClassification = "EXPOSED_AND_SUPPORTED"
-	ProtocolExposedButUnsupportedForRoute ProtocolClassification = "EXPOSED_BUT_UNSUPPORTED_FOR_ROUTE"
-	ProtocolNotExposed                    ProtocolClassification = "NOT_EXPOSED"
-)
+const ProtocolExposedAndSupported ProtocolClassification = "EXPOSED_AND_SUPPORTED"
 
 type RouteProtocolCase string
 

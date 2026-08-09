@@ -1,7 +1,6 @@
 package web
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"m365-native/internal/chathub"
@@ -9,70 +8,6 @@ import (
 	"strings"
 	"time"
 )
-
-// toolPlanSummary tells the client what will happen before the structured call.
-// It must describe the concrete operation, rather than repeat a generic phrase.
-func toolPlanSummary(calls []detectedToolCall) string {
-	if len(calls) == 0 {
-		return "我将整理当前请求并继续处理。"
-	}
-	plans := make([]string, 0, len(calls))
-	for _, c := range calls {
-		plans = append(plans, toolPlan(c))
-	}
-	return strings.Join(plans, "\n\n")
-}
-
-func toolPlan(c detectedToolCall) string {
-	return toolPlanFor(c.Name, c.Arguments)
-}
-
-func toolPlanFor(name string, arguments []byte) string {
-	var args map[string]any
-	_ = json.Unmarshal(arguments, &args)
-	verb := "调用 " + name
-	purpose := "获取该工具返回的信息"
-	var target string
-	for _, key := range []string{"command", "cmd", "path", "query", "url", "input", "prompt"} {
-		if s, ok := args[key].(string); ok && strings.TrimSpace(s) != "" {
-			target = strings.TrimSpace(s)
-			break
-		}
-	}
-	switch {
-	case strings.Contains(name, "shell") || strings.Contains(name, "exec") || strings.Contains(name, "command"):
-		verb = "执行工作区命令"
-		purpose = "读取项目状态、运行检查或完成用户指定的命令"
-	case strings.Contains(name, "read") || strings.Contains(name, "file"):
-		verb = "读取文件内容"
-		purpose = "检查文件内容并据此继续处理"
-	case strings.Contains(name, "write") || strings.Contains(name, "edit") || strings.Contains(name, "update"):
-		verb = "修改项目文件"
-		purpose = "应用请求的变更并保留现有逻辑"
-	case strings.Contains(name, "search") || strings.Contains(name, "browser") || strings.Contains(name, "fetch"):
-		verb = "查询外部信息"
-		purpose = "获取相关资料并用于当前回答"
-	}
-	if target != "" {
-		if len([]rune(target)) > 180 {
-			target = string([]rune(target)[:180]) + "…"
-		}
-		return fmt.Sprintf("我将执行：%s。\n\n目的：%s。\n\n预期：返回结果后继续处理。", verb+"："+target, purpose)
-	}
-	return fmt.Sprintf("我将执行：%s。\n\n目的：%s。\n\n预期：返回结果后继续处理。", verb, purpose)
-}
-
-func toolPlanSummaryFromMaps(calls []any) string {
-	converted := make([]detectedToolCall, 0, len(calls))
-	for _, raw := range calls {
-		tc, _ := raw.(map[string]any)
-		fn, _ := tc["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		args, _ := fn["arguments"].(string)
-		converted = append(converted, detectedToolCall{Name: name, Arguments: []byte(args)})
-	}
-	return toolPlanSummary(converted)
-}
 
 func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, preambleSent ...bool) error {
 	return writeToolResponseWithRoute(w, id, model, stream, calls, res, routeResolution{}, preambleSent...)
@@ -88,15 +23,17 @@ func writeToolResponseWithPolicy(w http.ResponseWriter, id, model string, stream
 
 func writeToolResponseWithMetadata(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, route routeResolution, policy nativePolicySnapshot, metadata map[string]any, reasoning string, preambleSent ...bool) error {
 	toolCalls := toolCallMaps(calls)
-	summary := toolPlanSummary(calls)
-	textContent := summary
+	var textContent any
 	if !stream && strings.TrimSpace(res.Text) != "" {
 		textContent = res.Text
 	}
 	images := validImageURLs(res.Images)
-	content := any(textContent)
+	content := textContent
 	if len(images) > 0 {
-		parts := []any{map[string]any{"type": "text", "text": textContent}}
+		parts := []any{}
+		if textContent != nil {
+			parts = append(parts, map[string]any{"type": "text", "text": textContent})
+		}
 		for _, url := range images {
 			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
 		}
@@ -137,7 +74,7 @@ func writeToolResponseWithMetadata(w http.ResponseWriter, id, model string, stre
 			return chunk
 		}
 		if len(preambleSent) == 0 || !preambleSent[0] {
-			delta := map[string]any{"role": "assistant", "content": summary}
+			delta := map[string]any{"role": "assistant"}
 			if reasoning != "" {
 				delta["reasoning_content"] = reasoning
 			}
@@ -286,14 +223,6 @@ func writeBufferedChatCompletionStream(w http.ResponseWriter, response map[strin
 		flusher.Flush()
 	}
 	return nil
-}
-
-func writeTextStreamEnd(w http.ResponseWriter, id, model string, routes ...routeResolution) {
-	route := routeResolution{}
-	if len(routes) > 0 {
-		route = routes[0]
-	}
-	writeTextStreamEndWithPolicy(w, id, model, route, nativePolicySnapshot{})
 }
 
 func writeTextStreamEndWithPolicy(w http.ResponseWriter, id, model string, route routeResolution, policy nativePolicySnapshot, results ...chathub.Result) {

@@ -214,6 +214,116 @@ func TestTransportCheckpointCanonicalIdentity(t *testing.T) {
 	})
 }
 
+func TestTransportCheckpointToolResultIdentityMismatchRebinds(t *testing.T) {
+	base := []oaiMsg{
+		{Role: "user", Content: "call lookup"},
+		{Role: "assistant", ToolCalls: []map[string]any{{
+			"id": "call-1", "type": "function",
+			"function": map[string]any{"name": "lookup", "arguments": `{"query":"one"}`},
+		}}},
+		{Role: "tool", Name: "lookup", ToolCallID: "call-1", Content: "result-one"},
+	}
+	cases := map[string]oaiMsg{
+		"content":      {Role: "tool", ToolCallID: "call-1", Content: "result-two"},
+		"tool call id": {Role: "tool", ToolCallID: "call-2", Content: "result-one"},
+	}
+	for name, toolResult := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := openCheckpointForTest(t)
+			turn := beginFullForTest(t, store, "chat", "owner", "key", base)
+			acceptForTest(t, turn, "conv-old", "session-old", nil, "")
+			active := append(append([]oaiMsg{}, base[:2]...), toolResult, oaiMsg{Role: "user", Content: "next"})
+			turn = beginFullForTest(t, store, "chat", "owner", "key", active)
+			if !turn.Rebound || turn.Binding.ConversationID != "" || !reflect.DeepEqual(turn.Outbound, active) {
+				t.Fatalf("tool result mismatch did not fully rebind: %#v", turn)
+			}
+			_ = turn.Abort()
+		})
+	}
+}
+
+func TestTransportCheckpointReusesLegacyToolNameDigest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoints.json")
+	store, err := openTransportCheckpointStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := []oaiMsg{
+		{Role: "user", Content: "call lookup"},
+		{Role: "assistant", ToolCalls: []map[string]any{{
+			"id": "call-1", "type": "function",
+			"function": map[string]any{"name": "lookup", "arguments": `{"query":"one"}`},
+		}}},
+		{Role: "tool", Name: "lookup", ToolCallID: "call-1", Content: "result-one"},
+	}
+	legacy, err := canonicalCheckpointMessages(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := canonicalCheckpointMessage(base[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope canonicalCheckpointMessageEnvelope
+	if err := json.Unmarshal(canonical, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	envelope.Name = "lookup"
+	canonical, err = json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.digests[2] = checkpointDigest(transportCheckpointHashDomain, string(canonical))
+	legacy.chains, err = extendCheckpointHashChain(nil, legacy.digests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	store.records["legacy"] = &transportCheckpointRecord{
+		ID:               "legacy",
+		Namespace:        "chat",
+		OwnerDigest:      checkpointDigest(transportCheckpointOwnerDomain, "owner"),
+		KeyDigest:        checkpointDigest(transportCheckpointKeyDomain, "key"),
+		ConversationID:   "conv-legacy",
+		CurrentSessionID: "session-legacy",
+		AcceptedCount:    len(base),
+		MessageDigests:   legacy.digests,
+		HashChain:        legacy.chains,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		Revision:         1,
+	}
+
+	active := append([]oaiMsg{}, base...)
+	active[2].Name = ""
+	active = append(active, oaiMsg{Role: "user", Content: "next"})
+	turn := beginFullForTest(t, store, "chat", "owner", "key", active)
+	if turn.Rebound || turn.Binding.ConversationID != "conv-legacy" || len(turn.Outbound) != 1 || turn.Outbound[0].Content != "next" {
+		t.Fatalf("legacy tool-name checkpoint did not reuse: %#v", turn)
+	}
+	acceptForTest(t, turn, "conv-legacy", "session-migrated", []oaiMsg{{Role: "assistant", Content: "next-answer"}}, "")
+
+	migrated := store.records["legacy"]
+	current, err := canonicalCheckpointMessages(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.MessageDigests[2] != current.digests[2] {
+		t.Fatal("accepted legacy match did not migrate to the current tool-result digest")
+	}
+
+	store, err = openTransportCheckpointStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRestart := append(append([]oaiMsg{}, active...), oaiMsg{Role: "assistant", Content: "next-answer"}, oaiMsg{Role: "user", Content: "after restart"})
+	turn = beginFullForTest(t, store, "chat", "owner", "key", afterRestart)
+	if turn.Rebound || turn.Binding.ConversationID != "conv-legacy" || turn.Binding.SessionID != "session-migrated" || len(turn.Outbound) != 1 || turn.Outbound[0].Content != "after restart" {
+		t.Fatalf("migrated checkpoint did not survive restart: %#v", turn)
+	}
+	_ = turn.Abort()
+}
+
 func TestTransportCheckpointMismatchRebindsFullHistory(t *testing.T) {
 	base := []oaiMsg{
 		{Role: "system", Content: "policy"},
@@ -234,6 +344,18 @@ func TestTransportCheckpointMismatchRebindsFullHistory(t *testing.T) {
 			base[0], base[1], {Role: "assistant", ToolCalls: []map[string]any{{
 				"id": "c2", "type": "function",
 				"function": map[string]any{"name": "read", "arguments": `{"path":"a"}`},
+			}}},
+		},
+		"tool name": {
+			base[0], base[1], {Role: "assistant", ToolCalls: []map[string]any{{
+				"id": "c1", "type": "function",
+				"function": map[string]any{"name": "write", "arguments": `{"path":"a"}`},
+			}}},
+		},
+		"tool arguments": {
+			base[0], base[1], {Role: "assistant", ToolCalls: []map[string]any{{
+				"id": "c1", "type": "function",
+				"function": map[string]any{"name": "read", "arguments": `{"path":"b"}`},
 			}}},
 		},
 		"compression rewrite": {

@@ -192,7 +192,7 @@ func TestCandidateChatValidationKeepsStagedCredentialInactive(t *testing.T) {
 	if !stagedManifest.Validation.ChatHub || stagedManifest.Validation.Complete() {
 		t.Fatalf("candidate validation evidence=%#v", stagedManifest.Validation)
 	}
-	resolved, err := s.resolveAccount("ignored-legacy-selector")
+	resolved, err := s.activeAccount()
 	if err != nil || resolved.AccessToken != "token-active" {
 		t.Fatalf("running server changed active account: account=%#v err=%v", resolved, err)
 	}

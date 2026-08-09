@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sort"
 	"strings"
 
 	"m365-native/internal/chathub"
@@ -330,17 +329,4 @@ func runWP2LegacyConfiguredFailureObservation(model string, caseID evidence.Lega
 		return evidence.LegacyConfiguredRecordV1{}, err
 	}
 	return evidence.CaptureLegacyConfigured(raw, descriptor, binding)
-}
-
-func WP2LegacyConfiguredEffectiveSettings(mappings []WP2ConfiguredMapping) map[string]any {
-	ordered := append([]WP2ConfiguredMapping(nil), mappings...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].PublicModel < ordered[j].PublicModel })
-	return map[string]any{
-		"schema":              "m365-wp2-legacy-configured-effective-settings/v1",
-		"legacy_routes":       append([]string(nil), wp2LegacyDirectOrder...),
-		"configured_mappings": ordered,
-		"protocols":           []string{"openai_chat_completions_nonstream", "openai_responses_nonstream", "anthropic_messages_nonstream", "legacy_chat_nonstream", "legacy_chat_stream"},
-		"efforts":             []string{"omitted", "none", "minimal", "low", "medium", "high", "xhigh"},
-		"production_access":   false, "hermes_access": false, "per_key_governance": false, "visibility_reduction": false,
-	}
 }

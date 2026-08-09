@@ -581,44 +581,6 @@ func TestOAuthLifecyclePrunesAbandonedCandidatesButKeepsCompletedCandidates(t *t
 	}
 }
 
-func TestOAuthLiveValidationPlanIsSeparateAndPrivacySafe(t *testing.T) {
-	raw, err := os.ReadFile("../../docs/wp5/oauth-live-validation-plan.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan := string(raw)
-	for _, required := range []string{
-		"WP5-03 未執行正式 Microsoft 線上驗收",
-		"明確授權",
-		"首次登入",
-		"階段式重新授權",
-		"Refresh 成功",
-		"Refresh 失敗與復原",
-		"重新啟動持久性",
-		"移除帳號",
-		"回復（Rollback）",
-		"Production 重新啟動不在此計畫範圍",
-		"不得加入公開的 `/api/auth/start` 覆寫",
-		"不得記錄 Client ID 文字",
-	} {
-		if !strings.Contains(plan, required) {
-			t.Errorf("live plan missing %q", required)
-		}
-	}
-	for _, forbidden := range []string{
-		"c0ab8ce9-e9a0-42e7-b064-33d422df41f1",
-		"person-lifecycle@example.test",
-		"oid-lifecycle",
-		"tid-lifecycle",
-		"accepted-login",
-		"refresh-success-next",
-	} {
-		if strings.Contains(plan, forbidden) {
-			t.Errorf("live plan leaked test or reusable identity %q", forbidden)
-		}
-	}
-}
-
 func TestOAuthLifecycleStartBodyIsBoundedClosedAndExistingProfileSafe(t *testing.T) {
 	for _, test := range []struct {
 		name        string

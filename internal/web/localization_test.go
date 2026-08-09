@@ -2,7 +2,6 @@ package web
 
 import (
 	"encoding/json"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +19,8 @@ var forbiddenSimplifiedAdministrationTerms = []string{
 	"浏览器", "粘贴", "链接", "超时", "生成", "配置", "当前", "开发版",
 	"稳定版", "接口", "权限", "创建", "复制", "剪贴板", "密码管理器", "失败次数", "稍后", "支持",
 	"会话", "凭据", "两次输入", "字符", "修改成功", "必须", "保护",
+	"状态", "时间", "与", "切换", "会", "并", "优先", "用于", "记录", "建议", "这个", "一个",
+	"识别", "尝试", "将", "发现", "个代理", "填写", "字段", "轮", "数", "项", "服务", "参数", "逗号",
 }
 
 func TestAdministrationTemplatesAreTaiwanTraditionalChinese(t *testing.T) {
@@ -32,14 +33,9 @@ func TestAdministrationTemplatesAreTaiwanTraditionalChinese(t *testing.T) {
 		if !strings.Contains(string(source), `lang="zh-TW"`) {
 			t.Errorf("%s source does not declare zh-TW", path)
 		}
-		raw, err := localizedAdministrationTemplate(rawPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		text := string(raw)
 		for _, term := range forbiddenSimplifiedAdministrationTerms {
-			if strings.Contains(text, term) {
-				t.Errorf("%s contains simplified administration term %q", path, term)
+			if strings.Contains(string(source), term) {
+				t.Errorf("%s source contains simplified administration term %q", path, term)
 			}
 		}
 	}
@@ -49,14 +45,14 @@ func TestAdministrationTemplatesUseTaiwanTerminology(t *testing.T) {
 	expected := map[string][]string{
 		"web/login.html": {"管理員登入", "管理主控台", "Microsoft 帳號", "切換密碼顯示"},
 		"web/index.html": {"Microsoft 帳號", "登入帳號", "存取設定", "執行日誌", "代理集區", "設定"},
-		"web/debug.html": {"診斷摘要", "短期診斷快照", "重新整理", "返回管理介面", "協定", "路由", "請求 ID", "快照到期時間"},
+		"web/debug.html": {"診斷摘要", "短期診斷快照", "純量內容", "請求標頭", "重新整理", "返回管理介面", "協定", "路由", "請求 ID", "快照到期時間"},
 	}
 	forbidden := map[string][]string{
 		"web/login.html": {"帳號集區"},
 		"web/index.html": {"帳號集區", "新增帳號", "profileRef", "profileRefVersion", "/api/accounts"},
 	}
 	for path, phrases := range expected {
-		raw, err := localizedAdministrationTemplate(filepath.Join("../..", path))
+		raw, err := os.ReadFile(filepath.Join("../..", path))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +68,7 @@ func TestAdministrationTemplatesUseTaiwanTerminology(t *testing.T) {
 			}
 		}
 		if path == "web/debug.html" {
-			for _, forbidden := range []string{"Snapshot expires", "Request ID", ">Protocol<", ">Route<"} {
+			for _, forbidden := range []string{"scalar 正文", "request headers", "Snapshot expires", "Request ID", ">Protocol<", ">Route<"} {
 				if strings.Contains(text, forbidden) {
 					t.Errorf("%s contains untranslated label %q", path, forbidden)
 				}
@@ -81,8 +77,24 @@ func TestAdministrationTemplatesUseTaiwanTerminology(t *testing.T) {
 	}
 }
 
+func TestAdministrationTemplateHasNoUnusedLegacyAssets(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("../..", "web/index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, removed := range []string{
+		"chart.js", `id="login"`, "@keyframes scaleIn", "@keyframes spin", "@keyframes pulse",
+		".account-cell{", ".avatar{",
+	} {
+		if strings.Contains(text, removed) {
+			t.Errorf("management UI still contains unused legacy asset %q", removed)
+		}
+	}
+}
+
 func TestWP6ManagementSettingsExposeProductPolicyOnly(t *testing.T) {
-	raw, err := localizedAdministrationTemplate(filepath.Join("../..", "web/index.html"))
+	raw, err := os.ReadFile(filepath.Join("../..", "web/index.html"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +117,7 @@ func TestWP6ManagementSettingsExposeProductPolicyOnly(t *testing.T) {
 
 func TestAdministrationTemplatesUseExplicitTaipeiDateFormatting(t *testing.T) {
 	for _, path := range []string{"web/index.html", "web/debug.html"} {
-		raw, err := localizedAdministrationTemplate(filepath.Join("../..", path))
+		raw, err := os.ReadFile(filepath.Join("../..", path))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -219,7 +231,7 @@ func TestCanonicalManagementIdentifiersRemainEnglish(t *testing.T) {
 		"web/debug.html": {"requestId", "expiresAt", "durationMs"},
 	}
 	for path, identifiers := range expected {
-		raw, err := localizedAdministrationTemplate(filepath.Join("../..", path))
+		raw, err := os.ReadFile(filepath.Join("../..", path))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -239,7 +251,7 @@ func TestLocalizedAdministrationInlineJavaScriptIsValid(t *testing.T) {
 	}
 	scriptPattern := regexp.MustCompile(`(?s)<script(?:\s[^>]*)?>(.*?)</script>`)
 	for _, path := range []string{"web/login.html", "web/index.html", "web/debug.html"} {
-		raw, err := localizedAdministrationTemplate(filepath.Join("../..", path))
+		raw, err := os.ReadFile(filepath.Join("../..", path))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -298,13 +310,5 @@ func TestVisibleManagementHandlersReturnZhTWErrors(t *testing.T) {
 				t.Fatalf("error=%+v want message=%q type=%q", response.Error, tc.wantMessage, tc.wantType)
 			}
 		})
-	}
-}
-
-func TestLocalizationTestDoesNotScanGeneratedOrEvidenceFiles(t *testing.T) {
-	// Keep the locale gate focused on live administration surfaces rather than
-	// historical evidence, generated packages, or protocol payload fixtures.
-	if _, err := fs.Stat(os.DirFS("../.."), "web/index.html"); err != nil {
-		t.Fatal(err)
 	}
 }

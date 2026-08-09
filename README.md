@@ -1,87 +1,103 @@
-# M365 Copilot2API
+# M365-Copilot2API
 
-這是維護者整理的衍生參考版，基於 [HEXUXIU/M365-Copilot2API](https://github.com/HEXUXIU/M365-Copilot2API) 的已接受來源快照重新整理而成。
+M365-Copilot2API 是社群維護的自架 Sidecar，將 Microsoft 365 Copilot ChatHub 轉接為常見的 OpenAI 與 Anthropic API 介面，並提供管理介面、工具呼叫、多模態輸入、Bing、Code Interpreter 與 MCP 整合。
 
-此版本的目標是保留一個可公開檢視、可自行建置、可重複驗證的參考樹，作為單一維護者使用的衍生快照；它**不是**用來追逐上游每一次後續功能變動的鏡像分支。
+本專案的唯一開發主線是公開倉庫 [`gpxsrz/M365-Copilot2API` 的 `main`](https://github.com/gpxsrz/M365-Copilot2API/tree/main)；所有修正、驗證與發佈皆以該分支為準。程式最初衍生自 [HEXUXIU/M365-Copilot2API](https://github.com/HEXUXIU/M365-Copilot2API)，目前僅將其視為唯讀來源參考，不會自動同步。
 
-## 專案定位
+> 本專案不是 Microsoft、OpenAI 或 Anthropic 的官方產品，也不代表官方 API 的完整等價實作。請只用於你有權存取的帳號與租戶。
 
-M365 Copilot2API 是一個自架的 Microsoft 365 Copilot Sidecar，將 Microsoft 365 Copilot 的 ChatHub 能力整理成 OpenAI 相容 API，並補上管理介面、工具呼叫、多模態輸入、Bing 搜尋、Code Interpreter、MCP 等整合邏輯。
+## 運作方式
 
-此快照採單一 Microsoft 365 帳號架構：
+本專案採單一 Microsoft 365 帳號架構：
 
 ```text
-一個 Sidecar instance
+一個 Sidecar 執行個體
 → 一個 Microsoft 365 帳號
-→ 多個彼此隔離的 API / agent conversations
+→ 多個彼此隔離的 API 對話
 ```
 
-長期聊天記憶不屬於此專案的責任範圍；若上層 agent 需要長期 history、memory 或 context compression，應由上游 consumer 自己管理。
+Sidecar 負責傳輸層的短期續接狀態；長期對話歷史、記憶與內容壓縮應由呼叫端管理。
 
-## 目前公開保留的能力重點
+## 支援範圍
 
-- `POST /v1/chat/completions` 為主要相容端點，支援一般文字、SSE streaming、Vision、caller tools 與部分 Microsoft built-in tools。
-- `POST /v1/responses` 與 `POST /v1/messages` 保留相容層，但主要驗證路徑仍以 `/v1/chat/completions` 為主。
-- `Private / Temporary Chat` 模式以每條新 ChatHub WebSocket 明確加上 `disableMemory=1` 為原則。
-- 一般文件與圖片走不同的 Microsoft transport；文件會經過 Graph / SharePoint / OneDrive staging，圖片則使用 image upload path。
-- `Code Interpreter` 可產生上游 artifact，但可下載檔案必須由 Sidecar 額外完成 authenticated artifact fetch，不能直接把瀏覽器 `blob:` URL 當成 API 結果。
-- MCP 同時保留 modern 與 legacy handler，但不同 consumer 是否可直接互通，仍要看實際掛載與路由狀態。
+| 介面 | 用途 |
+| --- | --- |
+| `GET /v1/models` | 取得可用模型目錄。 |
+| `POST /v1/chat/completions` | 主要相容介面，支援文字、SSE 串流、視覺輸入與呼叫端工具。 |
+| `POST /v1/responses` | OpenAI Responses 形狀相容層。 |
+| `POST /v1/messages` | Anthropic Messages 形狀相容層。 |
+| `/v1/mcp` | MCP Streamable HTTP。 |
+| `/v1/mcp/sse`、`/v1/mcp/message` | 舊版 MCP SSE 傳輸。 |
+| `/` | 管理登入、Microsoft 365 帳號連線、API 金鑰與執行設定。 |
+
+上表列出的 API 與 MCP 介面都需要管理介面建立的 API 金鑰，並以 `Authorization: Bearer <API_KEY>` 傳送。
 
 ## 快速開始
 
-### 需求
+需求：
 
-- Go 1.25 或相容版本
-- 可登入的 Microsoft 365 Copilot 帳號
-- 瀏覽器，用於首次管理登入與 Microsoft OAuth
+- Go 1.25
+- 具備 Microsoft 365 Copilot 使用權限的帳號
+- 可完成 Microsoft 登入的瀏覽器
 
-### 本機啟動
+### 本機執行
 
 ```bash
 export M365_ADMIN_PASSWORD='replace-with-a-unique-bootstrap-secret'
 go run ./cmd/server
 ```
 
-預設監聽：
+服務預設只監聽 `http://127.0.0.1:4141`。
 
-```text
-http://127.0.0.1:4141
-```
-
-首次進入管理介面後：
-
-1. 使用 `M365_ADMIN_PASSWORD` 登入。
-2. 立即設定持久管理員密碼。
-3. 完成 Microsoft 365 帳號登入。
-4. 建立 API Key。
-5. 讓上游 client 以 `Authorization: Bearer YOUR_API_KEY` 呼叫 Sidecar。
-
-### Docker Compose
+### 容器映像
 
 ```bash
-mkdir -p data secrets
-chmod 700 data secrets
-printf '%s\n' 'replace-with-a-unique-bootstrap-secret' > secrets/m365_admin_password
-chmod 600 secrets/m365_admin_password
-docker compose build
-docker compose up -d
+docker build -t m365-copilot2api .
 ```
 
-Compose 預設只綁定到本機 `127.0.0.1:4141`。
+`Dockerfile` 可作為自訂部署的建置基礎，但本專案不提供通用 Compose 快速啟動。管理 bootstrap 僅允許真正的 loopback 請求；一般 bridge/NAT 會被視為非 loopback，必須先設計 HTTPS、可信反向代理、資料卷權限與持久管理員密碼的安全佈署流程。
 
-## 主要操作原則
+## 首次設定
 
-- 預設使用 `Private / Temporary Chat`，不要把一般 API 流量當成普通可見聊天歷史。
-- `128000` UTF-16 units 應視為官方 Web 相容的保守文字政策，不是 Microsoft backend 的已證明硬上限。
-- 對於 conversation reuse，應採 strict hash-prefix / checkpoint 驗證，而不是 fuzzy similarity。
-- 對於大型 tool result、混合 Bing + caller tools、Code Interpreter artifact 回傳與 MCP consumer 互通，請先閱讀 [docs/已知限制.md](docs/已知限制.md) 與 [docs/相容性與驗證矩陣.md](docs/相容性與驗證矩陣.md)。
+1. 開啟 `http://127.0.0.1:4141`。
+2. 使用部署時提供的一次性 bootstrap secret 登入；本機直接執行時就是 `M365_ADMIN_PASSWORD`。第一次成功登入後，此 secret 會立即失效，管理介面會強制改用持久管理員密碼。
+3. 在管理介面完成 Microsoft 365 帳號登入。
+4. 建立 API 金鑰。
+5. 以該金鑰測試模型目錄：
 
-## 公開文件範圍
+```bash
+export M365_API_KEY='replace-with-your-api-key'
+curl -sS http://127.0.0.1:4141/v1/models \
+  -H "Authorization: Bearer ${M365_API_KEY}"
+```
 
-這個公開快照只保留對外有用、可安全分享的說明：
+## 隱私與限制
 
-- [docs/研究與測試成果.md](docs/研究與測試成果.md)
-- [docs/相容性與驗證矩陣.md](docs/相容性與驗證矩陣.md)
-- [docs/已知限制.md](docs/已知限制.md)
+- 預設聊天模式為 `Private`。每次建立 ChatHub WebSocket 都會重新套用 `disableMemory=1`，但這不代表 Microsoft 完全不保留任何資料。
+- 呼叫端文字預設上限為 `128000` 個 UTF-16 碼元。這是與官方 Web 編輯器相容的保守政策，不是已證明的 Microsoft 後端硬上限。
+- 文件與圖片使用不同的 Microsoft 傳輸路徑。文件可能經由 Graph、OneDrive 或 SharePoint 暫存；圖片則走專用圖片上傳路徑。
+- Code Interpreter 產出的檔案會由 Sidecar 以已登入身分擷取、存入本機私有儲存區，再轉成短期下載網址（capability URL）。網址本身具有存取能力，請勿公開轉傳。
+- 將服務暴露到 loopback 以外之前，必須另行配置 TLS、可信反向代理、網路存取限制及正確的公開來源設定。
 
-其餘部署證據、內部治理、審查材料、私人操作紀錄與原始證據封包不包含在此公開樹中。
+完整邊界請見 [已知限制](docs/已知限制.md)；安全注意事項請見 [SECURITY.md](SECURITY.md)。
+
+## 開發與驗證
+
+變更應從公開 `main` 建立分支，並以最小、可驗證的修正回到同一個公開倉庫。Go 程式變更至少執行：
+
+```bash
+gofmt -w <changed-go-files>
+go mod verify
+go test ./...
+go vet ./...
+go build ./...
+git diff --check
+```
+
+涉及併發、串流或生命週期的變更，另執行 `go test -race ./...`。詳細規範請見 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 問題回報
+
+- 一般錯誤、功能需求與相容性問題：[GitHub Issues](https://github.com/gpxsrz/M365-Copilot2API/issues)
+- 安全性問題：依 [SECURITY.md](SECURITY.md) 私下回報，請勿在公開議題附上 token、cookie、帳號資料或可重放封包。
+- 授權條款：[LICENSE](LICENSE)

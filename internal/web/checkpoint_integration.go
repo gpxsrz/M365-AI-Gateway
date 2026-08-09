@@ -316,7 +316,7 @@ func assistantTextCheckpointMessage(text string, images []string) oaiMsg {
 }
 
 func assistantToolCheckpointMessage(calls []detectedToolCall, result chathub.Result, stream bool) oaiMsg {
-	content := toolPlanSummary(calls)
+	content := ""
 	if !stream && strings.TrimSpace(result.Text) != "" {
 		content = result.Text
 	}
@@ -324,7 +324,20 @@ func assistantToolCheckpointMessage(calls []detectedToolCall, result chathub.Res
 }
 
 func assistantToolCheckpointMessageWithContent(calls []detectedToolCall, content string, images []string) oaiMsg {
-	message := assistantTextCheckpointMessage(content, images)
+	message := oaiMsg{Role: "assistant"}
+	images = validImageURLs(images)
+	if len(images) > 0 {
+		parts := make([]any, 0, len(images)+1)
+		if content != "" {
+			parts = append(parts, map[string]any{"type": "text", "text": content})
+		}
+		for _, image := range images {
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": image}})
+		}
+		message.Content = parts
+	} else if content != "" {
+		message.Content = content
+	}
 	message.ToolCalls = checkpointToolCalls(calls)
 	return message
 }

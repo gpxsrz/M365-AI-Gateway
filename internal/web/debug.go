@@ -488,7 +488,7 @@ func (d *debugStore) sessionStatus() debugSessionStatus {
 
 func (d *debugStore) sessionStatusLocked(now time.Time) debugSessionStatus {
 	status := debugSessionStatus{
-		Warning: "診斷快照會移除所有 scalar 正文與 request headers，並在到期後自動清除。",
+		Warning: "診斷快照會移除所有純量內容與請求標頭，並在到期後自動清除。",
 	}
 	if d.data.Session == nil || !now.Before(d.data.Session.ExpiresAt) {
 		return status

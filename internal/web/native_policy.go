@@ -25,14 +25,12 @@ type CapabilityPolicy string
 type EnforcementLevel string
 
 const (
-	PolicyInherit     CapabilityPolicy = "inherit"
-	PolicyEnabled     CapabilityPolicy = "enabled"
-	PolicyDisabled    CapabilityPolicy = "disabled"
-	PolicyUnsupported CapabilityPolicy = "unsupported"
+	PolicyInherit  CapabilityPolicy = "inherit"
+	PolicyEnabled  CapabilityPolicy = "enabled"
+	PolicyDisabled CapabilityPolicy = "disabled"
 
 	EnforcementNone      EnforcementLevel = "none"
 	EnforcementPrompt    EnforcementLevel = "prompt_only"
-	EnforcementPayload   EnforcementLevel = "payload_enforced"
 	EnforcementExecution EnforcementLevel = "execution_enforced"
 )
 

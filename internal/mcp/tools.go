@@ -141,8 +141,3 @@ func (r CallResult) Text() string {
 	}
 	return strings.Join(out, "\n")
 }
-
-func (r CallResult) ContentJSON() []byte {
-	b, _ := json.Marshal(r.Content)
-	return b
-}

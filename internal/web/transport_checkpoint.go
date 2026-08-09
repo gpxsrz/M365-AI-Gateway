@@ -315,6 +315,10 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 	if err != nil {
 		return nil, err
 	}
+	legacyHistory, err := legacyCanonicalCheckpointMessages(active)
+	if err != nil {
+		return nil, err
+	}
 	ownerDigest := checkpointDigest(transportCheckpointOwnerDomain, owner)
 	keyDigest := ""
 	if key != "" {
@@ -362,7 +366,7 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 	if !forceNew {
 		if keyDigest != "" {
 			matches := s.findExplicitLocked(namespace, ownerDigest, keyDigest)
-			if len(matches) == 1 && recordHasExactPrefix(matches[0], history.digests, history.chains) {
+			if len(matches) == 1 && recordHasAnyExactPrefix(matches[0], history, legacyHistory) {
 				selected = matches[0]
 			} else if len(matches) > 0 {
 				rebound = true
@@ -370,7 +374,7 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 			}
 		} else {
 			var ambiguous bool
-			selected, ambiguous = s.uniqueLongestPrefixLocked(namespace, ownerDigest, history.digests, history.chains)
+			selected, ambiguous = s.uniqueLongestPrefixLocked(namespace, ownerDigest, history, legacyHistory)
 			rebound = ambiguous || (selected == nil && s.hasOwnerNamespaceRecordLocked(namespace, ownerDigest))
 		}
 	} else if keyDigest != "" {
@@ -709,12 +713,12 @@ func (s *transportCheckpointStore) hasOwnerNamespaceRecordLocked(namespace, owne
 	return false
 }
 
-func (s *transportCheckpointStore) uniqueLongestPrefixLocked(namespace, ownerDigest string, digests, chains []string) (*transportCheckpointRecord, bool) {
+func (s *transportCheckpointStore) uniqueLongestPrefixLocked(namespace, ownerDigest string, histories ...checkpointHistory) (*transportCheckpointRecord, bool) {
 	longest := -1
 	var selected *transportCheckpointRecord
 	ambiguous := false
 	for _, record := range s.records {
-		if record.Namespace != namespace || record.OwnerDigest != ownerDigest || record.AcceptedCount == 0 || !recordHasExactPrefix(record, digests, chains) {
+		if record.Namespace != namespace || record.OwnerDigest != ownerDigest || record.AcceptedCount == 0 || !recordHasAnyExactPrefix(record, histories...) {
 			continue
 		}
 		if record.AcceptedCount > longest {
@@ -901,12 +905,29 @@ type checkpointHistory struct {
 }
 
 func canonicalCheckpointMessages(messages []oaiMsg) (checkpointHistory, error) {
+	return canonicalCheckpointMessagesWithLegacyToolNames(messages, false)
+}
+
+func legacyCanonicalCheckpointMessages(messages []oaiMsg) (checkpointHistory, error) {
+	return canonicalCheckpointMessagesWithLegacyToolNames(messages, true)
+}
+
+func canonicalCheckpointMessagesWithLegacyToolNames(messages []oaiMsg, legacy bool) (checkpointHistory, error) {
 	digests := make([]string, 0, len(messages))
+	toolNames := make(map[string]string)
 	for _, message := range messages {
 		if message.SidecarGenerated {
 			continue
 		}
-		canonical, err := canonicalCheckpointMessage(message)
+		toolName := ""
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if legacy && role == "tool" {
+			toolName = message.Name
+			if toolName == "" {
+				toolName = toolNames[message.ToolCallID]
+			}
+		}
+		canonical, err := canonicalCheckpointMessageWithToolName(message, toolName)
 		if err != nil {
 			return checkpointHistory{}, err
 		}
@@ -914,6 +935,14 @@ func canonicalCheckpointMessages(messages []oaiMsg) (checkpointHistory, error) {
 		_, _ = io.WriteString(h, transportCheckpointHashDomain)
 		_, _ = h.Write(canonical)
 		digests = append(digests, hex.EncodeToString(h.Sum(nil)))
+		for _, call := range message.ToolCalls {
+			id, _ := call["id"].(string)
+			function, _ := call["function"].(map[string]any)
+			name, _ := function["name"].(string)
+			if id != "" && name != "" {
+				toolNames[id] = name
+			}
+		}
 	}
 	chains, err := extendCheckpointHashChain(nil, digests)
 	if err != nil {
@@ -938,6 +967,10 @@ type canonicalCheckpointToolCall struct {
 }
 
 func canonicalCheckpointMessage(message oaiMsg) ([]byte, error) {
+	return canonicalCheckpointMessageWithToolName(message, "")
+}
+
+func canonicalCheckpointMessageWithToolName(message oaiMsg, toolName string) ([]byte, error) {
 	content, err := canonicalCheckpointValue(message.Content)
 	if err != nil {
 		return nil, fmt.Errorf("%w: content: %v", ErrCheckpointCanonicalization, err)
@@ -950,10 +983,15 @@ func canonicalCheckpointMessage(message oaiMsg) ([]byte, error) {
 	if role == "" {
 		role = "user"
 	}
+	name := message.Name
+	if role == "tool" {
+		// Clients may omit this redundant field when reloading tool results.
+		name = toolName
+	}
 	return json.Marshal(canonicalCheckpointMessageEnvelope{
 		Role:       role,
 		Content:    content,
-		Name:       message.Name,
+		Name:       name,
 		ToolCallID: message.ToolCallID,
 		ToolCalls:  toolCalls,
 	})
@@ -1070,6 +1108,15 @@ func recordHasExactPrefix(record *transportCheckpointRecord, digests, chains []s
 	}
 	return equalStrings(record.MessageDigests, digests[:record.AcceptedCount]) &&
 		equalStrings(record.HashChain, chains[:record.AcceptedCount])
+}
+
+func recordHasAnyExactPrefix(record *transportCheckpointRecord, histories ...checkpointHistory) bool {
+	for _, history := range histories {
+		if recordHasExactPrefix(record, history.digests, history.chains) {
+			return true
+		}
+	}
+	return false
 }
 
 func checkpointDeltaOutbound(active []oaiMsg, acceptedCount int) []oaiMsg {

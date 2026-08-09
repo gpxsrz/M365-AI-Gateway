@@ -34,7 +34,10 @@ func TestResponsesResultWritesCustomToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := response["output"].([]any)
-	call := output[1].(map[string]any)
+	if len(output) != 1 {
+		t.Fatalf("tool response added visible narration: %#v", output)
+	}
+	call := output[0].(map[string]any)
 	if call["type"] != "custom_tool_call" || call["name"] != "exec" || call["input"] != "uname -s" {
 		t.Fatalf("custom output=%#v", call)
 	}

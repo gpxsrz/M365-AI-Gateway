@@ -11,8 +11,8 @@
 <body>
 <main>
 <h1>診斷摘要</h1>
-<p class="muted">預設只保存結構化摘要，不保存完整 prompt、response、tool arguments、附件內容或 request headers。</p>
-<div class="warning"><strong>短期診斷快照</strong><div id="warningText">快照會移除所有 scalar 正文，並在到期後自動清除。</div></div>
+<p class="muted">預設只儲存結構化摘要，不儲存完整提示詞、回應、工具參數、附件內容或請求標頭。</p>
+<div class="warning"><strong>短期診斷快照</strong><div id="warningText">快照會移除所有純量內容，並在到期後自動清除。</div></div>
 <div class="toolbar">
 <button class="button primary" onclick="startSession()">啟用 15 分鐘診斷</button>
 <button class="button danger" onclick="clearSession()">停止並清除快照</button>
@@ -33,11 +33,11 @@
 <div class="table-wrap"><table><thead><tr><th>時間</th><th>操作</th><th>結果</th><th>Session</th><th>Record</th></tr></thead><tbody id="auditRows"></tbody></table></div>
 </section>
 <section id="detail" class="detail hidden">
-<button class="button" onclick="showList()">返回列表</button>
+<button class="button" onclick="showList()">返回清單</button>
 <h2 id="detailTitle"></h2>
 <div id="detailSummary" class="grid"></div>
 <h3>深度去敏結構快照</h3>
-<p class="muted">只顯示格式、大小、型別與深度統計；所有 scalar 值、未知欄位名稱與 request headers 均已移除。</p>
+<p class="muted">只顯示格式、大小、型別與深度統計；所有純量值、未知欄位名稱與請求標頭均已移除。</p>
 <pre id="snapshot">這筆摘要沒有快照。</pre>
 </section>
 </main>
@@ -46,7 +46,7 @@ const $=id=>document.getElementById(id);let records=[],audit=[];
 const fmtTime=value=>value?new Intl.DateTimeFormat('zh-TW',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(value)):'—';
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(url,options={}){options.headers={'Content-Type':'application/json',...(options.headers||{})};const response=await fetch(url,options);const text=await response.text();let data={};try{data=text?JSON.parse(text):{}}catch{data={error:{message:text}}}if(!response.ok)throw new Error(data?.error?.message||text||'請求失敗');return data}
-function renderSession(session){$('warningText').textContent=session.warning||'快照會深度去敏並自動到期。';$('session').innerHTML=session.active?'<strong>診斷中</strong> · 到期時間 '+esc(fmtTime(session.expiresAt))+' · '+esc(session.capturedRecords)+' / '+esc(session.maxRecords)+' 筆 · '+esc(session.capturedBytes)+' / '+esc(session.maxBytes)+' bytes':'<strong>未啟用診斷快照</strong> · 目前只保存結構化摘要。'}
+function renderSession(session){$('warningText').textContent=session.warning||'快照會深度去敏並自動到期。';$('session').innerHTML=session.active?'<strong>診斷中</strong> · 到期時間 '+esc(fmtTime(session.expiresAt))+' · '+esc(session.capturedRecords)+' / '+esc(session.maxRecords)+' 筆 · '+esc(session.capturedBytes)+' / '+esc(session.maxBytes)+' bytes':'<strong>未啟用診斷快照</strong> · 目前只儲存結構化摘要。'}
 async function load(){try{const data=await api('/api/admin/debug/logs');records=data.records||[];audit=data.audit||[];renderSession(data.session||{});$('recordCount').textContent=records.length;$('inputTokens').textContent=records.reduce((sum,item)=>sum+(item.inputTokens||0),0);$('outputTokens').textContent=records.reduce((sum,item)=>sum+(item.outputTokens||0),0);$('snapshotCount').textContent=records.filter(item=>item.snapshotAvailable).length;$('rows').innerHTML=records.map(item=>'<tr data-id="'+esc(item.id)+'" onclick="showDetail(\''+esc(item.id)+'\')"><td>'+esc(fmtTime(item.at))+'</td><td><code>'+esc(item.protocol)+'</code><div class="muted">'+esc(item.method)+' '+esc(item.path)+'</div></td><td><code>'+esc(item.route)+'</code></td><td><span class="pill">'+esc(item.status)+'</span><div class="muted">'+esc(item.errorCode||item.level)+'</div></td><td>'+esc(item.durationMs)+' ms</td><td>訊息 '+esc(item.messageCount)+' · 工具 '+esc(item.toolCount)+' · 附件 '+esc(item.attachmentCount)+' · 事件 '+esc(item.eventCount)+'</td><td>'+(item.snapshotAvailable?'到期 '+esc(fmtTime(item.snapshotExpiresAt)):'—')+'</td><td><code>'+esc(item.id)+'</code></td></tr>').join('')||'<tr><td colspan="8" class="muted" style="text-align:center;padding:36px">目前沒有診斷摘要</td></tr>';$('auditRows').innerHTML=audit.map(item=>'<tr><td>'+esc(fmtTime(item.at))+'</td><td><code>'+esc(item.action)+'</code></td><td>'+esc(item.result)+'</td><td><code>'+esc(item.sessionId||'—')+'</code></td><td><code>'+esc(item.recordId||'—')+'</code></td></tr>').join('')||'<tr><td colspan="5" class="muted" style="text-align:center;padding:24px">目前沒有稽核事件</td></tr>'}catch(error){$('session').textContent=error.message}}
 async function startSession(){try{const session=await api('/api/admin/debug/session',{method:'POST',body:JSON.stringify({ttlSeconds:900})});renderSession(session);await load()}catch(error){alert(error.message)}}
 async function clearSession(){if(!confirm('停止診斷工作階段並立即清除所有短期快照？結構化摘要會依原 TTL 保留。'))return;try{const session=await api('/api/admin/debug/session',{method:'DELETE'});renderSession(session);await load()}catch(error){alert(error.message)}}
