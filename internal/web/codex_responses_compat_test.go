@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"m365-copilot2api/internal/chathub"
+	"m365-native/internal/chathub"
 )
 
 func TestParseContentAcceptsResponsesTextBlocks(t *testing.T) {

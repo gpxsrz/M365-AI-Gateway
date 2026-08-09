@@ -37,8 +37,13 @@ func TestResponsesCustomExecIsExclusiveTool(t *testing.T) {
 	if len(o.Tools) != 1 || o.Tools[0].Type != "custom" {
 		t.Fatalf("tools=%#v, want only custom exec", o.Tools)
 	}
-	if !strings.Contains(fmt.Sprint(o.Messages[0].Content), "Never use") {
-		t.Fatalf("missing native-tool prohibition: %#v", o.Messages)
+	policy := fmt.Sprint(o.Messages[0].Content)
+	if strings.Contains(policy, "Never use, request, or mention Microsoft 365/Copilot native tools") ||
+		strings.Contains(policy, "only permitted execution tool") ||
+		!strings.Contains(policy, "Microsoft 365 native Bing web search") ||
+		!strings.Contains(policy, "read-only information retrieval remain allowed") ||
+		!strings.Contains(policy, "Do not use Microsoft 365 native execution or file-mutation tools") {
+		t.Fatalf("custom exec policy is not scoped: %#v", o.Messages)
 	}
 }
 
@@ -85,6 +90,14 @@ func TestAnthropicToOpenAI(t *testing.T) {
 	o, err := r.openAI()
 	if err != nil || len(o.Messages) != 2 || len(o.Tools) != 1 {
 		t.Fatalf("%+v %v", o, err)
+	}
+}
+
+func TestAnthropicAccountIDIsPreserved(t *testing.T) {
+	r := anthropicRequest{Model: "m", AccountID: "account-b", Messages: []anthropicMessage{{Role: "user", Content: any("weather")}}}
+	o, err := r.openAI()
+	if err != nil || o.AccountID != "account-b" {
+		t.Fatalf("account_id=%q err=%v", o.AccountID, err)
 	}
 }
 

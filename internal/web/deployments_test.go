@@ -2,10 +2,9 @@ package web
 
 import (
 	"context"
-	"m365-copilot2api/internal/outbound"
+	"m365-native/internal/outbound"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 )
@@ -82,13 +81,8 @@ func TestDeploymentCheckAddsHealthyURLToPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer outbound.ConfigurePool(nil)
-	saveEnv := os.Getenv("M365_DATA_DIR")
-	os.Setenv("M365_DATA_DIR", t.TempDir())
-	defer os.Setenv("M365_DATA_DIR", saveEnv)
-	st := openDeployments()
-	st.mu.Lock()
-	st.Items = []deployment{{ID: "test", ActiveURL: ts.URL, DefaultURL: ts.URL}}
-	st.mu.Unlock()
+	st := &deploymentStore{Items: []deployment{{ID: "test", ActiveURL: ts.URL, DefaultURL: ts.URL}}}
+	deployments = st
 	s := &Server{}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/deployment/check?id=test", nil)

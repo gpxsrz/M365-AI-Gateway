@@ -1,0 +1,246 @@
+{
+  "schema": "m365-wp2-route-protocol-evidence-index/v1",
+  "payload": {
+    "path": "evidence-set.json.gz.b64",
+    "encoding": "base64(gzip-mtime-0-level-9(json))",
+    "json_schema": "m365-wp2-route-protocol-evidence-set/v1",
+    "json_sha256": "f7f80bfbd54972afce4eec8ecb8ee9e598013e48ee6f24f50cc726d1c0718546",
+    "json_bytes": 215248,
+    "gzip_sha256": "f2856c2d38aa1555dfe2a3a3ac16e49974b5547906bb8fa815536b36fb24e32f",
+    "gzip_bytes": 14636,
+    "base64_sha256": "c36f3f6a8418e29d786b0a67ce63e2376b6cd84fb4c035278f1ea14e6139452e",
+    "base64_bytes": 19517
+  },
+  "records": 56,
+  "observation_counts": {
+    "success": 36,
+    "upstream_empty_response": 12,
+    "unknown_route": 4,
+    "disabled_route": 4
+  },
+  "public_http_evidence": {
+    "entrypoint": "Server.Routes",
+    "request_id_observed_all": true,
+    "security_headers_observed_all": true,
+    "auth_modes": {
+      "api_key": 42,
+      "admin_session": 14
+    }
+  },
+  "matrix": [
+    {
+      "canonical_route": "m365-auto",
+      "resolved_tone": "magic",
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "eaa5fbc6f520a3b5106a03ca2a56ad0d5a6cc1a23483291ca771afdf630459ac",
+        "2aa0ccdf93e1c88a0884bfff14bbc1230d31c6f5bcd23c77a609de031db7d28f",
+        "e55ab33903498f013a910dd6c25c4e9a4e4fcd0df554e45cb28a83e4c949cf0c"
+      ],
+      "empty_observation_sha256": "3940d7989a350b2a039dfc1eaf50766b1c7d2ce037adb8e7b17f2a77f53dbc14"
+    },
+    {
+      "canonical_route": "m365-auto",
+      "resolved_tone": "magic",
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "860776e3161d6c6dd3cf04c4f9315de005dac4423b68359a092b6116aa6ec867",
+        "3b0688c929b1f687eee8c7440cefc5a0013ed4f78e7868a2365892eceab1e367",
+        "0c7bbb37af08641516f2223356a808b471856d3902527b4ef9c3be019a318d4b"
+      ],
+      "empty_observation_sha256": "51f00d8dc25dac8921c5cc4047e40c8d08d1dfbad0848f5e1d4124fad70713ad"
+    },
+    {
+      "canonical_route": "m365-auto",
+      "resolved_tone": "magic",
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "0ad9dff9720948d2d2eba08977d11a9f171bc19e58799e159f80f2204edae870",
+        "ec2c38ee842fd574c91bf45918b85c335bc929bdca296bb5a8b0f3077a067500",
+        "a1cff18fffe92ec7109faf0a0d739d73a044125b452b38f486c680f8036bca0d"
+      ],
+      "empty_observation_sha256": "2ad6c03525f99a1f629b52492719129dc8a37b016bca97cc1f2d3dfd15e1c9b3"
+    },
+    {
+      "canonical_route": "m365-auto",
+      "resolved_tone": "magic",
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "422ee549d0f7128f1b9c822bf6998b29df042d842f497a25a41956e2847a611c",
+        "4b6851cdd3b15668a1798b6c16ad2309ab2ed6d37b0dbff8215503b01df83936",
+        "303bd874e061a794d7105bcddc1b67c7800e59a041be952d63e9ecc00e8d69d1"
+      ],
+      "empty_observation_sha256": "4808abd05c7a2e32bea6681183af58626b53f767a05667fbf163869e81e201df"
+    },
+    {
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "resolved_tone": "Gpt_5_6_Reasoning",
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "c4613ab6f83a711c1bc8ef2b208843aafcf8164f68751fd335c916ee2dbcba58",
+        "63065d3372de5664bac1fee80af8071269f735d0928e0c34a714a3f05aef66a5",
+        "cd3fc4ab8067dbcbed68cb60b7adef499c23a03a2891d6aeafad1036758c2385"
+      ],
+      "empty_observation_sha256": "f0a972b8402463518a7040d5ee926090bd6a5143d10f8def02e8ba053ae865b9"
+    },
+    {
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "resolved_tone": "Gpt_5_6_Reasoning",
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "fe910de0e7613a89dae4ea983577392a1601ae57513e28ca7f5a5a1712da4ea4",
+        "db7e97d46833aa5809e3de06790f94785f4740e3e72913370adcce48ba438280",
+        "db5df309023388befed02dd2319bd0bc4b71fe7af58cdeec00a40bf3eace8fbe"
+      ],
+      "empty_observation_sha256": "87cc5b6b5cc0b1a0f7d002584e2a1b927e7e44e3bbf06dbf98294197d3408156"
+    },
+    {
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "resolved_tone": "Gpt_5_6_Reasoning",
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "eef9df135a8f15ca8bbd0d800c5b44fb4bfce6cb26067d549a6b5164d79c56c6",
+        "a5cd8e468576eff31a471bd391dad076c172324aacda2400d7b02b661bdf1200",
+        "d4965d43126ef23b96bd8201a8292cd0768c519b59d6c28746e004486568ced1"
+      ],
+      "empty_observation_sha256": "eef29ccb00b78eb539f0183850bd44faf35391a3a88ecdb0fe4e5f46b744f2ef"
+    },
+    {
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "resolved_tone": "Gpt_5_6_Reasoning",
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "aa3d4bb3a7fce1fae54cc6768b041d908431ce6c7988fad93e2bfdd1ccd98766",
+        "2de3a7d085e343c1dea9b04cadee8b4c7bb6ae5a8ad2bb84f4835c75d5370d82",
+        "aa26ed9f5df8d71181b780f2557b3ebd2669a4efe3f1cd6066ef313bd71e4c8a"
+      ],
+      "empty_observation_sha256": "e030da105d498c781b959ee0737443377e4d5455adccaf49b9bfbdb23fc23b03"
+    },
+    {
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "resolved_tone": "Gpt_5_5_Chat",
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "a972f9864eb323bb8f34e0f2e4965e4cf25c6872f4eac11383dc91c8bd6cc38c",
+        "1e41d8151df199e27db4baa62428d06917b175558678ec887dda140c7a16ae7c",
+        "be033be9bc3384f6f7740f8da0b7da020703ec41867aa4105f3176635b82999f"
+      ],
+      "empty_observation_sha256": "3397f06c7dfd679322ed29f44eaeb635ebbc5c59016b87e0d826ffd7065f6681"
+    },
+    {
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "resolved_tone": "Gpt_5_5_Chat",
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "9b58635387b1f0436769b5d0a3d2191bd594e384dbbba230a5e9546df01797ed",
+        "f936e9d6d54ae9e27dd856af1618377aeb366f5cae8663730d29ca25925193a8",
+        "6ec0b722580428f5167c6a20277fe0ac2c99d96ed8587ba1678b57d3215eace5"
+      ],
+      "empty_observation_sha256": "dcbaf00a7b237cf76d27ef57d230a8d73eaee4d73fd7fb7495f8297d17fe157c"
+    },
+    {
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "resolved_tone": "Gpt_5_5_Chat",
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "1b17ed6181a1fc3213fb451a51b7b60c8c07672dd80c6bd56dc1313fd4bc7f7f",
+        "f3dcf106feb0e7c7b9430852b14ae39780b96f60ca071e7772bf1ba920e388df",
+        "8aa9957d830b3200aff45b7735f7ea0eca62a72f580f63dedfd2dbe0995cb96b"
+      ],
+      "empty_observation_sha256": "9c47609e678c922bf628c02bb3cf287e29dbf7cbdc148cf8515978fba1211bad"
+    },
+    {
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "resolved_tone": "Gpt_5_5_Chat",
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "classification": "EXPOSED_AND_SUPPORTED",
+      "success_observation_sha256": [
+        "ad22d44e5c453ce54009ce5520b83e0d430864c970620e78d7ce1b815705af00",
+        "c2feddc5f2e295e693b8d52055cd3a019a5f4455db20207879ea628d34d68edd",
+        "04a35cdd68fe30adb9d30e66187e475799d9039fd38d5542ea33f77615ec1e3d"
+      ],
+      "empty_observation_sha256": "62a2d8d6ec1c82966d2be229abc5e9de1c9282b06b0e2d884a601dba1b7eb6b4"
+    }
+  ],
+  "route_failures": [
+    {
+      "requested_model": "wp2-unknown-route",
+      "case_id": "unknown_route",
+      "protocol": "openai_chat_completions_nonstream",
+      "observation_sha256": "e2ac6897476d4b648c140c7d660adcf9e427fbb02b8b8f257fa667446682d097",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "openai_chat_completions_nonstream",
+      "observation_sha256": "0d40f6fce4973be691a828f441c4c4096a9a13c52ccf1f310ded997ee3e099ea",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "wp2-unknown-route",
+      "case_id": "unknown_route",
+      "protocol": "openai_responses_nonstream",
+      "observation_sha256": "106ad0fb53581b51edb175282b885379a7cd60843124b21bb75f82b3cade992d",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "openai_responses_nonstream",
+      "observation_sha256": "cc2858c2a537449e123d1ea389622a08d9c90b50e69e88c7e0e2304b71588d3d",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "wp2-unknown-route",
+      "case_id": "unknown_route",
+      "protocol": "anthropic_messages_nonstream",
+      "observation_sha256": "864cd035fd8c9f19a13a45d519aa2f2eb0bf7d0d73cd183cf84c3ca8ca124fd3",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "anthropic_messages_nonstream",
+      "observation_sha256": "c76e9e4b8f75835078bce209211820b863ff558f716aa7be504259682fad4b0f",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "wp2-unknown-route",
+      "case_id": "unknown_route",
+      "protocol": "legacy_chat_nonstream",
+      "observation_sha256": "4eef9b79707a3bf2cfb33ba0049467ef2228dfcbb4ebee066895c8d995ab560e",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "legacy_chat_nonstream",
+      "observation_sha256": "bbc55b5de6e69a912209755e6c5ada53c68f19ac0f638a08eb23091b90365cb1",
+      "expected_failure_code": "model_unavailable"
+    }
+  ]
+}

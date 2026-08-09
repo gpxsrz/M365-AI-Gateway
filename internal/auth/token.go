@@ -1,11 +1,12 @@
 package auth
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"m365-copilot2api/internal/outbound"
+	"m365-native/internal/outbound"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,32 +38,78 @@ type tokenResponse struct {
 	ErrorDesc    string `json:"error_description"`
 }
 
+type TokenEndpointError struct {
+	Status int
+	Code   string
+}
+
+func (e *TokenEndpointError) Error() string {
+	code := strings.TrimSpace(e.Code)
+	if code == "" {
+		code = "token_endpoint_error"
+	}
+	return fmt.Sprintf("token endpoint HTTP %d: %s", e.Status, code)
+}
+
 func (t TokenSet) Valid() bool {
 	return t.AccessToken != "" && time.Now().Before(t.ExpiresAt.Add(-30*time.Second))
 }
 
 func ExchangeCode(code, verifier, redirect string) (TokenSet, error) {
+	return ExchangeCodeWithConfig(CurrentOAuthConfig(), code, verifier, redirect)
+}
+
+func ExchangeCodeWithConfig(config OAuthConfig, code, verifier, redirect string) (TokenSet, error) {
+	config, err := normalizeOAuthConfig(config)
+	if err != nil {
+		return TokenSet{}, err
+	}
 	form := url.Values{}
-	form.Set("client_id", ClientID())
+	form.Set("client_id", config.ClientID)
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("redirect_uri", redirect)
 	form.Set("code_verifier", verifier)
-	form.Set("scope", Scope())
-	return requestToken(form)
+	form.Set("scope", config.Scope)
+	return requestToken(config.TokenEndpoint, form)
 }
 
 func Refresh(refreshToken string) (TokenSet, error) {
-	form := url.Values{}
-	form.Set("client_id", ClientID())
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", refreshToken)
-	form.Set("scope", Scope())
-	return requestToken(form)
+	return RefreshWithConfig(CurrentOAuthConfig(), refreshToken)
 }
 
-func requestToken(form url.Values) (TokenSet, error) {
-	req, err := http.NewRequest(http.MethodPost, TokenEndpoint(), strings.NewReader(form.Encode()))
+func RefreshWithConfig(config OAuthConfig, refreshToken string) (TokenSet, error) {
+	config, err := normalizeOAuthConfig(config)
+	if err != nil {
+		return TokenSet{}, err
+	}
+	form := url.Values{}
+	form.Set("client_id", config.ClientID)
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	form.Set("scope", config.Scope)
+	return requestToken(config.TokenEndpoint, form)
+}
+
+func requestToken(endpoint string, form url.Values) (TokenSet, error) {
+	return requestTokenContext(context.Background(), endpoint, form)
+}
+
+func refreshWithConfigContext(ctx context.Context, config OAuthConfig, refreshToken string) (TokenSet, error) {
+	config, err := normalizeOAuthConfig(config)
+	if err != nil {
+		return TokenSet{}, err
+	}
+	form := url.Values{}
+	form.Set("client_id", config.ClientID)
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	form.Set("scope", config.Scope)
+	return requestTokenContext(ctx, config.TokenEndpoint, form)
+}
+
+func requestTokenContext(ctx context.Context, endpoint string, form url.Values) (TokenSet, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return TokenSet{}, err
 	}
@@ -81,13 +128,13 @@ func requestToken(form url.Values) (TokenSet, error) {
 		return TokenSet{}, fmt.Errorf("decode token response: %w", err)
 	}
 	if tr.Error != "" {
-		return TokenSet{}, fmt.Errorf("token endpoint HTTP %d: %s: %s", resp.StatusCode, tr.Error, tr.ErrorDesc)
+		return TokenSet{}, &TokenEndpointError{Status: resp.StatusCode, Code: safeTokenErrorCode(tr.Error, form)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return TokenSet{}, fmt.Errorf("token endpoint HTTP %d", resp.StatusCode)
+		return TokenSet{}, &TokenEndpointError{Status: resp.StatusCode, Code: "http_error"}
 	}
 	if tr.AccessToken == "" {
-		return TokenSet{}, fmt.Errorf("token endpoint HTTP %d: empty access token", resp.StatusCode)
+		return TokenSet{}, &TokenEndpointError{Status: resp.StatusCode, Code: "empty_access_token"}
 	}
 	set := TokenSet{
 		AccessToken:  tr.AccessToken,
@@ -115,6 +162,24 @@ func requestToken(form url.Values) (TokenSet, error) {
 		}
 	}
 	return set, nil
+}
+
+func safeTokenErrorCode(code string, form url.Values) string {
+	code = strings.TrimSpace(code)
+	for _, key := range []string{"refresh_token", "code", "code_verifier"} {
+		if secret := form.Get(key); secret != "" && strings.Contains(code, secret) {
+			return "oauth_error"
+		}
+	}
+	if code == "" || len(code) > 128 {
+		return "oauth_error"
+	}
+	for _, r := range code {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.') {
+			return "oauth_error"
+		}
+	}
+	return code
 }
 
 func decodeJWTClaims(token string) (map[string]string, error) {

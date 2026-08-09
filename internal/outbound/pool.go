@@ -150,29 +150,5 @@ type poolRoundTripper struct {
 func (t *poolRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(r)
 	t.pool.mark(t.entry.raw, err)
-	if err == nil {
-		return resp, nil
-	}
-	// Replay the request on the next healthy proxy once (body must be replayable).
-	if r.Body != nil && r.GetBody == nil {
-		return resp, err
-	}
-	for i := 0; i < len(t.pool.entries)+1; i++ {
-		next := t.pool.pick()
-		if next == nil || next == t.entry {
-			break
-		}
-		body, berr := r.GetBody()
-		if berr != nil {
-			break
-		}
-		retry := r.Clone(r.Context())
-		retry.Body = body
-		resp2, err2 := next.clients.HTTP.Transport.RoundTrip(retry)
-		t.pool.mark(next.raw, err2)
-		if err2 == nil {
-			return resp2, nil
-		}
-	}
 	return resp, err
 }

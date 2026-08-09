@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"m365-copilot2api/internal/chathub"
+	"m365-native/internal/chathub"
 )
 
 // responsesRequest is the OpenAI Responses API request subset supported by the gateway.
@@ -16,18 +16,20 @@ type responsesRequest struct {
 	Input              any              `json:"input"`
 	Tools              []map[string]any `json:"tools,omitempty"`
 	ToolChoice         any              `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool            `json:"parallel_tool_calls,omitempty"`
 	Stream             bool             `json:"stream,omitempty"`
 	User               string           `json:"user,omitempty"`
 	Reasoning          *reasoningConfig `json:"reasoning,omitempty"`
+	Verbosity          string           `json:"verbosity,omitempty"`
 	PreviousResponseID string           `json:"previous_response_id,omitempty"`
 	Conversation       string           `json:"conversation,omitempty"`
 	NewConversation    bool             `json:"new_conversation,omitempty"`
 }
 
-const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
+const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Use the caller-provided exec tool only for local filesystem and command execution. Do not use Microsoft 365 native execution or file-mutation tools for those operations. Microsoft 365 native Bing web search, citations, grounding, and read-only information retrieval remain allowed. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
 
 func (r responsesRequest) openAI() (oaiReq, error) {
-	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, User: r.User}
+	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, ParallelToolCalls: r.ParallelToolCalls, User: r.User, Verbosity: r.Verbosity}
 	if instructions := strings.TrimSpace(r.Instructions); instructions != "" {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: instructions})
 	}
@@ -42,14 +44,24 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		}
 		o.Messages = append(o.Messages, oaiMsg{Role: "user", Content: v})
 	case []any:
+		var sameTurnCalls []map[string]any
+		flushCalls := func() {
+			if len(sameTurnCalls) == 0 {
+				return
+			}
+			o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: sameTurnCalls})
+			sameTurnCalls = nil
+		}
 		for _, raw := range v {
 			m, ok := raw.(map[string]any)
 			if !ok {
+				flushCalls()
 				continue
 			}
 			typ, _ := m["type"].(string)
 			switch typ {
 			case "function_call_progress":
+				flushCalls()
 				// Progress is deliberately not converted into an assistant/tool
 				// message. It is transport metadata from a long-running client-side
 				// executor and must not trigger a model turn or tool completion.
@@ -58,9 +70,11 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				}
 				continue
 			case "function_call_output":
+				flushCalls()
 				id, _ := m["call_id"].(string)
 				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: m["output"]})
 			case "custom_tool_call_output":
+				flushCalls()
 				id, _ := m["call_id"].(string)
 				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: m["output"]})
 			case "function_call":
@@ -73,13 +87,14 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 						args = x
 					}
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": mustJSON(args)}}}})
+				sameTurnCalls = append(sameTurnCalls, map[string]any{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": mustJSON(args)}})
 			case "custom_tool_call":
 				id, _ := m["call_id"].(string)
 				name, _ := m["name"].(string)
 				input, _ := m["input"].(string)
-				o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{"id": id, "type": "custom", "function": map[string]any{"name": name, "arguments": mustJSON(map[string]any{"input": input})}}}})
+				sameTurnCalls = append(sameTurnCalls, map[string]any{"id": id, "type": "custom", "function": map[string]any{"name": name, "arguments": mustJSON(map[string]any{"input": input})}})
 			default:
+				flushCalls()
 				role, _ := m["role"].(string)
 				if role == "" {
 					role = "user"
@@ -94,6 +109,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				o.Messages = append(o.Messages, oaiMsg{Role: role, Content: content})
 			}
 		}
+		flushCalls()
 	default:
 		return o, fmt.Errorf("input must be string or array")
 	}
@@ -126,7 +142,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		o.Tools = append(o.Tools, chathub.Tool{Type: typ, Function: b})
 	}
 	if hasCustomExec {
-		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecWorkspaceInstruction}}, o.Messages...)
+		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecWorkspaceInstruction, SidecarGenerated: true}}, o.Messages...)
 	}
 	return o, nil
 }
@@ -142,6 +158,7 @@ type anthropicTool struct {
 }
 type anthropicRequest struct {
 	Model      string             `json:"model"`
+	AccountID  string             `json:"accountId,omitempty"`
 	System     any                `json:"system,omitempty"`
 	Messages   []anthropicMessage `json:"messages"`
 	Tools      []anthropicTool    `json:"tools,omitempty"`
@@ -151,7 +168,7 @@ type anthropicRequest struct {
 }
 
 func (r anthropicRequest) openAI() (oaiReq, error) {
-	o := oaiReq{Model: r.Model, Stream: r.Stream}
+	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream}
 	if r.System != nil {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: r.System})
 	}
@@ -181,9 +198,14 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 				// parser's input_image shape without copying image bytes elsewhere.
 				source, _ := b["source"].(map[string]any)
 				if source != nil {
+					sourceType, _ := source["type"].(string)
 					data, _ := source["data"].(string)
 					media, _ := source["media_type"].(string)
-					if data != "" {
+					remote, _ := source["url"].(string)
+					switch {
+					case sourceType == "url" && remote != "":
+						text = append(text, map[string]any{"type": "input_image", "image_url": remote})
+					case (sourceType == "base64" || sourceType == "") && data != "":
 						if media == "" {
 							media = "application/octet-stream"
 						}
@@ -210,6 +232,9 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 		o.Tools = append(o.Tools, chathub.Tool{Type: "function", Function: b})
 	}
 	if c, ok := r.ToolChoice.(map[string]any); ok {
+		if disabled, ok := c["disable_parallel_tool_use"].(bool); ok {
+			o.ParallelToolCalls = boolPointerValue(!disabled)
+		}
 		switch c["type"] {
 		case "auto":
 			o.ToolChoice = "auto"
@@ -223,3 +248,5 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 	}
 	return o, nil
 }
+
+func boolPointerValue(value bool) *bool { return &value }

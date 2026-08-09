@@ -88,8 +88,15 @@ func TestModelsAdvertiseContextAndReasoning(t *testing.T) {
 		if _, ok := m["service_tiers"].([]any); !ok {
 			t.Fatalf("missing service tiers: %#v", m)
 		}
-		if m["apply_patch_tool_type"] != "freeform" || m["web_search_tool_type"] != "text_and_image" || m["tool_mode"] != "code_mode_only" || m["multi_agent_version"] != "v2" {
+		if m["apply_patch_tool_type"] != "freeform" || m["support_verbosity"] != true || m["supports_image_detail_original"] != true || m["web_search_tool_type"] != "text_and_image" || m["tool_mode"] != "code_mode_only" || m["multi_agent_version"] != "v2" {
 			t.Fatalf("missing Codex tool metadata: %#v", m)
+		}
+		if m["x_m365_verbosity_semantics"] != "accepted_and_downgraded" || m["x_m365_image_detail_semantics"] != "accepted_and_downgraded" {
+			t.Fatalf("missing downgrade capability metadata: %#v", m)
+		}
+		downgraded, ok := m["x_m365_accepted_downgrade_parameters"].([]any)
+		if !ok || len(downgraded) != 2 || downgraded[0] != "image_detail" || downgraded[1] != "verbosity" {
+			t.Fatalf("invalid accepted downgrade list: %#v", m)
 		}
 		if m["max_context_window"] != m["context_window"] || m["effective_context_window_percent"] != float64(95) {
 			t.Fatalf("inconsistent Codex context metadata: %#v", m)
@@ -136,22 +143,59 @@ func TestModelsAdvertiseContextAndReasoning(t *testing.T) {
 	}
 }
 
+func TestOpenAIModelsUsesServerSettings(t *testing.T) {
+	cfg := defaultRuntimeSettings()
+	cfg.ModelMappings = append(cfg.ModelMappings, modelMapping{
+		PublicModel:           "server-local-route",
+		UpstreamTone:          "Gpt_5_6_Reasoning",
+		DisplayName:           "Server Local Route",
+		DefaultReasoningLevel: "low",
+	})
+	s := &Server{settings: &settingsStore{v: cfg}}
+	w := httptest.NewRecorder()
+	s.openaiModels(w, httptest.NewRequest("GET", "/v1/models", nil))
+	var body struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range body.Data {
+		if model["id"] == "server-local-route" {
+			return
+		}
+	}
+	t.Fatalf("server-local mapping missing from catalog: %#v", body.Data)
+}
+
 func TestConfiguredModelMappingsDriveCatalogAndRouting(t *testing.T) {
-	mappings := []modelMapping{{PublicModel: "gpt-5.6-sol", UpstreamTone: "Gpt_5_6_Reasoning", DisplayName: "GPT-5.6-Sol", DefaultReasoningLevel: "low"}}
+	mappings := []modelMapping{{PublicModel: "existing-custom-route", UpstreamTone: "Gpt_5_6_Reasoning", DisplayName: "Existing Custom Route", DefaultReasoningLevel: "low"}}
 	models := configuredModelSpecs(mappings)
-	if len(models) != len(gatewayModels)+1 || models[len(models)-1].ID != "gpt-5.6-sol" || models[len(models)-1].DefaultReasoningLevel != "low" {
+	if len(models) != len(gatewayModels)+1 || models[len(models)-1].ID != "existing-custom-route" || models[len(models)-1].DefaultReasoningLevel != "low" || !models[len(models)-1].ConfiguredMapping {
 		t.Fatalf("configured models=%#v", models)
 	}
-	mapping, ok := configuredModelMapping("GPT-5.6-SOL", mappings)
+	mapping, ok := configuredModelMapping("EXISTING-CUSTOM-ROUTE", mappings)
 	if !ok || mapping.UpstreamTone != "Gpt_5_6_Reasoning" {
 		t.Fatalf("mapping=%#v ok=%t", mapping, ok)
 	}
-	if tone, ok := configuredModelTone("gpt-5.6-sol", mappings); !ok || tone != "Gpt_5_6_Reasoning" {
+	if tone, ok := configuredModelTone("existing-custom-route", mappings); !ok || tone != "Gpt_5_6_Reasoning" {
 		t.Fatalf("tone=%q ok=%t", tone, ok)
 	}
-	override := configuredModelSpecs([]modelMapping{{PublicModel: "gpt-5.5", UpstreamTone: "Gpt_5_5_Reasoning", DisplayName: "GPT-5.5", DefaultReasoningLevel: "high"}})
-	if len(override) != len(gatewayModels) || override[5].DefaultReasoningLevel != "high" {
-		t.Fatalf("built-in override=%#v", override)
+	override := configuredModelSpecs([]modelMapping{{PublicModel: "gpt-5.4", UpstreamTone: "Gpt_5_4_Reasoning", DisplayName: "Existing GPT-5.4 Override", DefaultReasoningLevel: "high"}})
+	var foundOverride bool
+	for _, model := range override {
+		if model.ID == "gpt-5.4" {
+			foundOverride = model.ConfiguredMapping && model.ResolvedTone == "Gpt_5_4_Reasoning" && model.DefaultReasoningLevel == "high"
+		}
+	}
+	if !foundOverride {
+		t.Fatalf("legacy direct override not preserved=%#v", override)
+	}
+	locked := configuredModelSpecs([]modelMapping{{PublicModel: "gpt-5.5", UpstreamTone: "Gpt_5_5_Reasoning", DisplayName: "Should Not Override", DefaultReasoningLevel: "high"}})
+	for _, model := range locked {
+		if model.ID == "gpt-5.5" && (model.ConfiguredMapping || model.ResolvedTone != "Gpt_5_5_Chat") {
+			t.Fatalf("route-locked compatibility alias was overridden: %#v", model)
+		}
 	}
 }
 

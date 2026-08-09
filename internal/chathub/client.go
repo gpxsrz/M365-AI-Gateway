@@ -2,12 +2,11 @@ package chathub
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"m365-copilot2api/internal/outbound"
+	"m365-native/internal/outbound"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,30 +16,41 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
+func foldStreamText(current, update string, cumulative bool) (next, delta string) {
+	if update == "" {
+		return current, ""
 	}
-	return b
+	if !cumulative {
+		return current + update, update
+	}
+	if current == "" {
+		return update, update
+	}
+	if strings.HasPrefix(update, current) {
+		return update, strings.TrimPrefix(update, current)
+	}
+	if strings.HasPrefix(current, update) {
+		return current, ""
+	}
+	// A divergent snapshot is ambiguous. Keep the longest stable text already
+	// observed rather than duplicating or replacing it with an unrelated frame.
+	return current, ""
 }
 
 const (
 	rs          = "\x1e"
 	defaultTone = "magic"
 	wsBase      = "wss://substrate.office.com/m365Copilot/Chathub"
-	// maxAttachments bounds per-request remote downloads: each image is
-	// base64-encoded and held in memory alongside the multipart body.
-	maxAttachments   = 10
-	maxAttachmentMiB = 10
 )
 
 // Variants mirrored from the verified browser / Python probe.
 const variants = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix"
 
 type Account struct {
-	AccessToken string
-	OID         string
-	TID         string
+	AccessToken      string
+	GraphAccessToken string
+	OID              string
+	TID              string
 }
 
 type Request struct {
@@ -51,6 +61,7 @@ type Request struct {
 	Attachments    []Attachment
 	Tools          []Tool
 	ToolChoice     any
+	ToolCallLimit  int
 	MCPServerURL   string // URL of the MCP HTTP SSE server for tool discovery
 	// Started is true only for the first turn of a ChatHub conversation.
 	Started bool
@@ -73,7 +84,6 @@ type StreamHandler func(StreamEvent) error
 
 type Result struct {
 	Text           string
-	Reasoning      string
 	ConversationID string
 	SessionID      string
 	RequestID      string
@@ -82,14 +92,28 @@ type Result struct {
 	Events         []json.RawMessage
 	Normalized     []Event
 	Images         []string
+	Artifacts      []Artifact
+	Attributions   []Attribution
+	UnknownEvents  []Event
+	Terminal       TerminalState
 }
 
 type Client struct {
 	HTTPHeader http.Header
 	HTTPClient *http.Client
 	Dialer     *websocket.Dialer
+	// PrivateMode is evaluated for every new WebSocket. A nil callback fails
+	// private so reconnects and isolated callers cannot silently create history.
+	PrivateMode func() bool
 	// Trace receives attachment-only metadata; URL contents are never exposed.
 	Trace func(map[string]any)
+	// AttachmentNameSuffix is a deterministic test seam. Production uses a
+	// fresh cryptographically random suffix for every new document upload.
+	AttachmentNameSuffix func() (string, error)
+	// These narrow test seams let the downloader resolve once, validate every
+	// address, then dial one of those exact IPs with the original TLS name.
+	ResolveAttachmentIPs func(context.Context, string) ([]net.IP, error)
+	PinnedHTTPSClient    func(string) *http.Client
 }
 
 func NewClient() *Client {
@@ -97,14 +121,41 @@ func NewClient() *Client {
 	h.Set("Origin", "https://m365.cloud.microsoft")
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
 	return &Client{
-		HTTPHeader: h,
-		HTTPClient: outbound.HTTPClient(),
-		Dialer:     outbound.WebSocketDialer(),
+		HTTPHeader:        h,
+		HTTPClient:        outbound.HTTPClient(),
+		Dialer:            outbound.WebSocketDialer(),
+		PinnedHTTPSClient: outbound.PinnedHTTPSClient,
 	}
 }
 
 func (c *Client) Chat(ctx context.Context, acc Account, req Request) (Result, error) {
 	return c.ChatWithDelta(ctx, acc, req, nil)
+}
+
+func (c *Client) privateModeEnabled() bool {
+	if c.PrivateMode == nil {
+		return true
+	}
+	return c.PrivateMode()
+}
+
+func webSocketDialFailure(status int, err error) error {
+	if status > 0 {
+		return fmt.Errorf("ws dial failed: HTTP %d: %w", status, err)
+	}
+	return fmt.Errorf("ws dial: %w", err)
+}
+
+func callerContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if networkError, ok := err.(net.Error); ok && networkError.Timeout() {
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline && !time.Now().Before(deadline) {
+			return context.DeadlineExceeded
+		}
+	}
+	return nil
 }
 
 // ChatWithEvents is the compatibility entry point for the full event stream.
@@ -126,19 +177,6 @@ func (c *Client) ChatWithEvents(ctx context.Context, acc Account, req Request, h
 // reconstruction but are not emitted as deltas, preventing duplicate text.
 func (c *Client) ChatWithDelta(ctx context.Context, acc Account, req Request, onDelta func(string) error) (Result, error) {
 	return c.chatWithHandlers(ctx, acc, req, onDelta, nil)
-}
-
-// ChatWithReasoning is the streaming entry point used by the OpenAI-compatible
-// layer. onDelta receives answer text tokens, onReasoning receives the
-// multi-step ChainOfThought transcript that ChatHub marks with
-// contentOrigin=ChainOfThoughtSummary / addToChainOfThought=true.
-func (c *Client) ChatWithReasoning(ctx context.Context, acc Account, req Request, onDelta func(string) error, onReasoning func(string) error) (Result, error) {
-	return c.chatWithHandlers(ctx, acc, req, onDelta, func(ev StreamEvent) error {
-		if ev.Kind == "reasoning" && ev.Text != "" && onReasoning != nil {
-			return onReasoning(ev.Text)
-		}
-		return nil
-	})
 }
 
 func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
@@ -167,115 +205,115 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return Result{}, fmt.Errorf("upload attachment: %w", err)
 	}
 
-	wsURL, err := buildWSURL(acc, req.SessionID, req.ConversationID, requestID)
+	privateMode := c.privateModeEnabled()
+	wsURL, err := buildWSURL(acc, req.SessionID, req.ConversationID, requestID, privateMode)
 	if err != nil {
 		return Result{}, err
 	}
 
 	dialStarted := time.Now()
-	conn, _, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+	conn, response, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
 	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
 	if err != nil {
-		return Result{}, fmt.Errorf("ws dial: %w", err)
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+		}
+		log.Printf("chathub ws_dial_failed status=%d", status)
+		return Result{}, webSocketDialFailure(status, err)
 	}
 	defer conn.Close()
+	stopContextClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopContextClose()
 
-	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
-	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return Result{}, fmt.Errorf("set chat read deadline: %w", err)
+		}
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return Result{}, fmt.Errorf("set chat write deadline: %w", err)
+		}
+	}
 
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
+		if ctxErr := callerContextError(ctx, err); ctxErr != nil {
+			return Result{}, ctxErr
+		}
 		return Result{}, fmt.Errorf("handshake send: %w", err)
 	}
 	if _, _, err := conn.ReadMessage(); err != nil {
+		if ctxErr := callerContextError(ctx, err); ctxErr != nil {
+			return Result{}, ctxErr
+		}
 		return Result{}, fmt.Errorf("handshake recv: %w", err)
 	}
 
-	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.MCPServerURL)
+	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.ToolCallLimit, req.MCPServerURL)
 	log.Printf("chathub prompt-trace text=%d tools=%d payload=%d", len(req.Text), len(req.Tools), len(payload))
 	if c.Trace != nil {
-		meta := map[string]any{"stage": "chathub_payload", "attachment_count": len(req.Attachments), "payload_has_attachments": strings.Contains(payload, `"attachments"`), "attachments": []map[string]any{}}
-		for _, a := range req.Attachments {
-			meta["attachments"] = append(meta["attachments"].([]map[string]any), map[string]any{"type": a.Type, "mime_type": a.MimeType, "url_length": len(a.URL), "data_url": strings.HasPrefix(a.URL, "data:"), "name": a.Name})
+		dataURLCount := 0
+		for _, attachment := range req.Attachments {
+			if strings.HasPrefix(attachment.URL, "data:") {
+				dataURLCount++
+			}
 		}
-		c.Trace(meta)
+		c.Trace(map[string]any{
+			"stage":                     "chathub_payload",
+			"attachment_count":          len(req.Attachments),
+			"data_url_attachment_count": dataURLCount,
+			"payload_has_attachments":   strings.Contains(payload, `"attachments"`),
+			"private_mode":              privateMode,
+		})
 	}
 	log.Printf("chathub timing handshake_ms=%d", time.Since(dialStarted).Milliseconds())
 	payloadSentAt := time.Now()
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		if ctxErr := callerContextError(ctx, err); ctxErr != nil {
+			return Result{}, ctxErr
+		}
 		return Result{}, fmt.Errorf("chat send: %w", err)
 	}
 
-	var deltas []string
-	var streamed strings.Builder
-	emitDelta := func(d string) error {
-		if d == "" {
+	var streamedText string
+	emitText := func(update string, cumulative bool) error {
+		next, delta := foldStreamText(streamedText, update, cumulative)
+		if delta == "" {
 			return nil
 		}
-		if streamed.Len() == 0 {
-			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
+		if streamedText == "" {
+			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(delta))
 		}
-		streamed.WriteString(d)
-		deltas = append(deltas, d)
+		streamedText = next
 		if onDelta != nil {
-			return onDelta(d)
+			return onDelta(delta)
 		}
 		return nil
-	}
-	// ChatHub signals text either as a full snapshot or as cursor rewrites.
-	// Only the portion not already streamed may be emitted; naive prefix
-	// checks misfire when upstream rewrites the whole buffer, which duplicated
-	// answers (AAA…). Match any overlap and emit the tail.
-	emitSnapshot := func(snapshot string) error {
-		if snapshot == "" {
-			return nil
-		}
-		cur := streamed.String()
-		if cur == "" {
-			return emitDelta(snapshot)
-		}
-		if strings.HasPrefix(snapshot, cur) {
-			return emitDelta(strings.TrimPrefix(snapshot, cur))
-		}
-		if i := strings.Index(snapshot, cur); i >= 0 {
-			return emitDelta(snapshot[i+len(cur):])
-		}
-		if len(snapshot) > len(cur) && strings.HasSuffix(snapshot, cur) {
-			return emitDelta(snapshot[:len(snapshot)-len(cur)])
-		}
-		return emitDelta(snapshot)
 	}
 	var final string
 	var throttling any
 	var rawResult string
 	var events []json.RawMessage
 	seenStreamTools := map[string]bool{}
-	var reasoningBuf strings.Builder
 
-	deadline := time.Now().Add(5 * time.Minute)
-	type wsRead struct {
-		msg []byte
-		err error
-	}
-	for time.Now().Before(deadline) {
-		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		// ReadMessage 阻塞期间无法响应 ctx 取消，放入独立 goroutine 由 select 联动。
-		readCh := make(chan wsRead, 1)
-		go func() {
-			_, msg, err := conn.ReadMessage()
-			readCh <- wsRead{msg: msg, err: err}
-		}()
-		var read wsRead
+	for {
 		select {
 		case <-ctx.Done():
 			return Result{}, ctx.Err()
-		case read = <-readCh:
+		default:
 		}
-		if read.err != nil {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctxErr := callerContextError(ctx, err); ctxErr != nil {
+				return Result{}, ctxErr
+			}
 			// Never convert a timeout or dropped WebSocket into a successful
 			// partial response. A response is complete only after SignalR type 3.
-			return Result{}, fmt.Errorf("ws read before completion: %w", read.err)
+			return Result{}, fmt.Errorf("ws read before completion: %w", err)
 		}
-		for _, part := range strings.Split(string(read.msg), rs) {
+		for _, part := range strings.Split(string(msg), rs) {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
@@ -308,16 +346,15 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 								return Result{}, err
 							}
 						}
-					}
 
-					for _, ev := range classifyUpdateMessages(msgs) {
-						if ev.Kind == "reasoning" {
-							reasoningBuf.WriteString(ev.Text)
-						}
-						ev.Raw = eventRaw(arg)
-						if ev.Kind != "text" && onEvent != nil {
-							if err := onEvent(ev); err != nil {
-								return Result{}, err
+						for _, ev := range classifyUpdateMessages(msgs) {
+							if !artifactBearingMap(arg) {
+								ev.Raw = eventRaw(arg)
+							}
+							if ev.Kind != "text" {
+								if err := onEvent(ev); err != nil {
+									return Result{}, err
+								}
 							}
 						}
 					}
@@ -331,7 +368,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						}
 					}
 					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame {
-						if err := emitSnapshot(w); err != nil {
+						if err := emitText(w, false); err != nil {
 							return Result{}, err
 						}
 					}
@@ -350,7 +387,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							if author == "bot" && mt == "" && text != "" {
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
-								if err := emitSnapshot(text); err != nil {
+								if err := emitText(text, true); err != nil {
 									return Result{}, err
 								}
 							}
@@ -378,38 +415,52 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 3 {
-				if errObj, ok := obj["error"].(map[string]any); ok {
-					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
+				event := normalize(json.RawMessage(part))
+				if event.ErrorText != "" {
+					state := TerminalState{Kind: "error", Error: event.ErrorText}
+					result := Result{ConversationID: req.ConversationID, SessionID: req.SessionID, RequestID: requestID, Events: events, Terminal: state}
+					if err := CanonicalizeResult(&result); err != nil {
+						return result, err
+					}
+					return result, &TerminalError{State: result.Terminal}
 				}
 				// end of stream
-				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
+				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), len(streamedText), len(events))
 				text := final
 				if text == "" {
-					text = strings.Join(deltas, "")
+					text = streamedText
 				}
-				return Result{
+				result := Result{
 					Text:           text,
-					Reasoning:      reasoningBuf.String(),
 					ConversationID: req.ConversationID,
 					SessionID:      req.SessionID,
 					RequestID:      requestID,
 					Throttling:     throttling,
 					RawResult:      rawResult,
 					Events:         events,
-					Normalized:     NormalizeEvents(events),
 					Images:         imageURLs(events),
-				}, nil
+					Terminal:       TerminalState{Kind: "complete"},
+				}
+				if err := CanonicalizeResult(&result); err != nil {
+					return result, err
+				}
+				return result, nil
+			}
+
+			if int(t) == 7 {
+				event := normalize(json.RawMessage(part))
+				state := TerminalState{Kind: "close", Error: event.ErrorText, AllowReconnect: event.AllowReconnect}
+				result := Result{ConversationID: req.ConversationID, SessionID: req.SessionID, RequestID: requestID, Events: events, Terminal: state}
+				if err := CanonicalizeResult(&result); err != nil {
+					return result, err
+				}
+				return result, &TerminalError{State: result.Terminal}
 			}
 		}
 	}
-
-	// Reaching the overall deadline without a SignalR completion frame is
-	// an incomplete upstream response. Do not return accumulated deltas as if
-	// they were a successful, finished answer.
-	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
 }
 
-func buildWSURL(acc Account, sessionID, conversationID, requestID string) (string, error) {
+func buildWSURL(acc Account, sessionID, conversationID, requestID string, private bool) (string, error) {
 	q := url.Values{}
 	q.Set("chatsessionid", requestID)
 	q.Set("clientrequestid", requestID)
@@ -424,6 +475,9 @@ func buildWSURL(acc Account, sessionID, conversationID, requestID string) (strin
 	q.Set("licenseType", "Starter")
 	q.Set("agent", "web")
 	q.Set("scenario", "OfficeWebIncludedCopilot")
+	if private {
+		q.Set("disableMemory", "1")
+	}
 
 	// url.Values encodes quotes; probe used safe='",' so keep quotes unescaped-ish.
 	// Gorilla/url will encode " to %22 which MS accepts.
@@ -432,140 +486,43 @@ func buildWSURL(acc Account, sessionID, conversationID, requestID string) (strin
 }
 
 func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversationID string, attachments []Attachment) error {
-	imageCount := 0
+	if len(attachments) > maxActiveAttachments {
+		return fmt.Errorf("too many active attachments: limit is %d", maxActiveAttachments)
+	}
 	for i := range attachments {
 		a := &attachments[i]
-		if a.Type != "image" {
-			continue
-		}
-		imageCount++
-		if imageCount > maxAttachments {
-			return fmt.Errorf("too many image attachments: limit is %d", maxAttachments)
-		}
-		// For non-data URLs, download the image first
-		imageData := a.URL
-		if !strings.HasPrefix(a.URL, "data:") {
-			if err := validateRemoteDownloadURL(a.URL); err != nil {
+		switch a.Type {
+		case "file":
+			if a.DocID != "" && a.ReferenceURL != "" && a.UploadedConversationID == conversationID {
+				continue
+			}
+			a.DocID, a.ReferenceURL, a.TransportName, a.UploadedConversationID = "", "", "", ""
+			if err := c.uploadDocument(ctx, acc, conversationID, a); err != nil {
 				return err
 			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
-			if err != nil {
+			continue
+		case "image":
+			if a.DocID != "" && a.UploadedConversationID == conversationID {
 				continue
 			}
-			resp, err := c.HTTPClient.Do(req)
-			if err != nil {
-				continue
+			a.DocID, a.FileType, a.UploadedConversationID = "", "", ""
+			if err := c.uploadImage(ctx, acc, conversationID, i, a); err != nil {
+				return err
 			}
-			body, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentMiB<<20))
-			resp.Body.Close()
-			if err != nil || resp.StatusCode != http.StatusOK {
-				continue
-			}
-			mimeType := resp.Header.Get("Content-Type")
-			if mimeType == "" {
-				mimeType = "image/png"
-			}
-			imageData = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(body)
-		}
-		comma := strings.IndexByte(imageData, ',')
-		if comma < 0 {
-			return fmt.Errorf("invalid image data URL")
-		}
-		encoded := imageData[comma+1:]
-		if strings.Contains(strings.ToLower(imageData[:comma]), ";base64") == false {
-			return fmt.Errorf("image URL is not base64")
-		}
-		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
-			return fmt.Errorf("decode image: %w", err)
-		}
-		form := url.Values{}
-		form.Set("scenario", "UploadImage")
-		form.Set("conversationId", conversationID)
-		// The browser sends the complete data URL in FileBase64, including the
-		// media-type prefix. UploadFile accepts this form and returns docId.
-		// Live-verified 2026-08-08: UploadFile rejects multipart bodies
-		// (HTTP 400 InvalidRequest); it requires x-www-form-urlencoded like
-		// PyRIT's httpx client sends.
-		form.Set("FileBase64", imageData)
-		if c.Trace != nil {
-			c.Trace(map[string]any{"stage": "upload_start", "index": i, "conversation_id": conversationID, "mime_type": a.MimeType, "base64_length": len(encoded), "token_present": acc.AccessToken != ""})
-		}
-		form.Add("optionsSets", "cwcgptvsan")
-		form.Add("optionsSets", "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch")
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://substrate.office.com/m365Copilot/UploadFile", strings.NewReader(form.Encode()))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		if acc.AccessToken != "" {
-			req.Header.Set("Authorization", "Bearer "+acc.AccessToken)
-		}
-		req.Header.Set("Accept", "application/json")
-		// Required by the enterprise Copilot UploadFile image-input path.
-		// This feature gate is documented in the prior reverse-proxy research
-		// and mirrors the PyRIT request flow.
-		req.Header.Set("X-Variants", "feature.EnableImageSupportInUploadFile")
-		req.Header.Set("X-Scenario", "OfficeWebIncludedCopilot")
-		req.Header.Set("Referer", "https://m365.cloud.microsoft/")
-		for k, vv := range c.HTTPHeader {
-			for _, v := range vv {
-				if k != "Origin" || v != "" {
-					req.Header.Add(k, v)
-				}
-			}
-		}
-		resp, err := c.HTTPClient.Do(req)
-		if err != nil {
-			log.Printf("[upload] http error: %v", err)
 			continue
-		}
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-		resp.Body.Close()
-		if readErr != nil {
-			log.Printf("[upload] read error: %v", readErr)
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Printf("[upload] status %s: %s", resp.Status, strings.TrimSpace(string(data[:minInt(len(data), 500)])))
-			continue
-		}
-		var out struct {
-			DocID    string `json:"docId"`
-			FileName string `json:"fileName"`
-			FileType string `json:"fileType"`
-			Result   struct {
-				Value string `json:"value"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(data, &out); err != nil {
-			log.Printf("[upload] json error: %v", err)
-			continue
-		}
-		if out.Result.Value != "Success" || out.DocID == "" {
-			log.Printf("[upload] failed: %s", strings.TrimSpace(string(data)))
-			continue
-		}
-		a.DocID = out.DocID
-		a.FileType = strings.TrimPrefix(strings.ToLower(out.FileType), ".")
-		// ChatHub's ImageFile annotation uses jpg for JPEG uploads.
-		if a.FileType == "jpeg" {
-			a.FileType = "jpg"
-		}
-		if a.Name == "" {
-			a.Name = out.FileName
-		}
-		if c.Trace != nil {
-			c.Trace(map[string]any{"stage": "upload_success", "doc_id": a.DocID, "file_name": a.Name, "file_type": a.FileType})
+		case "":
+			return fmt.Errorf("attachment type is required")
+		default:
+			return fmt.Errorf("unsupported attachment type %q", a.Type)
 		}
 	}
 	return nil
 }
 
-func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, mcpServerURL string) string {
-	text = toolProtocolPrompt(text, tools, toolChoice)
+func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, toolCallLimit int, mcpServerURL string) string {
+	text = toolProtocolPrompt(text, tools, toolChoice, toolCallLimit)
 	message := map[string]any{
 		"author":                "user",
-		"attachments":           attachments,
 		"inputMethod":           "Keyboard",
 		"text":                  text,
 		"entityAnnotationTypes": []string{"People", "File", "Event", "Email", "TeamsMessage"},
@@ -584,7 +541,19 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 	// sends a file annotation after the file has been uploaded by Office.
 	annotations := make([]any, 0, len(attachments))
 	for _, a := range attachments {
-		if a.Type != "image" || a.DocID == "" {
+		if a.DocID == "" || a.UploadedConversationID != conversationID {
+			continue
+		}
+		if a.Type == "file" {
+			if a.TransportName != "" && a.ReferenceURL != "" {
+				annotations = append(annotations, map[string]any{
+					"id": a.DocID, "text": a.TransportName, "url": a.ReferenceURL,
+					"messageAnnotationType": "LocalFile",
+				})
+			}
+			continue
+		}
+		if a.Type != "image" {
 			continue
 		}
 		if a.Name == "" {
@@ -609,22 +578,6 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 	if len(annotations) > 0 {
 		message["messageAnnotations"] = annotations
 		message["connectedFederatedConnections"] = []string{"dummyId"}
-	}
-	// Restore the old gateway's multimodal injection path. The historical
-	// implementation merged imageUrl/imageBase64 directly into message rather
-	// than relying solely on the newer attachments array.
-	for _, a := range attachments {
-		if a.Type != "image" || a.URL == "" {
-			continue
-		}
-		if strings.HasPrefix(a.URL, "data:") {
-			if comma := strings.IndexByte(a.URL, ','); comma >= 0 && comma+1 < len(a.URL) {
-				message["imageBase64"] = a.URL[comma+1:]
-			}
-		} else {
-			message["imageUrl"] = a.URL
-		}
-		break
 	}
 	optionsSets := []any{
 		"search_result_progress_messages_with_search_queries",
@@ -658,6 +611,8 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 				"options":             map[string]any{},
 				"allowedMessageTypes": []string{
 					"Chat", "Suggestion", "Disengaged", "Progress", "EndOfRequest", "InternalLoaderMessage",
+					"GeneratedCode", "GenerateContentQuery", "ReferencesListComplete", "RenderCardRequest",
+					"SearchQuery", "InternalSearchQuery", "SemanticSerp", "AuthError",
 				},
 				"sliceIds":          []any{},
 				"threadLevelGptId":  map[string]any{},
@@ -673,7 +628,7 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 				"streamingMode": "ConciseWithPadding",
 				"message":       message,
 
-				"plugins":    clientPlugins(tools, mcpServerURL),
+				"plugins":    clientPlugins(callerToolsForChoice(tools, toolChoice), callerMCPForChoice(mcpServerURL, toolChoice)),
 				"toolChoice": toolChoice,
 			},
 		},

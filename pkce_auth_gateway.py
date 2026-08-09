@@ -54,7 +54,7 @@ SCOPES = [
 ]
 
 DEFAULT_STATE_DIR = Path(os.environ.get("M365_STATE_DIR", "/tmp/m365-pkce"))
-TOKEN_FILE = Path(os.path.expanduser(os.environ.get("M365_TOKEN_FILE", "~/.config/m365-copilot2api/accounts.json")))
+TOKEN_FILE = Path(os.path.expanduser(os.environ.get("M365_TOKEN_FILE", "~/.config/m365-native/accounts.json")))
 DEFAULT_HOST = os.environ.get("M365_AUTH_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("M365_AUTH_PORT", "8765"))
 
@@ -242,7 +242,7 @@ def persist_tokens(token_response: dict[str, Any], token_file: Path = TOKEN_FILE
     token_file.parent.mkdir(parents=True, exist_ok=True)
     token_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     # also mirror to the path our earlier scripts used, if different
-    mirror = Path("/tmp/m365-copilot2api-tokens.json")
+    mirror = Path("/tmp/m365-native-tokens.json")
     if token_file.resolve() != mirror.resolve():
         try:
             mirror.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -578,7 +578,7 @@ def main() -> int:
     parser.add_argument("--print-url", action="store_true", help="print auth URL and exit")
     parser.add_argument(
         "--token-file",
-        default=str(Path(os.path.expanduser(os.environ.get("M365_TOKEN_FILE", "~/.config/m365-copilot2api/accounts.json")))),
+        default=str(Path(os.path.expanduser(os.environ.get("M365_TOKEN_FILE", "~/.config/m365-native/accounts.json")))),
     )
     args = parser.parse_args()
     TOKEN_FILE = Path(args.token_file)

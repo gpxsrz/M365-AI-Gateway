@@ -3,9 +3,12 @@ package web
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"m365-native/internal/chathub"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +21,18 @@ type pipeResponseWriter struct {
 	h      http.Header
 	w      *io.PipeWriter
 	status int
+}
+
+func replayRecordedResponse(w http.ResponseWriter, recorded *httptest.ResponseRecorder) {
+	for name, values := range recorded.Header() {
+		w.Header()[name] = append([]string(nil), values...)
+	}
+	status := recorded.Code
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(recorded.Body.Bytes())
 }
 
 func (p *pipeResponseWriter) Header() http.Header { return p.h }
@@ -34,12 +49,35 @@ func (p *pipeResponseWriter) Write(b []byte) (int, error) {
 }
 func (p *pipeResponseWriter) Flush() {}
 
+func readBoundedSSELine(reader *bufio.Reader, limit int64) (string, error) {
+	var line strings.Builder
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if int64(line.Len()+len(fragment)) > limit {
+			return "", errRequestBodyTooLarge
+		}
+		line.Write(fragment)
+		switch {
+		case err == nil:
+			return strings.TrimSuffix(strings.TrimSuffix(line.String(), "\n"), "\r"), nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF) && line.Len() > 0:
+			return line.String(), nil
+		default:
+			return "", err
+		}
+	}
+}
+
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
-func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
+func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string, policy nativePolicySnapshot) {
 	o.Stream = true
 	b, _ := json.Marshal(o)
-	r2 := r.Clone(r.Context())
+	innerContext, cancelInner := context.WithCancel(r.Context())
+	defer cancelInner()
+	r2 := r.Clone(innerContext)
 	r2.Method = http.MethodPost
 	r2.Body = io.NopCloser(bytes.NewReader(b))
 	r2.ContentLength = int64(len(b))
@@ -56,34 +94,76 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
-	emit := func(name string, v any) error {
-		return writeSSE(r, w, flusher, name, v)
+	policyMetadata := withNativePolicy(map[string]any{}, policy)
+	emit := func(name string, v any) {
+		if event, ok := v.(map[string]any); ok {
+			event["m365"] = policyMetadata
+		}
+		writeSSE(w, name, v)
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
 	id := "resp_" + uuid.NewString()
+	if execution := checkpointExecutionFrom(r.Context()); execution != nil && execution.turn != nil && execution.turn.responseID != "" {
+		id = execution.turn.responseID
+	}
 	created := time.Now().Unix()
 	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 
 	var text strings.Builder
+	var reasoning strings.Builder
+	var innerError strings.Builder
+	images := []string{}
+	innerM365 := map[string]any{}
+	var innerStreamError map[string]any
 	messageID := "msg_" + uuid.NewString()
 	contentID := "txt_" + uuid.NewString()
+	reasoningID := "rs_" + uuid.NewString()
 	textStarted := false
+	messageOutputIndex := -1
+	reasoningOutputIndex := -1
+	nextOutputIndex := 0
 	type tcState struct {
 		ID, Name, Args, Type string
 		ItemID               string
+		OutputIndex          int
+		ArgumentParts        []string
 	}
 	calls := map[int]*tcState{}
-	scanner := bufio.NewScanner(pr)
-	scanner.Buffer(make([]byte, 4096), 2<<20)
-	for scanner.Scan() {
-		if r.Context().Err() != nil {
-			return
+	reader := bufio.NewReaderSize(pr, 64<<10)
+	var innerReadError error
+	for {
+		line, readErr := readBoundedSSELine(reader, requestBodySafetyBytes)
+		if errors.Is(readErr, io.EOF) {
+			break
 		}
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+		if readErr != nil {
+			innerReadError = readErr
+			cancelInner()
+			_ = pr.CloseWithError(readErr)
+			break
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			if strings.TrimSpace(line) != "" {
+				innerError.WriteString(line)
+			}
+			continue
+		}
+		if line == "data: [DONE]" {
 			continue
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
+			continue
+		}
+		if metadata, ok := chunk["m365"].(map[string]any); ok {
+			for key, value := range metadata {
+				innerM365[key] = value
+			}
+		}
+		if streamErr, ok := chunk["error"].(map[string]any); ok {
+			innerStreamError = streamErr
 			continue
 		}
 		choices, _ := chunk["choices"].([]any)
@@ -92,18 +172,53 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		}
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
+		if content := responsesReasoningText(delta["reasoning_content"]); content != "" {
+			if reasoningOutputIndex < 0 {
+				reasoningOutputIndex = nextOutputIndex
+				nextOutputIndex++
+				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": reasoningOutputIndex, "item": responsesReasoningItem(reasoningID, "", "in_progress")})
+				emit("response.reasoning_summary_part.added", map[string]any{"type": "response.reasoning_summary_part.added", "output_index": reasoningOutputIndex, "item_id": reasoningID, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+			}
+			reasoning.WriteString(content)
+			emit("response.reasoning_summary_text.delta", map[string]any{"type": "response.reasoning_summary_text.delta", "output_index": reasoningOutputIndex, "item_id": reasoningID, "summary_index": 0, "delta": content})
+		}
 		if content, ok := delta["content"].(string); ok && content != "" {
 			text.WriteString(content)
 			if !textStarted {
 				textStarted = true
-				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
+				messageOutputIndex = nextOutputIndex
+				nextOutputIndex++
+				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
 			}
-			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": content})
+			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": messageOutputIndex, "content_index": 0, "item_id": messageID, "delta": content})
+		}
+		if rawImages, ok := delta["images"].([]any); ok {
+			for _, rawImage := range rawImages {
+				url, _ := rawImage.(string)
+				url = strings.TrimSpace(url)
+				if !chathub.IsImageURL(url) {
+					continue
+				}
+				duplicate := false
+				for _, existing := range images {
+					if existing == url {
+						duplicate = true
+						break
+					}
+				}
+				if !duplicate {
+					images = append(images, url)
+				}
+			}
 		}
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
 			for _, raw := range rawCalls {
 				tc, _ := raw.(map[string]any)
-				idx := int(tc["index"].(float64))
+				idxValue, ok := tc["index"].(float64)
+				if !ok {
+					continue
+				}
+				idx := int(idxValue)
 				st := calls[idx]
 				typ := "function"
 				if v, ok := tc["type"].(string); ok && v == "custom" {
@@ -111,15 +226,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				}
 				if st == nil {
 					prefix := "fc_"
-					item := map[string]any{"type": "function_call", "call_id": "", "name": "", "arguments": "", "status": "in_progress"}
 					if typ == "custom" {
 						prefix = "ctc_"
-						item = map[string]any{"type": "custom_tool_call", "call_id": "", "name": "", "input": "", "status": "in_progress"}
 					}
-					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ}
+					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ, OutputIndex: nextOutputIndex}
+					nextOutputIndex++
 					calls[idx] = st
-					item["id"] = st.ItemID
-					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
 				}
 				if v, ok := tc["id"].(string); ok {
 					st.ID = v
@@ -130,82 +242,189 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				}
 				if v, ok := fn["arguments"].(string); ok {
 					st.Args += v
-					if st.Type != "custom" {
-						emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
+					if v != "" {
+						st.ArgumentParts = append(st.ArgumentParts, v)
 					}
 				}
 			}
 		}
 	}
 	<-innerDone
-	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
+	if innerStreamError != nil {
+		typ, _ := innerStreamError["type"].(string)
+		code, _ := innerStreamError["code"].(string)
+		message, _ := innerStreamError["message"].(string)
+		if typ == "" {
+			typ = "upstream_error"
+		}
+		if code == "" {
+			code = "upstream_error"
+		}
+		if message == "" {
+			message = "inner chat stream failed"
+		}
+		emit("response.failed", map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id": id, "object": "response", "status": "failed", "model": model,
+				"error": map[string]any{"type": typ, "code": code, "message": message, "http_status": http.StatusBadGateway},
+			},
+		})
+		return
+	}
+	if innerReadError != nil || irw.status >= http.StatusBadRequest {
 		status := irw.status
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
-		emit("response.failed", map[string]any{
-			"type": "response.failed",
-			"response": map[string]any{
-				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": map[string]any{"code": status, "message": "inner chat request failed"},
-			},
-		})
-		return
-	}
-	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" {
-		// Never leave a Responses stream after response.created without a
-		// terminal event: clients otherwise render this as a successful blank
-		// answer and may reuse an incomplete response on the next turn.
-		emit("response.failed", map[string]any{
-			"type": "response.failed",
-			"response": map[string]any{
-				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": map[string]any{"code": "empty_upstream_response", "message": "ChatHub returned no text or tool call"},
-			},
-		})
-		return
-	}
-	output := []any{}
-	if len(calls) > 0 {
-		for i := 0; i < len(calls); i++ {
-			st := calls[i]
-			if st == nil {
-				continue
-			}
-			if st.Type == "custom" {
-				input := customToolInput(st.Args)
-				item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
-				output = append(output, item)
-				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
-				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
-				emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
-				continue
-			}
-			item := map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
-			output = append(output, item)
-			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": i, "item": map[string]any{"type": "function_call", "id": item["id"], "call_id": st.ID, "name": st.Name, "arguments": "", "status": "in_progress"}})
-			emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": i, "item_id": item["id"], "delta": st.Args})
-			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": item["id"], "arguments": st.Args})
-			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+		typ, code, message := openAIErrorDetails([]byte(innerError.String()))
+		if typ == "" {
+			typ = "upstream_error"
 		}
-	} else {
-		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}
-		output = append(output, item)
+		if code == "" {
+			code = "upstream_error"
+		}
+		if message == "" {
+			message = "inner chat request failed"
+		}
+		emit("response.failed", map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id": id, "object": "response", "status": "failed", "model": model,
+				"error": map[string]any{"type": typ, "code": code, "message": message, "http_status": status},
+			},
+		})
+		return
+	}
+	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" && len(images) == 0 {
+		emit("response.failed", map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id": id, "object": "response", "status": "failed", "model": model,
+				"error": map[string]any{"code": "upstream_empty_response", "message": "ChatHub returned no text, tool call, or image result"},
+			},
+		})
+		return
+	}
+	for _, st := range calls {
+		if st == nil {
+			continue
+		}
+		if strings.TrimSpace(st.ID) == "" || strings.TrimSpace(st.Name) == "" {
+			emit("response.failed", map[string]any{
+				"type": "response.failed",
+				"response": map[string]any{
+					"id": id, "object": "response", "status": "failed", "model": model,
+					"error": map[string]any{"type": "upstream_error", "code": "invalid_tool_call_stream", "message": "tool call stream ended without a stable call_id and name"},
+				},
+			})
+			return
+		}
+	}
+
+	outputByIndex := map[int]any{}
+	if reasoningOutputIndex >= 0 {
+		outputByIndex[reasoningOutputIndex] = responsesReasoningItem(reasoningID, reasoning.String(), "completed")
+	}
+	messageTextIndex := -1
+	var completedMessage map[string]any
+	if textStarted || strings.TrimSpace(text.String()) != "" || len(images) > 0 {
+		if messageOutputIndex < 0 {
+			messageOutputIndex = nextOutputIndex
+			nextOutputIndex++
+		}
+		content := []any{}
+		if strings.TrimSpace(text.String()) != "" {
+			messageTextIndex = len(content)
+			content = append(content, map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}})
+		}
+		for _, url := range images {
+			content = append(content, map[string]any{"type": "output_image", "image_url": url})
+		}
+		inProgress := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": content}
 		if !textStarted {
-			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
-			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": text.String()})
+			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": inProgress})
+			if messageTextIndex >= 0 {
+				emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": messageOutputIndex, "content_index": messageTextIndex, "item_id": messageID, "delta": text.String()})
+			}
 		}
-		emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": text.String()})
-		item["status"] = "completed"
-		item["content"] = []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}
-		emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
+		completedMessage = map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "completed", "content": content}
+		outputByIndex[messageOutputIndex] = completedMessage
 	}
-	usageOutput := text.String()
+
+	callsByOutputIndex := map[int]*tcState{}
+	for _, st := range calls {
+		if st != nil {
+			callsByOutputIndex[st.OutputIndex] = st
+		}
+	}
+	for outputIndex := 0; outputIndex < nextOutputIndex; outputIndex++ {
+		if outputIndex == reasoningOutputIndex {
+			text := reasoning.String()
+			part := map[string]any{"type": "summary_text", "text": text}
+			emit("response.reasoning_summary_text.done", map[string]any{"type": "response.reasoning_summary_text.done", "output_index": outputIndex, "item_id": reasoningID, "summary_index": 0, "text": text})
+			emit("response.reasoning_summary_part.done", map[string]any{"type": "response.reasoning_summary_part.done", "output_index": outputIndex, "item_id": reasoningID, "summary_index": 0, "part": part})
+			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": outputIndex, "item": outputByIndex[outputIndex]})
+			continue
+		}
+		if outputIndex == messageOutputIndex && completedMessage != nil {
+			if messageTextIndex >= 0 {
+				emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": outputIndex, "content_index": messageTextIndex, "item_id": messageID, "text": text.String()})
+			}
+			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": outputIndex, "item": completedMessage})
+			continue
+		}
+		st := callsByOutputIndex[outputIndex]
+		if st == nil {
+			continue
+		}
+		if st.Type == "custom" {
+			input := customToolInput(st.Args)
+			inProgress := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": "", "status": "in_progress"}
+			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": inProgress})
+			item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
+			outputByIndex[outputIndex] = item
+			emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": outputIndex, "item_id": st.ItemID, "delta": input})
+			emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": outputIndex, "item_id": st.ItemID, "input": input})
+			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": outputIndex, "item": item})
+			continue
+		}
+		inProgress := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": "", "status": "in_progress"}
+		emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": inProgress})
+		for _, part := range st.ArgumentParts {
+			emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": st.ItemID, "delta": part})
+		}
+		item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
+		outputByIndex[outputIndex] = item
+		emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": outputIndex, "item_id": st.ItemID, "arguments": st.Args})
+		emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": outputIndex, "item": item})
+	}
+
+	output := make([]any, 0, len(outputByIndex))
+	for outputIndex := 0; outputIndex < nextOutputIndex; outputIndex++ {
+		if item, ok := outputByIndex[outputIndex]; ok {
+			output = append(output, item)
+		}
+	}
+	usageOutput := text.String() + strings.Join(images, "")
 	for _, call := range calls {
 		usageOutput += call.Name + call.Args
 	}
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, usageOutput)
-	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
+	innerM365 = withNativePolicy(innerM365, policy)
+	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": responsesM365Metadata(map[string]any{"m365": innerM365}, estimate.Source)}
+	if execution := checkpointExecutionFrom(r.Context()); execution != nil {
+		if err := execution.Accept(); err != nil {
+			emit("response.failed", map[string]any{
+				"type": "response.failed",
+				"response": map[string]any{
+					"id": id, "object": "response", "status": "failed", "model": model,
+					"error": map[string]any{"type": "checkpoint_error", "code": "checkpoint_error", "message": err.Error()},
+				},
+			})
+			return
+		}
+	}
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
@@ -224,40 +443,110 @@ func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
-	startedAt := time.Now()
 	if r.Method != http.MethodPost {
 		writeResponsesError(w, 405, "invalid_request_error", "method not allowed")
 		return
 	}
+	settings := serverRuntimeSettings(s)
+	bodyLimit, err := requestBodyLimit(settings.TextInputLimitUTF16)
+	if err != nil {
+		writeResponsesError(w, http.StatusInternalServerError, "configuration_error", err.Error())
+		return
+	}
 	var body responsesRequest
-	if json.NewDecoder(r.Body).Decode(&body) != nil {
+	if err := decodeBoundedJSON(w, r, bodyLimit, &body); err != nil {
+		if isRequestBodyTooLarge(err) {
+			writeRequestBodyTooLarge(w, r.URL.Path, bodyLimit)
+			return
+		}
 		writeResponsesError(w, 400, "invalid_request_error", "bad json")
 		return
+	}
+	for _, tool := range body.Tools {
+		name, _ := tool["name"].(string)
+		if err := validateReservedNativeToolName(name); err != nil {
+			writeResponsesErrorCode(w, http.StatusBadRequest, "invalid_request_error", "reserved_native_tool_name", err.Error())
+			return
+		}
 	}
 	o, err := body.openAI()
 	if err != nil {
 		writeResponsesError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	tenant := extractAPIKey(r)
-	if body.PreviousResponseID != "" {
-		s.responseMu.Lock()
-		prior, ok := s.responseMessages[tenant][body.PreviousResponseID]
-		messages := append([]oaiMsg(nil), prior.Messages...)
-		s.responseMu.Unlock()
-		if !ok || len(messages) == 0 {
-			writeResponsesError(w, 400, "invalid_request_error", "unknown previous_response_id")
+	downgraded, err := adapterCompatibilityParameters(o)
+	if err != nil {
+		writeResponsesErrorCode(w, http.StatusBadRequest, "invalid_request_error", "invalid_parameter", err.Error())
+		return
+	}
+	setDowngradedParameters(w, downgraded)
+	if err := validateCallerText(o.Messages, settings.TextInputLimitUTF16); err != nil {
+		writeResponsesErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", err.Error())
+		return
+	}
+	r = withCallerTextValidated(r)
+	nativePolicy, err := resolveResponsesNativePolicy(settings.ToolPlanningMode, o.Tools)
+	if err != nil {
+		if errors.Is(err, errReservedNativeToolName) {
+			writeResponsesErrorCode(w, http.StatusBadRequest, "invalid_request_error", "reserved_native_tool_name", err.Error())
 			return
 		}
-		o.Messages = append(messages, o.Messages...)
+		writeResponsesErrorCode(w, http.StatusServiceUnavailable, "configuration_error", "invalid_native_policy", err.Error())
+		return
 	}
+	nativePolicy = withSidecarExecutionEnforcement(nativePolicy)
+	effort := o.ReasoningEffort
+	if o.Reasoning != nil && strings.TrimSpace(o.Reasoning.Effort) != "" {
+		effort = o.Reasoning.Effort
+	}
+	if _, routeErr := resolveRoute(o.Model, effort, settings.ModelMappings); routeErr != nil {
+		if typed, ok := routeErr.(*routeResolveError); ok {
+			writeResponsesErrorCode(w, typed.Status, "invalid_request_error", typed.Code, typed.Message)
+		} else {
+			writeResponsesError(w, http.StatusBadRequest, "invalid_request_error", routeErr.Error())
+		}
+		return
+	}
+	publicID := "resp_" + uuid.NewString()
+	control := checkpointRequestControl{Namespace: "responses", ResponseID: publicID, ForceNew: body.NewConversation}
+	switch {
+	case body.PreviousResponseID != "":
+		control.Mode = checkpointResponseParent
+		control.ParentID = body.PreviousResponseID
+	case strings.TrimSpace(body.Conversation) != "":
+		control.Mode = checkpointAppendOnly
+		control.Key = body.Conversation
+	default:
+		control.Mode = checkpointFullHistory
+		control.ForceNew = true
+	}
+	checkpointContext := withCheckpointRequest(r.Context(), control)
+	checkpointTurn, checkpointErr := s.beginOpenAICheckpoint(checkpointContext, &o)
+	if checkpointErr != nil {
+		status := http.StatusConflict
+		if errors.Is(checkpointErr, ErrCheckpointUnknownCursor) || errors.Is(checkpointErr, ErrCheckpointNotFound) {
+			status = http.StatusBadRequest
+		}
+		writeResponsesError(w, status, "checkpoint_error", checkpointErr.Error())
+		return
+	}
+	execution := &checkpointExecution{turn: checkpointTurn}
+	defer execution.Abort()
+	r = r.WithContext(withCheckpointExecution(checkpointContext, execution))
 	if body.Stream {
-		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"))
+		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"), nativePolicy)
 		return
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
 	if status >= 400 {
-		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
+		typ, code, message := openAIErrorDetails(raw)
+		if typ == "" {
+			typ = "upstream_error"
+		}
+		if message == "" {
+			message = errorMessage(raw, "upstream protocol error")
+		}
+		writeResponsesErrorCode(w, status, typ, code, message)
 		return
 	}
 	if err != nil {
@@ -265,9 +554,14 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !responsesOutputHasContent(out) {
-		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "ChatHub returned an empty response; no reusable message was created")
+		writeResponsesErrorCode(w, http.StatusBadGateway, "upstream_error", "upstream_empty_response", "ChatHub returned an empty response; no reusable message was created")
 		return
 	}
+	metadata, _ := out["m365"].(map[string]any)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	out["m365"] = withNativePolicy(metadata, nativePolicy)
 	msg, _ := openAIChoice(out)
 	outputForUsage := ""
 	if msg != nil {
@@ -279,61 +573,12 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	estimate := estimateResponsesUsage(firstNonEmpty(body.Model, "m365-copilot"), o.Messages, o.Tools, o.ToolChoice, outputForUsage)
 	out["usage"] = estimate.Values
 	out["m365_usage_source"] = estimate.Source
-	s.usage.record(UsageRecord{
-		Time:         time.Now(),
-		APIKeyPrefix: extractAPIKey(r),
-		Model:        firstNonEmpty(body.Model, "m365-copilot"),
-		Endpoint:     "/v1/responses",
-		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
-		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
-		DurationMs:   time.Since(startedAt).Milliseconds(),
-		Status:       200,
-	})
-	// Retain the normalized history so a subsequent previous_response_id can
-	// validate its function_call_output against the original tool call.
 	if _, ok := out["id"].(string); ok {
-		// Use the same public response id that writeResponsesResult exposes.
-		publicID := "resp_" + uuid.NewString()
 		out["m365_response_id"] = publicID
-		stored := append([]oaiMsg(nil), o.Messages...)
-		if msg, _ := openAIChoice(out); msg != nil {
-			if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
-				converted := make([]map[string]any, 0, len(calls))
-				for _, call := range calls {
-					if m, ok := call.(map[string]any); ok {
-						converted = append(converted, m)
-					}
-				}
-				stored = append(stored, oaiMsg{Role: "assistant", ToolCalls: converted})
-			} else {
-				if text, _ := msg["content"].(string); text != "" {
-					stored = append(stored, oaiMsg{Role: "assistant", Content: text})
-				}
-			}
-		}
-		s.responseMu.Lock()
-		bucket := s.responseMessages[tenant]
-		if bucket == nil {
-			bucket = map[string]respHistory{}
-			s.responseMessages[tenant] = bucket
-		}
-		for k, h := range bucket {
-			if time.Since(h.At) > time.Hour {
-				delete(bucket, k)
-			}
-		}
-		if len(bucket) >= maxResponsesPerTenant {
-			var oldestKey string
-			var oldestAt time.Time
-			for k, h := range bucket {
-				if oldestKey == "" || h.At.Before(oldestAt) {
-					oldestKey, oldestAt = k, h.At
-				}
-			}
-			delete(bucket, oldestKey)
-		}
-		bucket[publicID] = respHistory{At: time.Now(), Messages: stored}
-		s.responseMu.Unlock()
+	}
+	if err := execution.Accept(); err != nil {
+		writeResponsesError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
+		return
 	}
 	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
 }
@@ -346,45 +591,82 @@ func responsesOutputHasContent(src map[string]any) bool {
 	if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
 		return true
 	}
-	text, _ := msg["content"].(string)
-	return strings.TrimSpace(text) != ""
+	return len(responsesMessageContentBlocks(msg["content"])) > 0
 }
 
 func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
-	startedAt := time.Now()
 	if r.Method != http.MethodPost {
 		writeAnthropicError(w, 405, "invalid_request_error", "method not allowed")
 		return
 	}
+	settings := serverRuntimeSettings(s)
+	bodyLimit, err := requestBodyLimit(settings.TextInputLimitUTF16)
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+		return
+	}
 	var body anthropicRequest
-	if json.NewDecoder(r.Body).Decode(&body) != nil {
+	if err := decodeBoundedJSON(w, r, bodyLimit, &body); err != nil {
+		if isRequestBodyTooLarge(err) {
+			writeRequestBodyTooLarge(w, r.URL.Path, bodyLimit)
+			return
+		}
 		writeAnthropicError(w, 400, "invalid_request_error", "bad json")
 		return
+	}
+	if body.Stream {
+		setStreamingSemantics(w, "posthoc-adapter")
+	}
+	if body.MaxTokens > 0 {
+		setIgnoredParameters(w, []string{"max_tokens"})
+	}
+	for _, tool := range body.Tools {
+		if err := validateReservedNativeToolName(tool.Name); err != nil {
+			writeAnthropicErrorCode(w, http.StatusBadRequest, "invalid_request_error", "reserved_native_tool_name", err.Error())
+			return
+		}
 	}
 	o, err := body.openAI()
 	if err != nil {
 		writeAnthropicError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
+	checkpointContext := withCheckpointRequest(r.Context(), checkpointRequestControl{Mode: checkpointFullHistory, Namespace: "anthropic"})
+	checkpointTurn, checkpointErr := s.beginOpenAICheckpoint(checkpointContext, &o, func(messages []oaiMsg) error {
+		return validateCallerText(messages, settings.TextInputLimitUTF16)
+	})
+	if checkpointErr != nil {
+		var textLimitErr *callerTextLimitError
+		if errors.As(checkpointErr, &textLimitErr) {
+			writeAnthropicErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", checkpointErr.Error())
+			return
+		}
+		writeAnthropicError(w, http.StatusConflict, "checkpoint_error", checkpointErr.Error())
+		return
+	}
+	execution := &checkpointExecution{turn: checkpointTurn}
+	defer execution.Abort()
+	r = withCallerTextValidated(r)
+	r = r.WithContext(withCheckpointExecution(r.Context(), execution))
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
 	if status >= 400 {
-		writeAnthropicError(w, status, "api_error", errorMessage(raw, "upstream protocol error"))
+		typ, code, message := openAIErrorDetails(raw)
+		if typ == "" {
+			typ = "api_error"
+		}
+		if message == "" {
+			message = errorMessage(raw, "upstream protocol error")
+		}
+		writeAnthropicErrorCode(w, status, typ, code, message)
 		return
 	}
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
 		return
 	}
-	estimate := estimateResponsesUsage(firstNonEmpty(body.Model, "m365-copilot"), o.Messages, o.Tools, o.ToolChoice, "")
-	s.usage.record(UsageRecord{
-		Time:         time.Now(),
-		APIKeyPrefix: extractAPIKey(r),
-		Model:        firstNonEmpty(body.Model, "m365-copilot"),
-		Endpoint:     "/v1/messages",
-		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
-		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
-		DurationMs:   time.Since(startedAt).Milliseconds(),
-		Status:       200,
-	})
+	if err := execution.Accept(); err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
+		return
+	}
 	writeAnthropicResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
 }

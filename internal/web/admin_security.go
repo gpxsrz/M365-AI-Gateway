@@ -4,7 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"net"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,7 +12,25 @@ import (
 	"time"
 )
 
-const defaultAdminPassword = "admin123"
+type adminCredentialMode uint8
+
+const (
+	adminCredentialUnavailable adminCredentialMode = iota
+	adminCredentialPersisted
+	adminCredentialBootstrap
+	adminCredentialBootstrapConsumed
+)
+
+var (
+	errAdminCredentialUnavailable = errors.New("管理員憑證無法使用")
+	errAdminCredentialChanged     = errors.New("管理員憑證已變更")
+	errAdminBootstrapConsumed     = errors.New("管理員一次性 bootstrap secret 已使用")
+)
+
+type adminCredential struct {
+	Password string
+	Mode     adminCredentialMode
+}
 
 type loginAttempt struct {
 	Failures                 int
@@ -20,72 +38,173 @@ type loginAttempt struct {
 }
 
 func adminPasswordPath() string {
-	if dir := strings.TrimSpace(os.Getenv("M365_DATA_DIR")); dir != "" {
-		return filepath.Join(dir, "admin-password")
-	}
 	if p := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD_FILE")); p != "" {
 		return p
+	}
+	if dir := strings.TrimSpace(os.Getenv("M365_DATA_DIR")); dir != "" {
+		return filepath.Join(dir, "admin-password")
 	}
 	if p := strings.TrimSpace(os.Getenv("M365_CONFIG")); p != "" {
 		return filepath.Join(filepath.Dir(p), "admin-password")
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "m365-copilot2api", "admin-password")
+	return filepath.Join(home, ".config", "m365-native", "admin-password")
 }
-func loadAdminPassword() (string, bool) {
-	// The writable persisted value takes precedence over bootstrap sources.
-	if b, e := os.ReadFile(adminPasswordPath()); e == nil && strings.TrimSpace(string(b)) != "" {
-		p := strings.TrimSpace(string(b))
-		return p, p == defaultAdminPassword
-	}
-	if bootstrap := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD_BOOTSTRAP_FILE")); bootstrap != "" {
-		if b, e := os.ReadFile(bootstrap); e == nil && strings.TrimSpace(string(b)) != "" {
-			p := strings.TrimSpace(string(b))
-			return p, p == defaultAdminPassword
+
+func adminBootstrapConsumedPath() string {
+	return adminPasswordPath() + ".bootstrap-consumed"
+}
+
+func loadAdminCredential() (adminCredential, error) {
+	// A present persisted file is authoritative, including an empty/corrupt
+	// file, so bootstrap material can never silently resurrect behind it.
+	b, err := os.ReadFile(adminPasswordPath())
+	if err == nil {
+		password := strings.TrimSpace(string(b))
+		if password == "" {
+			return adminCredential{}, nil
 		}
+		return adminCredential{Password: password, Mode: adminCredentialPersisted}, nil
 	}
-	if p := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD")); p != "" {
-		return p, p == defaultAdminPassword
+	if !os.IsNotExist(err) {
+		return adminCredential{}, fmt.Errorf("read persisted administrator credential: %w", err)
 	}
-	return defaultAdminPassword, true
+
+	if _, err := os.Stat(adminBootstrapConsumedPath()); err == nil {
+		return adminCredential{}, nil
+	} else if !os.IsNotExist(err) {
+		return adminCredential{}, fmt.Errorf("read administrator bootstrap state: %w", err)
+	}
+
+	if bootstrapPath := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD_BOOTSTRAP_FILE")); bootstrapPath != "" {
+		b, err := os.ReadFile(bootstrapPath)
+		if err != nil {
+			// Bootstrap is optional input, not authority. Missing, unreadable, or
+			// incorrectly mounted input leaves management safely unavailable.
+			return adminCredential{}, nil
+		}
+		password := strings.TrimSpace(string(b))
+		if password == "" {
+			return adminCredential{}, nil
+		}
+		return adminCredential{Password: password, Mode: adminCredentialBootstrap}, nil
+	}
+
+	if password := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD")); password != "" {
+		return adminCredential{Password: password, Mode: adminCredentialBootstrap}, nil
+	}
+	return adminCredential{}, nil
 }
+
 func saveAdminPassword(password string) error {
 	p := adminPasswordPath()
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".admin-password-*")
+	if err != nil {
+		return err
+	}
+	temporary := f.Name()
+	defer os.Remove(temporary)
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.WriteString(password + "\n"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// os.Rename replaces an existing regular destination on supported Go
+	// platforms; on Windows the standard library uses MoveFileEx with
+	// MOVEFILE_REPLACE_EXISTING.
+	return os.Rename(temporary, p)
+}
+
+func markAdminBootstrapConsumed() error {
+	p := adminBootstrapConsumedPath()
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		return err
 	}
-	return writeFileAtomic(p, []byte(password+"\n"), 0600)
-}
-func clientIP(r *http.Request) string {
-	// Trust proxy headers only when the direct peer is loopback (normal local reverse-proxy deployment).
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if net.ParseIP(host).IsLoopback() {
-		// A trusted reverse proxy appends the client address to XFF. Use the
-		// right-most valid address rather than the attacker-controlled first one.
-		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
-				return ip.String()
-			}
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return errAdminBootstrapConsumed
+	}
+	if err != nil {
+		return err
+	}
+	remove := true
+	defer func() {
+		_ = f.Close()
+		if remove {
+			_ = os.Remove(p)
 		}
+	}()
+	if _, err := f.WriteString("m365-admin-bootstrap-consumed-v1\n"); err != nil {
+		return err
 	}
-	if host != "" {
-		return host
+	if err := f.Sync(); err != nil {
+		return err
 	}
-	return r.RemoteAddr
+	if err := f.Close(); err != nil {
+		return err
+	}
+	remove = false
+	return nil
 }
+
 func validNewAdminPassword(p string) error {
-	if p == defaultAdminPassword {
-		return errors.New("new password must not be the default password")
-	}
 	if len(p) < 6 {
-		return errors.New("new password must be at least 6 characters")
+		return errors.New("新密碼至少需要 6 個字元")
 	}
 	if len(p) > 256 {
-		return errors.New("new password is too long")
+		return errors.New("新密碼過長")
 	}
 	return nil
 }
+
+func (s *Server) establishAdminSession(expectedPassword string, expectedMode adminCredentialMode, token string, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.adminCredentialMode != expectedMode || subtle.ConstantTimeCompare([]byte(s.adminPassword), []byte(expectedPassword)) != 1 {
+		if expectedMode == adminCredentialBootstrap && s.adminCredentialMode != adminCredentialBootstrap {
+			return false, errAdminBootstrapConsumed
+		}
+		return false, errAdminCredentialChanged
+	}
+	switch expectedMode {
+	case adminCredentialPersisted:
+		// Normal persisted login.
+	case adminCredentialBootstrap:
+		if err := markAdminBootstrapConsumed(); err != nil {
+			if errors.Is(err, errAdminBootstrapConsumed) {
+				s.adminPassword = ""
+				s.adminCredentialMode = adminCredentialUnavailable
+				s.mustChangePassword = false
+				s.adminSessions = map[string]adminSession{}
+			}
+			return false, err
+		}
+		s.adminCredentialMode = adminCredentialBootstrapConsumed
+		s.mustChangePassword = true
+		// The newly issued session is the only session allowed to rotate the
+		// consumed bootstrap credential.
+		s.adminSessions = map[string]adminSession{}
+	default:
+		return false, errAdminCredentialUnavailable
+	}
+	s.adminSessions[token] = adminSession{CreatedAt: now, LastSeenAt: now, ExpiresAt: now.Add(adminSessionAbsoluteTimeout)}
+	return s.mustChangePassword, nil
+}
+
 func (s *Server) loginAllowed(ip string, now time.Time) (bool, time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -124,18 +243,20 @@ func (s *Server) recordLoginFailure(ip string, now time.Time) {
 	}
 	s.loginAttempts[ip] = a
 }
+
 func (s *Server) clearLoginFailures(ip string) {
 	s.mu.Lock()
 	delete(s.loginAttempts, ip)
 	s.mu.Unlock()
 }
+
 func (s *Server) adminChangePassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeOpenAIError(w, 405, "invalid_request_error", "method not allowed")
+		writeOpenAIError(w, 405, "invalid_request_error", "不支援此 HTTP 方法")
 		return
 	}
 	if !s.validAdminSession(r) {
-		writeOpenAIError(w, 401, "auth_error", "administrator login required")
+		writeOpenAIError(w, 401, "auth_error", "需要先以管理員身分登入")
 		return
 	}
 	var b struct {
@@ -143,14 +264,23 @@ func (s *Server) adminChangePassword(w http.ResponseWriter, r *http.Request) {
 		New     string `json:"new_password"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&b) != nil {
-		writeOpenAIError(w, 400, "invalid_request_error", "bad json")
+		writeOpenAIError(w, 400, "invalid_request_error", "JSON 格式錯誤")
 		return
 	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	current := s.adminPassword
-	s.mu.Unlock()
+	if current == "" || s.adminCredentialMode == adminCredentialUnavailable {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", "管理員憑證無法使用")
+		return
+	}
 	if subtle.ConstantTimeCompare([]byte(b.Current), []byte(current)) != 1 {
-		writeOpenAIError(w, 401, "auth_error", "current password is invalid")
+		writeOpenAIError(w, 401, "auth_error", "目前密碼不正確")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(b.New), []byte(current)) == 1 {
+		writeOpenAIError(w, 400, "invalid_request_error", "新密碼不得與目前密碼相同")
 		return
 	}
 	if err := validNewAdminPassword(b.New); err != nil {
@@ -158,14 +288,13 @@ func (s *Server) adminChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := saveAdminPassword(b.New); err != nil {
-		writeOpenAIError(w, 500, "storage_error", "administrator password could not be saved; check the persistent data directory permissions")
+		writeOpenAIError(w, 500, "storage_error", "無法儲存管理員密碼；請檢查持久化資料目錄的權限")
 		return
 	}
-	s.mu.Lock()
 	s.adminPassword = b.New
+	s.adminCredentialMode = adminCredentialPersisted
 	s.mustChangePassword = false
-	s.adminSessions = map[string]time.Time{}
-	s.mu.Unlock()
+	s.adminSessions = map[string]adminSession{}
 	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Path: "/", HttpOnly: true, Secure: secureAdminCookie(r), SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	jsonOut(w, map[string]any{"status": "password_changed", "reauthenticate": true})
 }

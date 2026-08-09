@@ -80,14 +80,87 @@ func TestActiveMessagesIgnoresOlderToolHistory(t *testing.T) {
 	}
 }
 
+func TestRecoveryUserTurnKeepsPendingEvidenceInFullLedger(t *testing.T) {
+	messages := []oaiMsg{
+		{Role: "assistant", ToolCalls: []map[string]any{{
+			"id":   "pending-1",
+			"type": "function",
+			"function": map[string]any{
+				"name":      "deploy",
+				"arguments": `{"target":"service"}`,
+			},
+		}}},
+		{Role: "user", Content: "Continue after the interruption."},
+	}
+	if err := validateToolConversation(messages); err != nil {
+		t.Fatalf("recovery turn rejected: %v", err)
+	}
+	full := buildAgentLedger(messages)
+	if len(full.Pending) != 1 || full.Pending[0].ID != "pending-1" {
+		t.Fatalf("pending evidence was erased: %+v", full)
+	}
+	active := buildAgentLedger(activeMessages(messages))
+	if len(active.Pending) != 0 {
+		t.Fatalf("old pending call leaked into active round limit scope: %+v", active)
+	}
+}
+
 func TestCompletionGuardRejectsPendingAndUnsupportedSuccess(t *testing.T) {
 	l := buildAgentLedger([]oaiMsg{
 		{Role: "assistant", ToolCalls: []map[string]any{
 			{"id": "p1", "type": "function", "function": map[string]any{"name": "deploy", "arguments": "{}"}},
 		}},
 	})
-	if completionEvidenceAllows("Deployment completed successfully", l) {
-		t.Fatal("pending action allowed as complete")
+	for _, answer := range []string{
+		"Deployment completed successfully.",
+		"It's done.",
+		"The work is finished.",
+		"The deployment passed.",
+		"The update was applied.",
+		"The service is running.",
+		"I cannot confirm it, but deployment completed successfully.",
+	} {
+		if completionEvidenceAllows(answer, l) {
+			t.Fatalf("pending action allowed as complete: %q", answer)
+		}
+	}
+}
+
+func TestCompletionGuardAllowsNeutralPendingStatus(t *testing.T) {
+	ledger := buildAgentLedger([]oaiMsg{{
+		Role: "assistant",
+		ToolCalls: []map[string]any{{
+			"id":       "p1",
+			"type":     "function",
+			"function": map[string]any{"name": "deploy", "arguments": "{}"},
+		}},
+	}})
+	for _, answer := range []string{
+		"A health check is running; the deployment outcome remains unconfirmed.",
+		"The active request is still being observed; no completion is confirmed.",
+		"The configuration was updated in memory, but no external action is confirmed.",
+		"The proposed fix is documented; execution remains unconfirmed.",
+	} {
+		if !completionEvidenceAllows(answer, ledger) {
+			t.Fatalf("neutral pending status was rejected: %q", answer)
+		}
+	}
+}
+
+func TestCompletionGuardRejectsSuccessWhenCompletedEvidenceFailed(t *testing.T) {
+	ledger := buildAgentLedger([]oaiMsg{
+		{Role: "assistant", ToolCalls: []map[string]any{{
+			"id":       "c1",
+			"type":     "function",
+			"function": map[string]any{"name": "deploy", "arguments": "{}"},
+		}}},
+		{Role: "tool", ToolCallID: "c1", Content: "exit code 1: deployment failed"},
+	})
+	if completionEvidenceAllows("Deployment completed successfully.", ledger) {
+		t.Fatal("failed completed evidence authorized a success claim")
+	}
+	if !completionEvidenceAllows("Deployment failed and remains incomplete.", ledger) {
+		t.Fatal("honest failed outcome was rejected")
 	}
 }
 

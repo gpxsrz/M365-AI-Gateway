@@ -17,7 +17,14 @@ type reasoningConfig struct {
 
 type modelSpec struct {
 	ID, Owner, DisplayName, DefaultReasoningLevel string
-	Tools                                         bool
+	CanonicalRoute, ResolvedTone                  string
+	RouteKind                                     routeKind
+	OperationalStatus                             operationalStatus
+	MappingEvidence                               mappingEvidence
+	IdentityStatus                                identityStatus
+	CatalogVisibility                             catalogVisibility
+	AliasUsed, CompatibilityRequired              bool
+	ConfiguredMapping, Experimental, Deprecated   bool
 }
 
 type reasoningEffortPreset struct {
@@ -52,17 +59,42 @@ func codexModelMessages() map[string]any {
 	}
 }
 
-var gatewayModels = []modelSpec{
-	{ID: "gpt-5.2", Owner: "microsoft-365", Tools: true},
-	{ID: "gpt-5.2-reasoning", Owner: "microsoft-365", Tools: true},
-	{ID: "gpt-5.3", Owner: "microsoft-365", Tools: true},
-	{ID: "gpt-5.4", Owner: "microsoft-365", Tools: true},
-	{ID: "gpt-5.4-reasoning", Owner: "microsoft-365", Tools: true},
-	{ID: "gpt-5.5", Owner: "microsoft-365", Tools: true},
-	{ID: "gpt-5.5-reasoning", Owner: "microsoft-365", Tools: true},
-	{ID: "gpt-5.6-reasoning", Owner: "microsoft-365", Tools: true},
-	{ID: "claude-sonnet", Owner: "anthropic-via-microsoft-365", Tools: true},
-	{ID: "claude-sonnet-reasoning", Owner: "anthropic-via-microsoft-365", Tools: true},
+func gatewayModelSpecs() []modelSpec {
+	return modelSpecsFromRoutes(catalogRouteDefinitions(nil))
+}
+
+// gatewayModels remains as the package-level compatibility projection used by
+// existing tests and callers. Runtime catalog generation still uses the route
+// registry so settings mappings are evaluated per request.
+var gatewayModels = gatewayModelSpecs()
+
+func modelSpecsFromRoutes(routes []routeDefinition) []modelSpec {
+	models := make([]modelSpec, 0, len(routes))
+	for _, route := range routes {
+		displayName := route.DisplayName
+		if displayName == "" {
+			displayName = route.ID
+		}
+		models = append(models, modelSpec{
+			ID:                    route.ID,
+			Owner:                 route.Owner,
+			DisplayName:           displayName,
+			DefaultReasoningLevel: route.DefaultReasoningLevel,
+			CanonicalRoute:        route.CanonicalRoute,
+			ResolvedTone:          route.Tone,
+			RouteKind:             route.Kind,
+			OperationalStatus:     route.OperationalStatus,
+			MappingEvidence:       route.MappingEvidence,
+			IdentityStatus:        route.IdentityStatus,
+			CatalogVisibility:     route.CatalogVisibility,
+			AliasUsed:             route.Kind == routeKindAlias || route.Kind == routeKindPreset,
+			CompatibilityRequired: route.CompatibilityRequired,
+			ConfiguredMapping:     route.ConfiguredMapping,
+			Experimental:          route.Experimental,
+			Deprecated:            route.Deprecated,
+		})
+	}
+	return models
 }
 
 func validUpstreamTone(tone string) bool {
@@ -75,7 +107,7 @@ func validUpstreamTone(tone string) bool {
 }
 
 func knownUpstreamTones() []string {
-	return []string{"Gpt_5_2_Chat", "Gpt_5_2_Reasoning", "Gpt_5_3_Chat", "Gpt_5_3_Reasoning", "Gpt_5_4_Chat", "Gpt_5_4_Reasoning", "Gpt_5_5_Chat", "Gpt_5_5_Reasoning", "Gpt_5_6_Reasoning", "Claude_Sonnet", "Claude_Sonnet_Reasoning"}
+	return []string{"Gpt_5_2_Chat", "Gpt_5_2_Reasoning", "Gpt_5_3_Chat", "Gpt_5_4_Chat", "Gpt_5_4_Reasoning", "Gpt_5_5_Chat", "Gpt_5_5_Reasoning", "Gpt_5_6_Reasoning", "Gpt_Quick", "Gpt_Reasoning", "Claude_Sonnet", "Claude_Sonnet_Reasoning"}
 }
 
 func configuredModelMapping(model string, mappings []modelMapping) (modelMapping, bool) {
@@ -97,25 +129,7 @@ func configuredModelTone(model string, mappings []modelMapping) (string, bool) {
 }
 
 func configuredModelSpecs(mappings []modelMapping) []modelSpec {
-	models := append([]modelSpec(nil), gatewayModels...)
-	for _, mapping := range mappings {
-		spec := modelSpec{
-			ID: strings.TrimSpace(mapping.PublicModel), Owner: "microsoft-365", Tools: true,
-			DisplayName: strings.TrimSpace(mapping.DisplayName), DefaultReasoningLevel: strings.TrimSpace(mapping.DefaultReasoningLevel),
-		}
-		replaced := false
-		for i := range models {
-			if strings.EqualFold(models[i].ID, spec.ID) {
-				models[i] = spec
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			models = append(models, spec)
-		}
-	}
-	return models
+	return modelSpecsFromRoutes(catalogRouteDefinitions(mappings))
 }
 
 func positiveEnvInt(name string, fallback int) int {
@@ -126,7 +140,10 @@ func positiveEnvInt(name string, fallback int) int {
 	return fallback
 }
 func configuredModelLimits() modelLimits {
-	cfg := currentSettings()
+	return configuredModelLimitsForSettings(currentSettings())
+}
+
+func configuredModelLimitsForSettings(cfg runtimeSettings) modelLimits {
 	contextWindow := cfg.ContextWindow
 	maxOutput := cfg.MaxOutputTokens
 	if maxOutput >= contextWindow {
@@ -145,45 +162,32 @@ func normalizeReasoningEffort(e string) (string, error) {
 	switch e {
 	case "none", "minimal", "low", "medium", "high", "xhigh":
 		return e, nil
+	case "max", "ultra":
+		// Hermes v0.20.0 exposes these levels. ChatHub has no corresponding
+		// request field, so keep the strongest supported Sidecar mapping without
+		// forwarding the incompatible caller value upstream.
+		return "xhigh", nil
 	}
-	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, or xhigh", e)
+	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, xhigh, max, or ultra", e)
 }
 func reasoningTone(model, effort string) (string, error) {
-	e, err := normalizeReasoningEffort(effort)
+	resolution, err := resolveRoute(model, effort, currentSettings().ModelMappings)
 	if err != nil {
 		return "", err
 	}
-	if tone, ok := configuredModelTone(model, currentSettings().ModelMappings); ok {
-		return tone, nil
-	}
-	base := modelTone(model)
-	// Explicit reasoning aliases are never silently downgraded by a generic client default.
-	if strings.Contains(strings.ToLower(model), "reasoning") {
-		return base, nil
-	}
-	if e == "" || e == "none" || e == "minimal" || e == "low" {
-		return base, nil
-	}
-	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "claude", "claude-sonnet":
-		return "Claude_Sonnet_Reasoning", nil
-	case "gpt-5.2":
-		return "Gpt_5_2_Reasoning", nil
-	case "gpt-5.3":
-		return "Gpt_5_3_Reasoning", nil
-	case "gpt-5.4":
-		return "Gpt_5_4_Reasoning", nil
-	case "gpt-5.5":
-		return "Gpt_5_5_Reasoning", nil
-	case "gpt-5.6":
-		return "Gpt_5_5_Reasoning", nil
-	default:
-		return "Gpt_5_5_Reasoning", nil
-	}
+	return resolution.ResolvedTone, nil
 }
 func modelCatalog() []map[string]any {
-	l := configuredModelLimits()
-	models := configuredModelSpecs(currentSettings().ModelMappings)
+	return modelCatalogForSettings(currentSettings())
+}
+
+func modelCatalogForSettings(cfg runtimeSettings) []map[string]any {
+	return modelCatalogForSettingsAndEvidence(cfg, nil)
+}
+
+func modelCatalogForSettingsAndEvidence(cfg runtimeSettings, projection *catalogEvidenceProjection) []map[string]any {
+	l := configuredModelLimitsForSettings(cfg)
+	models := configuredModelSpecs(cfg.ModelMappings)
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
 		// Keep capability fields both at the top level and under capabilities:
@@ -207,8 +211,12 @@ func modelCatalog() []map[string]any {
 		if defaultReasoningLevel == "" {
 			defaultReasoningLevel = "medium"
 		}
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id": m.ID, "slug": m.ID, "display_name": displayName, "description": "Microsoft 365 gateway model route.",
+			"canonical_route": m.CanonicalRoute, "resolved_tone": m.ResolvedTone, "route_kind": m.RouteKind,
+			"operational_status": m.OperationalStatus, "mapping_evidence": m.MappingEvidence, "identity_status": m.IdentityStatus,
+			"catalog_visibility": m.CatalogVisibility, "alias_used": m.AliasUsed, "compatibility_required": m.CompatibilityRequired,
+			"configured_mapping": m.ConfiguredMapping, "experimental": m.Experimental, "deprecated": m.Deprecated,
 			"base_instructions": gatewayCodexBaseInstructions, "model_messages": codexModelMessages(),
 			"default_reasoning_level": defaultReasoningLevel, "object": "model", "owned_by": m.Owner,
 			"shell_type": "shell_command", "visibility": "list", "supported_in_api": true, "priority": 1,
@@ -218,16 +226,26 @@ func modelCatalog() []map[string]any {
 			"support_verbosity": true, "default_verbosity": "low", "apply_patch_tool_type": "freeform",
 			"web_search_tool_type": "text_and_image", "truncation_policy": map[string]any{"mode": "tokens", "limit": 10000},
 			"supports_parallel_tool_calls": true, "supports_image_detail_original": true,
-			"max_context_window": l.ContextWindow, "effective_context_window_percent": 95,
+			"x_m365_accepted_downgrade_parameters": []string{"image_detail", "verbosity"},
+			"x_m365_verbosity_semantics":           "accepted_and_downgraded",
+			"x_m365_image_detail_semantics":        "accepted_and_downgraded",
+			"max_context_window":                   l.ContextWindow, "effective_context_window_percent": 95,
 			"experimental_supported_tools": []any{}, "supports_search_tool": true, "use_responses_lite": false,
 			"tool_mode": "code_mode_only", "multi_agent_version": "v2",
 			"context_window": l.ContextWindow, "max_input_tokens": l.MaxInputTokens, "max_output_tokens": l.MaxOutputTokens,
-			"capabilities": caps, "supports_tools": true, "tool_calls": true,
+			"x_m365_standard_fields_source": "compatibility_default",
+			"x_m365_route_source":           "registry_config",
+			"x_m365_mapping_source":         "registry_config",
+			"x_m365_protocol_source":        "none",
+			"x_m365_evidence_source":        "none",
+			"capabilities":                  caps, "supports_tools": true, "tool_calls": true,
 			"supported_reasoning_levels": advertisedReasoningEfforts,
 			"function_calling":           true, "supports_function_calling": true, "supports_vision": true,
 			"vision": true, "modalities": modalities, "input_modalities": modalities,
 			"output_modalities": []string{"text"}, "supported_features": features,
-		})
+		}
+		projection.apply(entry, m)
+		out = append(out, entry)
 	}
 	return out
 }

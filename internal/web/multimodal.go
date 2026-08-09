@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"m365-copilot2api/internal/chathub"
+	"m365-native/internal/chathub"
 )
 
 func parseContent(c any) (string, []chathub.Attachment) {
@@ -23,39 +23,41 @@ func parseContent(c any) (string, []chathub.Attachment) {
 			continue
 		}
 		typ, _ := m["type"].(string)
-		// Responses API uses input_text and may put image_url directly on
-		// the content item rather than nesting it under image_url.
 		if v, ok := m["text"].(string); ok && (typ == "text" || typ == "input_text" || typ == "output_text" || typ == "") {
 			text.WriteString(v)
-		}
-		if direct, ok := m["image_url"].(string); ok && direct != "" {
-			files = append(files, chathub.Attachment{Type: "image", URL: direct, MimeType: "image/*"})
 		}
 		switch typ {
 		case "text", "input_text", "output_text":
 			// handled above
 		case "image_url":
-			if u, ok := m["image_url"].(map[string]any); ok {
-				if v, ok := u["url"].(string); ok {
-					a := chathub.Attachment{Type: "image", URL: v, MimeType: "image/*"}
-					if d, ok := u["detail"].(string); ok {
-						a.Detail = d
-					}
-					files = append(files, a)
-				}
+			a := chathub.Attachment{Type: "image", MimeType: "image/*"}
+			switch image := m["image_url"].(type) {
+			case string:
+				a.URL = image
+			case map[string]any:
+				a.URL = stringValue(image, "url", "data", "image_url")
+				a.Detail = stringValue(image, "detail", "image_detail")
+			}
+			if a.Detail == "" {
+				a.Detail = stringValue(m, "detail", "image_detail")
+			}
+			if a.URL != "" {
+				files = append(files, a)
 			}
 		case "input_image", "image":
-			// Responses API accepts both image_url as a string and image_url
-			// as an object containing url. Also accept nested source.url/data.
-			u := stringValue(m, "image_url", "url", "source")
-			if raw, ok := m["image_url"].(map[string]any); ok {
-				u = stringValue(raw, "url", "data", "image_url")
+			a := chathub.Attachment{Type: "image", MimeType: "image/*", Detail: stringValue(m, "detail", "image_detail")}
+			a.URL = stringValue(m, "image_url", "url")
+			if image, ok := m["image_url"].(map[string]any); ok {
+				a.URL = stringValue(image, "url", "data", "image_url")
+				if a.Detail == "" {
+					a.Detail = stringValue(image, "detail", "image_detail")
+				}
 			}
-			if raw, ok := m["source"].(map[string]any); ok && u == "" {
-				u = stringValue(raw, "url", "data", "source")
+			if source, ok := m["source"].(map[string]any); ok && a.URL == "" {
+				a.URL = stringValue(source, "url", "data", "source")
 			}
-			if u != "" {
-				files = append(files, chathub.Attachment{Type: "image", URL: u, MimeType: "image/*"})
+			if a.URL != "" {
+				files = append(files, a)
 			}
 		case "input_file", "file":
 			u := stringValue(m, "file_data", "file_url", "url", "source", "file_id")

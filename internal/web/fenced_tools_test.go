@@ -15,3 +15,27 @@ func TestFencedWorkspaceShellIsStructuredToolCall(t *testing.T) {
 		t.Fatalf("unexpected arguments: %s", calls[0].Arguments)
 	}
 }
+
+func TestFencedBashIsNotInventedWhenUnregistered(t *testing.T) {
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "terminal"}}}
+	calls := fencedToolCalls("```bash\n{\"command\":\"sudo apt install chrome\"}\n```", tools, "auto")
+	if len(calls) != 0 {
+		t.Fatalf("unregistered bash tool was invented: %#v", calls)
+	}
+}
+
+func TestPlainCommandJSONDoesNotInventBash(t *testing.T) {
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "terminal"}}}
+	calls := fencedToolCalls(`{"command":"sudo apt install chrome"}`, tools, "auto")
+	if len(calls) != 0 {
+		t.Fatalf("plain command JSON invented bash: %#v", calls)
+	}
+}
+
+func TestFencedBashUsesRegisteredBashTool(t *testing.T) {
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "bash"}}}
+	calls := fencedToolCalls("```bash\n{\"command\":\"echo ok\"}\n```", tools, "auto")
+	if len(calls) != 1 || calls[0].Name != "bash" {
+		t.Fatalf("registered bash call not preserved: %#v", calls)
+	}
+}

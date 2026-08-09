@@ -2,7 +2,7 @@ package web
 
 import (
 	"fmt"
-	"m365-copilot2api/internal/chathub"
+	"m365-native/internal/chathub"
 	"strings"
 )
 
@@ -17,17 +17,18 @@ func flattenPromptMessages(messages []oaiMsg, attachments []chathub.Attachment) 
 		}
 		txt, files := parseContent(m.Content)
 		attachments = append(attachments, files...)
+		if role == "tool" {
+			b.WriteString(fmt.Sprintf("\n[tool result id=%s]\n", m.ToolCallID))
+			b.WriteString(txt)
+			b.WriteString("\n[/tool result]\n")
+			continue
+		}
 		txt = strings.TrimSpace(txt)
 		if len(m.ToolCalls) > 0 {
 			if txt != "" {
 				b.WriteString(fmt.Sprintf("\n[%s]\n%s\n", role, txt))
 			}
 			b.WriteString(fmt.Sprintf("\n[%s tool_calls]\n%s\n", role, mustJSON(m.ToolCalls)))
-			continue
-		}
-		if role == "tool" {
-			txt = compactToolResult(txt, 4000)
-			b.WriteString(fmt.Sprintf("\n[tool result id=%s]\n%s\n", m.ToolCallID, txt))
 			continue
 		}
 		if txt == "" {

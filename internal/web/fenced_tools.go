@@ -18,6 +18,9 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		_ = json.Unmarshal([]byte(args), &v)
 		// Auto-convert bash/shell code blocks to tool calls
 		if !allowed[name] && (name == "bash" || name == "sh" || name == "shell" || name == "powershell" || name == "cmd") {
+			if !allowed["bash"] || !toolChoiceAllows(choice, "bash") {
+				continue
+			}
 			if m, ok := v.(map[string]any); ok {
 				if cmd, hasCmd := m["command"]; hasCmd && cmd != "" {
 					cmdBytes, _ := json.Marshal(map[string]any{"command": cmd, "timeout": m["timeout"], "workdir": m["workdir"]})
@@ -41,8 +44,9 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		b, _ := json.Marshal(v)
 		out = append(out, detectedToolCall{ID: callID(name, string(b), len(out)), Type: toolType(name, tools), Name: name, Arguments: b})
 	}
-	// Also check for plain JSON objects with a "command" field (not in fenced blocks)
-	if len(out) == 0 {
+	// Also check for plain JSON objects with a "command" field (not in fenced blocks).
+	// Only convert them when the caller explicitly exposed a bash tool.
+	if len(out) == 0 && allowed["bash"] && toolChoiceAllows(choice, "bash") {
 		for i := 0; i < len(text); i++ {
 			if text[i] != '{' {
 				continue

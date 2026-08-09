@@ -2,7 +2,7 @@ package web
 
 import (
 	"encoding/json"
-	"m365-copilot2api/internal/chathub"
+	"m365-native/internal/chathub"
 )
 
 func xmlToolCalls(text string, tools []map[string]any, choice any) []detectedToolCall {

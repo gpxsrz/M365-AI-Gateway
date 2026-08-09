@@ -15,19 +15,23 @@ func classifyUpdateMessages(messages []any) []StreamEvent {
 		mt, _ := m["messageType"].(string)
 		ct, _ := m["contentType"].(string)
 		origin, _ := m["contentOrigin"].(string)
-		cot, _ := m["addToChainOfThought"].(bool)
+		addToChainOfThought, _ := m["addToChainOfThought"].(bool)
+		// A mixed provider message may carry safe progress/text beside a
+		// protected Code Interpreter artifact child. This projection exposes
+		// only the selected text/tool fields, so reject the whole message only
+		// when the message itself is the artifact or its visible text is
+		// protected. Field-level traversal handles protected siblings elsewhere.
+		if generatedCodeInterpreterMessage(m) || ContainsProtectedArtifactReference(text) {
+			continue
+		}
 		kind := "text"
-		if mt == "Progress" || ct == "SearchResults" || ct == "Code" || ct == "ToolCall" {
+		if reasoningSummaryMessage(mt, origin, addToChainOfThought, text) {
+			kind = "reasoning"
+		} else if mt == "Progress" || ct == "SearchResults" || ct == "Code" || ct == "ToolCall" {
 			kind = "progress"
 		}
-		// ChatHub marks the multi-step reasoning transcript (ChainOfThought cards)
-		// via contentOrigin and addToChainOfThought. Expose it separately so the
-		// OpenAI-compatible layer can render it as reasoning_content.
-		if origin == "ChainOfThoughtSummary" || cot {
-			kind = "reasoning"
-		}
 		name, args := extractToolFields(m)
-		if name != "" && len(args) > 0 {
+		if name != "" {
 			kind = "tool"
 		}
 		if text == "" && kind == "text" {
@@ -39,10 +43,11 @@ func classifyUpdateMessages(messages []any) []StreamEvent {
 }
 
 func extractToolFields(m map[string]any) (string, json.RawMessage) {
-	var name string
+	var name, nameKey string
 	for _, k := range []string{"name", "toolName", "pluginName", "functionName"} {
 		if v, ok := m[k].(string); ok && v != "" {
 			name = v
+			nameKey = k
 			break
 		}
 	}
@@ -57,7 +62,20 @@ func extractToolFields(m map[string]any) (string, json.RawMessage) {
 			}
 		}
 	}
+	if argumentlessToolShape(m, nameKey) {
+		return name, nil
+	}
 	return "", nil
+}
+
+func argumentlessToolShape(m map[string]any, nameKey string) bool {
+	if nameKey != "name" {
+		return true
+	}
+	messageType, _ := m["messageType"].(string)
+	contentType, _ := m["contentType"].(string)
+	target, _ := m["target"].(string)
+	return messageType == "Progress" || contentType == "ToolCall" || target == "plugin"
 }
 
 func eventRaw(v any) json.RawMessage { b, _ := json.Marshal(v); return b }
@@ -75,15 +93,30 @@ func extractToolEvents(v any, seen map[string]bool) []StreamEvent {
 				walk(item)
 			}
 		case map[string]any:
-			name, args := extractToolFields(z)
-			if name != "" && len(args) > 0 {
-				key := name + "|" + string(args)
-				if !seen[key] {
-					seen[key] = true
-					out = append(out, StreamEvent{Kind: "tool", ToolName: name, Arguments: args, Raw: eventRaw(z)})
-				}
+			if generatedCodeInterpreterMessage(z) {
+				return
 			}
-			for _, child := range z {
+			name, args := extractToolFields(z)
+			if name != "" {
+				if len(args) == 0 || !ContainsProtectedArtifactJSON(args) {
+					key := name + "|" + string(args)
+					if !seen[key] {
+						seen[key] = true
+						messageType, _ := z["messageType"].(string)
+						contentType, _ := z["contentType"].(string)
+						raw := eventRaw(z)
+						if artifactBearingMap(z) {
+							raw = nil
+						}
+						out = append(out, StreamEvent{Kind: "tool", MessageType: messageType, ContentType: contentType, ToolName: name, Arguments: args, Raw: raw})
+					}
+				}
+				return
+			}
+			for key, child := range z {
+				if IsProtectedArtifactField(key, child) {
+					continue
+				}
 				walk(child)
 			}
 		}

@@ -7,8 +7,23 @@ type Tool struct {
 	Function json.RawMessage `json:"function,omitempty"`
 }
 
+func callerToolsForChoice(tools []Tool, choice any) []Tool {
+	if mode, ok := choice.(string); ok && mode == "none" {
+		return nil
+	}
+	return tools
+}
+
+func callerMCPForChoice(serverURL string, choice any) string {
+	if mode, ok := choice.(string); ok && mode == "none" {
+		return ""
+	}
+	return serverURL
+}
+
 func clientPlugins(tools []Tool, mcpServerURL string) []any {
-	plugins := make([]any, 0, len(tools)+1)
+	plugins := make([]any, 0, len(tools)+2)
+	plugins = append(plugins, map[string]any{"Id": "BingWebSearch", "Source": "BuiltIn"})
 	if mcpServerURL != "" {
 		plugins = append(plugins, map[string]any{
 			"Id":                "mcp-gateway",

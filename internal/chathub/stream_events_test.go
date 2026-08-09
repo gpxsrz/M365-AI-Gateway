@@ -1,6 +1,23 @@
 package chathub
 
-import "testing"
+import (
+	"errors"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+func TestWebSocketDialFailurePreservesStatusAndCause(t *testing.T) {
+	cause := errors.New("bad handshake")
+	withStatus := webSocketDialFailure(http.StatusForbidden, cause)
+	if !errors.Is(withStatus, cause) || !strings.Contains(withStatus.Error(), "HTTP 403") {
+		t.Fatalf("status dial error=%q", withStatus)
+	}
+	withoutStatus := webSocketDialFailure(0, cause)
+	if !errors.Is(withoutStatus, cause) || !strings.Contains(withoutStatus.Error(), "ws dial: bad handshake") {
+		t.Fatalf("statusless dial error=%q", withoutStatus)
+	}
+}
 
 func TestClassifyUpdateMessages(t *testing.T) {
 	got := classifyUpdateMessages([]any{
@@ -16,31 +33,22 @@ func TestClassifyUpdateMessages(t *testing.T) {
 	}
 }
 
-func TestClassifyChainOfThoughtAsReasoning(t *testing.T) {
-	got := classifyUpdateMessages([]any{
-		map[string]any{"author": "bot", "text": "**搜索用户需求**\n- 查询相关文档", "messageType": "Progress", "contentOrigin": "ChainOfThoughtSummary"},
-		map[string]any{"author": "bot", "text": "使用工具查找", "messageType": "Progress", "addToChainOfThought": true},
-		map[string]any{"author": "bot", "text": "普通进度", "messageType": "Progress", "contentOrigin": "SomeOtherOrigin"},
-	})
-	if len(got) != 3 {
-		t.Fatalf("unexpected event count: %#v", got)
-	}
-	if got[0].Kind != "reasoning" || got[0].Text == "" {
-		t.Fatalf("expected reasoning, got %#v", got[0])
-	}
-	if got[1].Kind != "reasoning" {
-		t.Fatalf("expected reasoning via addToChainOfThought, got %#v", got[1])
-	}
-	if got[2].Kind != "progress" {
-		t.Fatalf("ordinary progress must stay progress, got %#v", got[2])
+func TestExtractToolEventsNestedAndDeduped(t *testing.T) {
+	seen := map[string]bool{}
+	arg := map[string]any{"plugin": map[string]any{"functionName": "web_search", "functionArguments": map[string]any{"query": "golang"}, "messageType": "Progress", "contentType": "SearchResults"}}
+	got := extractToolEvents([]any{arg, arg}, seen)
+	if len(got) != 1 || got[0].ToolName != "web_search" || got[0].MessageType != "Progress" || got[0].ContentType != "SearchResults" {
+		t.Fatalf("unexpected nested tools: %#v", got)
 	}
 }
 
-func TestExtractToolEventsNestedAndDeduped(t *testing.T) {
-	seen := map[string]bool{}
-	arg := map[string]any{"plugin": map[string]any{"functionName": "list_files", "functionArguments": map[string]any{"path": "."}}}
-	got := extractToolEvents([]any{arg, arg}, seen)
-	if len(got) != 1 || got[0].ToolName != "list_files" {
-		t.Fatalf("unexpected nested tools: %#v", got)
+func TestExtractToolEventsPreservesArgumentlessToolShape(t *testing.T) {
+	got := extractToolEvents(map[string]any{
+		"messageType": "Progress",
+		"contentType": "ToolCall",
+		"pluginName":  "delete_file",
+	}, map[string]bool{})
+	if len(got) != 1 || got[0].Kind != "tool" || got[0].ToolName != "delete_file" || len(got[0].Arguments) != 0 {
+		t.Fatalf("unexpected argumentless tool event: %#v", got)
 	}
 }

@@ -1,11 +1,12 @@
 package web
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 type detectedToolCall struct {
@@ -39,6 +40,24 @@ func allowedToolNames(tools []map[string]any) map[string]bool {
 	return out
 }
 
+func filterAllowedToolCalls(calls []detectedToolCall, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
+	allowed := allowedToolNames(tools)
+	out := make([]detectedToolCall, 0, len(calls))
+	rejected := false
+	for _, call := range calls {
+		if !allowed[call.Name] || !toolChoiceAllows(choice, call.Name) {
+			rejected = true
+			continue
+		}
+		if validateToolArgumentsRaw(call.Arguments, toolFunction(call.Name, tools)) != nil {
+			rejected = true
+			continue
+		}
+		out = append(out, call)
+	}
+	return out, rejected
+}
+
 func toolChoiceAllows(choice any, name string) bool {
 	if choice == nil {
 		return true
@@ -58,9 +77,8 @@ func toolChoiceAllows(choice any, name string) bool {
 	return true
 }
 
-func callID(name, args string, index int) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%s:%s", index, name, args)))
-	return "call_" + hex.EncodeToString(h[:8])
+func callID(_ string, _ string, _ int) string {
+	return "call_" + uuid.NewString()
 }
 
 func extractToolCalls(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
@@ -69,27 +87,30 @@ func extractToolCalls(text string, tools []map[string]any, choice any) ([]detect
 	if start < 0 || end <= start {
 		return nil, false
 	}
-	var raw any
-	if json.Unmarshal([]byte(text[start+len("<m365-tool-call>"):end]), &raw) != nil {
-		return nil, false
+	type wireCall struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
 	}
-	items := []any{raw}
-	if arr, ok := raw.([]any); ok {
-		items = arr
+	raw := bytes.TrimSpace([]byte(text[start+len("<m365-tool-call>") : end]))
+	var items []wireCall
+	if len(raw) > 0 && raw[0] == '[' {
+		if json.Unmarshal(raw, &items) != nil {
+			return nil, false
+		}
+	} else {
+		var item wireCall
+		if json.Unmarshal(raw, &item) != nil {
+			return nil, false
+		}
+		items = []wireCall{item}
 	}
 	allowed := allowedToolNames(tools)
 	out := make([]detectedToolCall, 0, len(items))
 	for i, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
+		if !allowed[item.Name] || !toolChoiceAllows(choice, item.Name) || validateToolArgumentsRaw(item.Arguments, toolFunction(item.Name, tools)) != nil {
 			continue
 		}
-		n, _ := m["name"].(string)
-		if !allowed[n] || !toolChoiceAllows(choice, n) {
-			continue
-		}
-		a, _ := json.Marshal(m["arguments"])
-		out = append(out, detectedToolCall{ID: callID(n, string(a), i), Type: toolType(n, tools), Name: n, Arguments: a})
+		out = append(out, detectedToolCall{ID: callID(item.Name, string(item.Arguments), i), Type: toolType(item.Name, tools), Name: item.Name, Arguments: append(json.RawMessage(nil), item.Arguments...)})
 	}
 	return out, len(out) > 0
 }

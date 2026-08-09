@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"m365-copilot2api/internal/outbound"
+	"m365-native/internal/outbound"
 	"net/http"
 	"net/url"
 	"strings"
@@ -111,7 +111,7 @@ func PollDeviceCode(deviceCode string) (TokenSet, bool, error) {
 		}
 	}
 	if tr.AccessToken == "" {
-		return TokenSet{}, false, fmt.Errorf("token endpoint returned no access token")
+		return TokenSet{}, false, fmt.Errorf("empty access token: %s", string(body))
 	}
 	set := TokenSet{
 		AccessToken:  tr.AccessToken,

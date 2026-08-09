@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"m365-copilot2api/internal/chathub"
+	"m365-native/internal/chathub"
 	"net/http"
 	"strings"
 	"time"
@@ -22,14 +22,31 @@ type imageGenerationRequest struct {
 }
 
 func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
-	startedAt := time.Now()
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	settings := serverRuntimeSettings(s)
+	bodyLimit, err := requestBodyLimit(settings.TextInputLimitUTF16)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", err.Error())
+		return
+	}
 	var b imageGenerationRequest
-	if json.NewDecoder(r.Body).Decode(&b) != nil || strings.TrimSpace(b.Prompt) == "" {
+	if err := decodeBoundedJSON(w, r, bodyLimit, &b); err != nil {
+		if isRequestBodyTooLarge(err) {
+			writeRequestBodyTooLarge(w, r.URL.Path, bodyLimit)
+			return
+		}
 		http.Error(w, `{"error":{"message":"prompt is required","type":"invalid_request_error"}}`, 400)
+		return
+	}
+	if strings.TrimSpace(b.Prompt) == "" {
+		http.Error(w, `{"error":{"message":"prompt is required","type":"invalid_request_error"}}`, 400)
+		return
+	}
+	if err := validateCallerString(b.Prompt, settings.TextInputLimitUTF16); err != nil {
+		writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", err.Error())
 		return
 	}
 	if b.N <= 0 {
@@ -43,7 +60,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"response_format must be url or b64_json","type":"invalid_request_error"}}`, 400)
 		return
 	}
-	acc, err := s.resolveAccount(firstNonEmpty(b.AccountID, b.User))
+	acc, err := s.activeAccount()
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -55,7 +72,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "account missing oid/tid", 400)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ImageTimeoutSeconds)*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ImageTimeoutSeconds)*time.Second)
 	defer cancel()
 	size := b.Size
 	if size == "" {
@@ -64,10 +81,13 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	prompt := fmt.Sprintf("Generate an image with the Flux model. Size: %s. Description: %s. Return the image URL directly.", size, b.Prompt)
 	res, err := s.chat.Chat(ctx, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic"})
 	if err != nil {
+		if writeCanonicalTerminalError(w, err) {
+			return
+		}
 		http.Error(w, upstreamError(err), 502)
 		return
 	}
-	log.Printf("[image-gen] conversation=%s images=%d text_len=%d events=%d raw_len=%d", res.ConversationID, len(res.Images), len(res.Text), len(res.Events), len(res.RawResult))
+	log.Printf("[image-gen] images=%d text_bytes=%d events=%d raw_bytes=%d conversation_present=%t", len(res.Images), len(res.Text), len(res.Events), len(res.RawResult), res.ConversationID != "")
 	if len(res.Images) == 0 {
 		// Fallback: try to find image URLs in the raw result
 		if urls := extractImageURLs(res.RawResult); len(urls) > 0 {
@@ -81,27 +101,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(res.Images) == 0 {
-		// Debug: log the response to understand what the model returned
-		textPreview := res.Text
-		if len(textPreview) > 500 {
-			textPreview = textPreview[:500]
-		}
-		rawPreview := ""
-		if len(res.RawResult) > 0 {
-			rawPreview = res.RawResult
-			if len(rawPreview) > 500 {
-				rawPreview = rawPreview[:500]
-			}
-		}
-		debug := map[string]any{
-			"text":        textPreview,
-			"raw_len":     len(res.RawResult),
-			"events":      len(res.Events),
-			"images":      res.Images,
-			"raw_preview": rawPreview,
-		}
-		b, _ := json.Marshal(debug)
-		log.Printf("[image-gen-debug] %s", string(b))
+		log.Printf("[image-gen] code=no_image_resource text_bytes=%d raw_bytes=%d events=%d", len(res.Text), len(res.RawResult), len(res.Events))
 		http.Error(w, `{"error":{"message":"upstream returned no image resource","type":"upstream_error"}}`, 502)
 		return
 	}
@@ -121,16 +121,6 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 			data = append(data, map[string]string{"url": u})
 		}
 	}
-	s.usage.record(UsageRecord{
-		Time:         time.Now(),
-		APIKeyPrefix: extractAPIKey(r),
-		AccountEmail: acc.Email,
-		Model:        firstNonEmpty(b.Model, "flux"),
-		Endpoint:     "/v1/images/generations",
-		InputTokens:  EstimateTokens(prompt),
-		DurationMs:   time.Since(startedAt).Milliseconds(),
-		Status:       200,
-	})
 	jsonOut(w, map[string]any{"created": time.Now().Unix(), "data": data, "m365": map[string]any{"conversationId": res.ConversationID, "sessionId": res.SessionID, "images": images}})
 }
 
@@ -156,7 +146,7 @@ func extractImageURLs(raw string) []string {
 			for k, e := range x {
 				lk := strings.ToLower(k)
 				if s, ok := e.(string); ok && (lk == "url" || lk == "imageurl" || lk == "thumbnailurl" || lk == "downloadurl" || lk == "src" || lk == "value" || lk == "data") {
-					if strings.HasPrefix(s, "https://") && !seen[s] {
+					if strings.HasPrefix(s, "https://") && !chathub.ContainsProtectedArtifactReference(s) && !seen[s] {
 						if strings.Contains(strings.ToLower(s), "image") || strings.HasSuffix(strings.ToLower(s), ".png") || strings.HasSuffix(strings.ToLower(s), ".jpg") || strings.HasSuffix(strings.ToLower(s), ".jpeg") || strings.HasSuffix(strings.ToLower(s), ".webp") || strings.HasSuffix(strings.ToLower(s), ".gif") {
 							seen[s] = true
 							out = append(out, s)

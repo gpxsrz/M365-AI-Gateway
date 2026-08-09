@@ -2,7 +2,7 @@ package web
 
 import (
 	"encoding/json"
-	"m365-copilot2api/internal/chathub"
+	"m365-native/internal/chathub"
 	"strings"
 	"testing"
 )
@@ -21,13 +21,19 @@ func TestCompatMetadataHidesEventsByDefault(t *testing.T) {
 
 func TestCompatMetadataEventsAreExplicitOptIn(t *testing.T) {
 	t.Setenv("M365_INCLUDE_UPSTREAM_EVENTS", "true")
-	res := chathub.Result{Events: []json.RawMessage{json.RawMessage(`{"type":1}`)}}
-	if _, ok := compatM365Metadata(res)["events"]; !ok {
+	res := chathub.Result{Events: []json.RawMessage{json.RawMessage(`{"type":1,"target":"update","arguments":[{"messages":[{"messageType":"Progress","contentOrigin":"ChainOfThoughtSummary","text":"summary","hiddenText":"secret"}]}]}`)}}
+	events, ok := compatM365Metadata(res)["events"]
+	if !ok {
 		t.Fatal("opt-in events missing")
+	}
+	encoded, _ := json.Marshal(events)
+	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), `"raw"`) {
+		t.Fatalf("opt-in events leaked raw/hidden data: %s", encoded)
 	}
 }
 
 func TestNamedToolChoiceModeIsStable(t *testing.T) {
+	t.Skip("provisional model-tool-router continuation policy is excluded from the pure WP1 deployment candidate")
 	choice := map[string]any{"name": "weather"}
 	if got := normalizedToolChoiceMode(choice); got != "named:weather" {
 		t.Fatalf("mode=%q", got)

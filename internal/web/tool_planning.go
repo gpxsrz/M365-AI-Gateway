@@ -3,8 +3,9 @@ package web
 import "strings"
 
 func toolPlanningMode(raw string) string {
-	if strings.EqualFold(strings.TrimSpace(raw), "native") {
-		return "native"
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		return "router"
 	}
-	return "router"
+	return mode
 }

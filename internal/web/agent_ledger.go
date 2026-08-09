@@ -10,14 +10,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 type toolEvidence struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-	Result    string `json:"result"`
-	Failed    bool   `json:"failed"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	ArgumentsSHA256 string `json:"arguments_sha256"`
+	ResultLength    int    `json:"result_length"`
+	ResultSHA256    string `json:"result_sha256,omitempty"`
+	Failed          bool   `json:"failed"`
+	Preview         string `json:"preview,omitempty"`
+	hasResult       bool   `json:"-"`
 }
 type agentLedger struct {
 	Completed           []toolEvidence `json:"completed"`
@@ -26,33 +32,110 @@ type agentLedger struct {
 	RepeatedCall        bool           `json:"repeated_call"`
 	RepeatedFailure     bool           `json:"repeated_failure"`
 	RepetitionSignature string         `json:"repetition_signature,omitempty"`
+	KnownCallDigests    []string       `json:"-"`
 }
 
 var failureSignal = regexp.MustCompile(`(?i)(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)`)
-var unsupportedSuccess = regexp.MustCompile(`(?i)\b(installed|created|written|executed|ran|started|deployed|deleted|verified|completed|succeeded|successful(?:ly)?)\b`)
+var unsupportedSuccess = regexp.MustCompile(`(?i)\b(installed|created|written|executed|ran|started|deployed|deleted|verified|completed|succeeded|success(?:ful(?:ly)?)?|done|finished|passed|applied)\b`)
+var unsupportedServiceState = regexp.MustCompile(`(?i)\b(service|server|daemon|application|app|deployment)\s+(is|was)\s+(currently\s+|now\s+)?(running|active)\b`)
+var unsupportedResolvedState = regexp.MustCompile(`(?i)\b(issue|bug|problem|failure)\s+(is|was|has been)\s+(fixed|resolved)\b`)
+
+const unconfirmedToolOutcomeResponse = "I cannot confirm completion because no matching tool results were returned. No external action has been verified."
+const completedToolCallSuppressedResponse = "The matching tool call was not reissued because its result is already present in the conversation."
+const toolResultPreviewBytes = 4000
+
+func claimsUnsupportedSuccess(answer string) bool {
+	return unsupportedSuccess.MatchString(answer) || unsupportedServiceState.MatchString(answer) || unsupportedResolvedState.MatchString(answer)
+}
+
+func suppressedKnownCallResponse(l agentLedger) string {
+	if len(l.Pending) > 0 {
+		return unconfirmedToolOutcomeResponse
+	}
+	return completedToolCallSuppressedResponse
+}
 
 func compactToolResult(s string, limit int) string {
 	s = strings.TrimSpace(s)
+	return boundedUTF8Preview(s, limit)
+}
+
+func boundedUTF8Preview(s string, limit int) string {
 	if limit < 200 {
 		limit = 200
 	}
 	if len(s) <= limit {
 		return s
 	}
-	head := limit / 3
-	tail := limit - head - 80
-	if tail < 80 {
-		tail = 80
+	marker := fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-limit)
+	budget := limit - len(marker)
+	if budget < 2 {
+		budget = 2
 	}
-	return s[:head] + fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-head-tail) + s[len(s)-tail:]
+	head := budget / 3
+	tail := budget - head
+	prefix := utf8SafePrefix(s, head)
+	suffix := utf8SafeSuffix(s, tail)
+	marker = fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-len(prefix)-len(suffix))
+	if len(prefix)+len(marker)+len(suffix) > limit {
+		suffix = utf8SafeSuffix(s, limit-len(prefix)-len(marker))
+	}
+	return prefix + marker + suffix
 }
-func scopedCallID(name, args string, index int, scope string) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%s:%s", scope, index, name, args)))
-	return "call_" + hex.EncodeToString(h[:8])
+
+func utf8SafePrefix(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	end := limit
+	for end > 0 && !utf8.ValidString(s[:end]) {
+		end--
+	}
+	return s[:end]
 }
-func buildAgentLedger(messages []oaiMsg) agentLedger {
+
+func utf8SafeSuffix(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	start := len(s) - limit
+	for start < len(s) && !utf8.ValidString(s[start:]) {
+		start++
+	}
+	return s[start:]
+}
+func scopedCallID(_ string, _ string, _ int, _ string) string {
+	return "call_" + uuid.NewString()
+}
+func buildAgentLedger(messages []oaiMsg, prior ...agentLedger) agentLedger {
 	calls := map[string]toolEvidence{}
 	order := []string{}
+	knownCallDigests := []string{}
+	known := map[string]struct{}{}
+	if len(prior) > 0 {
+		for _, digest := range prior[0].KnownCallDigests {
+			if _, duplicate := known[digest]; duplicate {
+				continue
+			}
+			known[digest] = struct{}{}
+			knownCallDigests = append(knownCallDigests, digest)
+		}
+		for _, evidence := range prior[0].Completed {
+			evidence.hasResult = true
+			calls[evidence.ID] = evidence
+			order = append(order, evidence.ID)
+		}
+		for _, evidence := range prior[0].Pending {
+			calls[evidence.ID] = evidence
+			order = append(order, evidence.ID)
+		}
+	}
 	for _, m := range messages {
 		if m.Role == "assistant" {
 			for _, raw := range m.ToolCalls {
@@ -61,37 +144,48 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 				name, _ := fn["name"].(string)
 				args := fmt.Sprint(fn["arguments"])
 				if id != "" {
-					calls[id] = toolEvidence{ID: id, Name: name, Arguments: args}
-					order = append(order, id)
+					if _, exists := calls[id]; !exists {
+						calls[id] = toolEvidence{ID: id, Name: name, ArgumentsSHA256: toolArgumentsSHA256(args)}
+						order = append(order, id)
+					}
 				}
 			}
 		}
 		if m.Role == "tool" {
 			if e, ok := calls[m.ToolCallID]; ok {
-				e.Result = compactToolResult(contentToString(m.Content), 4000)
-				e.Failed = failureSignal.MatchString(e.Result)
+				result := contentToString(m.Content)
+				e.ResultLength = len(result)
+				e.ResultSHA256 = stringSHA256(result)
+				e.Failed = failureSignal.MatchString(result)
+				e.Preview = boundedUTF8Preview(result, toolResultPreviewBytes)
+				e.hasResult = true
 				calls[m.ToolCallID] = e
 			}
 		}
 	}
-	l := agentLedger{}
+	l := agentLedger{KnownCallDigests: knownCallDigests}
 	seenCall := map[string]int{}
 	seenFailure := map[string]int{}
 	for _, id := range order {
 		e := calls[id]
+		identityDigest := toolCallIdentityDigest(e.Name, e.ArgumentsSHA256)
+		if _, duplicate := known[identityDigest]; !duplicate {
+			known[identityDigest] = struct{}{}
+			l.KnownCallDigests = append(l.KnownCallDigests, identityDigest)
+		}
 		l.ToolRounds++
-		sig := e.Name + "\x00" + e.Arguments
+		sig := e.Name + "\x00" + e.ArgumentsSHA256
 		seenCall[sig]++
 		if seenCall[sig] >= 2 {
 			l.RepeatedCall = true
 			l.RepetitionSignature = sig
 		}
-		if e.Result == "" {
+		if !e.hasResult {
 			l.Pending = append(l.Pending, e)
 		} else {
 			l.Completed = append(l.Completed, e)
 			if e.Failed {
-				fs := e.Name + "\x00" + e.Arguments + "\x00" + normalizeFailure(e.Result)
+				fs := e.Name + "\x00" + e.ArgumentsSHA256 + "\x00" + e.ResultSHA256
 				seenFailure[fs]++
 				if seenFailure[fs] >= 2 {
 					l.RepeatedFailure = true
@@ -102,22 +196,18 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 	}
 	return l
 }
-func normalizeFailure(s string) string {
-	s = strings.ToLower(s)
-	s = regexp.MustCompile(`\d+`).ReplaceAllString(s, "#")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
-}
 func (l agentLedger) RouterContext() string {
 	type compact struct {
 		Completed    []toolEvidence `json:"completed"`
 		Pending      []toolEvidence `json:"pending"`
 		RepeatedCall bool           `json:"repeated_call"`
 	}
-	b, _ := json.Marshal(compact{l.Completed, l.Pending, l.RepeatedCall})
-	hint := "Use only this compact evidence. A completed call is final evidence; do not issue the same name and arguments again."
+	completed := append([]toolEvidence(nil), l.Completed...)
+	for i := range completed {
+		completed[i].Preview = ""
+	}
+	b, _ := json.Marshal(compact{completed, l.Pending, l.RepeatedCall})
+	hint := "Use only this compact evidence. Completed calls are final evidence. Pending calls have unknown outcomes because no matching tool result was returned. Do not automatically issue the same name and arguments as any completed or pending call. Report pending outcomes as unconfirmed unless independent evidence resolves them."
 	if l.RepeatedFailure {
 		hint += " The same call failed repeatedly; change strategy instead of retrying unchanged."
 	}
@@ -126,30 +216,66 @@ func (l agentLedger) RouterContext() string {
 func canonicalToolArguments(s string) string {
 	s = strings.TrimSpace(s)
 	var v any
-	if json.Unmarshal([]byte(s), &v) == nil {
+	decoder := json.NewDecoder(strings.NewReader(s))
+	decoder.UseNumber()
+	if decoder.Decode(&v) == nil && ensureJSONEOF(decoder) == nil {
 		b, _ := json.Marshal(v)
 		return string(b)
 	}
 	return s
 }
 
-func (l agentLedger) hasCompleted(name, args string) bool {
-	want := canonicalToolArguments(args)
-	for _, e := range l.Completed {
-		if e.Name == name && canonicalToolArguments(e.Arguments) == want {
+func stringSHA256(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func toolArgumentsSHA256(arguments string) string {
+	return checkpointDigest(transportCheckpointHashDomain, canonicalToolArguments(arguments))
+}
+
+func toolCallIdentityDigest(name, argumentsDigest string) string {
+	return checkpointDigest(transportCheckpointToolIdentityDomain, name+"\x00"+argumentsDigest)
+}
+
+func (l agentLedger) hasKnownCall(name, args string) bool {
+	want := toolArgumentsSHA256(args)
+	wantIdentity := toolCallIdentityDigest(name, want)
+	for _, digest := range l.KnownCallDigests {
+		if digest == wantIdentity {
 			return true
+		}
+	}
+	for _, group := range [][]toolEvidence{l.Completed, l.Pending} {
+		for _, e := range group {
+			if e.Name == name && e.ArgumentsSHA256 == want {
+				return true
+			}
 		}
 	}
 	return false
 }
-func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToolCall {
+func filterKnownCalls(calls []detectedToolCall, l agentLedger) []detectedToolCall {
 	out := calls[:0]
+	batch := make(map[string]struct{}, len(calls))
 	for _, c := range calls {
-		if !l.hasCompleted(c.Name, string(c.Arguments)) {
-			out = append(out, c)
+		identity := c.Name + "\x00" + toolArgumentsSHA256(string(c.Arguments))
+		if _, duplicate := batch[identity]; duplicate || l.hasKnownCall(c.Name, string(c.Arguments)) {
+			continue
 		}
+		batch[identity] = struct{}{}
+		out = append(out, c)
 	}
 	return out
+}
+
+func (l agentLedger) hasFailedCompletedEvidence() bool {
+	for _, evidence := range l.Completed {
+		if evidence.Failed {
+			return true
+		}
+	}
+	return false
 }
 func (l agentLedger) CanContinue(maxRounds int) error {
 	if maxRounds <= 0 {
@@ -188,28 +314,26 @@ func activeMessages(messages []oaiMsg) []oaiMsg {
 	return messages[last:]
 }
 func completionEvidenceAllows(answer string, l agentLedger) bool {
+	claimsSuccess := claimsUnsupportedSuccess(answer)
 	if len(l.Pending) > 0 {
-		return false
-	}
-	low := strings.ToLower(answer)
-	failureKeywords := []string{"cannot confirm", "not confirmed", "unable to confirm", "no tool result", "not completed", "failed", "i cannot", "i'm unable", "i'm not able", "i don't have", "i don't currently", "i apologize", "cannot", "unable", "not able", "could not", "was not able", "does not have", "do not have", "not available", "not supported", "can't", "won't"}
-	hasFailure := false
-	for _, h := range failureKeywords {
-		if strings.Contains(low, h) {
-			hasFailure = true
-			break
-		}
+		// Missing tool results mean the execution outcome is unknown. Any success
+		// claim is unsupported, even when the same answer also contains refusal
+		// or uncertainty language. Neutral or explicitly incomplete answers are
+		// safe to pass through.
+		return !claimsSuccess
 	}
 	if len(l.Completed) > 0 {
-		return !hasFailure
-	}
-	// No tool results at all: an unsupported "success" claim without any tool
-	// evidence must not pass the completion guard. An explicit inability to
-	// confirm is the only unverified case that may pass.
-	if unsupportedSuccess.MatchString(answer) {
+		if !claimsSuccess {
+			return true
+		}
+		for _, evidence := range l.Completed {
+			if evidence.ResultLength > 0 && !evidence.Failed {
+				return true
+			}
+		}
 		return false
 	}
-	return true
+	return !claimsSuccess
 }
 func completedCallIDs(l agentLedger) []string {
 	o := make([]string, 0, len(l.Completed))

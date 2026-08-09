@@ -1,50 +1,132 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
-	"sync"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 type Tool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	InputSchema map[string]any `json:"inputSchema,omitempty"`
+	Name         string         `json:"name"`
+	Title        string         `json:"title,omitempty"`
+	Description  string         `json:"description,omitempty"`
+	InputSchema  map[string]any `json:"inputSchema"`
+	OutputSchema map[string]any `json:"outputSchema,omitempty"`
+	Annotations  map[string]any `json:"annotations,omitempty"`
+	Meta         map[string]any `json:"_meta,omitempty"`
 }
 
 type CallResult struct {
-	Content        []map[string]any `json:"content,omitempty"`
-	StructuredData any              `json:"structuredContent,omitempty"`
+	Content        []map[string]any `json:"content"`
+	StructuredData map[string]any   `json:"structuredContent,omitempty"`
 	IsError        bool             `json:"isError,omitempty"`
+	Meta           map[string]any   `json:"_meta,omitempty"`
 }
 
-type ToolCache struct {
-	mu    sync.RWMutex
-	tools []Tool
+type rejectingSchemaLoader struct{}
+
+func (rejectingSchemaLoader) Load(rawURL string) (any, error) {
+	return nil, fmt.Errorf("external JSON Schema reference is not allowed: %s", rawURL)
 }
 
-func (c *ToolCache) Replace(tools []Tool) {
-	copyTools := append([]Tool(nil), tools...)
-	c.mu.Lock()
-	c.tools = copyTools
-	c.mu.Unlock()
+func compileToolSchema(schema map[string]any) (*jsonschema.Schema, error) {
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return nil, err
+	}
+	document, err := jsonschema.UnmarshalJSON(bytes.NewReader(encoded))
+	if err != nil {
+		return nil, err
+	}
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	compiler.UseLoader(rejectingSchemaLoader{})
+	const location = "urn:m365-copilot2api:mcp-tool-schema"
+	if err := compiler.AddResource(location, document); err != nil {
+		return nil, err
+	}
+	return compiler.Compile(location)
 }
 
-func (c *ToolCache) List() []Tool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return append([]Tool(nil), c.tools...)
+func validateToolValue(schema map[string]any, value any) error {
+	compiled, err := compileToolSchema(schema)
+	if err != nil {
+		return err
+	}
+	return compiled.Validate(value)
 }
 
-func (c *ToolCache) Find(name string) (Tool, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for _, tool := range c.tools {
-		if tool.Name == name {
-			return tool, true
+func decodeExactJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("one JSON value required")
+	}
+	return nil
+}
+
+func normalizeCallResult(tool Tool, result CallResult) (CallResult, error) {
+	if result.Content == nil {
+		result.Content = []map[string]any{}
+	}
+	for _, block := range result.Content {
+		kind, ok := block["type"].(string)
+		if !ok {
+			return CallResult{}, errors.New("content block type required")
+		}
+		switch kind {
+		case "text":
+			if _, ok := block["text"].(string); !ok {
+				return CallResult{}, errors.New("text content required")
+			}
+		case "image", "audio":
+			if _, ok := block["data"].(string); !ok {
+				return CallResult{}, errors.New("encoded content data required")
+			}
+			if _, ok := block["mimeType"].(string); !ok {
+				return CallResult{}, errors.New("content MIME type required")
+			}
+		case "resource_link":
+			if _, ok := block["name"].(string); !ok {
+				return CallResult{}, errors.New("resource link name required")
+			}
+			if _, ok := block["uri"].(string); !ok {
+				return CallResult{}, errors.New("resource link URI required")
+			}
+		case "resource":
+			resource, ok := block["resource"].(map[string]any)
+			if !ok {
+				return CallResult{}, errors.New("embedded resource required")
+			}
+			if _, ok := resource["uri"].(string); !ok {
+				return CallResult{}, errors.New("embedded resource URI required")
+			}
+			_, hasText := resource["text"].(string)
+			_, hasBlob := resource["blob"].(string)
+			if hasText == hasBlob {
+				return CallResult{}, errors.New("embedded resource must contain text or blob")
+			}
+		default:
+			return CallResult{}, errors.New("unsupported content block type")
 		}
 	}
-	return Tool{}, false
+	if tool.OutputSchema != nil && !result.IsError {
+		if result.StructuredData == nil {
+			return CallResult{}, errors.New("structured content required by output schema")
+		}
+		if err := validateToolValue(tool.OutputSchema, result.StructuredData); err != nil {
+			return CallResult{}, err
+		}
+	}
+	return result, nil
 }
 
 func (r CallResult) Text() string {

@@ -36,23 +36,27 @@ type deploymentStore struct {
 	Items []deployment `json:"items"`
 }
 
-var openDeployments = sync.OnceValue(func() *deploymentStore {
+var deployments *deploymentStore
+var cloudflareAPIBase = "https://api.cloudflare.com/client/v4"
+var workerNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func openDeployments() *deploymentStore {
+	if deployments != nil {
+		return deployments
+	}
 	dir := os.Getenv("M365_DATA_DIR")
 	if dir == "" {
 		h, _ := os.UserHomeDir()
-		dir = filepath.Join(h, ".config", "m365-copilot2api")
+		dir = filepath.Join(h, ".config", "m365-native")
 	}
 	s := &deploymentStore{path: filepath.Join(dir, "deployments.json")}
 	b, e := os.ReadFile(s.path)
 	if e == nil {
 		_ = json.Unmarshal(b, s)
 	}
+	deployments = s
 	return s
-})
-var cloudflareAPIBase = "https://api.cloudflare.com/client/v4"
-var workerNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-var deploymentHTTPClient = &http.Client{Timeout: 30 * time.Second}
-
+}
 func (s *deploymentStore) save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -63,7 +67,7 @@ func (s *deploymentStore) save() error {
 	if e != nil {
 		return e
 	}
-	return writeFileAtomic(s.path, b, 0600)
+	return os.WriteFile(s.path, b, 0600)
 }
 func randomState() string {
 	b := make([]byte, 24)
@@ -86,11 +90,11 @@ func (s *Server) deployments(w http.ResponseWriter, r *http.Request) {
 			Token     string `json:"token"`
 		}
 		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&in) != nil {
-			writeOpenAIError(w, 400, "invalid_request_error", "bad json")
+			writeOpenAIError(w, 400, "invalid_request_error", "JSON 格式錯誤")
 			return
 		}
 		if in.Provider != "cloudflare" {
-			writeOpenAIError(w, 400, "invalid_request_error", "only cloudflare is implemented")
+			writeOpenAIError(w, 400, "invalid_request_error", "目前僅支援 Cloudflare")
 			return
 		}
 		d, e := deployCloudflare(r.Context(), in.AccountID, in.Name, in.Token)
@@ -107,7 +111,7 @@ func (s *Server) deployments(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOut(w, map[string]any{"ok": true, "deployment": d})
 	default:
-		writeOpenAIError(w, 405, "invalid_request_error", "method not allowed")
+		writeOpenAIError(w, 405, "invalid_request_error", "不支援此 HTTP 方法")
 	}
 }
 func (s *Server) deploymentAction(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +127,7 @@ func (s *Server) deploymentAction(w http.ResponseWriter, r *http.Request) {
 	}
 	if d == nil {
 		st.mu.Unlock()
-		writeOpenAIError(w, 404, "not_found", "deployment not found")
+		writeOpenAIError(w, 404, "not_found", "找不到部署項目")
 		return
 	}
 	var in struct {
@@ -145,32 +149,32 @@ func (s *Server) deploymentAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.mu.Unlock()
-	writeOpenAIError(w, 405, "invalid_request_error", "method not allowed")
+	writeOpenAIError(w, 405, "invalid_request_error", "不支援此 HTTP 方法")
 }
 func deployCloudflare(ctx context.Context, account, name, token string) (deployment, error) {
 	if account == "" || name == "" || token == "" {
-		return deployment{}, fmt.Errorf("Account ID、Worker 名称和 API Token 都不能为空")
+		return deployment{}, fmt.Errorf("Account ID、Worker 名稱與 API Token 皆不得為空")
 	}
 	if !workerNamePattern.MatchString(name) {
-		return deployment{}, fmt.Errorf("Worker 名称只能包含字母、数字、短横线和下划线，长度不超过 64")
+		return deployment{}, fmt.Errorf("Worker 名稱只能包含英文字母、數字、連字號與底線，長度不得超過 64")
 	}
 	base := strings.TrimRight(cloudflareAPIBase, "/")
 	u := base + "/accounts/" + url.PathEscape(account) + "/workers/scripts/" + url.PathEscape(name)
-	script := "export default {async fetch(request){if(new URL(request.url).pathname==='/health')return new Response('ok');return new Response('m365-copilot2api worker relay is configured',{status:200})}}"
+	script := "export default {async fetch(request){if(new URL(request.url).pathname==='/health')return new Response('ok');return new Response('m365-native worker relay is configured',{status:200})}}"
 	req, e := http.NewRequestWithContext(ctx, http.MethodPut, u, strings.NewReader(script))
 	if e != nil {
 		return deployment{}, e
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/javascript")
-	resp, e := deploymentHTTPClient.Do(req)
+	resp, e := http.DefaultClient.Do(req)
 	if e != nil {
 		return deployment{}, e
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode/100 != 2 {
-		return deployment{}, fmt.Errorf("cloudflare deploy failed: %s", strings.TrimSpace(string(body)))
+		return deployment{}, fmt.Errorf("Cloudflare 部署失敗：%s", strings.TrimSpace(string(body)))
 	}
 	// The workers.dev hostname is account-specific; query it instead of guessing from Account ID.
 	checkURL := base + "/accounts/" + url.PathEscape(account) + "/workers/subdomain"
@@ -179,14 +183,14 @@ func deployCloudflare(ctx context.Context, account, name, token string) (deploym
 		return deployment{}, qe
 	}
 	q.Header.Set("Authorization", "Bearer "+token)
-	qr, qe := deploymentHTTPClient.Do(q)
+	qr, qe := http.DefaultClient.Do(q)
 	if qe != nil {
 		return deployment{}, qe
 	}
 	defer qr.Body.Close()
 	qb, _ := io.ReadAll(io.LimitReader(qr.Body, 1<<20))
 	if qr.StatusCode/100 != 2 {
-		return deployment{}, fmt.Errorf("cloudflare subdomain lookup failed: %s", strings.TrimSpace(string(qb)))
+		return deployment{}, fmt.Errorf("查詢 Cloudflare 子網域失敗：%s", strings.TrimSpace(string(qb)))
 	}
 	var sub struct {
 		Result struct {
@@ -194,7 +198,7 @@ func deployCloudflare(ctx context.Context, account, name, token string) (deploym
 		} `json:"result"`
 	}
 	if json.Unmarshal(qb, &sub) != nil || sub.Result.Subdomain == "" {
-		return deployment{}, fmt.Errorf("cloudflare returned no workers.dev subdomain")
+		return deployment{}, fmt.Errorf("Cloudflare 未回傳 workers.dev 子網域")
 	}
 	defaultURL := "https://" + name + "." + sub.Result.Subdomain + ".workers.dev"
 	return deployment{ID: "cf-" + randomState(), Provider: "cloudflare", Name: name, AccountID: account, DefaultURL: defaultURL, ActiveURL: defaultURL, Status: "deployed"}, nil
@@ -212,7 +216,7 @@ func (s *Server) deploymentCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	if d == nil {
 		st.mu.Unlock()
-		writeOpenAIError(w, 404, "not_found", "deployment not found")
+		writeOpenAIError(w, 404, "not_found", "找不到部署項目")
 		return
 	}
 	target := d.ActiveURL
@@ -222,7 +226,7 @@ func (s *Server) deploymentCheck(w http.ResponseWriter, r *http.Request) {
 	st.mu.Unlock()
 	start := time.Now()
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(target, "/")+"/health", nil)
-	resp, e := deploymentHTTPClient.Do(req)
+	resp, e := http.DefaultClient.Do(req)
 	lat := time.Since(start).Milliseconds()
 	st.mu.Lock()
 	if e != nil {
@@ -230,7 +234,7 @@ func (s *Server) deploymentCheck(w http.ResponseWriter, r *http.Request) {
 		d.LastError = e.Error()
 	} else if resp.StatusCode != http.StatusOK {
 		d.Status = "unhealthy"
-		d.LastError = fmt.Sprintf("health returned %s", resp.Status)
+		d.LastError = fmt.Sprintf("健康檢查回傳 %s", resp.Status)
 		resp.Body.Close()
 	} else {
 		d.Status = "healthy"

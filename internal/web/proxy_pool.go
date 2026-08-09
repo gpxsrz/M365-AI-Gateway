@@ -2,7 +2,7 @@ package web
 
 import (
 	"encoding/json"
-	"m365-copilot2api/internal/outbound"
+	"m365-native/internal/outbound"
 	"net/http"
 	"strings"
 )
@@ -38,7 +38,7 @@ func (s *Server) proxyPool(w http.ResponseWriter, r *http.Request) {
 			URLs []string `json:"urls"`
 		}
 		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body) != nil {
-			writeOpenAIError(w, 400, "invalid_request_error", "bad json")
+			writeOpenAIError(w, 400, "invalid_request_error", "JSON 格式錯誤")
 			return
 		}
 		urls := append(body.URLs, body.URL)
@@ -49,11 +49,11 @@ func (s *Server) proxyPool(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if err := outbound.AddProxy(strings.TrimSpace(v)); err != nil {
-					writeOpenAIError(w, 400, "invalid_request_error", err.Error())
+					writeOpenAIError(w, 400, "invalid_request_error", "代理網址無效")
 					return
 				}
 				if err := s.persistProxyPool(); err != nil {
-					writeOpenAIError(w, 500, "storage_error", err.Error())
+					writeOpenAIError(w, 500, "storage_error", "無法儲存代理集區設定")
 					return
 				}
 				added++
@@ -64,19 +64,19 @@ func (s *Server) proxyPool(w http.ResponseWriter, r *http.Request) {
 		raw := strings.TrimRight(strings.TrimSpace(r.URL.Query().Get("url")), "/")
 		if raw == "" {
 			if err := outbound.ConfigurePool(nil); err != nil {
-				writeOpenAIError(w, 400, "invalid_request_error", err.Error())
+				writeOpenAIError(w, 400, "invalid_request_error", "無法清除代理集區")
 				return
 			}
 		} else if err := outbound.RemoveProxy(raw); err != nil {
-			writeOpenAIError(w, 400, "invalid_request_error", err.Error())
+			writeOpenAIError(w, 400, "invalid_request_error", "找不到指定的代理網址")
 			return
 		}
 		if err := s.persistProxyPool(); err != nil {
-			writeOpenAIError(w, 500, "storage_error", err.Error())
+			writeOpenAIError(w, 500, "storage_error", "無法儲存代理集區設定")
 			return
 		}
 		jsonOut(w, map[string]any{"ok": true, "proxies": outbound.ProxyPoolStatus()})
 	default:
-		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "不支援此 HTTP 方法")
 	}
 }

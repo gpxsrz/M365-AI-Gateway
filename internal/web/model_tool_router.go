@@ -6,32 +6,40 @@ import (
 	"strings"
 )
 
-func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) string {
+func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, limits ...int) string {
 	defs, _ := json.Marshal(tools)
 	mode := normalizedToolChoiceMode(choice)
-	rules := `- If a tool is needed, respond with: CALL_TOOL: tool_name({"arg1":"value1"})
-- If no tool is needed, respond with: NO_TOOL_NEEDED
-- Only use tools from the available list above
-- Validate all arguments against the tool's schema
-- Do not invent tools that are not in the list`
-	// Multi-turn: completed tool evidence (tool[...], tool_calls:) was already
-	// acted upon, so re-invoking those tools would duplicate work.
-	if strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {
-		rules += `
-- Completed evidence must not be repeated: tool_calls/tool[call_x] rows are prior results already delivered to the user, never re-invoke them
-- Only start a new tool call when fresh unfinished work remains on the current request`
+	limit := 1
+	if len(limits) > 0 && limits[0] > 0 {
+		limit = limits[0]
 	}
-	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
+	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide the next caller-side tool call or calls.
 
 Available tools: %s
 
-MODE: %s
+Mode: %s
+
+Maximum calls this turn: %d
 
 Rules:
-%s
+- Return JSON only as {"calls":[{"name":"function_name","arguments":{}}],"answer":""}.
+- If no caller-side tool is needed, use {"calls":[],"answer":"direct final answer"} and put the complete user-facing answer in answer.
+- If any caller-side call is returned, answer must be empty.
+- Caller execution tools are separate from Microsoft native Bing web search, citations, grounding, and read-only information retrieval. Native Bing and those native read-only capabilities remain allowed. When the user requests Microsoft native Bing, perform the search before returning the caller-side JSON decision. Preserve actual SearchResults and any upstream references/citations. When both are needed, preserve native grounding and still return the caller decision in this JSON format.
+- Multiple calls are allowed only when they are mutually independent and clearly read-only.
+- Commands, mutations, dependent operations, and uncertain operations must be returned one at a time.
+- Never exceed Maximum calls this turn.
+- Only use tools from the available list above
+- Validate all arguments against the tool's schema
+- Do not invent tools that are not in the list
 
 User request and evidence:
-%s`, defs, mode, rules, prompt)
+%s`, defs, mode, limit, prompt)
+}
+
+func modelToolRouterRepairPrompt(output string) string {
+	return `Repair the previous tool-routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}],"answer":""}. Do not invent calls. If no caller-side tool is needed, use {"calls":[],"answer":"direct final answer"} and preserve the complete user-facing answer in answer. OUTPUT:
+` + compactToolResult(output, 6000)
 }
 
 func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
@@ -45,14 +53,10 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 			end := strings.LastIndex(rest, ")")
 			if start > 0 && end > start {
 				name := strings.TrimSpace(rest[:start])
-				argsStr := rest[start+1 : end]
-				var args map[string]any
-				if json.Unmarshal([]byte(argsStr), &args) == nil && toolChoiceAllows(choice, name) {
-					fn := toolFunction(name, tools)
-					if fn != nil {
-						b, _ := json.Marshal(args)
-						return []detectedToolCall{{ID: callID(name, string(b), 0), Type: toolType(name, tools), Name: name, Arguments: b}}, true
-					}
+				args := json.RawMessage(strings.TrimSpace(rest[start+1 : end]))
+				fn := toolFunction(name, tools)
+				if fn != nil && toolChoiceAllows(choice, name) && validateToolArgumentsRaw(args, fn) == nil {
+					return []detectedToolCall{{ID: callID(name, string(args), 0), Type: toolType(name, tools), Name: name, Arguments: append(json.RawMessage(nil), args...)}}, true
 				}
 			}
 		}
@@ -70,8 +74,8 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 	}
 	var envelope struct {
 		Calls []struct {
-			Name      string         `json:"name"`
-			Arguments map[string]any `json:"arguments"`
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
 		} `json:"calls"`
 	}
 	if json.Unmarshal([]byte(text[start:end+1]), &envelope) != nil {
@@ -80,11 +84,30 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 	out := make([]detectedToolCall, 0, len(envelope.Calls))
 	for i, c := range envelope.Calls {
 		fn := toolFunction(c.Name, tools)
-		if fn == nil || c.Arguments == nil || !toolChoiceAllows(choice, c.Name) || schemaValid(c.Arguments, fn) != nil {
+		if fn == nil || len(c.Arguments) == 0 || !toolChoiceAllows(choice, c.Name) || validateToolArgumentsRaw(c.Arguments, fn) != nil {
 			continue
 		}
-		b, _ := json.Marshal(c.Arguments)
-		out = append(out, detectedToolCall{ID: callID(c.Name, string(b), i), Type: toolType(c.Name, tools), Name: c.Name, Arguments: b})
+		out = append(out, detectedToolCall{ID: callID(c.Name, string(c.Arguments), i), Type: toolType(c.Name, tools), Name: c.Name, Arguments: append(json.RawMessage(nil), c.Arguments...)})
 	}
 	return out, true
+}
+
+func parseModelToolDirectAnswer(text string) (string, bool) {
+	text = strings.TrimSpace(text)
+	if i := strings.Index(text, "```"); i >= 0 {
+		text = strings.TrimSpace(strings.TrimPrefix(strings.TrimSuffix(text[i+3:], "```"), "json"))
+	}
+	start, end := strings.Index(text, "{"), strings.LastIndex(text, "}")
+	if start < 0 || end <= start {
+		return "", false
+	}
+	var envelope struct {
+		Calls  []json.RawMessage `json:"calls"`
+		Answer string            `json:"answer"`
+	}
+	if json.Unmarshal([]byte(text[start:end+1]), &envelope) != nil || len(envelope.Calls) != 0 {
+		return "", false
+	}
+	answer := strings.TrimSpace(envelope.Answer)
+	return answer, answer != ""
 }

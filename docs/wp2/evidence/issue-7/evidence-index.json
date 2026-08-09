@@ -1,0 +1,38 @@
+{
+  "schema": "m365-wp2-account-pool-evidence-index/v1",
+  "payload": {
+    "path": "evidence-set.json.gz.b64",
+    "encoding": "base64(gzip-mtime-0(json))",
+    "json_schema": "m365-wp2-account-pool-evidence-set/v1",
+    "json_sha256": "505b3bfd790b91d89a550dd86cc9800f258b0b7e86b8a597ee6828ac3fcefba2",
+    "json_bytes": 117558,
+    "gzip_sha256": "ef2fe833eed70c1527ee2bd480dc692b82f660f7c7c9c305847f38fc5fc52b36",
+    "gzip_bytes": 9996,
+    "base64_sha256": "e36d8ba60203b17af3aea87258e1054dc0023c7af5bd3edf54d386bfd32e1d2d",
+    "base64_bytes": 13329
+  },
+  "profile_set_sha256": "91145a2da73857f1dfa6b716c0cd462b2039fde9fd9881b8faae513c17f10c2b",
+  "profile_counts": {
+    "total": 3,
+    "eligible": 2,
+    "unavailable": 1
+  },
+  "matrix_entries": 24,
+  "accepted_capability_manifests": 93,
+  "global_claims": 12,
+  "account_dependent_claims": [
+    {
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "protocol": "openai_responses_nonstream",
+      "route_eligibility": "INCONCLUSIVE"
+    }
+  ],
+  "public_http_evidence": {
+    "entrypoint": "Server.Routes",
+    "explicit_account_selection": true,
+    "cross_account_resends_all_zero": true,
+    "anthropic_account_id_preserved": true,
+    "production_access": false,
+    "hermes_access": false
+  }
+}

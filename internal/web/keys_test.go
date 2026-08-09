@@ -3,7 +3,7 @@ package web
 import "testing"
 
 func TestAPIKeyCreateRollsBackWhenPersistenceFails(t *testing.T) {
-	store := newAPIKeyStore(t.TempDir())
+	store := &apiKeyStore{Path: t.TempDir()}
 	if _, _, err := store.create("test"); err == nil {
 		t.Fatal("expected persistence error")
 	}
@@ -13,7 +13,7 @@ func TestAPIKeyCreateRollsBackWhenPersistenceFails(t *testing.T) {
 }
 
 func TestAPIKeyRevokeRollsBackWhenPersistenceFails(t *testing.T) {
-	store := newAPIKeyStore(t.TempDir() + "/api-keys.json")
+	store := &apiKeyStore{Path: t.TempDir() + "/api-keys.json"}
 	record, _, err := store.create("test")
 	if err != nil {
 		t.Fatal(err)

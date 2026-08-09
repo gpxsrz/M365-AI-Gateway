@@ -2,9 +2,11 @@ package web
 
 import (
 	"encoding/json"
+	"m365-native/internal/auth"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -80,6 +82,57 @@ func TestStartPKCEUsesConfiguredRedirectURIExactly(t *testing.T) {
 	}
 	if got := u.Query().Get("redirect_uri"); got != redirectURI {
 		t.Fatalf("authorization redirect URI = %q, want %q", got, redirectURI)
+	}
+}
+
+func TestStartPKCEUsesActiveProfileOAuthConfig(t *testing.T) {
+	config := auth.OAuthConfig{
+		ClientID:          "candidate-client",
+		Authority:         "https://candidate.example.test/common",
+		RedirectURI:       "https://candidate.example.test/oauth/callback",
+		Scope:             "openid offline_access candidate.read",
+		AuthorizeEndpoint: "https://candidate.example.test/common/oauth2/v2.0/authorize",
+		TokenEndpoint:     "https://candidate.example.test/common/oauth2/v2.0/token",
+	}
+	store, err := auth.OpenStoreWithConfig(filepath.Join(t.TempDir(), "accounts.json"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{tokens: store, pkce: map[string]pendingPKCE{}}
+	rr := httptest.NewRecorder()
+	s.startPKCE(rr, httptest.NewRequest(http.MethodPost, "/api/auth/start", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		State       string `json:"state"`
+		URL         string `json:"url"`
+		RedirectURI string `json:"redirectUri"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(response.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Scheme+"://"+u.Host+u.Path != config.AuthorizeEndpoint {
+		t.Fatalf("authorize endpoint = %q, want %q", u.Scheme+"://"+u.Host+u.Path, config.AuthorizeEndpoint)
+	}
+	if got := u.Query().Get("client_id"); got != config.ClientID {
+		t.Fatalf("client_id = %q, want %q", got, config.ClientID)
+	}
+	if got := u.Query().Get("scope"); got != config.Scope {
+		t.Fatalf("scope = %q, want %q", got, config.Scope)
+	}
+	if response.RedirectURI != config.RedirectURI || u.Query().Get("redirect_uri") != config.RedirectURI {
+		t.Fatalf("redirect URI response=%q query=%q, want %q", response.RedirectURI, u.Query().Get("redirect_uri"), config.RedirectURI)
+	}
+	s.mu.Lock()
+	transaction := s.pkce[response.State]
+	s.mu.Unlock()
+	if transaction.OAuth != config {
+		t.Fatalf("transaction OAuth config = %#v, want %#v", transaction.OAuth, config)
 	}
 }
 

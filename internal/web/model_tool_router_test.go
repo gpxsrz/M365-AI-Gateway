@@ -17,11 +17,37 @@ func TestParseModelToolDecisionNoCall(t *testing.T) {
 		t.Fatalf("calls=%v ok=%v", calls, ok)
 	}
 }
-func TestModelToolRouterPromptMarksCompletedResults(t *testing.T) {
-	p := modelToolRouterPrompt(`assistant tool_calls: [...]
-tool[call_x]: 2026-07-18`, testTools(), "auto")
-	if !strings.Contains(p, "Completed evidence must not be repeated") || !strings.Contains(p, "tool[call_x]: 2026-07-18") || !strings.Contains(p, "unfinished work remains") {
-		t.Fatalf("missing multi-turn evidence constraint: %s", p)
+
+func TestParseModelToolDecisionRejectsUnparseableText(t *testing.T) {
+	for _, text := range []string{"", "ordinary text"} {
+		calls, ok := parseModelToolDecision(text, testTools(), "auto")
+		if ok || len(calls) != 0 {
+			t.Fatalf("text=%q calls=%v ok=%v", text, calls, ok)
+		}
+	}
+}
+func TestModelToolRouterPromptCarriesInterruptedCallEvidence(t *testing.T) {
+	ledger := buildAgentLedger([]oaiMsg{{
+		Role: "assistant",
+		ToolCalls: []map[string]any{{
+			"id":   "call_x",
+			"type": "function",
+			"function": map[string]any{
+				"name":      "terminal",
+				"arguments": `{"command":"deploy"}`,
+			},
+		}},
+	}})
+	p := modelToolRouterPrompt("Continue after interruption.\n"+ledger.RouterContext(), testTools(), "auto")
+	for _, want := range []string{
+		"Pending calls have unknown outcomes",
+		"Do not automatically issue the same name and arguments",
+		`"id":"call_x"`,
+		`"name":"terminal"`,
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("missing %q in continuation prompt: %s", want, p)
+		}
 	}
 }
 

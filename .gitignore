@@ -10,9 +10,8 @@ cookies*.txt
 /tmp/
 
 # Build artifacts
-/m365-copilot2api
-/m365-copilot2api.exe
-/m365-copilot2api.exe.rollback
+/m365-native
+/m365-native.exe
 /bin/
 /dist/
 *.out
@@ -27,24 +26,10 @@ __pycache__/
 # Local runtime and diagnostic artifacts
 /debug-logs.jsonl
 /server
-/m365-copilot2api.next
-/m365-copilot2api.service
-/m365-copilot2api.rollback*
-/m365-copilot2api.exe~
+/m365-native.next
+/m365-native.service
+/m365-native.rollback*
 /data/
 /secrets/
 .runtime-backups/
-backups/
 runtime.pid
-conversations.json
-sessions.json
-test-results.jsonl
-server.log
-server-error.log
-*.pid
-
-# Local agent memory (machine-specific notes)
-AGENTS.md
-
-# WIP build during this session
-/m365-copilot2api.new*

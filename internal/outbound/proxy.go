@@ -126,6 +126,37 @@ func HTTPClient() *http.Client {
 	}
 	return c
 }
+
+// PinnedHTTPSClient returns a one-host client whose TLS identity remains the
+// original hostname even when the request URL contains a previously resolved
+// IP address. The configured outbound proxy path is preserved.
+func PinnedHTTPSClient(serverName string) *http.Client {
+	clientsMu.RLock()
+	p, configured := proxyPool, clients.HTTP
+	clientsMu.RUnlock()
+	if p != nil {
+		if entry := p.pick(); entry != nil {
+			base := pinnedHTTPTransport(entry.clients.HTTP.Transport, serverName)
+			return &http.Client{Transport: &poolRoundTripper{pool: p, entry: entry, base: base}, Timeout: entry.clients.HTTP.Timeout}
+		}
+	}
+	return &http.Client{Transport: pinnedHTTPTransport(configured.Transport, serverName), Timeout: configured.Timeout}
+}
+
+func pinnedHTTPTransport(roundTripper http.RoundTripper, serverName string) http.RoundTripper {
+	transport, ok := roundTripper.(*http.Transport)
+	if !ok {
+		return roundTripper
+	}
+	clone := transport.Clone()
+	if clone.TLSClientConfig == nil {
+		clone.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+	}
+	clone.TLSClientConfig.ServerName = serverName
+	return clone
+}
 func WebSocketDialer() *websocket.Dialer {
 	clientsMu.RLock()
 	p, c := proxyPool, clients.WebSocket

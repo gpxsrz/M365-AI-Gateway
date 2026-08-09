@@ -1,0 +1,2035 @@
+{
+  "schema": "m365-wp2-alias-projection-evidence-index/v1",
+  "payload": {
+    "path": "evidence-set.json.gz.b64",
+    "encoding": "base64(gzip-mtime0-level9(json))",
+    "json_schema": "m365-wp2-alias-projection-evidence-set/v1",
+    "json_sha256": "b08bf0d014ad116b4ad22e83aea120d7e098afc4ef81ff79e6e608df69f6892e",
+    "json_bytes": 1476171,
+    "gzip_sha256": "e8812a0716fc41b84f8385c73bf17234751db18ec61f540bfc696981439f6c59",
+    "gzip_bytes": 85155,
+    "base64_sha256": "9d83305701242429283d8028072b5011bd8fc55a33cafe666ee9dbc3a312e4b1",
+    "base64_bytes": 113541
+  },
+  "records": 285,
+  "observation_counts": {
+    "catalog_projection": 9,
+    "success": 261,
+    "unknown_route": 5,
+    "disabled_route": 10
+  },
+  "capability_counts": {
+    "route_identity": 261,
+    "route_mapping": 261,
+    "basic_text_delivery": 261,
+    "protocol_transport": 261
+  },
+  "catalog": [
+    {
+      "requested_identity": "m365-copilot",
+      "canonical_route": "m365-auto",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "default_reasoning_level": "none",
+      "listed": true,
+      "observation_sha256": "aabc606e46fc8f97b2519913e5fb5ed3d54dc1dbdfeea504d05b2beada361ad0"
+    },
+    {
+      "requested_identity": "gpt-5.6-reasoning",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "default_reasoning_level": "medium",
+      "listed": true,
+      "observation_sha256": "4873aefac4031d2cef1aa8ec832075f890e20b36f622fb2764eaa46811f39c1c"
+    },
+    {
+      "requested_identity": "gpt-5.5",
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "default_reasoning_level": "low",
+      "listed": true,
+      "observation_sha256": "9a05198fed969aebd34516ad06f87caa4806c89854bd9f15d297ec15ae28498b"
+    },
+    {
+      "requested_identity": "gpt-5.6-sol",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "default_reasoning_level": "low",
+      "listed": true,
+      "observation_sha256": "85c02102a91b64e6e6ba50bafe3ec5259b0c142d7de82f7dbf42741286ad52de"
+    },
+    {
+      "requested_identity": "gpt-5.6-terra",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "default_reasoning_level": "medium",
+      "listed": true,
+      "observation_sha256": "879a7b23dd33963cb352350533d555593a6521e1ba50537789d0dfc39b7f0a6c"
+    },
+    {
+      "requested_identity": "gpt-5.6-luna",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "default_reasoning_level": "medium",
+      "listed": true,
+      "observation_sha256": "186b977b2688d1bb8bab3e51036ad8f13240c50b618eced9f182fd2935188c47"
+    },
+    {
+      "requested_identity": "claude",
+      "canonical_route": "claude-sonnet",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "listed": false,
+      "observation_sha256": "c98a2fff01fc61c90790f2809278f8a3fa8a42942471c8065a87181f14a4e205"
+    },
+    {
+      "requested_identity": "gpt-5.4-quick",
+      "canonical_route": "gpt-5.4",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "listed": false,
+      "observation_sha256": "a3476250d6b279dfe5547f36cff1200360826cd385a6614432c7ecfc7426079c"
+    },
+    {
+      "requested_identity": "gpt-5.3-think-deeper",
+      "canonical_route": "gpt-5.3",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "listed": false,
+      "observation_sha256": "5d8d23ecca3305376b7319cb0bc093f8f9fa27657fb1bce188f0d6325758d8cd"
+    }
+  ],
+  "matrix": [
+    {
+      "requested_identity": "m365-copilot",
+      "canonical_route": "m365-auto",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "magic",
+          "observation_sha256": "d4a33c919463e2705a4596837f108cffe12923d9d2360ef2f4b67c1c2f555512"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "magic",
+          "observation_sha256": "9e63a4b33ac44c8b84c21e73e2edd595f21ed6e8381ab35295bd2341df371dbf"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "magic",
+          "observation_sha256": "d4aee0ab4414d6406899c7985074d642719c3a63d6bdfac2bf9c575fde701644"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "magic",
+          "observation_sha256": "3571dc963eb3d88b12aa42114e12573056eaab65e4c9f1e1fd8978e00631540f"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "magic",
+          "observation_sha256": "92a3830a1bed0c488500e2db5995e568896f57c2d912cf670748d7f80193a2f5"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "magic",
+          "observation_sha256": "b300e3859dcc371180966e7d8ac062455439320e0fee48f4162f052f06a22107"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "magic",
+          "observation_sha256": "8e10bce7a89620b7ef692263c936243a996bb81c704bb30d6cd35de9300f8aeb"
+        }
+      ]
+    },
+    {
+      "requested_identity": "m365-copilot",
+      "canonical_route": "m365-auto",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "magic",
+          "observation_sha256": "478eda87baf65ad9308b9f3ce3f7106d4e4106b15c8a2e5277cbcaa374539b83"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "magic",
+          "observation_sha256": "18fb9fbf5d284af83e6005a97eb9622fc3948fa4e43cc50e9d762adf0a0c4551"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "magic",
+          "observation_sha256": "dc7bf63e8e0b5baa0f46bb37eea4e8d75d176cf288f8299ff35c490773149a8e"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "magic",
+          "observation_sha256": "8b5b57338f89a6158907bb12a265c560afb520a035aba837ca2a9f5136c41c91"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "magic",
+          "observation_sha256": "9c73812ded7c1ba711ff9757a56eb62725351aadd247e90ad2d2998cb5d15207"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "magic",
+          "observation_sha256": "01dae9e462ffb947cd34eb981f9adfd302e4a7beb1e2c745c7e3e6dd882f6f22"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "magic",
+          "observation_sha256": "09a74aa556fdc8013d84abf4fbeb3177c299dba11c8fe37819c8dc86639d19b7"
+        }
+      ]
+    },
+    {
+      "requested_identity": "m365-copilot",
+      "canonical_route": "m365-auto",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "magic",
+          "observation_sha256": "5a808c38b61ad54e91146cf1598101f8a293c75d5e751614dcf75495a3400f1a"
+        }
+      ]
+    },
+    {
+      "requested_identity": "m365-copilot",
+      "canonical_route": "m365-auto",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "magic",
+          "observation_sha256": "f55447d7404e28e4f80d445c0725106f6db4a6e0fd730abb5d7ac108fc9e0110"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "magic",
+          "observation_sha256": "f8832726b4dcb223a02c3e41120ae8a07d7896b58e7e4e3295d179a0bdd7323a"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "magic",
+          "observation_sha256": "3eb50ba103e90d79511ceb64d93430ab8cb3ca4f07824ec82c7d4b42ef4daeb4"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "magic",
+          "observation_sha256": "d0e21f475790ce5e9e03aecfd1124f14701e8ea96824f70233a6f594ac04f9da"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "magic",
+          "observation_sha256": "1c710a96917a3583d68802980a99baed2b0110ed8eb7a11aad80f294b9036557"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "magic",
+          "observation_sha256": "1cbf04c0bde9381db70a498648e73106f6f722a828d6c2d517cc7efc9bd5937c"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "magic",
+          "observation_sha256": "89fc937689c20799eb393d957dd6fe63072497cd5d3395d571a5fd8abd628324"
+        }
+      ]
+    },
+    {
+      "requested_identity": "m365-copilot",
+      "canonical_route": "m365-auto",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "magic",
+          "observation_sha256": "4af398831a65dafdd0b5d73c75520f75ef76d1ab7a7326785ed59a62b66e0685"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "magic",
+          "observation_sha256": "4bdf4bd1647771c7f0d9d1b8cbc38c8e54622e2cc03ae9ac3075f386dfea1042"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "magic",
+          "observation_sha256": "29feacc7613df7f96553d8936e5d0d331335b72452d0b6f127df166a9e36d0c9"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "magic",
+          "observation_sha256": "5c98c8f9a5414cfecdf9fd21b370d15a2fba9360348fa2e196f805cd51326b78"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "magic",
+          "observation_sha256": "8fd2c2cdbf5339bb63a5e3b84cc5db18b9797511a6cdf44140dc270b5b214710"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "magic",
+          "observation_sha256": "0734f3784103b886fd45d8094bcd670f11b02c9306173379e048d8aa0efa32b3"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "magic",
+          "observation_sha256": "ef72e13810a4f6889af44bc6af4ad5a62ba5a8e3bf6aebfaf5b3edc39f1ac6b3"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-reasoning",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "ba2653376f6bdcdc83aef773ef892cc75e8963de079bb480230d4a326d4a28cb"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "beecc0c06a461478f60015765c627cf8669d05a610e88547fa8e2c0854b9de02"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "cba39e82038b6b505769fae3def2e6cae0cf15f6b93eea5c994f8ddf553c022c"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "0640769b9d610f8e9483a5bd7d83fa7a9b47521f27ba5cad642c9b8c2d4523b7"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "0cbbc553310f2af0882843b602fb2f44fdf099589b24fd3258d51deb5e2e0e6b"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "f65b6cb174de924b2f2d974a5b59e31522813035b7137fb95972f956c34c2886"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "5ef2f3503262b4595a39eadd90e5c8e2cb0480e803e5981121585b99d1f9c4b4"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-reasoning",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "7deb65a040b0bbb804987cf37107407fe454e527f0d397c92e6724b33c616c5c"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "24d92e94d80da3bfe01daca4ed19c596ca880ae4605673ff4faddf5744c86431"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "50244f345028c21a58cadf5ec082a6664bad9570f52f9ab451d394074b69a73c"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "49f5475706459d127a37609fd17c92dedf37e7c77ec4deca3fb2026c2ae6ef99"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "19615124c641708ebaf1fd73340a0d53768785a6f030d5fd580723bdb0e5a2ec"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "df94240d119856007b8550daa9f847fb66cff1a888e4760309a20c6b77cc10e0"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "1b280e4b519d9c64b72478236f819707e7b548c71f8943418182253c4c73a18f"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-reasoning",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "bdfc3e1faa504fb95613ee6971067d763f89ef063a9841f3b815b450fcfdf258"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-reasoning",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "92318616f8ec2f3dc2533e95813d1edcd03cef658dd554b6e5ad8e33f2371dd9"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "adaa7ef6d98432281d55cf366504a15ff505245ca8e3f1f570bd3ffa7fdc28d2"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "6de46168f81fba66e577b65ccc2fbf837890e9eeccf530a0e12f39005ca56371"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "6b1a5abe519a5a6ac3d74a73756336e44788bd8de9024e46941524c99ea28b4f"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "de8c49aa5d27daf7192a870579d41a297d497ee27f233e163d3b0c16a5232418"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "922fc5450da70148edb704fbb669a38ec58e8d6f27816c7a00f3b31368bb11d1"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "bb7e39bbb47db00950e0fb499cff3c723f8c555e19f2980060de18c82c2d47d9"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-reasoning",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "9ebb6770af78d3e4bd346abe9f28b5b6d8f535693924b8263e507ad4d1f546f0"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "864297b0a5664538f0b8bd2aa8fa9979b5671e036d90b47ea0b78ac1cfa21644"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "538b52bf7c5fe11439d7101a38ddd5d653711ad7129ab583c560a0abd9373d78"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "4c6455ba01b2391202e88f5dce83296a5b9e8585736805e97a29787c9bd231d0"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "d516f2347a6687e2392ae520d5f2b121897f200327f1917ff132a5756404a249"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "d43c467952d1843d12938e36eb53fe47f4f03f5035c4e9f0617eb417ed791818"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "dc046930b84324ce0b309560026f72112cbce3dca809393dc720ad64c89d2588"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.5",
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "f6f3ffabf98a79a6fd207112df335b5b02cb5eca62b007681af325e3cb848cc3"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "a06941e277dc41e4f39be4f2e4b3cfa5b2cc598620cb7784911605f28c2b7b90"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "9a6b23cc2515aac1c0bfc2901e064804c9a7c9aaf99ef1c2026f43e8b28c408a"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "c8288c15e171580ec4354861c9c901ac1cdde40acfd0a4b02f96621dfa6962df"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "4e57484ddd646716866a6bb08304715eece365ebcc6577b16e00e1f39c1c004c"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "4f16f5700322a2a1172278ec08ca2fe9a277bb4963a809a0085dcff5bc9795c7"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "13bede1161e38703d3af85b386a6c587643f1c2de862a688571a8c46280e5e49"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.5",
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "2b8c6128998e59258b9f2eba0c98b5feed8bfbd2f5a0f0c7c937f5eac7f57d64"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "17920fa623fb4ad764a8a8244e44d73bb27c74b69f384c8dc63a0696eed0e7bc"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "2f9ca4dcedafea6a958952326ac89bb642976e611551479822db32a9c2d62cbd"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "0a98aba399bdf6b7a41104879b67aff1927a2fa832854199b65f8da1853b6cee"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "05f850f1d5edd620e0caa523bf6b5192b19463b318bce2cd0ae85e9ceadf3530"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "bb9d53e90c9d6f355e1386be8097889c84fdb029693e97219f4687d12cf9cab2"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "6d2c83e9b3a262bea4ec22448ceed922ace6acd0bdcde68b56f8c1c8cd815c23"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.5",
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "1e6d8fea2def04a3090fbb73c1e77f7b21fed579c7b378dfc34b0d2cff5a74db"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.5",
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "56ee017a33c109798d3a50621c80822cf61c608f84cc86aa4941ee75a28289bd"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "690d9f3b04a9a7a2985b1924dcf641e6f2fe86c2017725e05256176698caba4e"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "e8bc75b42d5d0a6211a23950e162042c73442e148a34dac7b7a5942148abcd30"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "74edb2f693f0f6c486404a254bf31891952dfea4c32cd29b262c84bc2a0ee9e5"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "0da42a63fdd19b85b7ff6e5ab99bf65b4ec6c2f8a0339ec09a924e56a719b1cc"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "c9aabc60b162d9902f848ac15ae44be91b706f7d24c4c4439e89122ffc2ecfdb"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "7b470615847eda0a6f480ce077a90da4dd6b050fa455acafc4a54ecba7d07b52"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.5",
+      "canonical_route": "m365-gpt-5.5-quick-response",
+      "route_kind": "alias",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "d19d8a839b1abe3cbaf9089c0d8147e2b1a6e7ef720818486435445ac1910235"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "30e1677226dcdec398e42f11b1536708b12b89e6810fb5e4155165f586045cb8"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "51ffedb57caab5ea05fa9887773e808c8127ca9a9ebedac4135acc04a73dcf36"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_5_Chat",
+          "observation_sha256": "4ebfa32cf78ba02a6472eee12ddd0ea8a8d1652ea057810c710dbfc2bd7f1c1e"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "41570f49c25426285b1a46b1c6d6e460899263303f12a04fe1332997cfca6508"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "3836f44ba207068bb7b14bf62224af2266b3db326787defe05bbaf826d81a00a"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_5_Reasoning",
+          "observation_sha256": "2f51084978a608c33b92c00dd130ea27587cad0733db14715d9a95eaa0129973"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-sol",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "3a11d5afdca6f7a43b56bc276a901d972ac68590384d6a7b91a5ddf9598ee4a8"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "bbe96ceed92e2a6e906f03ef832798efafe7e110914027b16091841785b29e94"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "150f5765dd9948d61b34cc68c96a362024aab7c9c94685949352f3f23cbfc4dc"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "ca85849870b42af20560b08a63b1d00372fd29c6781a81082330ca26a2c7cce3"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "285cb785ea9129026e78709be541b2420d5d9180ab7783dcb454934c750f7994"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "916d3ccd9a4113f6b685e9937fa0013185e3a37b02689f53945e2969a471d142"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "e092b73eff454c9085df1ff03c9b88d7f14af2db4e0bf353cb06c623b5fae2d8"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-sol",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "e9075b2f2bb6755d316bc05a4f560a9e1358fe1d7088f979545d09ecf2b9455b"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "e686792884437f28c5e98190190e797e51b9d67295595b065e282ff587008ad9"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "4f17423ace0655ea2e464e3dfdd0ff256ebf6e946c0424447e5a8405b9ea4b40"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "157e37b665e7b699d67df9723d9057ed63f11b90924c576f7f7f891afc864ba3"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "885ef128b867bbc451c6b25aacfbc6325d4cc880990e5dbcefaadf89870c5035"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "a11724bb0a875a32727426e59a8dca92d7d67129c1db83b42355ccd673da2102"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "75dd84c70af2d39a71e7523317ed3cb8eeec86c5436d579ba0c74fa27d797f83"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-sol",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "11aafcd07877fc2e9ef91c90f44491af63e76e83aae52c2b240008296bce5389"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-sol",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "be19c6181689909ec41072b6d680431245380c71cf2e5d885a439560f79f5fb7"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "8adf69155ccaed17d6585e3a50523a71bbbb472fab4d37d8190ca4a3004e38cb"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "93348a240f6feddfb465aaeb7037fcff38f35dd39bd0534fa59a81604452e0ab"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "218a069c34095f48d4fb89bcef4aa1567c5d576c9260b0ec685578637801e2bb"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "9e8a8fdc709edada482c2cec28a24507692e9d1e8b437ebd0564b415c00c7928"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "d000f62c3fa29852ba1f24f9caf194d9bf1e2b5f75dbea4efee47b375d3b11c6"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "f929bb0fd9cd9288f4217b4270e2f786c61b9966466904ec1b5c4381fd0f2ca5"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-sol",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "ad1e6213c4d813df032afb44ed608368f293e30a2da579513468ab980eeb88cf"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "38d5f6b8a41ee14f9a051ed66d394937e994a9b4088f4f0fb893fce392e81682"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "01c15e0507261aa19c4cc8a60fa2fd271959067ccc8c20f9faa70244244c3e5e"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "0137518438db766ef30608f7430f626ef65964eac6f0d817f11c589654262d4d"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "ce2c9b8c87230fb519d8594861406b759a62085fbab9724fb17d03591e27471f"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "554630eb773c05a4928db3e9877d9fcb03cbb21590b4a85d749603c64a7a23ac"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "aae29ac09f9cdcb908c91050673db0c082f9cdabb0f1a71702003bd891a23d5e"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-terra",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "7fd4edcbfffd7f88d85b4d32b8305da6baba7fc3f5cf2a05ebee05b06cb51a97"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "3fe5602137a9b1ba906c7cdd3ef5006901bd84bcced98e74ac23a74a4aef1fbd"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "73c77657bdd19b52db830f39f5372134752fd004b775d8314a00af5a715edb8b"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "2882c7c0be9ee5fcd3f0fdd04d1eb1310a37e538d820a523cf3b2f5a507a3a37"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "f073ae36f2828b4835507ac6104430050ce3aa0b98622d22b3e2b5907bb98f42"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "2f0970a8619d15ad68e433250f88aace0d7cde6970565824eb7d4b3a926803e6"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "1ed1b8575941d88a16b548f600ea93b6357cc8cce646382950f4a8c8c3ec7c9d"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-terra",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "6a90f15af11917daddf94e2e447a7c9d0c936d9fbbe7d262e7bee3d8897f858e"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "4c9ac7e82000ddab34f21ece003fe0e53ea800939107680aec02c18a95c6abc1"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "a244ca9747a2ed4a4b3a09acd9df19c2eb0e73264cbbb00e6a5940d8e6467ad6"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "f636c2b80c301f61339a008de60022f04eb80defe741a8ce2e1d92ed7fe62712"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "c1111341467be4d5d25c161d018065982c81bec1528cfa1d89ead12517e9830b"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "d8e1e4cb18d4fd3bb563e46534d579e90b611856e3edbdf9d9fa03e14ba1d5ff"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "69aac5f33b5843845ee9e908ecd119aa360efec2f8bb549b61b9910e2a842960"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-terra",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "8fd621e5cf954f0723081952494c802676e3914c5bfd414f24a7fd18942cd169"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-terra",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "e867ab92fa06b86aec62e3273b6b273df5ae8843c9039abbd35588e7f5ba009f"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "256b20ccda9c1151eb082e0d12d9d048c2466b1ed5890e71a16f183aaeaf26d3"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "fa456db8694e13d342282dad4acb3b8e9e56f9d5efafd66535fa82c54911ed45"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "b30a3327731627e5f68b324502b3fe16bcc6c74bbd7ae710363c386623d51b3b"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "2f071e3496ab1914c1cacc844609a02ccee5fb956c89b179b6858989475d272b"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "bb489ef16edd81453234b802239b04f3209e254243d3988b29fd1b2dcda481f3"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "6769e088e7b0cd7cb65635ad2a5b53692af608615d60754e3c6eba8696eba19f"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-terra",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "6eb635216ec80f691cba01aa82f35a1ad6bb7cea2082b1343f3f2bdb52f831ca"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "27af5c7456761e7a7f11b158e49fce404099cbb506279be16ae7090208c0a4f1"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "b47514108ed52cdede8b52766411596755b1ac0d7437f5efad06e77edc598c06"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "6d660e28e2449b009893935e9168f8777d4f4672ec86f88d484ae95863398444"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "70bcd8cbe668288c8bd9a7d3a0915ce6c1434df8c39a058a10532997dd2a6648"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "b73e5e9f8792478a3eb8642b6b3138623475ac24e8c6ec401f2934f5b88347f7"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "622991c1f6763944ac11df39cd40e495f7831b24d02d75fcaa8e3065f6f39d87"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-luna",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "7e481110e20ad044dba4f78610e94399346107d1c55bc1623b37f72c3ef92f92"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "dfc5f122e05e1451b83b6974ec908945f63e2b9cd33034767839347f0c0a5410"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "e168286fee20b1d14f1e2284ab02a0fde43c7c3adb9569db25edbd7eb668a32a"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "1064570d97ab90a5660bbfd27a523eb341347f7b5efae799b38559a2eb026568"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "fde827e2b010eb3591a4c62f22b47709c7ea900bef3331ce17558cb2f5019858"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "257d74dbbe5480ee584d77534f40f52cfc2944da89c15d4da96486e09836a3b0"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "3d830761c511abf09fa1af04806f48d8ae8916c4f686b92f75ff6ddc3589482a"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-luna",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "5715eaa22426dd20ad55a919bdaef6eed2a7c65066e55005f51308ade0dbe4ad"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "558a92b92addeb9a06ecd1dfc341ad84be8fc2d5d810d0f442d4e65563128aa2"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "653aeb2f7f67b1b1119211112c082216474aba9980dec591af591c9d7cc19daf"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "0ca84c8ff50bb56f1e671a26bbdfc4d7a86118978f751c00e92a4008e70dafb3"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "2e758251826dea87da377476c85cbc17711e3a5ba94dd22599b99452e143a602"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "02ed0c95193b03013f8851aa01bf464c973cf4d62dcc14d19f18030a181fa37f"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "ab3e4de0290c4c5514eef4ab779db012984359f8b2ff8d637f60cc16bc0edd76"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-luna",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "489488c6bc199722ca9386facf3ec76ecc2032da0da1f63e89e8645dd206baae"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-luna",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "bc12e183fd1382057736984b99455aa2d757cc57b3581d2bd50109e47a354080"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "808c5e78592ca8e8f4f09a4251e3c561fc47dd58069a5bc094ee8f2166c50890"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "6c251fa73ecff7a31d2f1d70d990678095b720912385d536a7ba22fbaabea9de"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "4707554e7f0412509147eba618ea3d2e3a7a264ebe6f0eedc764eb739c038ffa"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "2bfbb9e05b7389baeaca117055560f07d2b726a8bd6c8f30b9d5b71088507e01"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "407cb0b38bd212706d95eb60c09e806cd0e5b18eec05b85bf302bb845a343b62"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "adee6ff5926aa3b0efdf8ad8523a81281e03595f58a6e715a45eeea4b32ad5bd"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.6-luna",
+      "canonical_route": "m365-gpt-5.6-think-deeper",
+      "route_kind": "preset",
+      "catalog_visibility": "compatibility",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "467e899b79f578ab0dfd103508006c9e98eaca05f4296fcb16c9aed339ff963f"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "3255abf038a2a035769acff8a1d8332d876997aa4608e4c6188386d758bf7bf8"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "c82db8b8fbe9b340f284ade23adc0b2f8dfa67fc2873311a9f7326f47f9298af"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "c070cb50f80f6e8b6f6375455108af96f2ac404936647946faab15a065862687"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "7fee632fe2915ffc73e08a077051969118900cdf4ad1fcc3798ef605efa6dd3a"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "236debd75a4fdee9cb55ed29cf0a2718c92687d9979691dbb75c7c90aa787ac6"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_5_6_Reasoning",
+          "observation_sha256": "b4e7b4c83a6b56a9fcfae3e4e697515fdc7a45ae075fdfb9516ed1f405e66b1f"
+        }
+      ]
+    },
+    {
+      "requested_identity": "claude",
+      "canonical_route": "claude-sonnet",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "e608932eab31bf4dd3ebaca4ba38580a9eef8838d451ad80de21bdb18d7bde84"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "92f7d1dce20fc723a910d2b4b15269cb8a23fb9edc6d88e8069808fa822bf6e4"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "d0005e7ccee5a7fef0e6354dca0de796f7e34fa845fb5faa4072879456574205"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "3eca85861548516d68761cefbbe0e1adca144dfa8995fd6eeaf9c5328feca80f"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "37c77ce1ee69eca8707173f6aee79163849ea3e61bf824bd218fcb736c8ae8cb"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "13c05a350b6a8b6be0ed8e721d73f8479bfe41afd77e1cb9160f8040c2b79b98"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "b512e413960168aefb2e3d2b476a8e4083d7d1488a7a7fd4b42275d5d529d545"
+        }
+      ]
+    },
+    {
+      "requested_identity": "claude",
+      "canonical_route": "claude-sonnet",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "1761e035d4505d2a3644c7c3e8869a1f8c78b823b8f05f98f65809c914541727"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "a987288f2ecc40d44d9031cd6d8fa3e81a421b545fc7083491ab822b4fadb86f"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "94ef1e566f9e10879ecedebc35abb05e6f1a80902e2b3d820f62a0db7d970330"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "32df6c657a3b33e85bbeb33254349bd13656cdc3e9708e69fb3b032994636e22"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "c3fcca32209a470e47f701ce30cf15574f98dccb73ea6cc5700e0e6881bbdca7"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "35c8f6ec08091e880c68816104ec341e6cf8372b14d70e9d42610b49ab7b1ddf"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "398f3e4ac6673a75f317dd478eae855d7d049a1348c3daeafe21c677a9156671"
+        }
+      ]
+    },
+    {
+      "requested_identity": "claude",
+      "canonical_route": "claude-sonnet",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "745e6d84ab33f53a2c3ec4218999c027256f74048a11f5f2ebe65c084dc47047"
+        }
+      ]
+    },
+    {
+      "requested_identity": "claude",
+      "canonical_route": "claude-sonnet",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "fce1200e4767bb2827910be028a1ba672f2aad5794bacf8ca1d398547c904930"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "1c5e4ae2e91af138b0ce41002171736f6ad354507bb393195076fdb57b392e83"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "29aad46bd3cdb1eb214fb08a7e6f8b9d89229fac85ee2c16c642a05c3e51fc5e"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "8dec8ca14716840e6e21d4173099fd742b0bc44655d8c37d63c742e2102ac7fd"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "f3aa50be72c21077d4ae5d79d5921e38d0c52f52e178703752c461d0a89d9a05"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "fee470c3e6f337c05456a3e0500a1ea934beac590b455d82a9f3ee1e16fadc3c"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "44ac01888b6f3435d073d2f6e54e41c390774adc2595558c38f1c617b3576c7b"
+        }
+      ]
+    },
+    {
+      "requested_identity": "claude",
+      "canonical_route": "claude-sonnet",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "272dd0ce33fded6f4c92d064e8120ca98667e479f26ab061528e8932d7e9fa9a"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "15f7ff7837d2c09f05b254190eaeb30b955a14560b087e05298d618fa5cddec2"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "96996bcf8bf83f548b0f70392f4b5f9c36104b9c17e925ed1a9c92fedd1c403d"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Claude_Sonnet",
+          "observation_sha256": "151ef54f0d9990c9350d2c9cedae544cdb9bbab27ea17eed159eec950299dac2"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "c0fa1ab5818f3fecb98f94d48ff093fe232628cdf07be6f7bfa833fd7eb701ed"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "fbf9e9fc3bef920807c1ddfea5944534df4586b642c78a374793a626372da87e"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Claude_Sonnet_Reasoning",
+          "observation_sha256": "8a412c8b2f28c09366840126125d208b38de3c82da1bca29c215e4df92f6d31b"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.4-quick",
+      "canonical_route": "gpt-5.4",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "9c0af659ed72841be627bdfcd348947e53143c6c200c804832b41dc7b24eefad"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "10982e35239b616bd23b4f291fcefaee53103ee464fa5f3ff5c35b616c27d0dc"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "546d47c605084bac7144f3165538bb025411a4d8fe61ffba7bd51e381e5543b5"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "e93594a3484c105c3b0b4136ad861fcd0ad6e918a45c6e047336299509c6f40d"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "b1f434cb75f28052b3bfd209be1284370f03bae8cb2a968018cc4f81fb854a71"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "20e52592b311d264c454acfbdd4366bca80f6c84c8993c5907dbd2b079a05f6c"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "8d9dadd2ee9e4be30b466ea68d2661f18e429027049fef724f067de8b4f0f925"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.4-quick",
+      "canonical_route": "gpt-5.4",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "1872750e53da09c6c5d1ddffdb9630ef39abc318c3f369927b209cf5ba3ed981"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "ad55453a642af62a9e46457a41de5168910f707b1b337c370c26e6a511db3126"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "27a452fe133656ac222201325e4e6d649ffb00a0cf08f0c6f8a90b3ace6701a0"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "b1341e22b29678fc6848e3bf97616d9b9e0e62904ea14abb4b1501119f638908"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "fc1412f3922e96489dbe4eabab9dc92a51cf70876ffb250bff2a30315ffc410d"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "3cfc55252bbb2008a3993437db6df62c2a943218a4966c34f9534ff908ab01fb"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "b029754e6f09d616c91e9554927a03951ca2d8eb0449ba667b24ba3758a29e02"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.4-quick",
+      "canonical_route": "gpt-5.4",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "b9a1169b01d0347ba98744b3ce3fad07bea67eb27f6b3a455f55770bfabc53c0"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.4-quick",
+      "canonical_route": "gpt-5.4",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "d0e36edf56a266342d33caaaf2599d55cc30178a082301dccacf43ce71117397"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "199b34b3b3d3d13eaba264161704be55b77f1d4b35dc6989db3e2b30e9923867"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "40eca7e98b89ee80fce221b6535de545e75a5b7c952ba165c0e49ed2c0332d21"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "569c8631ddaa12467fd96213994b9737c2b8e9fee996ae75a05ca27058e49ec7"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "7deafa5864e3c099d69c5fdb65a00d6678a4003c83fe192979a7bca42ce7aff1"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "96b6cc5beb2b716d830fef77d9f584e8b1bfd5a4bfb92343cbf1c82b2f522e81"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "c4df8aeaa44191f007cb103bd0ed767b0102ff3e3ce18963acbc5ad23e59ac6b"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.4-quick",
+      "canonical_route": "gpt-5.4",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "eeae45003f6d75d2c27c27cd4b9d631b2aec847e40213496e982f774be3780a6"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "c54ce093e221e5b62685eb496433b350ae62d9cf098bf5d7c841a47b59677253"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "bd0c4749fe19879407d8d530e353737070273614401d4a85a73bbb4e136f95ec"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_4_Chat",
+          "observation_sha256": "82ad38fecbb65d023769473fd653abea9c8d36a82a5ede78a088b74c72b91547"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "b5df8107552279013312d8e41d4b33576e63372e936d62235a9c2454574a6cf2"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "60e2098551a91b46784c8298e0352009f78bce26476fd18144f46249d36211d1"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "c2eeeb888f9b2f737a46b29756215d3bba0a3a39605e58268e360898c66ecf61"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.3-think-deeper",
+      "canonical_route": "gpt-5.3",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "openai_chat_completions_nonstream",
+      "endpoint_path": "/v1/chat/completions",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "10c0c3b0eb05858dd285b78003dd22f01239aab10d4e203adb4e96ad5efad203"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "5778e1436631003da5fe51dfa4485edc4ff632d7b35ef044f9cb76dbeb69a19f"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "bf6f21007215f9e96f360e5e4efe57ee9c1ef18048ab7a5bf3ccaba9366ffed0"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "134398a13c93e628adef3728f561e7ccfac5734ae4ad6e3aadf11852b21d3cd0"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "afb76a98ca0c44f7435f45eb3bfefdda90d631995cbf50efc4f121d5c1c07ad6"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "f9c7fad52cfe7d224823bc0819bf41bd162cc7c29306128b3c23031702758eaf"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "fd20130a4191c55c3d5b67a2047bdb08e76e6f02dd14c137c170b24e69e19b91"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.3-think-deeper",
+      "canonical_route": "gpt-5.3",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "openai_responses_nonstream",
+      "endpoint_path": "/v1/responses",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "ad15a1e8a9fb595edacfd96dd4ed7a30634a47abed9b4be525669c431b139783"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "61d87d75eff15a9ef5860f7811832a17903de2d1a6e3fcd1bf1d6ac4ad8e5f70"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "e24432196e58f9d3a1ce04f17e37060620cb36fc3ca347d8bc50ed342bcbc762"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "8447eca3d1b19392fa64b3adbf02d488678e69097f5f9f25e162518f6c505f5c"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "1313f6db2d6c98fac77e389fc8315f637daabac98535bbe2f80bb15f2c7b6b0e"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "d8579640564b586ec6b26a5549cacf56f00b271ac54d93beee633b23370c24fa"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "fe707f69e7ed2c74f553f2f466d70807133dca6b0bff004460c44e912a3df88c"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.3-think-deeper",
+      "canonical_route": "gpt-5.3",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "anthropic_messages_nonstream",
+      "endpoint_path": "/v1/messages",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "0609821e0e36c915d4ace775a58a1df82403691cd89da2645fc80c0f0e0a6844"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.3-think-deeper",
+      "canonical_route": "gpt-5.3",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_nonstream",
+      "endpoint_path": "/api/chat",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "7eb978215b8a6b2747eadb59bcecf252da339cf31f32b5f0fcda3c93054c7b07"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "d03cf0774efa4e3cbb37f9e98037a0a641075c0ffe7b6ea7997dd9d32bf0eefb"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "27045a2684679eff639ba21149f75969e8783349606851dbcf4c592283c1a8d0"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "ec716c2ffb4d5c090a4d55d46f365667d3a7b34ff0cf6fe5a9709c78c5cbd0e1"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "be9f06e901508404b11dfcef9d53e67845afe6eb99ba1612d48f096b39d24cfc"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "4294dc65a0515b9145cc93151fba57a833f2ed3bd36357c4140318f4166df823"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "eaacc53c38cf826b13ede25b2be6f0566e8369b9bf1a7f8cadc57ccf2ba577f9"
+        }
+      ]
+    },
+    {
+      "requested_identity": "gpt-5.3-think-deeper",
+      "canonical_route": "gpt-5.3",
+      "route_kind": "alias",
+      "catalog_visibility": "hidden",
+      "compatibility_required": true,
+      "protocol": "legacy_chat_stream",
+      "endpoint_path": "/api/chat/stream",
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "6ae5382723c3dbf507ce2e73c0136df9a019a8b67dc487a634c1461c5581eeda"
+        },
+        {
+          "effort": "none",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "dbe1c6ebd394cf1aebd18754a67fd4b37a04cdd2fab1dc9bd2e2b388ee1026a9"
+        },
+        {
+          "effort": "minimal",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "7134fdbd66afc7a62429a8b3cbcb75258e0b827466dfbe23be0d9e4cfd674fbf"
+        },
+        {
+          "effort": "low",
+          "resolved_tone": "Gpt_5_3_Chat",
+          "observation_sha256": "7046c18e1b9f8775abc1edc6f3d4dc985e00711430404ff2549fc410327b4db3"
+        },
+        {
+          "effort": "medium",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "887c1cb372d482758f6c1594d296ba3c72e73489ac5d56702146066263a171f8"
+        },
+        {
+          "effort": "high",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "77d7df0414781510b98a9e39d8aadb0c394fec27ff43932c6a1a5394030baaca"
+        },
+        {
+          "effort": "xhigh",
+          "resolved_tone": "Gpt_Reasoning",
+          "observation_sha256": "b37f3fc4a86b86625b3dbbf4d574cae0817a8cdad42b825f553211b7a2934d0f"
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "requested_model": "wp2-unknown-alias",
+      "case_id": "unknown_route",
+      "protocol": "openai_chat_completions_nonstream",
+      "observation_sha256": "56697f6f16d26d7b0681cdf4439e4cd0d57d9894045b0e618e29d2112cdae69f",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "openai_chat_completions_nonstream",
+      "observation_sha256": "03844284e8aa4a60b41ff1138e1f6c7dbd3583a86641d4de05a0f5beaf2cd9f2",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "think-deeper",
+      "case_id": "disabled_route",
+      "protocol": "openai_chat_completions_nonstream",
+      "observation_sha256": "0867ab66840861e8036a8d71e2bece0731646f3c60ff7bb88bc7413be00d8e1c",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "wp2-unknown-alias",
+      "case_id": "unknown_route",
+      "protocol": "openai_responses_nonstream",
+      "observation_sha256": "40bf6fa1224b1dd1b60282c38e8e89a68211fc652561e8934255ed2a691fee44",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "openai_responses_nonstream",
+      "observation_sha256": "25dc81128ad96303333f7d55484e21a7254379a6ff3b2d9f27b65329ee81974e",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "think-deeper",
+      "case_id": "disabled_route",
+      "protocol": "openai_responses_nonstream",
+      "observation_sha256": "7d070a1dba56ac74662f8b60f8767e7da6bdbc4deeabcbe75958295db54b19ec",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "wp2-unknown-alias",
+      "case_id": "unknown_route",
+      "protocol": "anthropic_messages_nonstream",
+      "observation_sha256": "9321641787c35605f2d08f23c4c3ed47240f5dc515939eeb1822daf93991ad0e",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "anthropic_messages_nonstream",
+      "observation_sha256": "a0213824162312d80601fe5c0f05fcaec78c708ba6b28863258f57e293844f23",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "think-deeper",
+      "case_id": "disabled_route",
+      "protocol": "anthropic_messages_nonstream",
+      "observation_sha256": "2fb300b6cb3c4fa1ebc0f0957a2241d82743d8708bd81fb3089bf60f7e627808",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "wp2-unknown-alias",
+      "case_id": "unknown_route",
+      "protocol": "legacy_chat_nonstream",
+      "observation_sha256": "6764459be808c26cef579cf042d6d8e6bb1165b2df6c09155212e7aa6b53bc0d",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "legacy_chat_nonstream",
+      "observation_sha256": "2b713cdaaf56bd9957cdc4b3fe3263ccae596e3be79aa69c3be6d4539ebe9767",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "think-deeper",
+      "case_id": "disabled_route",
+      "protocol": "legacy_chat_nonstream",
+      "observation_sha256": "c76b045a63adb5d9db985bb526da1033be1d5b80169ce599d46066651db7aa4a",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "wp2-unknown-alias",
+      "case_id": "unknown_route",
+      "protocol": "legacy_chat_stream",
+      "observation_sha256": "616def9bf62b7d02382ce6f965530009a4ffb22b089ad17f3d1ecfc52e11bbc8",
+      "expected_failure_code": "model_not_found"
+    },
+    {
+      "requested_model": "quick",
+      "case_id": "disabled_route",
+      "protocol": "legacy_chat_stream",
+      "observation_sha256": "91ad4f69e91cfa72827da0879ef551af02e8ab2a6008713bcb9ce27440aab3c7",
+      "expected_failure_code": "model_unavailable"
+    },
+    {
+      "requested_model": "think-deeper",
+      "case_id": "disabled_route",
+      "protocol": "legacy_chat_stream",
+      "observation_sha256": "9249a4971f976c3b043d7198f0c329f654e597ec1ef3e89fd98df3a4b27d7a42",
+      "expected_failure_code": "model_unavailable"
+    }
+  ],
+  "public_http_evidence": {
+    "entrypoint": "Server.Routes",
+    "request_id_observed_all": true,
+    "security_headers_observed_all": true,
+    "auth_modes": [
+      "api_key",
+      "admin_session"
+    ]
+  },
+  "advanced_capability_promotions": 0
+}

@@ -1,0 +1,2344 @@
+{
+  "capability_counts": {
+    "basic_text_delivery": 290,
+    "protocol_transport": 290,
+    "route_identity": 290,
+    "route_mapping": 290
+  },
+  "case_counts": {
+    "catalog_projection": 10,
+    "disabled_route": 10,
+    "success": 290,
+    "unknown_route": 5
+  },
+  "catalog": [
+    {
+      "canonical_route": "gpt-5.2",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "13deb9f79b46f70ad3a6e1795c7df2b7e3b4c3ba7844f218fbc61be1dd823308",
+      "owner": "microsoft-365",
+      "requested_model": "gpt-5.2",
+      "resolved_tone": "Gpt_5_2_Chat",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2-reasoning",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "6a6c995ea78461337a255227e4859863d6340c1cc7732825068f3224d1885a4c",
+      "owner": "microsoft-365",
+      "requested_model": "gpt-5.2-reasoning",
+      "resolved_tone": "Gpt_5_2_Reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.3",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "9d7399cf337a31946c1caecb015bf25a866bd2f97ecf9974b1482c9f0829034a",
+      "owner": "microsoft-365",
+      "requested_model": "gpt-5.3",
+      "resolved_tone": "Gpt_5_3_Chat",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "15559f9aaa00311c9b226b99bfa0a24bf860589f918683519ba7fa973b7771cd",
+      "owner": "microsoft-365",
+      "requested_model": "gpt-5.4",
+      "resolved_tone": "Gpt_5_4_Chat",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4-reasoning",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "a05dd60b06e37b892a69e6dec69fa8445290151a478e1ab1b01237490293803b",
+      "owner": "microsoft-365",
+      "requested_model": "gpt-5.4-reasoning",
+      "resolved_tone": "Gpt_5_4_Reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.5-reasoning",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "fa0b113b2365a2daeeb72cef14dbd8a330ee3f8f75c4803702d33d5571c64ccb",
+      "owner": "microsoft-365",
+      "requested_model": "gpt-5.5-reasoning",
+      "resolved_tone": "Gpt_5_5_Reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "bff305ff742456f4073c1073a41678f8c5b467821c8b5bba988a35044704fbda",
+      "owner": "anthropic-via-microsoft-365",
+      "requested_model": "claude-sonnet",
+      "resolved_tone": "Claude_Sonnet",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet-reasoning",
+      "catalog_visibility": "public",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": false,
+      "default_reasoning_level": "medium",
+      "experimental": true,
+      "listed": true,
+      "observation_sha256": "51c64b36305f860517d2c9912ab34c252acb08fdafc04b88ba6e14877551b75c",
+      "owner": "anthropic-via-microsoft-365",
+      "requested_model": "claude-sonnet-reasoning",
+      "resolved_tone": "Claude_Sonnet_Reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "existing-microsoft-route",
+      "catalog_visibility": "compatibility",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": true,
+      "default_reasoning_level": "medium",
+      "experimental": false,
+      "listed": true,
+      "observation_sha256": "f3c25d37a764b542fac36bde8f39b05b9a0d197bf97040867b0f6e8d5edb421b",
+      "owner": "microsoft-365",
+      "requested_model": "existing-microsoft-route",
+      "resolved_tone": "Gpt_5_6_Reasoning",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-claude-route",
+      "catalog_visibility": "compatibility",
+      "classification": "INCONCLUSIVE",
+      "configured_mapping": true,
+      "default_reasoning_level": "medium",
+      "experimental": false,
+      "listed": true,
+      "observation_sha256": "6695d2c09372fc271fb1bb71a925b3387221ba419ce717bdc49b97d97529bcda",
+      "owner": "anthropic-via-microsoft-365",
+      "requested_model": "existing-claude-route",
+      "resolved_tone": "Claude_Sonnet_Reasoning",
+      "route_kind": "configured_mapping"
+    }
+  ],
+  "classification_counts": {
+    "INCONCLUSIVE": 25,
+    "VERIFIED": 290
+  },
+  "failures": [
+    {
+      "case_id": "unknown_route",
+      "expected_failure_code": "model_not_found",
+      "observation_sha256": "5568750a9636987b1bc17954e48c2d285cbd3e62687e0e2df81d6f1aeeada97e",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "wp2-unknown-legacy-route"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "ae55912fffdf4189ccc49368182b02a756dc92c7d1c958c0364f5f3cf251f33f",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "quick"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "f18d0d8ca7056a73de40013f32f4d9a1e2803bec4eb7a4d99e379cd2e2e44e6e",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "think-deeper"
+    },
+    {
+      "case_id": "unknown_route",
+      "expected_failure_code": "model_not_found",
+      "observation_sha256": "f1e1a77c4aeb82c7ecf2c23e6c29187dfea43564da6870b92c1b9f7e1f747fa2",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "wp2-unknown-legacy-route"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "9c15c503e3ef8603215c5b56689d031d13f2a99f55186ffa9498c6b263de74c4",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "quick"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "e1b2cdef8bbdf6e99e73672e56986d041c3dec504c62a620a2cfe5be2c4ae2fb",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "think-deeper"
+    },
+    {
+      "case_id": "unknown_route",
+      "expected_failure_code": "model_not_found",
+      "observation_sha256": "94850b558f72a6637bb3ae7def9451e56c6d511ee7ce597c3ebc583673ce5c2a",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "wp2-unknown-legacy-route"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "7e2a074ec933cd89419814fef01f65e45b74830570057a4de3b669bf078f55f1",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "quick"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "5a2a1ee5739ae49f88a6a026a4b6de92b62fe65efe3d75d9c3e4f7bd89784795",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "think-deeper"
+    },
+    {
+      "case_id": "unknown_route",
+      "expected_failure_code": "model_not_found",
+      "observation_sha256": "7ae08b6d590fd7f6bd88be997c8139fcb7aa051d9b2b2c33d493b9a43654a1e3",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "wp2-unknown-legacy-route"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "745a47bd9b95be5ea7b5fe155090916b01ec5f5e48103fedfd90e7ee1ff4bac5",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "quick"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "d69ec65e22461e70581a9a21aca2b7c4770fa482323c86dae4c8817739b10320",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "think-deeper"
+    },
+    {
+      "case_id": "unknown_route",
+      "expected_failure_code": "model_not_found",
+      "observation_sha256": "ade63df9117074b6de92a81edbc208659dc0d696f0668b08415bc1afab505250",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "wp2-unknown-legacy-route"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "04cada2d2030d744bb144bd61b4d4ec0a78f14e8065ff4a945d4f762f0047404",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "quick"
+    },
+    {
+      "case_id": "disabled_route",
+      "expected_failure_code": "model_unavailable",
+      "observation_sha256": "cb85a08f0a478c2a39f7f28d49a0ed85a943109f6e887596e687dc746a4159f8",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "think-deeper"
+    }
+  ],
+  "matrix": [
+    {
+      "canonical_route": "gpt-5.2",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "6a5e3f6ede41f5db9b25f76ff4505041cbb38eebac8da9dbbc5c57329a0de444",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "9aac52bc6f09ae451d48fd4dc9141565400c79c0b246bb4bcd44bd5accff568b",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "1b1d06325ceba0f3b3cb1fc6d3f870c8cbf46cdef74a8379a2e42599ac5cf16e",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "bc311073b63299a0066f3646553bc415de55f178713023a722e1834e5cc962c9",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "062b8e6e30ac7da7f1c6165c57d2feb53782a1d0222e5d72f09c879f76f33e68",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "b6125076625b1fe6525941224e902dce15fae89136a73790f4c01732b62cff85",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "6b41e8056c8a7c370fb32f774f31c3bbe2923298673fcd907d04195ce12ce88d",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "gpt-5.2",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "ad4cafd9ba55f7e33324a318d92dabd3808b92a1d8b4aaee82dd1b0b603a41cd",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "35ba86e1560a85fec87a4bb2cf4d1d2601aea08499742f6575fae064a69472df",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "170aa9499ed0932c1fdc65c7f711a2259c9b0b09a83fc7b2572856d63742349e",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "a9cfcfaa3ad94a1bf35ff50b1c679af906815d3abe182396f2bbdb2131e0ce53",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "5ab3fc4a40d34bc4cdfb339a34c3d4f55ea008ef37e9fe7599efbbcdc7949783",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "dfcfc3cb9e2809551bfbdb909e3b9e50dd7e92f17e12fb32a6c09f6f67198191",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "7004219ccfb0c39afd97bdacf20e71ba0ea2a9eea338bef48da0dba4ee7fa6c9",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "gpt-5.2",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "0a306a285a483a8c7e63ec2054264f11ff3d9d997b337f945696802dbb59d6a2",
+          "resolved_tone": "Gpt_5_2_Chat"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "gpt-5.2",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "c08796f53bc6df3a30c3f56ff00f77170106e56aa7e7f6aac4e1d64e335c86c9",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "2a81844ec6a2b70b158a90af2bc0627736ae9cb623d2ecaa1c01360f21b94646",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "5b50f34801021458ad92324613914ab841c5b6829e1125e1b4f74878bb2ac9bd",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "96602041bd1c8322f4827c83ca0b6ceb76bd7c1909d534fda8174725eea540b8",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "9cffc3d344209065c57bae838010f96fb0466cb484de87d268ef8cf92bb7d3e5",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "d40279a36f60855458f295d9e7efd4a8c3658dbedf04aa3195fa4756220b8cae",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "87ec6b2cb37deb189f1503e40638292fb375b4fe39e2e7b9e4f061d0cd52f4a9",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "gpt-5.2",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "2edeb4510b18cbc9867cbf2ff1361559ab177aaee09112ca6ab578f5232eb93f",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "16ff916cc4aa12b7107c6d0b2cc77700f6a2d3c461d168674ed213d57e56865b",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "85ce2950d1839a3d77364468d8f2cc057d678a99cd6fb733bf2ff19873917b1c",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "b63f6f56eac77d5de73f1d2da7bfe69c80c68b346ec499bd41cab4f8a0a476e0",
+          "resolved_tone": "Gpt_5_2_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "f6e87e2a4d2e92f2ea8311f0688e503440d2f97531cd83151cf85a4a81a90002",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "958dd94f0c6b502fcdd6be278ba6bd98078411fde66b128448204b630001723a",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "5fa98d12001e85b6ecb8540d1f513249036226bd58615e0081297904007715ea",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "gpt-5.2",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "f500f24d2ce2c0b907573c5abd803c008d9151ab202d69b241c6a5eb0e061de6",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "dee3625851371c0d4ec0aa641af92ccde892e32474c394be7682bd7f5f1d8eaa",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "4789947bd95a5e430199180dbaac4629a64203326d4839f0e729db5e75f06788",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "ad8dade88b5d71b38f123af908faea5ebdf01af1d45d30808105a63478f1cc35",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "9e17b2b42d0ae35da90208e4bc74c453996c06392299fb48304fa6873f863d9e",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "e5c24738bf6d89601a1b019e08365d7c9a5540d548524e9809f202d3305a3348",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "525577ec44906a47507998b81c6b64ed5400d65c047261c390092b731fd4a8ca",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "gpt-5.2-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "2265afa23b0d248997faaab26ff36d0ed5f919401c00ed7ee3a8897e3b177a71",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "29a74f0f638e59660d2a19a750e11797beecff7512a36eb9637ee6221ffd5edb",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "82c0838ae60e42ca5215b1215e1bd88b63c0a21980104a9bf847f1380c3ab4e0",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "5c49117ff16e85aa38272f17ade5da075df90cb1ff2c9d0c75107c31f8296f6a",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "0270906adea58038f7bdca2c11f601d708a6b5d04ab312388f4c3cbd5b49422b",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "51216140070728c266d23d644fd8090bd18616bd735afe29b4a7d3951d56c75d",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "43197356fe4b7373dadc454855e04201a4e083f5681a308afb488480068023fb",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "gpt-5.2-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "83fd047fdfe63cf816bbfb63bb0e93958812192671f5b429058f1970bc63f95e",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "gpt-5.2-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "4dbf696d0395f3530b0a4d5da44ef00d6f090d98878b6d81f742a41e6b9e594f",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "8ff307484a3c9d6352b8e82ad7fc87d89e667091ac4988086a1e4c662c05547a",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "e3bd9bf40a7f3e05422c3cc9ea241fa3d2f0f80018a69f2aab082b61b9d7f379",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "c845a2c46d41e92dc986c8b3d3b40b5962767819b4af7e5587fbf584054adb77",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "ab04488f53a42caca161930ebd762871f7f4ea7069f0b50de07c9ef8474c6e4e",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "862776442d2e9225db355500b6c2e39435f24d1d64546cc9e1be9d48d5d2ca38",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "faf73a3d49de2f7ad7e2ce515a8ff4c993ef3a26a91e2126a8dfc35b2dc8a468",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "gpt-5.2-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.2-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "e9e978ce7cd2b5ec2d1791ac2a9efd2f97acc300d361686d188ae62247fd592b",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "9a0c4029d627d10a54f2e4d38c1da29f02f3dd44b8acc7bed5bae04010efda58",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "daf3739509f7c10e58282a7ce09c6034a6ad8b0380ce58f98490a84bb04a2421",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "082ccb84831abaedc0aa3363f11ee8ce5b53cae629f8eae2f81e45f14115a972",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "413b090b8df4a63bc5b9fa9f8f12ad63e4c02666b8d72f3eac2db243f594d6fe",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "79173f467ab60e31e19ef4c599526d9049e65e08cad6004328526070c71fb053",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "132bc35ccdc3f18a661667afac1a2bb8e18849d93e525e33a60813ba9dea8e08",
+          "resolved_tone": "Gpt_5_2_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "gpt-5.2-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.3",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "f35e710d1eb28b2ad3a9da2958eb54965027c620ff6e04f5ca62e9b7d195353f",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "a103e087cb3df2d6e345556eb47d6b7a93293300dcbfe1d6f7314e03870a65e0",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "9b6536e5c24aa1af5b7668ee8376875cebaf3cfab56409446e6328cd9f26d07c",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "e6b4e142091adb1cae3c404698a6c3313254b5050360d5fd31e4801f399c1a28",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "ce5873de292d902de36c65a5a2c961f02326d72f6621302cc1e0fe4bce76963f",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "79d85bd851833ae77a4ab1400818ce07433abfc498918def55b66b8be95dc282",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "b07e3334054cb6920897f1263b2e2ca44e9949a22758c36fa4186ad5c4a10ab4",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "gpt-5.3",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.3",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "3a801df276c9480c7fe3f34f8878a6e81e6d191f67f149c522ec7e2698ced9a1",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "419cfb247eab640b401c2ddd1b89ff6d37c4dbb15dc6953189b6de9879e73968",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "6ee286e01997c25feb1bef53d9251e6f4bebf9bf34e5069eb78a842fdb2886d4",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "61f2990c2b4633233cac304b5cb76cccb71e96a83593b1374b7f04639402a8b9",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "e83e3d7d9bbbd31c49250ac57caa0d95270c54afcdc005f14c061cb7ba27d52f",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "39f2bc374aea199a11edef08b2a38486177c113715a916472bf1e59e89a101b0",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "6c6621ac997e4449b9e8365d6e1924d46d558a87ec60d550194523ab6465c8e1",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "gpt-5.3",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.3",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "449cad36974c85da45c1445085840317bd907e3890e3e8d0954c3378c8a238f9",
+          "resolved_tone": "Gpt_5_3_Chat"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "gpt-5.3",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.3",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "15a26a2b9c62d7fa59abf041e2e75aa4f4c8f44c3381c604ed96102677def678",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "7a8e29af4f883b18ecf900dd007763c28c4e197165a9bfc2b2981c8f91bf5974",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "893fba6588c20b4c0de9b6cb5815ef67bea05b41c7bee789688672fde367e420",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "b9af8bd7837dadd72145b56ad4b2e1fa351c6f74c84bf89ba91c2ae989c1bba5",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "d196c19b4d2316c6f7a1cef6081fec53e4f222fed13f66972e2decfce38f50c1",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "d8ae7277dedfcfda557d6faab0be902862d0597b1ac57c0900bc19082bb7f119",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "489c93ea5e763ba048fdecf89f24d93101b81d2bb2ceee64d79699a39bb61866",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "gpt-5.3",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.3",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "d51182d3fdc84cd9214c3978636b11f6b24e73d8584ecba925862e598105d879",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "6824df663694ff8f84628c18b13b61df31954f2d99864e4cc21a43c8ddae8265",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "ba62a25e7d9c06fff973c37f867622b4d0a1be269562e04a6d987538a7992ddc",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "077206bafe632b163ac12c62ce0112a655e659090e1a1d5afce7501b4ae32e83",
+          "resolved_tone": "Gpt_5_3_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "34303a713ee08472801b6f3421a35121d93ec2700b27e0a63c53da344e395bb9",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "aec3a7caa854ac008b70057f8100dbcab2f684e4854c7f6da3b17238a1fe7c57",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "1b301f3c2c36ab86ec3f6840e78d075cc735a51e4b758efaddc3962601a88cf4",
+          "resolved_tone": "Gpt_5_3_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "gpt-5.3",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "291a6668f05fe214a46a808e7bf394f11a32dfe6e913dd23a9cd06c1995be5dd",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "30faa8c50e40b75bc0aefed8cd9f56c58a89cb6cae35f38bca168c9f175e04e3",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "b5e0a22f9e14096ac481dc9242662ba21c34d1773b930b81b820d11c557b7847",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "7506412441d38f00444a12bb4352262fb3c3dfe09d0ebb4e94093d3d05e29210",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "cd4168d6fd3c0c42d49c0a1acf00e8ea6111031a0343461c748a27632b84721f",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "f6add83b27550ee7b5468339617b416ccb49ee60cddb512762c8c7f167f60065",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "424bbe77c8c9f92f5fa5f5a9e9af5b54563cc481708f36f3d2aaf698cd5360fc",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "gpt-5.4",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "88d7d282f7d05a65e6de15d101de9aa871cdaaf937409a361714fa5c31892225",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "7a5d237817fffdbb4aa25be3cc1f6cd7fc9d9e840d2a258895ab8f799de6f942",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "419d98472fd2458cc968c7a6e006071bcdcdd1783947cd326019aa70c33499ac",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "2d61cbd31b6cda255394eb7932411191afc67b416e11dfe65d0eb8ff1d7cdacd",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "091def36ddc098608003ed65cd9e4504a7edbdf1a9b6fd7d84e35a9bba4793aa",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "c01053b0392da928a7fff560c17fa98c8c0e0fcc9781eb9b3d775287201ad6da",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "201bb4063521f010c51af44d17ec404187465f9ea29400efc853182057a4f514",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "gpt-5.4",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "c5ffb39650764a07c8e40ab723a1d2a2868cc4d3f692df572996ae5bdc8c5a06",
+          "resolved_tone": "Gpt_5_4_Chat"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "gpt-5.4",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "2aa65d695b437d36de22cb6144b2b83361e6333bd072cfcb5e265dbe705fe589",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "f23bf8b67783e42083bcedf2319ed10e0d8fee7d7e28d5aa747daac19482b901",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "a1e9a541851e0bc9f6e73e05709b46c3a574dac8e2e1091b4ae203af72ea3fdf",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "501abbb681bcb9b4e4560e0909e3e3f0674370ba1fc7326eeb92a52b91015562",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "e21c2c99d7e0f475f02bc7f8395d4278e396007e8e381a97dd899b9ee45a8a9b",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "77bbd007ae13bf06663ded7792409ed9af6b39320d8b7a73a285829534d12639",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "6575863d3997e8d8a60757dca41a40020deaba6d96854a14b93c78febd51d8bf",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "gpt-5.4",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "19e4afeaa316af4de48cd195a18da8497b1b38e9a8cbeaeb68978bee22344490",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "7649b950854996164cf4ff33cd1c204e8faf6a6f233346c0bf9c436871160b30",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "0f546e02ec7d679a149106cd90901835505ee8032f4e0dd264c29682c2ef3993",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "4ea555f25e5e65c3c38cc5732f147c2762dacf350debb25cb10892d4261b7425",
+          "resolved_tone": "Gpt_5_4_Chat"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "e7a8174c9e7f703354018cbf578abc4d018ec9b548f377e9591384bd16f38ebd",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "ab729c89c951b0e25693739ca19002c2fe7fad1be0bcc5aa5541a5cd266ec386",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "abfff47bd70744c50e1441c2ebbf7d4ad31ef87bf31256402fe573d58ee6cf65",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "gpt-5.4",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "d5995651bdc56d7634453cfba36fd0d9f514f19fe60d835d19ad6c1458f199e9",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "6cb86a188410da2ec649fa3251897ee528344835357f005ba8640246e57cd21e",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "c6e51915df83c857df325149f6643d3afaaa0795010336165195d9756a85fb84",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "b2dce967e98988e58477b629fee781e17f930057979e9bc9eed9f0f40e7467e1",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "93892ad3bf39a7dc3464f57da39cfd894e048b67233bda0b68639cf5a9e532b6",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "cbc214c9628eb494df5d409f9923527f2eae95f3baf9e53be3d03ce7a4f0642d",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "2ed573e3ff0e082e8050752692ebe959e062966922785cc987faf11953b0347f",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "gpt-5.4-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "0f1037ac1a3a7af2986e8cbbded288c0e96a5ad1a94060cdff94bbfbf483a4e7",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "16a58eeca718600526ffd824422006b89197d2d6cc531b0f1172738b4c7c1aef",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "1873c923ac6576c89013c3fa70238afaf0a8f3a9a5812977ca48c2d796ff7ca2",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "7748c91b7390c0315f992e4c09b1ddde3a0eeaae1b33ca6f4c6906a31fb780fd",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "fe9ab3b2c6e0d15f9f6d74b6ba23a9fa37ee25eec9f676765e662d3d36ecc87e",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "24fbda8904edd291dad049d74f576ccf38772ca8e224c733b480cb09f4ed0af1",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "2b96b0189f518154c85eb8c5be19371f7bba6acc63c7105aecdb729d936c8387",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "gpt-5.4-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "54662573400a0a070f8be1a06aa4f11b643bf84187a15c92bc1915173911c057",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "gpt-5.4-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "c0d6ca90c8a523217ea4d77af68fe58f47005ff963b511407cf27524d48ce4c2",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "d0c6b07ab139d32e66a64ccb4da6d71ee7b0c5a7eb759bbd05d718c4cf6fd161",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "bfea7d779a5df0e25b6184884e8bdccc686adced6a263accfbaf6ac3e19cea91",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "401f0c185dbf00b57a3feaa3b9139c1ccc3a66969917768aa7d47cb248cf250e",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "f9591a7394d317412693a06e67e06cceb5afa756c079b998d3578b48619a08fd",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "ab823b5bb8ce9e1db8fcc768d0c956c5f477126bf6716a3bdf431b6b3fbb387f",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "fc371a81a49d82d0e74fca4a570a9a75a5ec9ea8af28d9df1ebab4f191467284",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "gpt-5.4-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.4-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "b8c2240707e6c8bd24bed3cc2f1ac0a7ed4e1e789e5a7e340250162f8594852d",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "b89202eef8dfbca033f63a1390a9c908a3ef373ce2c041361d81c30377f9c112",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "24dc8050e5813d1cc4ece88279652b317b38db28e44b120517a1677e3462c03c",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "59916641486f660a26633d6c74df194073036101df7e4610d4f9dabd6965d262",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "85ea11fa2a4c81227f3be27024590339c0152b4080d8dd7a047199ca4529a9af",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "ee7778f550213fb7aae11165b723d006e2b5762fe09a81f52afe71ad3139ec1e",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "852d29052d44a7b3e267bc399cd44aeb00c7476a3ea14a5887b83b5e4e7941e7",
+          "resolved_tone": "Gpt_5_4_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "gpt-5.4-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.5-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "2427a13a53e442f8d4f161de9516275f5609249729803042df7cbd1ba5e86929",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "495054bd35591928a3217f1a177018206e5e3d098e66fc8785a36386edf63038",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "f97a0eff042c6c226f4d71b48d374959f1742e64590933d8e0fd7c62fc4d220d",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "ae41e9b7debb2df35c29078fbae751d3bd53ccf41026c81726800e26a4634517",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "a4beafa857c91bbb764d1218727b198f7d75fd07c4ddcdfa0877e4936588a8a3",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "dc339531da3286f1695272924394a0244475afa51cd300625e5b3de300b88942",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "2d19f483b9bf0a6cf51b07adf2dabc7991686945ceee17aed1548389728c9ac3",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "gpt-5.5-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.5-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "c563d204cc825108305f54ec0868cfd948d39040b4bff76d547e797b83056e0e",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "acd3ffc82b468ab901a7eecd31a50b742c2fff43742b6cb9a1126cfa73068037",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "79c2b192d7ac98a56c658dc2b74cae0e3edd853c8ee82244f6a40807d8d9d7fc",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "bac4b57c447d19f59852c9e6a936269d254ecbff48e9b40acb3720cfd4be685d",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "ec2a4d84212b8c4a13c5e3567c01a010faa2c4f07b9fb5ca89889636cf38d282",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "3e1f5b78d9bc78bec709adb539314587ed81a622104763e0cb0d5e6a1b15ce4c",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "7767d7770be4c65b2c9b189e60e46974a030e6d6afe2f5acae203bd739881302",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "gpt-5.5-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.5-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "3a28250d6c52d472b440ae259940d028649031b56ab6ddd237818ac5f98e6d0c",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "gpt-5.5-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.5-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "04ab8c9f34f631295dcab5a5e4795fbd2cdcd1291a89a1da6a7e06bec85a1beb",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "abc76381af47a796b700f37ef85709f2172166c70fe78eaa393bd50fe4f11c85",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "cad5fe74301f9806ffe6c29416dd8058b8df73cbd962f7707c5696d34905e252",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "ae3a85240b3cc6c2b366c98575ad8b9dd7b7d193fedc2d3a4e5ac94fe0893541",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "989b342b30eefc333580ab4b932bee10631413bcce55ac9e6f62941918044266",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "f64b9a165dc1110adfbc8453adf27ff4a69a245b76523675cbf1323a6884b6c9",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "51b219695da2e0651da96794f15dc7d9df9c12e4ccbc1f984516b97102d3be7c",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "gpt-5.5-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "gpt-5.5-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "1e4524ff4de0887471cb6f35c831dc501bf87628351ba6578f564e3cf2426b41",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "bd7e608d3547d562496e2917a2af76514005ac47ca59cae9f999c0c6ce781055",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "99d19f21c3955ecee34dea14c646b146f5a620e57d9c9406db398712fb0f6db5",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "c2dc53c91b2faf138d81f2b9b893dcf53621dc92882ce5f3ef5c38efb17e2015",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "c639366921a63bbaf37e6c80f569901c53cb14156e40bd1bbaae5077f499e2ed",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "254ca3efcaf6d675aef115ec75ceb84842789fc71affe9a57d0a2f6d69a34a46",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "f728771df482b3d2baaa7417e4d2c61715277232fae0ec411f4f8d506f230c86",
+          "resolved_tone": "Gpt_5_5_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "gpt-5.5-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "4362eb2de2952ccde342ac0ee9854fc50768ea71dfc847b2bfe1c6065524b7c5",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "0e1645822003c7febf28cdb44f848d5e823ca811f33b66a936303e51fe639404",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "ec884e1d368d541048617f36c705f87f89ce9df8f09e3a475a16995b57599a0d",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "1e2fa5efcc38bc128fe0870ae943f1f790e30b4ad1f186544e6db85b9b9decb4",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "2126e80a517761d07e8ffe4b04c5ec6848e35bcc55afaabe66f0ba1885367d56",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "c4f277d2043392d625fe0e7fa7fdb3982fe4accb038173c2db428d764ea1d83e",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "b4bf9489b42be81b2a8e8203e2033d35994adac9619ad7640eecfd36d5b6c2da",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "claude-sonnet",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "8bfcacf7bd6df5275ab392c9518ecc829ee95550d5283d002b425b2e9863c95d",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "4b152292aedb544a7768040d08904f4522d6745ef81c183ffc304747c36e5477",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "ce7e5e522caf94a0eb1146032137fd87c1eb51b54ed5f96a6387609394f7199b",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "843ee64ee706011009b9ab6903e086c2389b3e4c620403820f6b7af9d1c8ffbe",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "9c6822e8ec014e48f06a01be3586cddf8311de4fe45dbffda44062e8cbf449d6",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "37e9cde77265450652bac654f6ec4129ee5b136ac9f1d91346095d7bc92eb6c9",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "f8ef00e7efad4694b5e2c9a4b90b81650d15c9579dff0b02dba14f87efc2df71",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "claude-sonnet",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "14b0027c31ff2b2e8ed6bc0dd8424dadf05f95903b2e9af020880d0103ce0878",
+          "resolved_tone": "Claude_Sonnet"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "claude-sonnet",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "33b0c5d622041b822e76eb5b441a7d049d3738f4c7bb8cadbf4e39dc366379a8",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "ea581dbb894d38f97d7526b4cf84f770f33d982e0aa70414134a52452bc1d767",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "b62a8c5fdff7259fdd956cb2e2bb996d05aaf153cdfd09c6527603dbaedf0ba8",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "a9035515018b466f1293742dd695a1f9beabaf81ffcdac31a6721eed7e72b602",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "96b147c33acc333b85c90c52a86d0045003df4388a31bd54f6091002a7ad5a27",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "c28aca72bf08600e7ae528c5e50770243bceca8cf7369fcfd3d0855a5f70b36a",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "d8898aa82360aabf53165d0e668d34c7d678f4a0f8d7bd1cf5efd77bed59b4bb",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "claude-sonnet",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "eac818e87a9742a6aefd6688ec1cc6a7f53ac22312c4cdedde1f279c7db113d5",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "62c6f69b3dc42ee8b0da76da16d69f1b7786de6a27fe1ed9607d4e41f0c0dbaa",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "83a11770c652fffed1a521018189605d6e8da8a29aad05ae921b6635d6673400",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "8bc4ac6e3484172e50938d4338eebdf3a6e21c0537491d6eaa941841c227abac",
+          "resolved_tone": "Claude_Sonnet"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "3ae7ced2f6326add8c64f9e50cafb04ae0ef12afbb8ec4cfa7b665b43b403509",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "515874faf54705d19508aae604871b67bf30aa60ce64a2bb1418e619b2f01038",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "9d1134a528908293b59b08c44f752399abd94833dc99ddc9da6f26558dc9384c",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "claude-sonnet",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "cabec0b064e63e216b73a37aee95e82f8283a0122b42ed588a44da8c5e86e3e2",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "5f80c47ee4da6db37d0af99d74056979fb2a4416950014c074e11da620a32552",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "2fc50a7d0adf054fc12a5ce66a4c57d28a16abc1dea224e56e655ef84c29e934",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "f868dadad93268822dc18fe8a3e7b312f6815f2a340af33c8ae6cdaf7d418df5",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "4114e9f24a86a36b8fa44fd6cdd98fe92802fe9506b9f54ff2c30d103e506289",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "338dd5f1fc03b36c8d44c185d5b457d1a89c66f994461450af2c7301bf2634a3",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "8deaa94f2c804dce03cacf6594661555ec245d8b20621fb6a687da03685a9e19",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "claude-sonnet-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "e382bff29479d94ae45f21014be5982e752207f40b5e58ccd8fe2fb577abf5f6",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "bf818da82b973e4466c2eb4cc9db8523955bf190e2a19cd7d25a3d7a62f142ca",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "967979aea76e94f4132208295cf84380f2c7da98b2fdc210e9d9123c5786c1bf",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "bae20fe2b9f99e7f5fe68cd99c282c56b8e5e0277fd724a8ad4531b3d71ed800",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "0a5bcda1eb4df80e1113472d75a63e833c10348cfe9ca6c581aba06297046f9d",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "755a20945989c0954bd990f5531457d1b8612f7b9e949c6acf3caebc7e1ba846",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "993f92eb97eaca1c95faadb98257efb81fee3c0f631f4243b8432ddabdf53a46",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "claude-sonnet-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "1982577bd736d1b203437ca7e415916d446f988219c2dd223b435630ffeb1f21",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "claude-sonnet-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "3deade0b1605dffb50c6155515c599e799ee58dffc7e1eba087356b414faa0db",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "e5c1c8de7cc7519fe445ada6ee57f24052946b2007f3b5d69fd2cb56f1359f90",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "8cb9e434fe4ed7a1f776f47e654b131c3cefcf0ba8752aadb666f25bc0a61820",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "03bec757a23576919f31b95a463059192e1f70914287e16ca32ea71695945271",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "e2b2f96575076160ed79f5fd42bd2d8a5f86d6ffc830e07a881808007e901841",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "6a23f67018cbf5749857b827077c4cb21df48bf9330056b7b8d00d2efe3acc3a",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "390f7045191a5fb7d42fd4d661f3ce8887518380226e160b64614f14001ff6a6",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "claude-sonnet-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "claude-sonnet-reasoning",
+      "classification": "VERIFIED",
+      "configured_mapping": false,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "92c0ec2ed5ac26fc43fb9b27d8c0546fd1374f30366a98e149f17d10965848de",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "75533bd2c41e62cb9984a34b267c5f6072544c627b1332d3a1267b2bdeb3de71",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "d3f7752573fecd5631a5bb21b40b42d2fb2bf738b4dec8e06b599ec8623c7c5b",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "4ce8a636b6804d1e9f04c64e5fc962326e95ac9a838a60890b8c9c45753b1556",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "da22d7e8746a1df77e1b02f3e5093bb79e2414279a5b25913068339ea6a326bf",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "c3cb85b7738abc5f937a521f44b4b47d5fa88ec34f2457a98ddf514f8b94e0bd",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "712542287a618c8c6fb17ae4bda2710d76964712b38e1c4072352c2b7a13d9e6",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "claude-sonnet-reasoning",
+      "route_kind": "legacy_direct"
+    },
+    {
+      "canonical_route": "existing-microsoft-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "694f41ddda47439c35535d15308d8ab5e645772a6093312d6fa1cb4653f2edaa",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "667b174a2f7f61bfbb9e515ccb487aa6f40cb1b8b3f29d546ec3bf744162c32b",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "5fb2d1db89d9f170f4173eaed3b5461803843bd9e41422f834fdfaca112b28bd",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "135a31fb4da21846c2701c69075dd6fff6c138edbb40f303dcb6e918f30266b5",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "234310addec103bd2e0aeee280424887ec1e6407dd850f46a7cf9600cbe937b7",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "8b2d89f701dcf2b590b9cdb93fb24535492139d16db392333a21eb7ce642605e",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "91cb1db43bdbe141fa65da062df8da7606623303848ad3192d1cd19458046440",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "existing-microsoft-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-microsoft-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "24f6bc11fa326afe475a7716259bba9fd505c25c8a48c763b940237c0d42c73c",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "204b0497aaff448e6a7c5b0da850371bde3d38e6baa27425fc368c80b4f4896b",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "7c3798258131ebadb08a147771751d23880599962fd038a5db558f89e3508586",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "e01117dcbe3e4edfd4fe01cff98b4d6ff906005fd12aafe08ec75acfe2709ac8",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "225c70560dd09d4287294a3c4b31dc8ac3ee001f4fcc14dff20856698ff2301e",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "ce8056830ceb9c49fc707828633d4816f163027236b750fa91bc79cb62d1781a",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "d8b9316caeeac735291fe9afb293d920fc9acec97efe529d6d646d8096d368e8",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "existing-microsoft-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-microsoft-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "86ba8139ed888e5ab574dc6ed5a68255bcc9f938c2e0d3faa21eb06ea4933c5d",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "existing-microsoft-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-microsoft-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "d7774955a2eed36dc82d2feb24f0d08bbec6544e1b8bb29e012c809e47480315",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "60b2c58c0064c170e2c1b40c7c4b4218f91959ece93762e797f44accb4833a97",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "09ee6fe01f7ffea3e57300cea8f6febec7d43020b18e0d59be781f334b788cb2",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "ff2a07a1d0399bf3ab94ce95831be52ec24eb788424976fe5c4feb0b2cdf97ea",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "c9c118fff9761e8ca08107512e339fca44a45c14235071dcbd03e5c3a1ca2196",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "77e41849b491aa3d68e81db0a4afbde897b1f5c63f857df65753f539fd8222bc",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "590d1382170228c2b01a68c7570ec0b526a166bcaf265ab3222f69a7888005dd",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "existing-microsoft-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-microsoft-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "461419bd552f686e6caabc77afc95d2e2f272ea4cdb6445a7d8ec54a2018c3dc",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "a6fc87a18f7f4ca5dfd66f99cd9e0c340ba0762f8c3123533788c1034cc5d8ba",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "aee968423ce6c91477c58eb5b803ab5fccb28240cb453b404f325cbab8ee6d00",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "4f2ef8419776258797ffed481eef4131f29703e5c14d2c82e334c1dedcf4f395",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "c88b8e9c0542f42557be12facfc4c474fcdd4309139f51d01c28febe30abd9b6",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "15d484e3f5715dffdb5845c683b5a4a8e7e508e5c017ada3b2105f3845525af4",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "6ec4f857731e026d700494e37495093616a50a1d650bed2cf4e8467d7ccf42c5",
+          "resolved_tone": "Gpt_5_6_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "existing-microsoft-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-claude-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "4bbaaed46c4a951c85d4fecd4e697f235b875778fc1b1ee34b1304500c17fd77",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "d593faeb781e791e39fb9dd030c55bd7b565eb366585a008d58dbfad9fee65a0",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "bfe7ea1e615f2365e33548e10a5acaa9de3acf8a03d9fa3470eddb594dcf028a",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "f2b1c99d5b9d25365678fe52b2d4efd44b26afc62e346d8294cb45abc2258d77",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "f562d3bb51386c612a58e7a92addcbe98c5d98375a250a954a5c3a9ac3f83e89",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "90e4220f69d890b197a160968023f23cd932c1af7afce3e7b22d5030c25f839c",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "f3cf1c34b63f5bb85ddc312e4586454963659b373aa60240a421af567e830a11",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/chat/completions",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "openai_chat_completions_nonstream",
+      "requested_model": "existing-claude-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-claude-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "fa00485ca5b7c809cffda35a220355646bac38d977806fabf96879d484d5b7fd",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "ea6d755f9df79cf70be7dc9e988718454ac2f4dc960a6128cfdbf2f10b92ef1b",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "444f374dc9e2a8fad6908baf116d95a7c83b9ad34c499c0a42b7f52a7e532d08",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "b8fb9ef70b87729fe72857594750f5a494995dd2a3ebb04a40ce30252b47c30e",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "164d63c599d3ed19f857c9c27018446f24a08983222059c1b7b8db40b51f076f",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "ab47af61f4283308595590886334b6a8e9d0e800b6e1b1640cafb41a849c53e5",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "2722dc46397be9854c49cec7602d45844a6fafaf17eb34934095f84434b58fd3",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/responses",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "openai_responses_nonstream",
+      "requested_model": "existing-claude-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-claude-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "4913e75bb4b009029ab1577138fa3e0c7c262871f84490b37a9488aed88e53be",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/v1/messages",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "anthropic_messages_nonstream",
+      "requested_model": "existing-claude-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-claude-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "3f22926eda8522f4e1e2e50843d59dbf0f9b1cd2aa0deaa4641781f43bb5c1fa",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "5866cc1ad6f3cc54405e4087ddc0d449bc408595f723bc0f672e08acb47fd001",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "d6414fe4258cc439bb75aa18164b8724b4fe2d85853778af2809f35fe75b4ffd",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "47433ac9f7f4daaebf3f019c56983cfccefd7fcecb9b3c5f05cf734d431c1759",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "c0c4be525685477ed1ccaa1255b6ed351b70c01675fdee1622c5d796c31ed061",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "a5d09ce41cd941e31006ffe1f8c11daa6f15e4c2151f47ef1eb64ff67a9a567b",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "2397cf1dbf9e62b8e22123b73f9f26f8e2ca3f5180207942b191c177508454d9",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "legacy_chat_nonstream",
+      "requested_model": "existing-claude-route",
+      "route_kind": "configured_mapping"
+    },
+    {
+      "canonical_route": "existing-claude-route",
+      "classification": "VERIFIED",
+      "configured_mapping": true,
+      "effort_observations": [
+        {
+          "effort": "omitted",
+          "observation_sha256": "af4312204489a78d611f54aea5742fde30f8c90fb4eb0a4bfdbc61c1a017194d",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "none",
+          "observation_sha256": "b812a54945c5ea196d5a8483200f71e7e868e7ed7a55f5bd20be9f4e259087f6",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "minimal",
+          "observation_sha256": "2d8e7de5449423efae71d836c418f32ee90643655c60ec9045ca239005ddfc39",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "low",
+          "observation_sha256": "30128b656bb515201e7fde5fc101bdf7dc9ebf5ca66e9e7f82a967f6d214b192",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "medium",
+          "observation_sha256": "8666bf0268f9cb912a988a6b33ab5686bbd914a56e28de6e829a4885bb6dda87",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "high",
+          "observation_sha256": "8f5c3f04a1d13f70294a7dca5e00ed1ed910e42a74e7c00b10ce5e6cccdc3ce8",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "observation_sha256": "a61624177c45115ef3de59b7ca928a952ff32df2830853d65039669fe6060646",
+          "resolved_tone": "Claude_Sonnet_Reasoning"
+        }
+      ],
+      "endpoint_path": "/api/chat/stream",
+      "owner": "anthropic-via-microsoft-365",
+      "protocol": "legacy_chat_stream",
+      "requested_model": "existing-claude-route",
+      "route_kind": "configured_mapping"
+    }
+  ],
+  "payload": {
+    "base64": {
+      "bytes": 125541,
+      "sha256": "a259dcaa39d2d159cc61d4b29e35f772d1a9919c28defc7dfb4986686f23b626"
+    },
+    "encoding": "base64(gzip-n-9(json))",
+    "gzip": {
+      "bytes": 94155,
+      "sha256": "dd5026b32d8e123ac8051e01be06d6c2c05320adca44e0b1fef424c01bd74acf"
+    },
+    "json": {
+      "bytes": 1615986,
+      "sha256": "b9022595697b4db99c16573ded7a39e763e79ac5ed247ef37491da42152adf1b"
+    },
+    "json_schema": "m365-wp2-legacy-configured-evidence-set/v1",
+    "path": "evidence-set.json.gz.b64"
+  },
+  "public_http_evidence": {
+    "entrypoint": "Server.Routes",
+    "per_key_restricted_any": false,
+    "request_id_observed_all": true,
+    "security_headers_observed_all": true
+  },
+  "records": 315,
+  "schema": "m365-wp2-legacy-configured-evidence-index/v1"
+}
