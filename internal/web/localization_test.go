@@ -67,11 +67,9 @@ func TestAdministrationTemplatesUseTaiwanTerminology(t *testing.T) {
 				t.Errorf("%s contains removed multi-account surface %q", path, phrase)
 			}
 		}
-		if path == "web/debug.html" {
-			for _, forbidden := range []string{"scalar 正文", "request headers", "Snapshot expires", "Request ID", ">Protocol<", ">Route<"} {
-				if strings.Contains(text, forbidden) {
-					t.Errorf("%s contains untranslated label %q", path, forbidden)
-				}
+		for _, required := range []string{`id="languageSelector"`, `value="en"`, "translations"} {
+			if !strings.Contains(text, required) {
+				t.Errorf("%s missing bilingual UI marker %q", path, required)
 			}
 		}
 	}

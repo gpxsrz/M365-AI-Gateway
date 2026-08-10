@@ -140,6 +140,9 @@ func (c *Client) privateModeEnabled() bool {
 }
 
 func webSocketDialFailure(status int, err error) error {
+	if status == http.StatusTooManyRequests {
+		return &RateLimitError{StatusCode: status, Err: err}
+	}
 	if status > 0 {
 		return fmt.Errorf("ws dial failed: HTTP %d: %w", status, err)
 	}

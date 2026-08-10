@@ -71,6 +71,7 @@ type Server struct {
 	artifacts           *artifactStore
 	artifactFetch       *artifactFetchClient
 	mcp                 *mcp.Server
+	compatTraffic       *compatibilityTrafficController
 }
 
 func newConfiguredChatHubClient(settings *settingsStore) *chathub.Client {
@@ -132,6 +133,7 @@ func New() (*Server, error) {
 		settings:            settings,
 		catalogEvidence:     catalogEvidence,
 		artifactOrigin:      artifactOrigin,
+		compatTraffic:       newCompatibilityTrafficController(),
 	}
 	server.mcp = server.newMCPRuntime()
 	if err := server.configureArtifactService(); err != nil {
@@ -173,7 +175,11 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/conversations", s.conversations)
 	m.HandleFunc("/api/conversations/delete", s.deleteConversation)
 	m.HandleFunc("/v1/models", s.openaiModels)
-	m.HandleFunc("/v1/chat/completions", s.openaiChat)
+	m.HandleFunc("/v1/chat/completions", s.interactiveOpenAIChat)
+	m.HandleFunc("/hermes/v1/models", s.openaiModels)
+	m.HandleFunc("/hermes/v1/chat/completions", s.hermesOpenAIChat)
+	m.HandleFunc("/memory/v1/models", s.openaiModels)
+	m.HandleFunc("/memory/v1/chat/completions", s.memoryOpenAIChat)
 	m.HandleFunc("/v1/responses", s.responses)
 	m.HandleFunc("/v1/messages", s.anthropicMessages)
 	m.HandleFunc("/v1/images/generations", s.imageGenerations)
@@ -191,7 +197,7 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/v1/") {
+		if strings.HasPrefix(r.URL.Path, "/v1/") || hermesCompatibilityRequest(r.URL.Path) || memoryCompatibilityRequest(r.URL.Path) {
 			if _, artifact := artifactCapabilityToken(r.URL.Path); artifact {
 				next.ServeHTTP(w, r)
 				return
@@ -990,6 +996,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[req-trace] id=%s stage=prompt_flattened prompt_len=%d attachments=%d", requestID, len(prompt), len(body.Attachments))
 	log.Printf("[multimodal-entry] messages=%d attachments=%d prompt_len=%d", len(body.Messages), len(body.Attachments), len(prompt))
 	prompt = strings.TrimSpace(prompt)
+	if memoryCompatibilityRequest(r.URL.Path) {
+		prompt += memorySchemaInstruction(responseFormat)
+	}
 	if prompt == "" && len(body.Attachments) == 0 {
 		http.Error(w, "messages required", http.StatusBadRequest)
 		return
@@ -1635,6 +1644,30 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 
 	if responseFormat != nil {
 		formatted, formatErr := validateResponseFormatText(res.Text, responseFormat)
+		if formatErr != nil && memoryCompatibilityRequest(r.URL.Path) && responseFormat.Type == "json_schema" {
+			if _, candidateErr := decodeExactJSONValue([]byte(normalizeJSONText(res.Text))); candidateErr == nil {
+				repairPrompt := memorySchemaRepairPrompt(res.Text, responseFormat, formatErr)
+				repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone}))
+				if repairErr != nil {
+					if writeCanonicalTerminalError(w, repairErr) {
+						return
+					}
+				} else {
+					execution.Observe(repairRes)
+					if repaired, repairedErr := validateResponseFormatText(repairRes.Text, responseFormat); repairedErr == nil {
+						if factErr := memoryRepairPreservesFacts(res.Text, repaired); factErr == nil {
+							res = repairRes
+							formatted = repaired
+							formatErr = nil
+						} else {
+							formatErr = factErr
+						}
+					} else {
+						formatErr = repairedErr
+					}
+				}
+			}
+		}
 		if formatErr != nil {
 			writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "response_format_validation_failed", formatErr.Error())
 			return

@@ -77,6 +77,47 @@ func TestAdminSettingsHTTP(t *testing.T) {
 	}
 }
 
+func TestAdminSettingsHTTPPartialPUTPreservesNewCompatibilityFields(t *testing.T) {
+	st := &settingsStore{path: filepath.Join(t.TempDir(), "settings.json"), v: defaultRuntimeSettings()}
+	before := st.get()
+	s := &Server{settings: st}
+	r := httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewBufferString(`{"chatMode":"normal"}`))
+	w := httptest.NewRecorder()
+	s.adminSettings(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("partial PUT=%d %s", w.Code, w.Body.String())
+	}
+	got := st.get()
+	if got.ChatMode != chatModeNormal || got.MemoryMaxConcurrent != before.MemoryMaxConcurrent || got.MemoryBackoffInitialSeconds != before.MemoryBackoffInitialSeconds || got.HermesCompatibilityEnabled != before.HermesCompatibilityEnabled {
+		t.Fatalf("partial PUT did not preserve compatibility fields: before=%#v after=%#v", before, got)
+	}
+}
+
+func TestAdminSettingsHTTPInvalidUpdateDoesNotClearCheckpoints(t *testing.T) {
+	checkpoints := openCheckpointForTest(t)
+	turn := beginFullForTest(t, checkpoints, "chat-completions", "owner", "session", []oaiMsg{{Role: "user", Content: "hello"}})
+	acceptForTest(t, turn, "conversation", "session", []oaiMsg{{Role: "assistant", Content: "hi"}}, "")
+	before := checkpointViewsForTest(t, checkpoints)
+	if len(before) != 1 {
+		t.Fatalf("checkpoint setup=%d", len(before))
+	}
+	st := &settingsStore{path: filepath.Join(t.TempDir(), "settings.json"), v: defaultRuntimeSettings()}
+	s := &Server{settings: st, checkpoints: checkpoints}
+	invalid := st.get()
+	invalid.ChatMode = chatModeNormal
+	invalid.MemoryMaxConcurrent = 0
+	body, _ := json.Marshal(invalid)
+	r := httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.adminSettings(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid update=%d %s", w.Code, w.Body.String())
+	}
+	if after := checkpointViewsForTest(t, checkpoints); len(after) != len(before) {
+		t.Fatalf("rejected settings update changed checkpoints: before=%d after=%d", len(before), len(after))
+	}
+}
+
 func TestAdminSettingsHTTPPreservesNonUIPlanningMode(t *testing.T) {
 	st := &settingsStore{path: filepath.Join(t.TempDir(), "settings.json"), v: defaultRuntimeSettings()}
 	st.v.ToolPlanningMode = "native"

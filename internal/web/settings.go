@@ -36,28 +36,35 @@ const (
 )
 
 type runtimeSettings struct {
-	ChatMode            string         `json:"chatMode"`
-	TextInputLimitUTF16 int            `json:"textInputLimitUTF16"`
-	MaxToolCallsPerTurn int            `json:"maxToolCallsPerTurn"`
-	MaxToolRounds       int            `json:"maxToolRounds"`
-	ContextWindow       int            `json:"contextWindow"`
-	MaxOutputTokens     int            `json:"maxOutputTokens"`
-	ChatTimeoutSeconds  int            `json:"chatTimeoutSeconds"`
-	ImageTimeoutSeconds int            `json:"imageTimeoutSeconds"`
-	LogLevel            string         `json:"logLevel"`
-	DebugLogPath        string         `json:"debugLogPath"`
-	ListenAddress       string         `json:"listenAddress"`
-	ConfigPath          string         `json:"configPath"`
-	TokenCachePath      string         `json:"tokenCachePath"`
-	SessionCachePath    string         `json:"sessionCachePath"`
-	OutboundProxy       string         `json:"outboundProxy"`
-	ProxyPool           []string       `json:"proxyPool,omitempty"`
-	ClientID            string         `json:"clientId"`
-	Authority           string         `json:"authority"`
-	RedirectURI         string         `json:"redirectUri"`
-	Scope               string         `json:"scope"`
-	ModelMappings       []modelMapping `json:"modelMappings"`
-	ToolPlanningMode    string         `json:"toolPlanningMode"`
+	ChatMode                     string         `json:"chatMode"`
+	HermesCompatibilityEnabled   bool           `json:"hermesCompatibilityEnabled"`
+	MemoryCompatibilityEnabled   bool           `json:"memoryCompatibilityEnabled"`
+	MemoryMaxConcurrent          int            `json:"memoryMaxConcurrent"`
+	MemoryQueueTimeoutSeconds    int            `json:"memoryQueueTimeoutSeconds"`
+	HermesPriorityHoldoffSeconds int            `json:"hermesPriorityHoldoffSeconds"`
+	MemoryBackoffInitialSeconds  int            `json:"memoryBackoffInitialSeconds"`
+	MemoryBackoffMaxSeconds      int            `json:"memoryBackoffMaxSeconds"`
+	TextInputLimitUTF16          int            `json:"textInputLimitUTF16"`
+	MaxToolCallsPerTurn          int            `json:"maxToolCallsPerTurn"`
+	MaxToolRounds                int            `json:"maxToolRounds"`
+	ContextWindow                int            `json:"contextWindow"`
+	MaxOutputTokens              int            `json:"maxOutputTokens"`
+	ChatTimeoutSeconds           int            `json:"chatTimeoutSeconds"`
+	ImageTimeoutSeconds          int            `json:"imageTimeoutSeconds"`
+	LogLevel                     string         `json:"logLevel"`
+	DebugLogPath                 string         `json:"debugLogPath"`
+	ListenAddress                string         `json:"listenAddress"`
+	ConfigPath                   string         `json:"configPath"`
+	TokenCachePath               string         `json:"tokenCachePath"`
+	SessionCachePath             string         `json:"sessionCachePath"`
+	OutboundProxy                string         `json:"outboundProxy"`
+	ProxyPool                    []string       `json:"proxyPool,omitempty"`
+	ClientID                     string         `json:"clientId"`
+	Authority                    string         `json:"authority"`
+	RedirectURI                  string         `json:"redirectUri"`
+	Scope                        string         `json:"scope"`
+	ModelMappings                []modelMapping `json:"modelMappings"`
+	ToolPlanningMode             string         `json:"toolPlanningMode"`
 }
 
 type settingsStore struct {
@@ -74,10 +81,30 @@ func envInt(name string, fallback int) int {
 	}
 	return fallback
 }
+
+func envNonNegativeInt(name string, fallback int) int {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback
+	}
+	n, e := strconv.Atoi(strings.TrimSpace(raw))
+	if e == nil && n >= 0 {
+		return n
+	}
+	return fallback
+}
 func defaultRuntimeSettings() runtimeSettings {
 	return runtimeSettings{
-		ChatMode: chatModePrivate, TextInputLimitUTF16: defaultTextInputLimitUTF16,
-		MaxToolCallsPerTurn: envInt("M365_MAX_TOOL_CALLS_PER_TURN", 2), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 16),
+		ChatMode:                     chatModePrivate,
+		HermesCompatibilityEnabled:   true,
+		MemoryCompatibilityEnabled:   true,
+		MemoryMaxConcurrent:          envInt("M365_MEMORY_MAX_CONCURRENT", 2),
+		MemoryQueueTimeoutSeconds:    envInt("M365_MEMORY_QUEUE_TIMEOUT_SECONDS", 60),
+		HermesPriorityHoldoffSeconds: envNonNegativeInt("M365_HERMES_PRIORITY_HOLDOFF_SECONDS", 30),
+		MemoryBackoffInitialSeconds:  envInt("M365_MEMORY_BACKOFF_INITIAL_SECONDS", 5),
+		MemoryBackoffMaxSeconds:      envInt("M365_MEMORY_BACKOFF_MAX_SECONDS", 60),
+		TextInputLimitUTF16:          defaultTextInputLimitUTF16,
+		MaxToolCallsPerTurn:          envInt("M365_MAX_TOOL_CALLS_PER_TURN", 2), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 16),
 		ContextWindow: envInt("M365_CONTEXT_WINDOW", 128000), MaxOutputTokens: envInt("M365_MAX_OUTPUT_TOKENS", 16384),
 		ChatTimeoutSeconds: envInt("M365_CHAT_TIMEOUT_SECONDS", 120), ImageTimeoutSeconds: envInt("M365_IMAGE_TIMEOUT_SECONDS", 150), LogLevel: firstNonEmptySetting(os.Getenv("M365_LOG_LEVEL"), "info"),
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
@@ -134,6 +161,21 @@ func firstNonEmptySetting(values ...string) string {
 func validateSettings(v runtimeSettings) error {
 	if v.ChatMode != chatModePrivate && v.ChatMode != chatModeNormal {
 		return fmt.Errorf("聊天模式必須為 private 或 normal")
+	}
+	if v.MemoryMaxConcurrent < 1 || v.MemoryMaxConcurrent > 16 {
+		return fmt.Errorf("Memory 同時請求上限必須為 1-16")
+	}
+	if v.MemoryQueueTimeoutSeconds < 1 || v.MemoryQueueTimeoutSeconds > 600 {
+		return fmt.Errorf("Memory 排隊逾時必須為 1-600 秒")
+	}
+	if v.HermesPriorityHoldoffSeconds < 0 || v.HermesPriorityHoldoffSeconds > 300 {
+		return fmt.Errorf("Hermes 優先保留時間必須為 0-300 秒")
+	}
+	if v.MemoryBackoffInitialSeconds < 1 || v.MemoryBackoffInitialSeconds > 300 {
+		return fmt.Errorf("Memory 初始退避必須為 1-300 秒")
+	}
+	if v.MemoryBackoffMaxSeconds < v.MemoryBackoffInitialSeconds || v.MemoryBackoffMaxSeconds > 3600 {
+		return fmt.Errorf("Memory 最大退避必須大於等於初始退避且不超過 3600 秒")
 	}
 	if _, err := requestBodyLimit(v.TextInputLimitUTF16); err != nil {
 		return err
@@ -235,21 +277,26 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		cfg := s.settings.get()
-		jsonOut(w, map[string]any{"settings": cfg, "codexModels": managementRouteIDs(cfg.ModelMappings), "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
+		traffic := compatibilityTrafficSnapshot{}
+		if s.compatTraffic != nil {
+			traffic = s.compatTraffic.snapshot()
+		}
+		jsonOut(w, map[string]any{"settings": cfg, "compatibilityTraffic": traffic, "codexModels": managementRouteIDs(cfg.ModelMappings), "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
 	case http.MethodPut:
-		var v runtimeSettings
+		current := s.settings.get()
+		v := current
 		if json.NewDecoder(r.Body).Decode(&v) != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", "JSON 格式錯誤")
 			return
 		}
-		// Tool planning is an internal compatibility setting, not an admin UI
-		// control. Preserve its current value when the browser submits the visible
-		// settings form.
 		if strings.TrimSpace(v.ToolPlanningMode) == "" {
-			v.ToolPlanningMode = s.settings.get().ToolPlanningMode
+			v.ToolPlanningMode = current.ToolPlanningMode
+		}
+		if e := validateSettings(v); e != nil {
+			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
+			return
 		}
 		s.checkpointLifecycle.Lock()
-		current := s.settings.get()
 		var e error
 		if current.ChatMode != v.ChatMode && s.checkpoints != nil {
 			e = s.checkpoints.Clear()

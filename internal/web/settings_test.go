@@ -19,6 +19,13 @@ func parallelRawToolForTest(function map[string]any) chathub.Tool {
 	return chathub.Tool{Type: "function", Function: definition}
 }
 
+func TestHermesPriorityHoldoffEnvAcceptsZero(t *testing.T) {
+	t.Setenv("M365_HERMES_PRIORITY_HOLDOFF_SECONDS", "0")
+	if got := defaultRuntimeSettings().HermesPriorityHoldoffSeconds; got != 0 {
+		t.Fatalf("holdoff=%d", got)
+	}
+}
+
 func TestLimitToolCalls(t *testing.T) {
 	calls := []detectedToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}}
 	got := limitToolCalls(calls, 1)

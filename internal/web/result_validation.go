@@ -111,6 +111,12 @@ func writeCanonicalTerminalFailure(w http.ResponseWriter, terminal chathub.Termi
 }
 
 func writeCanonicalTerminalError(w http.ResponseWriter, err error) bool {
+	var rateLimit *chathub.RateLimitError
+	if errors.As(err, &rateLimit) {
+		w.Header().Set("Retry-After", "1")
+		writeOpenAIErrorCode(w, http.StatusTooManyRequests, "rate_limit_error", "upstream_rate_limited", "Microsoft 365 Copilot is temporarily rate limited")
+		return true
+	}
 	var terminal *chathub.TerminalError
 	if !errors.As(err, &terminal) {
 		return false
@@ -119,6 +125,14 @@ func writeCanonicalTerminalError(w http.ResponseWriter, err error) bool {
 }
 
 func writeCanonicalTerminalStreamError(w http.ResponseWriter, err error) bool {
+	var rateLimit *chathub.RateLimitError
+	if errors.As(err, &rateLimit) {
+		if tracker, ok := w.(interface{ setOutcomeStatus(int) }); ok {
+			tracker.setOutcomeStatus(http.StatusTooManyRequests)
+		}
+		writeChatStreamError(w, "upstream_rate_limited", "Microsoft 365 Copilot is temporarily rate limited")
+		return true
+	}
 	var terminal *chathub.TerminalError
 	if !errors.As(err, &terminal) {
 		return false

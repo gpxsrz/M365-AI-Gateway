@@ -28,6 +28,28 @@ type TerminalState struct {
 	MessageType    string `json:"messageType,omitempty"`
 }
 
+type RateLimitError struct {
+	StatusCode int
+	Err        error
+}
+
+func (e *RateLimitError) Error() string {
+	if e == nil {
+		return "ChatHub rate limited"
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("chathub rate limited: HTTP %d: %v", e.StatusCode, e.Err)
+	}
+	return fmt.Sprintf("chathub rate limited: HTTP %d", e.StatusCode)
+}
+
+func (e *RateLimitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type TerminalError struct {
 	State TerminalState
 }

@@ -25,6 +25,7 @@ type checkpointRequestControl struct {
 	ParentID   string
 	ResponseID string
 	ForceNew   bool
+	Untracked  bool
 }
 
 type checkpointRequestContextKey struct{}
@@ -193,6 +194,17 @@ func (s *Server) beginOpenAICheckpoint(ctx context.Context, body *oaiReq, valida
 	control := checkpointRequestFrom(ctx)
 	if control.Namespace == "" {
 		control.Namespace = "chat-completions"
+	}
+	if control.Untracked {
+		if validateOutbound != nil {
+			if err := validateOutbound(body.Messages); err != nil {
+				return nil, err
+			}
+		}
+		body.ConversationID = ""
+		body.SessionID = ""
+		body.SessionKey = ""
+		return &publicCheckpointTurn{}, nil
 	}
 	owner := apiKeyOwnerFromContext(ctx)
 	var (

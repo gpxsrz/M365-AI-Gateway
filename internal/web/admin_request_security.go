@@ -269,7 +269,7 @@ func oneForwardedHeader(header http.Header, name string) (string, error) {
 func (s *Server) adminRequestSecurity(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cleanPath := path.Clean(r.URL.Path)
-		if cleanPath == "/v1" || strings.HasPrefix(cleanPath, "/v1/") {
+		if cleanPath == "/v1" || strings.HasPrefix(cleanPath, "/v1/") || hermesCompatibilityRequest(cleanPath) || memoryCompatibilityRequest(cleanPath) {
 			next.ServeHTTP(w, r)
 			return
 		}
