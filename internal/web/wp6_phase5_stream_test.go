@@ -35,6 +35,38 @@ func TestWP6ResponsesNonStreamMapsOnlyUpstreamReasoningSummary(t *testing.T) {
 	}
 }
 
+func TestWP6ResponsesReasoningOnlyIsDeliverable(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			chat := &wp1CandidateChat{
+				result: chathub.Result{Events: wp6Phase5RawEvents()},
+				events: []chathub.StreamEvent{{Kind: "reasoning", Text: "REAL_REASONING_SUMMARY"}},
+			}
+			server := newWP1CandidateServer(t, chat)
+			recorder := httptest.NewRecorder()
+			body := fmt.Sprintf(`{"model":"gpt-5.6-sol","input":"reason only","stream":%t}`, stream)
+			server.responses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+			payload := recorder.Body.String()
+			if recorder.Code != http.StatusOK || strings.Contains(payload, "upstream_empty_response") || !strings.Contains(payload, "REAL_REASONING_SUMMARY") {
+				t.Fatalf("reasoning-only response was not deliverable: status=%d body=%s", recorder.Code, payload)
+			}
+			if stream && !strings.Contains(payload, "event: response.completed") {
+				t.Fatalf("reasoning-only stream did not complete: %s", payload)
+			}
+			if !stream {
+				var response map[string]any
+				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				output, _ := response["output"].([]any)
+				if len(output) != 1 || output[0].(map[string]any)["type"] != "reasoning" {
+					t.Fatalf("reasoning-only output=%#v", output)
+				}
+			}
+		})
+	}
+}
+
 func TestWP6ResponsesDoesNotFabricateReasoning(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {

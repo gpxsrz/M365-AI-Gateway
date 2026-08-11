@@ -3,9 +3,11 @@ package web
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -82,6 +84,272 @@ func TestTransportCheckpointClearIsRestartSafe(t *testing.T) {
 	}
 }
 
+func TestTransportCheckpointExistingTurnPersistsOnlyTouchedRecordNearCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoints", "transport.json")
+	store, err := openTransportCheckpointStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := []oaiMsg{{Role: "user", Content: "one"}}
+	initial := beginFullForTest(t, store, "chat", "owner-target", "target-key", first)
+	targetID := initial.RecordID()
+	acceptForTest(t, initial, "conversation-target", "session-target", []oaiMsg{{Role: "assistant", Content: "answer"}}, "")
+
+	store.mu.Lock()
+	now := store.now()
+	var fillerID string
+	for i := 0; i < transportCheckpointMaxRecords-2; i++ {
+		id := fmt.Sprintf("filler-%03d", i)
+		if fillerID == "" {
+			fillerID = id
+		}
+		store.records[id] = &transportCheckpointRecord{
+			ID:               id,
+			Namespace:        "chat",
+			OwnerDigest:      checkpointDigest(transportCheckpointOwnerDomain, fmt.Sprintf("owner-%03d", i)),
+			ConversationID:   "conversation-" + id,
+			CurrentSessionID: "session-" + id,
+			MessageDigests:   []string{},
+			HashChain:        []string{},
+			CreatedAt:        now,
+			UpdatedAt:        now,
+			Revision:         2,
+		}
+	}
+	if err := store.persistLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	generation := store.generation
+	store.mu.Unlock()
+
+	manifestRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBefore := string(manifestRaw)
+	fillerPath := checkpointRecordPath(path, generation, fillerID)
+	fillerBefore, err := os.ReadFile(fillerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := checkpointRecordPath(path, generation, targetID)
+	targetBefore, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	active := []oaiMsg{
+		{Role: "user", Content: "one"},
+		{Role: "assistant", Content: "answer"},
+		{Role: "user", Content: "two"},
+	}
+	turn, err := store.BeginFull("chat", "owner-target", "target-key", active, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestRaw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(manifestRaw); got != manifestBefore {
+		t.Fatal("existing-turn update rewrote the global checkpoint manifest")
+	}
+	fillerAfter, err := os.ReadFile(fillerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(fillerAfter) != string(fillerBefore) {
+		t.Fatal("existing-turn update rewrote an unrelated checkpoint record")
+	}
+	targetAfter, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(targetAfter) == string(targetBefore) {
+		t.Fatal("existing-turn update did not durably update the touched record")
+	}
+	_ = turn.Abort()
+}
+
+func TestTransportCheckpointCapacityEvictsRequestingOwnerBeforeOtherOwners(t *testing.T) {
+	store := openCheckpointForTest(t)
+	now := store.now()
+	ownerA := checkpointDigest(transportCheckpointOwnerDomain, "owner-a")
+	ownerB := checkpointDigest(transportCheckpointOwnerDomain, "owner-b")
+
+	store.mu.Lock()
+	for i := 0; i < transportCheckpointMaxRecords-1; i++ {
+		id := fmt.Sprintf("owner-a-%03d", i)
+		store.records[id] = &transportCheckpointRecord{
+			ID:             id,
+			Namespace:      "responses",
+			OwnerDigest:    ownerA,
+			KeyDigest:      checkpointDigest(transportCheckpointKeyDomain, fmt.Sprintf("a-key-%03d", i)),
+			ConversationID: "conversation-" + id,
+			MessageDigests: []string{},
+			HashChain:      []string{},
+			CreatedAt:      now.Add(-time.Minute),
+			UpdatedAt:      now.Add(-time.Minute),
+			Revision:       2,
+		}
+	}
+	const ownerBRecordID = "owner-b-protected"
+	store.records[ownerBRecordID] = &transportCheckpointRecord{
+		ID:             ownerBRecordID,
+		Namespace:      "responses",
+		OwnerDigest:    ownerB,
+		KeyDigest:      checkpointDigest(transportCheckpointKeyDomain, "b-key"),
+		ConversationID: "conversation-b",
+		MessageDigests: []string{},
+		HashChain:      []string{},
+		ResponseCursors: []checkpointResponseCursor{{
+			Digest:   checkpointDigest(transportCheckpointCursorDomain, "response-b"),
+			Revision: 2,
+		}},
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Hour),
+		Revision:  2,
+	}
+	if err := store.persistLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
+
+	turn, err := store.BeginFull("responses", "owner-a", "new-owner-a-key", []oaiMsg{{Role: "user", Content: "new"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	_, ownerBStillPresent := store.records[ownerBRecordID]
+	ownerACount := 0
+	for _, record := range store.records {
+		if record.OwnerDigest == ownerA {
+			ownerACount++
+		}
+	}
+	store.mu.Unlock()
+	if !ownerBStillPresent {
+		t.Fatal("owner A churn evicted owner B while owner A had evictable records")
+	}
+	if ownerACount != transportCheckpointMaxRecords-1 {
+		t.Fatalf("owner A record count=%d want=%d after owner-local eviction and replacement", ownerACount, transportCheckpointMaxRecords-1)
+	}
+	continuation, err := store.BeginResponse("owner-b", "response-b", nil)
+	if err != nil {
+		t.Fatalf("owner B response cursor became unusable after owner A churn: %v", err)
+	}
+	_ = continuation.Abort()
+	_ = turn.Abort()
+}
+
+func TestTransportCheckpointMigratesV1SnapshotWithoutLosingContinuation(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "source", "transport.json")
+	source, err := openTransportCheckpointStore(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := []oaiMsg{{Role: "user", Content: "one"}}
+	turn := beginFullForTest(t, source, "chat", "owner", "key", first)
+	acceptForTest(t, turn, "conversation-v1", "session-v1", []oaiMsg{{Role: "assistant", Content: "answer"}}, "")
+	logical := readCheckpointForTest(t, sourcePath)
+	file, err := decodeTransportCheckpointFile(logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Schema = legacyTransportCheckpointSchema
+	legacyRaw, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRaw = append(legacyRaw, '\n')
+
+	legacyPath := filepath.Join(t.TempDir(), "upgrade", "sessions.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, legacyRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := openTransportCheckpointStore(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	views := checkpointViewsForTest(t, migrated)
+	if len(views) != 1 || views[0].ConversationID != "conversation-v1" || views[0].SessionID != "session-v1" {
+		t.Fatalf("v1 migration lost checkpoint: %#v", views)
+	}
+	manifest, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifest), transportCheckpointSchema) || strings.Contains(string(manifest), legacyTransportCheckpointSchema) {
+		t.Fatalf("v1 snapshot was not replaced by v2 manifest: %s", manifest)
+	}
+	active := []oaiMsg{
+		{Role: "user", Content: "one"},
+		{Role: "assistant", Content: "answer"},
+		{Role: "user", Content: "two"},
+	}
+	continued, err := migrated.BeginFull("chat", "owner", "key", active, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if continued.Rebound || continued.Binding.ConversationID != "conversation-v1" || continued.Binding.SessionID != "session-v1" {
+		t.Fatalf("migrated continuation rebound unexpectedly: %#v", continued)
+	}
+	_ = continued.Abort()
+}
+
+func TestTransportCheckpointClearThenRestoresOnChangeFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoints", "transport.json")
+	store, err := openTransportCheckpointStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := beginFullForTest(t, store, "chat", "owner", "key", []oaiMsg{{Role: "user", Content: "before change"}})
+	acceptForTest(t, turn, "conversation", "session", []oaiMsg{{Role: "assistant", Content: "answer"}}, "")
+	wantErr := errors.New("dependent persistence failed")
+	if err := store.ClearThen(func() error { return wantErr }); !errors.Is(err, wantErr) {
+		t.Fatalf("ClearThen error=%v, want dependent failure", err)
+	}
+	if got := checkpointViewsForTest(t, store); len(got) != 1 {
+		t.Fatalf("failed dependent change did not restore checkpoint: %#v", got)
+	}
+	reopened, err := openTransportCheckpointStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := checkpointViewsForTest(t, reopened); len(got) != 1 {
+		t.Fatalf("restored checkpoint did not survive restart: %#v", got)
+	}
+}
+
+func TestTransportCheckpointClearThenDoesNotCommitChangeWhenInvalidationFails(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openTransportCheckpointStore(filepath.Join(dir, "transport.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := beginFullForTest(t, store, "chat", "owner", "key", []oaiMsg{{Role: "user", Content: "before change"}})
+	acceptForTest(t, turn, "conversation", "session", []oaiMsg{{Role: "assistant", Content: "answer"}}, "")
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.path = filepath.Join(blocker, "transport.json")
+	committed := false
+	if err := store.ClearThen(func() error { committed = true; return nil }); err == nil {
+		t.Fatal("expected checkpoint invalidation failure")
+	}
+	if committed {
+		t.Fatal("dependent change committed after checkpoint invalidation failed")
+	}
+	if got := checkpointViewsForTest(t, store); len(got) != 1 {
+		t.Fatalf("failed invalidation changed in-memory checkpoints: %#v", got)
+	}
+}
 func TestRemoveLegacyDefaultSessionCache(t *testing.T) {
 	legacy := filepath.Join(t.TempDir(), "m365-native-sessions.json")
 	if err := os.WriteFile(legacy, []byte(`{"sessions":[{"title":"PRIVATE","prompt":"FULL-PRIVATE-PROMPT"}]}`), 0o600); err != nil {
@@ -741,9 +1009,39 @@ func acceptForTest(t *testing.T, turn *checkpointTurn, conversationID, sessionID
 
 func readCheckpointForTest(t *testing.T, path string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b
+	var header struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil || header.Schema != transportCheckpointSchema {
+		return raw
+	}
+	manifest, err := decodeTransportCheckpointManifest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(checkpointGenerationPath(path, manifest.Generation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := make([]transportCheckpointRecord, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		recordFile, _, err := readCheckpointRecordFile(filepath.Join(checkpointGenerationPath(path, manifest.Generation), entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, recordFile.Record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
+	logical, err := json.MarshalIndent(transportCheckpointFile{Schema: transportCheckpointSchema, Records: records}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(logical, '\n')
 }

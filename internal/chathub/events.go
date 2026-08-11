@@ -30,6 +30,7 @@ type TerminalState struct {
 
 type RateLimitError struct {
 	StatusCode int
+	RetryAfter string
 	Err        error
 }
 

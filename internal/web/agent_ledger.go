@@ -118,7 +118,9 @@ func buildAgentLedger(messages []oaiMsg, prior ...agentLedger) agentLedger {
 	order := []string{}
 	knownCallDigests := []string{}
 	known := map[string]struct{}{}
+	toolRounds := 0
 	if len(prior) > 0 {
+		toolRounds = prior[0].ToolRounds
 		for _, digest := range prior[0].KnownCallDigests {
 			if _, duplicate := known[digest]; duplicate {
 				continue
@@ -138,6 +140,7 @@ func buildAgentLedger(messages []oaiMsg, prior ...agentLedger) agentLedger {
 	}
 	for _, m := range messages {
 		if m.Role == "assistant" {
+			addedRound := false
 			for _, raw := range m.ToolCalls {
 				id, _ := raw["id"].(string)
 				fn, _ := raw["function"].(map[string]any)
@@ -147,8 +150,12 @@ func buildAgentLedger(messages []oaiMsg, prior ...agentLedger) agentLedger {
 					if _, exists := calls[id]; !exists {
 						calls[id] = toolEvidence{ID: id, Name: name, ArgumentsSHA256: toolArgumentsSHA256(args)}
 						order = append(order, id)
+						addedRound = true
 					}
 				}
+			}
+			if addedRound {
+				toolRounds++
 			}
 		}
 		if m.Role == "tool" {
@@ -156,14 +163,14 @@ func buildAgentLedger(messages []oaiMsg, prior ...agentLedger) agentLedger {
 				result := contentToString(m.Content)
 				e.ResultLength = len(result)
 				e.ResultSHA256 = stringSHA256(result)
-				e.Failed = failureSignal.MatchString(result)
+				e.Failed = m.ToolResultIsError || failureSignal.MatchString(result)
 				e.Preview = boundedUTF8Preview(result, toolResultPreviewBytes)
 				e.hasResult = true
 				calls[m.ToolCallID] = e
 			}
 		}
 	}
-	l := agentLedger{KnownCallDigests: knownCallDigests}
+	l := agentLedger{KnownCallDigests: knownCallDigests, ToolRounds: toolRounds}
 	seenCall := map[string]int{}
 	seenFailure := map[string]int{}
 	for _, id := range order {
@@ -173,7 +180,6 @@ func buildAgentLedger(messages []oaiMsg, prior ...agentLedger) agentLedger {
 			known[identityDigest] = struct{}{}
 			l.KnownCallDigests = append(l.KnownCallDigests, identityDigest)
 		}
-		l.ToolRounds++
 		sig := e.Name + "\x00" + e.ArgumentsSHA256
 		seenCall[sig]++
 		if seenCall[sig] >= 2 {
@@ -290,14 +296,20 @@ func (l agentLedger) CanContinue(maxRounds int) error {
 	return nil
 }
 func maxToolRounds() int {
+	return configuredMaxToolRounds(openSettingsStore())
+}
+
+func configuredMaxToolRounds(settings *settingsStore) int {
 	if raw, ok := os.LookupEnv("M365_MAX_TOOL_ROUNDS"); ok {
 		if n, e := strconv.Atoi(strings.TrimSpace(raw)); e == nil && n > 0 && n <= 512 {
 			return n
 		}
 		return 32
 	}
-	if n := currentSettings().MaxToolRounds; n > 0 && n <= 512 {
-		return n
+	if settings != nil {
+		if n := settings.get().MaxToolRounds; n > 0 && n <= 512 {
+			return n
+		}
 	}
 	return 32
 }

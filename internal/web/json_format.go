@@ -19,6 +19,23 @@ func normalizeJSONText(s string) string {
 	return s
 }
 
+func validateResponseFormatDefinition(format *responseFormat) error {
+	if format == nil || strings.TrimSpace(format.Type) == "" || format.Type == "text" || format.Type == "json_object" {
+		return nil
+	}
+	if format.Type != "json_schema" {
+		return fmt.Errorf("unsupported response_format type %q", format.Type)
+	}
+	schema, _ := format.JSONSchema["schema"].(map[string]any)
+	if schema == nil {
+		return errors.New("response_format json_schema requires json_schema.schema")
+	}
+	if _, err := compileWebSchema(schema); err != nil {
+		return fmt.Errorf("response_format json_schema is invalid: %w", err)
+	}
+	return nil
+}
+
 func validateResponseFormatText(text string, format *responseFormat) (string, error) {
 	text = normalizeJSONText(text)
 	if format == nil || strings.TrimSpace(format.Type) == "" || format.Type == "text" {

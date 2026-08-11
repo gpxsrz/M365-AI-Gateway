@@ -75,27 +75,25 @@ func Refresh(refreshToken string) (TokenSet, error) {
 }
 
 func RefreshWithConfig(config OAuthConfig, refreshToken string) (TokenSet, error) {
-	config, err := normalizeOAuthConfig(config)
-	if err != nil {
-		return TokenSet{}, err
-	}
-	form := url.Values{}
-	form.Set("client_id", config.ClientID)
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", refreshToken)
-	form.Set("scope", config.Scope)
-	return requestToken(config.TokenEndpoint, form)
+	return refreshWithConfigContext(context.Background(), config, refreshToken)
 }
 
 func requestToken(endpoint string, form url.Values) (TokenSet, error) {
 	return requestTokenContext(context.Background(), endpoint, form)
 }
 
+const oauthRefreshRequestTimeout = 60 * time.Second
+
 func refreshWithConfigContext(ctx context.Context, config OAuthConfig, refreshToken string) (TokenSet, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	config, err := normalizeOAuthConfig(config)
 	if err != nil {
 		return TokenSet{}, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, oauthRefreshRequestTimeout)
+	defer cancel()
 	form := url.Values{}
 	form.Set("client_id", config.ClientID)
 	form.Set("grant_type", "refresh_token")

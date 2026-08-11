@@ -8,6 +8,7 @@ import (
 	"m365-native/internal/chathub"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -267,6 +268,194 @@ func TestChatModeChangesClearTransportCheckpointsInBothDirections(t *testing.T) 
 	}
 	changeMode(chatModePrivate, chatModeNormal)
 	changeMode(chatModeNormal, chatModePrivate)
+}
+
+func TestRefreshSingleAccountPropagatesRequestCancellation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseServer := func() { releaseOnce.Do(func() { close(release) }) }
+	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+	}))
+	t.Cleanup(tokenEndpoint.Close)
+	t.Cleanup(releaseServer)
+
+	config := auth.OAuthConfig{
+		ClientID:          "profile-client",
+		Authority:         tokenEndpoint.URL + "/common",
+		RedirectURI:       tokenEndpoint.URL + "/callback",
+		Scope:             "openid offline_access profile.read",
+		AuthorizeEndpoint: tokenEndpoint.URL + "/authorize",
+		TokenEndpoint:     tokenEndpoint.URL,
+	}
+	store, err := auth.OpenStoreWithConfig(filepath.Join(t.TempDir(), "accounts.json"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := store.Upsert(auth.TokenSet{
+		AccessToken:  "expired-access",
+		RefreshToken: "refresh-original",
+		HomeOID:      "oid-store",
+		TenantID:     "tid-store",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{tokens: store}
+	ctx, cancel := context.WithCancel(context.Background())
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/account/refresh", nil).WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		server.refreshSingleAccount(recorder, request)
+		close(done)
+	}()
+	<-started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		releaseServer()
+		<-done
+		t.Fatal("account refresh ignored request cancellation")
+	}
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	got, ok := store.Get(account.ID)
+	if !ok || got.Status != "online" {
+		t.Fatalf("request cancellation changed durable account status: %#v", got)
+	}
+}
+
+func TestChatModePersistenceFailureRestoresTransportCheckpoints(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	server.checkpoints = openCheckpointForTest(t)
+	turn := beginFullForTest(t, server.checkpoints, "chat", "owner", "key", []oaiMsg{{Role: "user", Content: "before mode switch"}})
+	acceptForTest(t, turn, "conversation", "session", nil, "")
+	current := server.settings.get()
+	originalMode := current.ChatMode
+	current.ChatMode = chatModeNormal
+	if originalMode == chatModeNormal {
+		current.ChatMode = chatModePrivate
+	}
+	server.settings.persist = func(string, []byte) error { return fmt.Errorf("forced settings persistence failure") }
+
+	recorder := httptest.NewRecorder()
+	server.adminSettings(recorder, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(mustJSON(current))))
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("mode switch unexpectedly succeeded: %s", recorder.Body.String())
+	}
+	if got := server.settings.get().ChatMode; got != originalMode {
+		t.Fatalf("failed mode switch changed runtime mode: got=%q want=%q", got, originalMode)
+	}
+	if got := checkpointViewsForTest(t, server.checkpoints); len(got) != 1 {
+		t.Fatalf("failed mode switch destroyed prior checkpoint: %#v", got)
+	}
+	reopened, err := openTransportCheckpointStore(server.checkpoints.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := checkpointViewsForTest(t, reopened); len(got) != 1 {
+		t.Fatalf("restored checkpoint did not survive restart: %#v", got)
+	}
+}
+
+func TestOAuthTokenStoreCheckpointInvalidationFailureDoesNotCommitReplacement(t *testing.T) {
+	store, err := auth.OpenStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := store.Upsert(testTokenSet("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{tokens: store, checkpoints: openCheckpointForTest(t)}
+	turn := beginFullForTest(t, server.checkpoints, "chat", "owner", "key", []oaiMsg{{Role: "user", Content: "before replacement"}})
+	acceptForTest(t, turn, "old-conversation", "old-session", nil, "")
+
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server.checkpoints.path = filepath.Join(blocker, "transport.json")
+	_, failure := server.storeOAuthTokenSetInStore(auth.OAuthProfileManifest{}, store, testTokenSet("replacement"))
+	if failure == nil || failure.Code != "transport_checkpoint_clear_failed" {
+		t.Fatalf("failure=%#v", failure)
+	}
+	got, ok := store.Get(original.ID)
+	if !ok || got.AccessToken != original.AccessToken || got.RefreshToken != original.RefreshToken {
+		t.Fatalf("checkpoint invalidation failure committed replacement credential: %#v", got)
+	}
+	if checkpoints := checkpointViewsForTest(t, server.checkpoints); len(checkpoints) != 1 {
+		t.Fatalf("failed checkpoint invalidation changed in-memory checkpoint state: %#v", checkpoints)
+	}
+}
+
+func TestOAuthTokenStorePersistenceFailureRestoresTransportCheckpoints(t *testing.T) {
+	root := t.TempDir()
+	tokenDir := filepath.Join(root, "tokens")
+	if err := os.Mkdir(tokenDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tokenDir, "accounts.json")
+	store, err := auth.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := store.Upsert(testTokenSet("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{tokens: store, checkpoints: openCheckpointForTest(t)}
+	turn := beginFullForTest(t, server.checkpoints, "chat", "owner", "key", []oaiMsg{{Role: "user", Content: "before replacement"}})
+	acceptForTest(t, turn, "old-conversation", "old-session", nil, "")
+
+	if err := os.Chmod(tokenDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(tokenDir, 0o700) })
+	probe, probeErr := os.CreateTemp(tokenDir, ".permission-probe-*")
+	if probeErr == nil {
+		_ = probe.Close()
+		_ = os.Remove(probe.Name())
+		t.Skip("filesystem does not enforce directory write permissions for this test process")
+	}
+	_, failure := server.storeOAuthTokenSetInStore(auth.OAuthProfileManifest{}, store, testTokenSet("replacement"))
+	if err := os.Chmod(tokenDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if failure == nil || failure.Code != "oauth_token_store_failed" {
+		t.Fatalf("failure=%#v", failure)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("failed token replacement changed durable credential cache")
+	}
+	got, ok := store.Get(original.ID)
+	if !ok || got.AccessToken != original.AccessToken || got.RefreshToken != original.RefreshToken {
+		t.Fatalf("failed token replacement changed active in-memory credential: %#v", got)
+	}
+	if checkpoints := checkpointViewsForTest(t, server.checkpoints); len(checkpoints) != 1 {
+		t.Fatalf("failed token replacement did not restore transport checkpoint: %#v", checkpoints)
+	}
+	reopened, err := openTransportCheckpointStore(server.checkpoints.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoints := checkpointViewsForTest(t, reopened); len(checkpoints) != 1 {
+		t.Fatalf("restored checkpoint did not survive restart: %#v", checkpoints)
+	}
 }
 
 func TestOAuthTokenStoreRechecksActiveProfileInsideCheckpointLifecycle(t *testing.T) {

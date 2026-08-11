@@ -40,9 +40,13 @@ func (s *Server) interactiveOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if s.compatTraffic == nil {
 		s.compatTraffic = newCompatibilityTrafficController()
 	}
-	release := s.compatTraffic.beginHermes()
-	defer release(time.Duration(cfg.HermesPriorityHoldoffSeconds) * time.Second)
-	s.openaiChat(w, r)
+	release := s.compatTraffic.beginInteractive()
+	defer release(time.Duration(cfg.InteractivePriorityHoldoffSeconds) * time.Second)
+	tracked := &statusTrackingResponseWriter{ResponseWriter: w}
+	defer func() {
+		s.compatTraffic.observeInteractiveStatus(tracked.finalStatus(), cfg, tracked.Header().Get("Retry-After"))
+	}()
+	s.openaiChat(tracked, r)
 }
 
 func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +70,11 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	tracked := &statusTrackingResponseWriter{ResponseWriter: w}
 	defer func() {
-		release(tracked.finalStatus())
+		status := tracked.finalStatus()
+		release(status)
+		if status == http.StatusTooManyRequests {
+			s.compatTraffic.honorRetryAfter(tracked.Header().Get("Retry-After"))
+		}
 	}()
 	control, _ := compatibilityCheckpointControl(r.URL.Path)
 	control.Mode = checkpointFullHistory
@@ -82,11 +90,15 @@ func (s *Server) hermesOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if s.compatTraffic == nil {
 		s.compatTraffic = newCompatibilityTrafficController()
 	}
-	release := s.compatTraffic.beginHermes()
-	defer release(time.Duration(cfg.HermesPriorityHoldoffSeconds) * time.Second)
+	release := s.compatTraffic.beginInteractive()
+	defer release(time.Duration(cfg.InteractivePriorityHoldoffSeconds) * time.Second)
+	tracked := &statusTrackingResponseWriter{ResponseWriter: w}
+	defer func() {
+		s.compatTraffic.observeInteractiveStatus(tracked.finalStatus(), cfg, tracked.Header().Get("Retry-After"))
+	}()
 	control, _ := compatibilityCheckpointControl(r.URL.Path)
 	control.Mode = checkpointFullHistory
-	s.openaiChat(w, r.WithContext(withCheckpointRequest(r.Context(), control)))
+	s.openaiChat(tracked, r.WithContext(withCheckpointRequest(r.Context(), control)))
 }
 
 func memorySchemaInstruction(format *responseFormat) string {
@@ -127,7 +139,7 @@ PREVIOUS_CANDIDATE:
 %s`, validationErr, string(encoded), invalidText)
 }
 
-func memoryRepairPreservesFacts(previousText, repairedText string) error {
+func memoryRepairPreservesFacts(previousText, repairedText string, formats ...*responseFormat) error {
 	previousNormalized := normalizeJSONText(previousText)
 	repairedNormalized := normalizeJSONText(repairedText)
 	previous, err := decodeExactJSONValue([]byte(previousNormalized))
@@ -159,9 +171,100 @@ func memoryRepairPreservesFacts(previousText, repairedText string) error {
 		return fmt.Errorf("memory repair repaired signature: %w", err)
 	}
 	if previousSignature != repairedSignature {
-		return fmt.Errorf("memory repair changed structure, scalar order, or scalar-to-property association")
+		return fmt.Errorf("memory repair changed structure or scalar order")
+	}
+	if len(formats) > 0 && formats[0] != nil {
+		schema, _ := formats[0].JSONSchema["schema"].(map[string]any)
+		if schema != nil {
+			if err := memoryRepairPreservesSchemaAssociation(previous, repaired, schema); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func memoryRepairPreservesSchemaAssociation(previous, repaired any, schema map[string]any) error {
+	switch before := previous.(type) {
+	case map[string]any:
+		after, ok := repaired.(map[string]any)
+		if !ok || len(before) != len(after) {
+			return fmt.Errorf("memory repair changed object shape")
+		}
+		properties, _ := schema["properties"].(map[string]any)
+		var renamedBefore []string
+		var renamedAfter []string
+		for key, value := range before {
+			if repairedValue, exists := after[key]; exists {
+				if !memoryJSONValuesEqual(value, repairedValue) {
+					return fmt.Errorf("memory repair changed value associated with property %q", key)
+				}
+				if childSchema, ok := properties[key].(map[string]any); ok {
+					if err := memoryRepairPreservesSchemaAssociation(value, repairedValue, childSchema); err != nil {
+						return err
+					}
+				}
+			} else {
+				renamedBefore = append(renamedBefore, key)
+			}
+		}
+		for key := range after {
+			if _, exists := before[key]; !exists {
+				renamedAfter = append(renamedAfter, key)
+			}
+		}
+		if len(renamedBefore) != len(renamedAfter) {
+			return fmt.Errorf("memory repair changed object property count")
+		}
+		for _, oldKey := range renamedBefore {
+			value := before[oldKey]
+			var candidates []string
+			for _, newKey := range renamedAfter {
+				childSchema, ok := properties[newKey].(map[string]any)
+				if !ok {
+					continue
+				}
+				if validateWebSchemaValue(childSchema, value) == nil {
+					candidates = append(candidates, newKey)
+				}
+			}
+			if len(candidates) != 1 {
+				return fmt.Errorf("memory repair cannot prove a unique schema property for renamed property %q", oldKey)
+			}
+			target := candidates[0]
+			if !memoryJSONValuesEqual(value, after[target]) {
+				return fmt.Errorf("memory repair changed scalar-to-property association for %q", target)
+			}
+			childSchema, _ := properties[target].(map[string]any)
+			if err := memoryRepairPreservesSchemaAssociation(value, after[target], childSchema); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []any:
+		after, ok := repaired.([]any)
+		if !ok || len(before) != len(after) {
+			return fmt.Errorf("memory repair changed array shape")
+		}
+		itemSchema, _ := schema["items"].(map[string]any)
+		for i := range before {
+			if err := memoryRepairPreservesSchemaAssociation(before[i], after[i], itemSchema); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		if !memoryJSONValuesEqual(previous, repaired) {
+			return fmt.Errorf("memory repair changed a scalar value")
+		}
+		return nil
+	}
+}
+
+func memoryJSONValuesEqual(a, b any) bool {
+	left, errLeft := json.Marshal(a)
+	right, errRight := json.Marshal(b)
+	return errLeft == nil && errRight == nil && bytes.Equal(left, right)
 }
 
 func memoryRepairSignature(text string) (string, error) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"m365-native/internal/chathub"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -24,7 +25,7 @@ func validImageURLs(images []string) []string {
 }
 
 func usableChatResult(res chathub.Result, tools []chathub.Tool) bool {
-	if strings.TrimSpace(res.Text) != "" || len(validImageURLs(res.Images)) > 0 {
+	if strings.TrimSpace(res.Text) != "" || len(validImageURLs(res.Images)) > 0 || strings.TrimSpace(chathub.ReasoningContent(res.Events)) != "" {
 		return true
 	}
 	return len(nativeToolCalls(res.Events, tools)) > 0
@@ -113,7 +114,7 @@ func writeCanonicalTerminalFailure(w http.ResponseWriter, terminal chathub.Termi
 func writeCanonicalTerminalError(w http.ResponseWriter, err error) bool {
 	var rateLimit *chathub.RateLimitError
 	if errors.As(err, &rateLimit) {
-		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Retry-After", canonicalRetryAfter(rateLimit.RetryAfter))
 		writeOpenAIErrorCode(w, http.StatusTooManyRequests, "rate_limit_error", "upstream_rate_limited", "Microsoft 365 Copilot is temporarily rate limited")
 		return true
 	}
@@ -127,10 +128,12 @@ func writeCanonicalTerminalError(w http.ResponseWriter, err error) bool {
 func writeCanonicalTerminalStreamError(w http.ResponseWriter, err error) bool {
 	var rateLimit *chathub.RateLimitError
 	if errors.As(err, &rateLimit) {
+		retryAfter := canonicalRetryAfter(rateLimit.RetryAfter)
+		w.Header().Set("Retry-After", retryAfter)
 		if tracker, ok := w.(interface{ setOutcomeStatus(int) }); ok {
 			tracker.setOutcomeStatus(http.StatusTooManyRequests)
 		}
-		writeChatStreamError(w, "upstream_rate_limited", "Microsoft 365 Copilot is temporarily rate limited")
+		writeChatStreamRateLimitError(w, retryAfter)
 		return true
 	}
 	var terminal *chathub.TerminalError
@@ -153,14 +156,36 @@ func writeUpstreamEmptyResponseMessage(w http.ResponseWriter, message string) {
 	writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "upstream_empty_response", message)
 }
 
-func writeChatStreamError(w http.ResponseWriter, code, message string) {
-	payload, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"type":    "upstream_error",
-			"code":    code,
-			"message": message,
-		},
+func canonicalRetryAfter(value string) string {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseUint(value, 10, 63); err == nil {
+		return strconv.FormatUint(seconds, 10)
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		return when.UTC().Format(http.TimeFormat)
+	}
+	return "1"
+}
+
+func writeChatStreamRateLimitError(w http.ResponseWriter, retryAfter string) {
+	writeChatStreamErrorPayload(w, map[string]any{
+		"type":        "upstream_error",
+		"code":        "upstream_rate_limited",
+		"message":     "Microsoft 365 Copilot is temporarily rate limited",
+		"retry_after": retryAfter,
 	})
+}
+
+func writeChatStreamError(w http.ResponseWriter, code, message string) {
+	writeChatStreamErrorPayload(w, map[string]any{
+		"type":    "upstream_error",
+		"code":    code,
+		"message": message,
+	})
+}
+
+func writeChatStreamErrorPayload(w http.ResponseWriter, errorPayload map[string]any) {
+	payload, _ := json.Marshal(map[string]any{"error": errorPayload})
 	fmt.Fprintf(w, "data: %s\n\n", payload)
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher, ok := w.(http.Flusher); ok {

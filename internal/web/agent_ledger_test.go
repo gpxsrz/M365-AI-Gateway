@@ -42,6 +42,24 @@ func TestAgentLedgerEvidenceAndUniqueCallIDs(t *testing.T) {
 	}
 }
 
+func TestAgentLedgerCountsParallelCallsAsOneRound(t *testing.T) {
+	msgs := []oaiMsg{
+		{Role: "assistant", ToolCalls: []map[string]any{
+			{"id": "read-a", "type": "function", "function": map[string]any{"name": "read_file", "arguments": `{"path":"a"}`}},
+			{"id": "read-b", "type": "function", "function": map[string]any{"name": "read_file", "arguments": `{"path":"b"}`}},
+		}},
+		{Role: "tool", ToolCallID: "read-a", Content: "A"},
+		{Role: "tool", ToolCallID: "read-b", Content: "B"},
+	}
+	ledger := buildAgentLedger(msgs)
+	if ledger.ToolRounds != 1 {
+		t.Fatalf("parallel tool turn counted as %d rounds; want 1", ledger.ToolRounds)
+	}
+	if err := ledger.CanContinue(2); err != nil {
+		t.Fatalf("one parallel tool turn should remain below a two-round limit: %v", err)
+	}
+}
+
 func TestAgentLedgerDetectsRepeatedCallAndRoundLimit(t *testing.T) {
 	var msgs []oaiMsg
 	for i := 0; i < 4; i++ {

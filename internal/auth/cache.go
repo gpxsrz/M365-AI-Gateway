@@ -1,9 +1,12 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -77,15 +80,17 @@ func openStore(path string, config OAuthConfig, allowLegacySchema bool) (*Store,
 		return nil, err
 	}
 	s := &Store{path: path, config: config, data: Cache{Schema: TokenCacheSchema, Accounts: []AccountToken{}}}
-	b, err := os.ReadFile(path)
+	file, err := openPrivateTokenFile(path)
 	if os.IsNotExist(err) {
 		return s, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return nil, fmt.Errorf("secure token cache permissions: %w", err)
+	defer file.Close()
+	b, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("read token cache: %w", err)
 	}
 	if err := json.Unmarshal(b, &s.data); err != nil {
 		return nil, err
@@ -127,6 +132,39 @@ func openStore(path string, config OAuthConfig, allowLegacySchema bool) (*Store,
 	return s, nil
 }
 
+func openPrivateTokenFile(path string) (*os.File, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("token cache must not be a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("token cache must be a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		file.Close()
+		return nil, fmt.Errorf("token cache identity changed while opening")
+	}
+	if opened.Mode().Perm() != 0o600 {
+		if err := file.Chmod(0o600); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("secure token cache permissions: %w", err)
+		}
+	}
+	return file, nil
+}
+
 func (s *Store) Path() string {
 	return s.path
 }
@@ -153,6 +191,16 @@ func (s *Store) initialize() error {
 func atomicWritePrivateFile(path string, raw []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("token cache must not be a symbolic link")
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("token cache must be a regular file")
+		}
+	} else if !os.IsNotExist(err) {
 		return err
 	}
 	temporary, err := os.CreateTemp(dir, ".m365-private-*")
@@ -183,6 +231,10 @@ func atomicWritePrivateFile(path string, raw []byte) error {
 		return err
 	}
 	removeTemporary = false
+	if directory, err := os.Open(dir); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
+	}
 	return nil
 }
 
@@ -231,21 +283,31 @@ func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 			break
 		}
 	}
+	previous := append([]AccountToken(nil), s.data.Accounts...)
 	s.data.Accounts = []AccountToken{acc}
-	return acc, s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.data.Accounts = previous
+		return acc, err
+	}
+	return acc, nil
 }
 
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.data.Accounts[:0]
+	previous := append([]AccountToken(nil), s.data.Accounts...)
+	next := make([]AccountToken, 0, len(s.data.Accounts))
 	for _, a := range s.data.Accounts {
 		if a.ID != id {
 			next = append(next, a)
 		}
 	}
 	s.data.Accounts = next
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.data.Accounts = previous
+		return err
+	}
+	return nil
 }
 
 func (s *Store) Get(id string) (AccountToken, bool) {
@@ -269,6 +331,13 @@ func (s *Store) First() (AccountToken, bool) {
 }
 
 func (s *Store) EnsureValid(id string) (AccountToken, error) {
+	return s.EnsureValidContext(context.Background(), id)
+}
+
+func (s *Store) EnsureValidContext(ctx context.Context, id string) (AccountToken, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.resourceMu.Lock()
 	defer s.resourceMu.Unlock()
 
@@ -280,30 +349,20 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		return acc, nil
 	}
 	if acc.RefreshToken == "" {
-		acc.Status = "expired"
-		s.mu.Lock()
-		for i, a := range s.data.Accounts {
-			if a.ID == acc.ID {
-				s.data.Accounts[i] = acc
-				_ = s.saveLocked()
-				break
-			}
+		if err := s.persistExpiredStatus(acc); err != nil {
+			return acc, err
 		}
-		s.mu.Unlock()
+		acc.Status = "expired"
 		return acc, fmtExpired()
 	}
-	tok, err := RefreshWithConfig(s.config, acc.RefreshToken)
+	tok, err := refreshWithConfigContext(ctx, s.config, acc.RefreshToken)
 	if err != nil {
-		acc.Status = "expired"
-		s.mu.Lock()
-		for i, a := range s.data.Accounts {
-			if a.ID == acc.ID {
-				s.data.Accounts[i] = acc
-				_ = s.saveLocked()
-				break
+		if credentialTerminalRefreshError(err) {
+			if persistErr := s.persistExpiredStatus(acc); persistErr != nil {
+				return acc, persistErr
 			}
+			acc.Status = "expired"
 		}
-		s.mu.Unlock()
 		return acc, err
 	}
 	if tok.Email == "" {
@@ -319,6 +378,29 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		tok.TenantID = acc.TID
 	}
 	return s.Upsert(tok)
+}
+
+func credentialTerminalRefreshError(err error) bool {
+	var endpointError *TokenEndpointError
+	return errors.As(err, &endpointError) && endpointError.Status == http.StatusBadRequest && endpointError.Code == "invalid_grant"
+}
+
+func (s *Store) persistExpiredStatus(acc AccountToken) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, current := range s.data.Accounts {
+		if current.ID != acc.ID {
+			continue
+		}
+		previous := current
+		s.data.Accounts[i].Status = "expired"
+		if err := s.saveLocked(); err != nil {
+			s.data.Accounts[i] = previous
+			return fmt.Errorf("persist expired account status: %w", err)
+		}
+		return nil
+	}
+	return os.ErrNotExist
 }
 
 func fmtExpired() error {

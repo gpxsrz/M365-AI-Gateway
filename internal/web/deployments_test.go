@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"m365-native/internal/outbound"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,7 +66,7 @@ func TestDeployCloudflareRejectsSubdomainFailure(t *testing.T) {
 		t.Fatal("expected subdomain error")
 	}
 }
-func TestDeploymentCheckAddsHealthyURLToPool(t *testing.T) {
+func TestDeploymentCheckOnlyUpdatesDeploymentHealth(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
 			http.NotFound(w, r)
@@ -77,10 +76,6 @@ func TestDeploymentCheckAddsHealthyURLToPool(t *testing.T) {
 		_, _ = w.Write([]byte("ok"))
 	}))
 	defer ts.Close()
-	if err := outbound.ConfigurePool(nil); err != nil {
-		t.Fatal(err)
-	}
-	defer outbound.ConfigurePool(nil)
 	st := &deploymentStore{Items: []deployment{{ID: "test", ActiveURL: ts.URL, DefaultURL: ts.URL}}}
 	deployments = st
 	s := &Server{}
@@ -90,7 +85,7 @@ func TestDeploymentCheckAddsHealthyURLToPool(t *testing.T) {
 	if rr.Code != 200 {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if len(outbound.ProxyPoolStatus()) != 0 {
-		t.Fatalf("health-only deployment must not enter proxy pool: %#v", outbound.ProxyPoolStatus())
+	if st.Items[0].Status != "healthy" {
+		t.Fatalf("deployment health=%q want healthy", st.Items[0].Status)
 	}
 }

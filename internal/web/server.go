@@ -83,6 +83,27 @@ func newConfiguredChatHubClient(settings *settingsStore) *chathub.Client {
 	return client
 }
 
+func (s *Server) LongestRequestTimeout() time.Duration {
+	if s == nil || s.settings == nil {
+		return 0
+	}
+	settings := s.settings.get()
+	seconds := settings.ChatTimeoutSeconds
+	if settings.MemoryCompatibilityEnabled {
+		memorySeconds := settings.MemoryQueueTimeoutSeconds + settings.ChatTimeoutSeconds
+		if memorySeconds > seconds {
+			seconds = memorySeconds
+		}
+	}
+	if settings.ImageTimeoutSeconds > seconds {
+		seconds = settings.ImageTimeoutSeconds
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func New() (*Server, error) {
 	settings := openSettingsStore()
 	if settings.loadErr != nil {
@@ -108,6 +129,10 @@ func New() (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load management security policy: %w", err)
 	}
+	apiKeys, err := openAPIKeys()
+	if err != nil {
+		return nil, fmt.Errorf("load API key store: %w", err)
+	}
 	checkpoints, err := openConfiguredTransportCheckpointStore()
 	if err != nil {
 		return nil, fmt.Errorf("load transport checkpoints: %w", err)
@@ -128,7 +153,7 @@ func New() (*Server, error) {
 		adminSecurity:       adminSecurity,
 		mustChangePassword:  credential.Mode == adminCredentialBootstrap,
 		loginAttempts:       map[string]loginAttempt{},
-		apiKeys:             openAPIKeys(),
+		apiKeys:             apiKeys,
 		debug:               openDebugStore(),
 		settings:            settings,
 		catalogEvidence:     catalogEvidence,
@@ -150,7 +175,6 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/change-password", s.adminChangePassword)
 	m.HandleFunc("/api/admin/keys", s.adminKeys)
 	m.HandleFunc("/api/admin/settings", s.adminSettings)
-	m.HandleFunc("/api/admin/proxy-pool", s.proxyPool)
 	m.HandleFunc("/api/admin/deployments", s.deployments)
 	m.HandleFunc("/api/admin/deployment", s.deploymentAction)
 	m.HandleFunc("/api/admin/deployment/check", s.deploymentCheck)
@@ -447,7 +471,7 @@ func (s *Server) refreshSingleAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, "account_not_found", "尚未登入 Microsoft 帳號")
 		return
 	}
-	account, err := store.EnsureValid(account.ID)
+	account, err := store.EnsureValidContext(r.Context(), account.ID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "token_refresh_error", "無法重新整理帳號權杖")
 		return
@@ -565,7 +589,6 @@ func writeOAuthCompletionPage(w http.ResponseWriter) {
 
 type chatBody struct {
 	Model          string               `json:"model,omitempty"`
-	AccountID      string               `json:"accountId"`
 	Message        string               `json:"message"`
 	Prompt         string               `json:"prompt"`
 	Tone           string               `json:"tone"`
@@ -645,7 +668,9 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	defer turn.Abort()
 	body.ConversationID = turn.binding.ConversationID
 	body.SessionID = turn.binding.SessionID
-	acc, err := s.activeAccount()
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ChatTimeoutSeconds)*time.Second)
+	defer cancel()
+	acc, err := s.activeAccountContext(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -662,8 +687,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ChatTimeoutSeconds)*time.Second)
-	defer cancel()
 	account, err := s.chatHubAccount(ctx, acc, body.Attachments)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -734,22 +757,21 @@ func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 type oaiMsg struct {
-	Role             string           `json:"role"`
-	Content          any              `json:"content"`
-	Name             string           `json:"name,omitempty"`
-	ToolCallID       string           `json:"tool_call_id,omitempty"`
-	ToolCalls        []map[string]any `json:"tool_calls,omitempty"`
-	SidecarGenerated bool             `json:"-"`
+	Role              string           `json:"role"`
+	Content           any              `json:"content"`
+	Name              string           `json:"name,omitempty"`
+	ToolCallID        string           `json:"tool_call_id,omitempty"`
+	ToolCalls         []map[string]any `json:"tool_calls,omitempty"`
+	ToolResultIsError bool             `json:"-"`
+	SidecarGenerated  bool             `json:"-"`
 }
 
 type oaiReq struct {
-	Model          string          `json:"model"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
-	Messages       []oaiMsg        `json:"messages"`
-	Stream         bool            `json:"stream"`
-	// optional account routing
+	Model          string               `json:"model"`
+	ResponseFormat *responseFormat      `json:"response_format,omitempty"`
+	Messages       []oaiMsg             `json:"messages"`
+	Stream         bool                 `json:"stream"`
 	User           string               `json:"user"`
-	AccountID      string               `json:"accountId"`
 	ConversationID string               `json:"conversation_id"`
 	SessionID      string               `json:"session_id"`
 	SessionKey     string               `json:"session_key"`
@@ -791,6 +813,8 @@ func contentToString(c any) string {
 			}
 		}
 		return b.String()
+	case nil:
+		return ""
 	default:
 		return fmt.Sprint(v)
 	}
@@ -846,9 +870,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	if body.Stream {
+		w = wrapSSEDeadlineWriter(w)
+	}
 	setIgnoredParameters(w, ignoredOpenAICompatibilityParameters(body))
 	needsTextValidation := !callerTextAlreadyValidated(r)
 	responseFormat := body.ResponseFormat
+	if err := validateResponseFormatDefinition(responseFormat); err != nil {
+		writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "invalid_response_format", err.Error())
+		return
+	}
 	effort := body.ReasoningEffort
 	if body.Reasoning != nil && strings.TrimSpace(body.Reasoning.Effort) != "" {
 		effort = body.Reasoning.Effort
@@ -864,6 +895,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	tone := resolution.ResolvedTone
 	normalizeLegacyTools(&body)
+	if _, err := strictToolChoiceMode(body.ToolChoice); err != nil {
+		writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "invalid_tool_choice", err.Error())
+		return
+	}
 	nativePolicy, err := resolveNativePolicy(serverRuntimeSettings(s).ToolPlanningMode, body.Tools)
 	if err != nil {
 		if errors.Is(err, errReservedNativeToolName) {
@@ -999,6 +1034,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if memoryCompatibilityRequest(r.URL.Path) {
 		prompt += memorySchemaInstruction(responseFormat)
 	}
+	if prompt != "" {
+		if err := validateCallerString(prompt, settings.TextInputLimitUTF16); err != nil {
+			writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", err.Error())
+			return
+		}
+	}
 	if prompt == "" && len(body.Attachments) == 0 {
 		http.Error(w, "messages required", http.StatusBadRequest)
 		return
@@ -1010,7 +1051,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	setDowngradedParameters(w, downgraded)
 
-	acc, err := s.activeAccount()
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ChatTimeoutSeconds)*time.Second)
+	defer cancel()
+	acc, err := s.activeAccountContext(ctx)
 	if err != nil {
 		log.Printf("[account] resolve_failed code=account_unavailable")
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1042,8 +1085,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		answerToolChoice = body.ToolChoice
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-	defer cancel()
 	account, err := s.chatHubAccount(ctx, acc, body.Attachments)
 	if err != nil {
 		writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "resource_token_unavailable", err.Error())
@@ -1138,7 +1179,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			for i := range calls {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
-			calls = limitToolCalls(calls, requestToolCallLimit(body, calls, s.settings))
+			if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
+				writeChatStreamError(w, "tool_call_limit_exceeded", err.Error())
+				return
+			}
 			if !carrierIsRouteResult {
 				mergeSearchEvidence(&carrier, routerSearchEvidence)
 			}
@@ -1176,7 +1220,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					for i := range calls {
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
-					calls = limitToolCalls(calls, requestToolCallLimit(body, calls, s.settings))
+					if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
+						writeChatStreamError(w, "tool_call_limit_exceeded", err.Error())
+						return
+					}
 					mergeSearchEvidence(&retryRes, routerSearchEvidence)
 					retryRes.Text = ""
 					if err := completeCheckpointExecution(execution, ownsCheckpoint, retryRes, assistantToolCheckpointMessage(calls, retryRes, true)); err != nil {
@@ -1361,7 +1408,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if streamedToolCalls {
 				emitText(pending.String())
 			}
-			calls = limitToolCalls(calls, requestToolCallLimit(body, calls, s.settings))
+			if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
+				writeChatStreamError(w, "tool_call_limit_exceeded", err.Error())
+				return
+			}
 			if err := completeCheckpointExecution(execution, ownsCheckpoint, res, assistantToolCheckpointMessageWithContent(calls, visible.String(), res.Images)); err != nil {
 				writeChatStreamError(w, "checkpoint_error", err.Error())
 				return
@@ -1399,7 +1449,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			writeTextStreamEndWithPolicy(w, id, model, resolution, nativePolicy, res)
 			return
 		}
-		if strings.TrimSpace(text.String()) == "" && len(res.Images) == 0 {
+		if strings.TrimSpace(text.String()) == "" && len(res.Images) == 0 && strings.TrimSpace(chathub.ReasoningContent(res.Events)) == "" {
 			if rejectedUnavailableCalls || rejectedRouterCalls {
 				writeChatStreamError(w, "invalid_tool_call_stream", "ChatHub returned a tool call that was not exposed by the client")
 				return
@@ -1496,7 +1546,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			for i := range calls {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
-			calls = limitToolCalls(calls, requestToolCallLimit(body, calls, s.settings))
+			if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
+				writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "tool_call_limit_exceeded", err.Error())
+				return
+			}
 			if !carrierIsRouteResult {
 				mergeSearchEvidence(&carrier, routerSearchEvidence)
 			}
@@ -1533,7 +1586,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					for i := range calls {
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
-					calls = limitToolCalls(calls, requestToolCallLimit(body, calls, s.settings))
+					if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
+						writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "tool_call_limit_exceeded", err.Error())
+						return
+					}
 					mergeSearchEvidence(&retryRes, routerSearchEvidence)
 					retryRes.Text = ""
 					if err := completeCheckpointExecution(execution, ownsCheckpoint, retryRes, assistantToolCheckpointMessage(calls, retryRes, body.Stream)); err != nil {
@@ -1581,7 +1637,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		calls := filterKnownCalls(detected, ledger)
 		suppressedKnownCalls := len(detected) > len(calls)
 		if len(calls) > 0 && allowAnswerToolCalls {
-			calls = limitToolCalls(calls, requestToolCallLimit(body, calls, s.settings))
+			if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
+				writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "tool_call_limit_exceeded", err.Error())
+				return
+			}
 			toolResult := res
 			toolResult.Text = ""
 			if err := completeCheckpointExecution(execution, ownsCheckpoint, toolResult, assistantToolCheckpointMessage(calls, toolResult, body.Stream)); err != nil {
@@ -1612,7 +1671,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		calls := filterKnownCalls(detected, ledger)
 		suppressedKnownCalls := len(detected) > len(calls)
 		if len(calls) > 0 && allowAnswerToolCalls {
-			calls = limitToolCalls(calls, requestToolCallLimit(body, calls, s.settings))
+			if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
+				writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "tool_call_limit_exceeded", err.Error())
+				return
+			}
 			if err := completeCheckpointExecution(execution, ownsCheckpoint, res, assistantToolCheckpointMessage(calls, res, body.Stream)); err != nil {
 				writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 				return
@@ -1647,7 +1709,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if formatErr != nil && memoryCompatibilityRequest(r.URL.Path) && responseFormat.Type == "json_schema" {
 			if _, candidateErr := decodeExactJSONValue([]byte(normalizeJSONText(res.Text))); candidateErr == nil {
 				repairPrompt := memorySchemaRepairPrompt(res.Text, responseFormat, formatErr)
-				repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone}))
+				if budgetErr := validateCallerString(repairPrompt, settings.TextInputLimitUTF16); budgetErr != nil {
+					writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", budgetErr.Error())
+					return
+				}
+				repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, ToolChoice: "none", DisableBuiltInSearch: true}))
 				if repairErr != nil {
 					if writeCanonicalTerminalError(w, repairErr) {
 						return
@@ -1655,7 +1721,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				} else {
 					execution.Observe(repairRes)
 					if repaired, repairedErr := validateResponseFormatText(repairRes.Text, responseFormat); repairedErr == nil {
-						if factErr := memoryRepairPreservesFacts(res.Text, repaired); factErr == nil {
+						if factErr := memoryRepairPreservesFacts(res.Text, repaired, responseFormat); factErr == nil {
 							res = repairRes
 							formatted = repaired
 							formatErr = nil

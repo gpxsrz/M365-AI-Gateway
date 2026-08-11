@@ -44,12 +44,12 @@ func TestAdministrationTemplatesAreTaiwanTraditionalChinese(t *testing.T) {
 func TestAdministrationTemplatesUseTaiwanTerminology(t *testing.T) {
 	expected := map[string][]string{
 		"web/login.html": {"管理員登入", "管理主控台", "Microsoft 帳號", "切換密碼顯示"},
-		"web/index.html": {"Microsoft 帳號", "登入帳號", "存取設定", "執行日誌", "代理集區", "設定"},
+		"web/index.html": {"Microsoft 帳號", "登入帳號", "存取設定", "執行日誌", "代理節點部署", "單一 Outbound Proxy", "設定"},
 		"web/debug.html": {"診斷摘要", "短期診斷快照", "純量內容", "請求標頭", "重新整理", "返回管理介面", "協定", "路由", "請求 ID", "快照到期時間"},
 	}
 	forbidden := map[string][]string{
 		"web/login.html": {"帳號集區"},
-		"web/index.html": {"帳號集區", "新增帳號", "profileRef", "profileRefVersion", "/api/accounts"},
+		"web/index.html": {"帳號集區", "新增帳號", "代理集區", "profileRef", "profileRefVersion", "/api/accounts", "/api/admin/proxy-pool"},
 	}
 	for path, phrases := range expected {
 		raw, err := os.ReadFile(filepath.Join("../..", path))
@@ -286,7 +286,6 @@ func TestVisibleManagementHandlersReturnZhTWErrors(t *testing.T) {
 		{name: "admin login method", handler: server.adminLogin, method: http.MethodGet, target: "/api/admin/login", wantStatus: http.StatusMethodNotAllowed, wantMessage: "不支援此 HTTP 方法", wantType: "invalid_request_error"},
 		{name: "change password method", handler: server.adminChangePassword, method: http.MethodGet, target: "/api/admin/change-password", wantStatus: http.StatusMethodNotAllowed, wantMessage: "不支援此 HTTP 方法", wantType: "invalid_request_error"},
 		{name: "debug record missing", handler: server.debugDetail, method: http.MethodGet, target: "/api/admin/debug/detail?id=missing", wantStatus: http.StatusNotFound, wantMessage: "找不到診斷記錄", wantType: "not_found"},
-		{name: "proxy malformed json", handler: server.proxyPool, method: http.MethodPost, target: "/api/admin/proxy-pool", body: "{", wantStatus: http.StatusBadRequest, wantMessage: "JSON 格式錯誤", wantType: "invalid_request_error"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

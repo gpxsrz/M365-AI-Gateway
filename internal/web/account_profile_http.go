@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"m365-native/internal/auth"
 	"time"
@@ -33,6 +34,10 @@ func (s *Server) managementAccount(account auth.AccountToken) (managementAccount
 }
 
 func (s *Server) activeAccount() (auth.AccountToken, error) {
+	return s.activeAccountContext(context.Background())
+}
+
+func (s *Server) activeAccountContext(ctx context.Context) (auth.AccountToken, error) {
 	store := s.activeTokenStore()
 	if store == nil {
 		return auth.AccountToken{}, errors.New("account token store is unavailable")
@@ -41,7 +46,7 @@ func (s *Server) activeAccount() (auth.AccountToken, error) {
 	if !ok {
 		return auth.AccountToken{}, errors.New("no account; login first")
 	}
-	account, err := store.EnsureValid(account.ID)
+	account, err := store.EnsureValidContext(ctx, account.ID)
 	if err != nil {
 		return auth.AccountToken{}, err
 	}

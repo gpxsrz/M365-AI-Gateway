@@ -59,6 +59,51 @@ func bufferedToolResponse(name, arguments string) map[string]any {
 	}
 }
 
+func TestMemorySchemaFinalOutboundBudgetFailsBeforeChatHub(t *testing.T) {
+	chat := &wp1CandidateChat{result: chathub.Result{Text: "should not run"}}
+	server := newWP1CandidateServer(t, chat)
+	settings := server.settings.get()
+	settings.TextInputLimitUTF16 = 80
+	server.settings.v = settings
+	rr := httptest.NewRecorder()
+	body := `{"model":"gpt-5.6-reasoning","messages":[{"role":"user","content":"short"}],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"long_protocol_property_name":{"type":"string"}},"required":["long_protocol_property_name"]}}}}`
+	server.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)))
+	if rr.Code != http.StatusBadRequest || len(chat.requests) != 0 || !strings.Contains(rr.Body.String(), "text_policy_exceeded") {
+		t.Fatalf("status=%d upstream=%d body=%s", rr.Code, len(chat.requests), rr.Body.String())
+	}
+}
+
+func TestInvalidResponseFormatFailsBeforeChatHub(t *testing.T) {
+	chat := &wp1CandidateChat{result: chathub.Result{Text: "should not run"}}
+	server := newWP1CandidateServer(t, chat)
+	rr := httptest.NewRecorder()
+	body := `{"model":"gpt-5.6-reasoning","messages":[{"role":"user","content":"remember"}],"response_format":{"type":"json_schema","json_schema":{"schema":{"$ref":"https://example.invalid/schema.json"}}}}`
+	server.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)))
+	if rr.Code != http.StatusBadRequest || len(chat.requests) != 0 || !strings.Contains(rr.Body.String(), "invalid_response_format") {
+		t.Fatalf("status=%d upstream=%d body=%s", rr.Code, len(chat.requests), rr.Body.String())
+	}
+}
+
+func TestInvalidToolChoiceFailsBeforeChatHub(t *testing.T) {
+	for _, raw := range []string{
+		`"bogus"`,
+		`{"type":"function"}`,
+		`{"type":"not_function","function":{"name":"terminal"}}`,
+		`{"unexpected":true}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			chat := &wp1CandidateChat{result: chathub.Result{Text: "should not run"}}
+			server := newWP1CandidateServer(t, chat)
+			rr := httptest.NewRecorder()
+			body := `{"model":"gpt-5.6-reasoning","messages":[{"role":"user","content":"run"}],"tools":[` + routerFallbackTool + `],"tool_choice":` + raw + `}`
+			server.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+			if rr.Code != http.StatusBadRequest || len(chat.requests) != 0 || !strings.Contains(rr.Body.String(), "invalid_tool_choice") {
+				t.Fatalf("status=%d upstream=%d body=%s", rr.Code, len(chat.requests), rr.Body.String())
+			}
+		})
+	}
+}
+
 func terminalCatalog() []chathub.Tool {
 	return []chathub.Tool{{
 		Type:     "function",

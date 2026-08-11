@@ -19,7 +19,8 @@ import (
 )
 
 const (
-	transportCheckpointSchema                      = "wp6-transport-checkpoints/v1"
+	legacyTransportCheckpointSchema                = "wp6-transport-checkpoints/v1"
+	transportCheckpointSchema                      = "wp6-transport-checkpoints/v2"
 	transportCheckpointTTL                         = 24 * time.Hour
 	transportCheckpointMaxFileBytes                = int64(32 << 20)
 	transportCheckpointMaxRecords                  = 256
@@ -112,10 +113,14 @@ func (t *checkpointTurn) Abort() error {
 }
 
 type transportCheckpointStore struct {
-	mu      sync.Mutex
-	path    string
-	records map[string]*transportCheckpointRecord
-	now     func() time.Time
+	mu             sync.Mutex
+	path           string
+	records        map[string]*transportCheckpointRecord
+	now            func() time.Time
+	generation     string
+	recordBytes    map[string]int64
+	persistedBytes int64
+	nextPruneAt    time.Time
 }
 
 type transportCheckpointFile struct {
@@ -173,64 +178,13 @@ func openTransportCheckpointStoreWithClock(path string, now func() time.Time) (*
 		return nil, fmt.Errorf("%w: inspect path: %v", ErrCheckpointPersistence, err)
 	}
 	s := &transportCheckpointStore{
-		path:    path,
-		records: make(map[string]*transportCheckpointRecord),
-		now:     now,
+		path:        path,
+		records:     make(map[string]*transportCheckpointRecord),
+		recordBytes: make(map[string]int64),
+		now:         now,
 	}
-	b, err := readCheckpointFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("%w: read: %w", ErrCheckpointPersistence, err)
-	}
-
-	file, err := decodeTransportCheckpointFile(b)
-	if err != nil || file.Schema != transportCheckpointSchema {
-		// The former session cache stored Title/full prompt text. Replace any
-		// non-WP6 schema immediately instead of carrying private text forward.
-		if err := s.persistLocked(); err != nil {
-			return nil, err
-		}
-		return s, nil
-	}
-
-	dirty := false
-	openedAt := s.now()
-	for i := range file.Records {
-		record := cloneTransportCheckpointRecord(&file.Records[i])
-		if len(record.CompletedToolCallDigests) == 0 && len(record.CompletedToolEvidence) > 0 {
-			record.CompletedToolCallDigests = completedToolCallDigests(record.CompletedToolEvidence)
-			dirty = true
-		}
-		if len(record.CompletedToolIdentityDigests) == 0 && len(record.CompletedToolEvidence) > 0 {
-			record.CompletedToolIdentityDigests = completedToolIdentityDigests(record.CompletedToolEvidence)
-			dirty = true
-		}
-		if record.InFlight {
-			// A process exit can happen after Microsoft accepted a turn but before
-			// Finish committed it. Reusing that binding would be guesswork.
-			dirty = true
-			continue
-		}
-		if len(s.records) >= transportCheckpointMaxRecords || !validTransportCheckpointRecord(record) || transportCheckpointExpired(record, openedAt) {
-			dirty = true
-			continue
-		}
-		if _, duplicate := s.records[record.ID]; duplicate {
-			dirty = true
-			continue
-		}
-		s.records[record.ID] = record
-	}
-	if dirty {
-		if err := s.persistLocked(); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := secureCheckpointPath(path); err != nil {
-			return nil, err
-		}
+	if err := s.loadPersistence(); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -277,25 +231,55 @@ func (s *transportCheckpointStore) Delete(recordID string) (bool, error) {
 	}
 	snapshot := cloneTransportCheckpointRecords(s.records)
 	delete(s.records, recordID)
-	if err := s.persistLocked(); err != nil {
+	if err := s.deleteRecordLocked(recordID); err != nil {
 		s.records = snapshot
 		return false, err
 	}
+	s.recomputeNextPruneAtLocked()
 	return true, nil
 }
 
 func (s *transportCheckpointStore) Clear() error {
+	return s.ClearThen(nil)
+}
+
+func (s *transportCheckpointStore) ClearThen(change func() error) error {
 	if s == nil {
+		if change != nil {
+			return change()
+		}
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	snapshot := cloneTransportCheckpointRecords(s.records)
+	previousNextPruneAt := s.nextPruneAt
 	s.records = make(map[string]*transportCheckpointRecord)
-	if err := s.persistLocked(); err != nil {
+	s.nextPruneAt = time.Time{}
+	transition, err := s.switchCheckpointGenerationLocked(s.records)
+	if err != nil {
 		s.records = snapshot
+		s.nextPruneAt = previousNextPruneAt
 		return err
 	}
+	if change == nil {
+		s.commitCheckpointGenerationLocked(transition)
+		return nil
+	}
+	if err := change(); err != nil {
+		s.records = snapshot
+		s.nextPruneAt = previousNextPruneAt
+		if restoreErr := s.rollbackCheckpointGenerationLocked(transition); restoreErr != nil {
+			// The empty generation is already durable. Keep runtime state aligned
+			// with it instead of reusing checkpoints that may vanish on restart.
+			s.records = make(map[string]*transportCheckpointRecord)
+			s.nextPruneAt = time.Time{}
+			return fmt.Errorf("%w; restore transport checkpoints: %v", err, restoreErr)
+		}
+		return err
+	}
+	s.commitCheckpointGenerationLocked(transition)
 	return nil
 }
 
@@ -394,7 +378,7 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 		selected.InFlight = true
 		selected.Revision++
 		selected.UpdatedAt = s.now()
-		if err := s.persistLocked(); err != nil {
+		if err := s.persistRecordLocked(selected); err != nil {
 			s.records = snapshot
 			return nil, err
 		}
@@ -422,13 +406,16 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 			return nil, err
 		}
 	}
+	structuralChange := len(discard) > 0
 	for _, record := range discard {
 		delete(s.records, record.ID)
 	}
-	if err := s.makeRoomLocked(); err != nil {
+	evicted, err := s.makeRoomLocked(ownerDigest)
+	if err != nil {
 		s.records = snapshot
 		return nil, err
 	}
+	structuralChange = structuralChange || evicted
 	now := s.now()
 	recordID, err := newCheckpointID()
 	if err != nil {
@@ -448,7 +435,12 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 		InFlight:       true,
 	}
 	s.records[record.ID] = record
-	if err := s.persistLocked(); err != nil {
+	if structuralChange {
+		err = s.persistLocked()
+	} else {
+		err = s.persistRecordLocked(record)
+	}
+	if err != nil {
 		s.records = snapshot
 		return nil, err
 	}
@@ -546,9 +538,11 @@ func (s *transportCheckpointStore) beginAppendLocked(record *transportCheckpoint
 	}
 	if len(record.MessageDigests)+len(delta.digests) > transportCheckpointMaxMessages {
 		delete(s.records, record.ID)
-		if err := s.persistLocked(); err != nil {
+		if err := s.deleteRecordLocked(record.ID); err != nil {
+			s.records[record.ID] = record
 			return nil, err
 		}
+		s.recomputeNextPruneAtLocked()
 		return nil, ErrCheckpointHistoryLimit
 	}
 	snapshot := cloneTransportCheckpointRecords(s.records)
@@ -560,7 +554,7 @@ func (s *transportCheckpointStore) beginAppendLocked(record *transportCheckpoint
 	record.InFlight = true
 	record.Revision++
 	record.UpdatedAt = s.now()
-	if err := s.persistLocked(); err != nil {
+	if err := s.persistRecordLocked(record); err != nil {
 		s.records = snapshot
 		return nil, err
 	}
@@ -657,10 +651,11 @@ func (s *transportCheckpointStore) accept(turn *checkpointTurn, binding checkpoi
 	record.InFlight = false
 	record.Revision++
 	record.UpdatedAt = s.now()
-	if err := s.persistLocked(); err != nil {
+	if err := s.persistRecordLocked(record); err != nil {
 		delete(s.records, record.ID)
 		turn.closed = true
-		_ = s.persistLocked()
+		_ = s.deleteRecordLocked(record.ID)
+		s.recomputeNextPruneAtLocked()
 		return err
 	}
 	turn.closed = true
@@ -682,15 +677,20 @@ func (s *transportCheckpointStore) abort(turn *checkpointTurn) error {
 		return ErrCheckpointAttemptStale
 	}
 	delete(s.records, record.ID)
-	return s.persistLocked()
+	if err := s.deleteRecordLocked(record.ID); err != nil {
+		return err
+	}
+	s.recomputeNextPruneAtLocked()
+	return nil
 }
 
 func (s *transportCheckpointStore) invalidateTurnLocked(turn *checkpointTurn, cause error) error {
 	delete(s.records, turn.recordID)
 	turn.closed = true
-	if err := s.persistLocked(); err != nil {
+	if err := s.deleteRecordLocked(turn.recordID); err != nil {
 		return errors.Join(cause, err)
 	}
+	s.recomputeNextPruneAtLocked()
 	return cause
 }
 
@@ -735,28 +735,39 @@ func (s *transportCheckpointStore) uniqueLongestPrefixLocked(namespace, ownerDig
 	return selected, false
 }
 
-func (s *transportCheckpointStore) makeRoomLocked() error {
+func (s *transportCheckpointStore) makeRoomLocked(ownerDigest string) (bool, error) {
 	if len(s.records) < transportCheckpointMaxRecords {
-		return nil
+		return false, nil
 	}
-	var oldest *transportCheckpointRecord
+	var ownerOldest *transportCheckpointRecord
+	var globalOldest *transportCheckpointRecord
 	for _, record := range s.records {
 		if record.InFlight {
 			continue
 		}
-		if oldest == nil || record.UpdatedAt.Before(oldest.UpdatedAt) {
-			oldest = record
+		if globalOldest == nil || record.UpdatedAt.Before(globalOldest.UpdatedAt) {
+			globalOldest = record
+		}
+		if record.OwnerDigest == ownerDigest && (ownerOldest == nil || record.UpdatedAt.Before(ownerOldest.UpdatedAt)) {
+			ownerOldest = record
 		}
 	}
+	oldest := ownerOldest
 	if oldest == nil {
-		return ErrCheckpointCapacity
+		oldest = globalOldest
+	}
+	if oldest == nil {
+		return false, ErrCheckpointCapacity
 	}
 	delete(s.records, oldest.ID)
-	return nil
+	return true, nil
 }
 
 func (s *transportCheckpointStore) pruneExpiredLocked() error {
 	now := s.now()
+	if !s.nextPruneAt.IsZero() && now.Before(s.nextPruneAt) {
+		return nil
+	}
 	snapshot := cloneTransportCheckpointRecords(s.records)
 	changed := false
 	for id, record := range s.records {
@@ -766,10 +777,12 @@ func (s *transportCheckpointStore) pruneExpiredLocked() error {
 		}
 	}
 	if !changed {
+		s.recomputeNextPruneAtLocked()
 		return nil
 	}
 	if err := s.persistLocked(); err != nil {
 		s.records = snapshot
+		s.recomputeNextPruneAtLocked()
 		return err
 	}
 	return nil
@@ -780,23 +793,7 @@ func transportCheckpointExpired(record *transportCheckpointRecord, now time.Time
 }
 
 func (s *transportCheckpointStore) persistLocked() error {
-	records := make([]transportCheckpointRecord, 0, len(s.records))
-	for _, record := range s.records {
-		records = append(records, *cloneTransportCheckpointRecord(record))
-	}
-	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
-	b, err := json.MarshalIndent(transportCheckpointFile{Schema: transportCheckpointSchema, Records: records}, "", "  ")
-	if err != nil {
-		return fmt.Errorf("%w: encode: %v", ErrCheckpointPersistence, err)
-	}
-	b = append(b, '\n')
-	if int64(len(b)) > transportCheckpointMaxFileBytes {
-		return ErrCheckpointCapacity
-	}
-	if err := writeCheckpointFileAtomic(s.path, b); err != nil {
-		return fmt.Errorf("%w: %v", ErrCheckpointPersistence, err)
-	}
-	return nil
+	return s.persistAllLocked()
 }
 
 func decodeTransportCheckpointFile(b []byte) (transportCheckpointFile, error) {
@@ -1422,9 +1419,6 @@ func writeCheckpointFileAtomic(path string, data []byte) error {
 		return err
 	}
 	ok = true
-	if err := os.Chmod(path, 0o600); err != nil {
-		return err
-	}
 	if dirHandle, err := os.Open(dir); err == nil {
 		_ = dirHandle.Sync()
 		_ = dirHandle.Close()

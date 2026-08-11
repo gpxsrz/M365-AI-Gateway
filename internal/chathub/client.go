@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,15 +55,16 @@ type Account struct {
 }
 
 type Request struct {
-	Text           string
-	Tone           string
-	ConversationID string
-	SessionID      string
-	Attachments    []Attachment
-	Tools          []Tool
-	ToolChoice     any
-	ToolCallLimit  int
-	MCPServerURL   string // URL of the MCP HTTP SSE server for tool discovery
+	Text                 string
+	Tone                 string
+	ConversationID       string
+	SessionID            string
+	Attachments          []Attachment
+	Tools                []Tool
+	ToolChoice           any
+	ToolCallLimit        int
+	MCPServerURL         string // URL of the MCP HTTP SSE server for tool discovery
+	DisableBuiltInSearch bool   // internal compatibility path: omit Bing/native search from this request
 	// Started is true only for the first turn of a ChatHub conversation.
 	Started bool
 }
@@ -139,14 +141,28 @@ func (c *Client) privateModeEnabled() bool {
 	return c.PrivateMode()
 }
 
-func webSocketDialFailure(status int, err error) error {
+func webSocketDialFailure(status int, retryAfter string, err error) error {
 	if status == http.StatusTooManyRequests {
-		return &RateLimitError{StatusCode: status, Err: err}
+		return &RateLimitError{StatusCode: status, RetryAfter: normalizeRetryAfter(retryAfter), Err: err}
 	}
 	if status > 0 {
 		return fmt.Errorf("ws dial failed: HTTP %d: %w", status, err)
 	}
 	return fmt.Errorf("ws dial: %w", err)
+}
+
+func normalizeRetryAfter(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if seconds, err := strconv.ParseUint(value, 10, 63); err == nil {
+		return strconv.FormatUint(seconds, 10)
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		return when.UTC().Format(http.TimeFormat)
+	}
+	return ""
 }
 
 func callerContextError(ctx context.Context, err error) error {
@@ -219,14 +235,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
 	if err != nil {
 		status := 0
+		retryAfter := ""
 		if response != nil {
 			status = response.StatusCode
+			retryAfter = response.Header.Get("Retry-After")
 			if response.Body != nil {
 				_ = response.Body.Close()
 			}
 		}
 		log.Printf("chathub ws_dial_failed status=%d", status)
-		return Result{}, webSocketDialFailure(status, err)
+		return Result{}, webSocketDialFailure(status, retryAfter, err)
 	}
 	defer conn.Close()
 	stopContextClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
@@ -254,7 +272,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return Result{}, fmt.Errorf("handshake recv: %w", err)
 	}
 
-	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.ToolCallLimit, req.MCPServerURL)
+	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.ToolCallLimit, req.MCPServerURL, req.DisableBuiltInSearch)
 	log.Printf("chathub prompt-trace text=%d tools=%d payload=%d", len(req.Text), len(req.Tools), len(payload))
 	if c.Trace != nil {
 		dataURLCount := 0
@@ -522,7 +540,7 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 	return nil
 }
 
-func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, toolCallLimit int, mcpServerURL string) string {
+func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, toolCallLimit int, mcpServerURL string, disableBuiltInSearch ...bool) string {
 	text = toolProtocolPrompt(text, tools, toolChoice, toolCallLimit)
 	message := map[string]any{
 		"author":                "user",
@@ -604,6 +622,7 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 		"enable_batch_token_processing",
 		"enable_gg_gpt",
 	}
+	searchDisabled := len(disableBuiltInSearch) > 0 && disableBuiltInSearch[0]
 	chat := map[string]any{
 		"arguments": []any{
 			map[string]any{
@@ -631,7 +650,7 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 				"streamingMode": "ConciseWithPadding",
 				"message":       message,
 
-				"plugins":    clientPlugins(callerToolsForChoice(tools, toolChoice), callerMCPForChoice(mcpServerURL, toolChoice)),
+				"plugins":    clientPlugins(callerToolsForChoice(tools, toolChoice), callerMCPForChoice(mcpServerURL, toolChoice), searchDisabled),
 				"toolChoice": toolChoice,
 			},
 		},

@@ -76,16 +76,16 @@ curl -sS http://127.0.0.1:4141/v1/models \
 ## 隱私與限制
 
 - 預設聊天模式為 `Private`。每次建立 ChatHub WebSocket 都會重新套用 `disableMemory=1`，但這不代表 Microsoft 完全不保留任何資料。
-- 呼叫端文字預設上限為 `128000` 個 UTF-16 碼元。這是與官方 Web 編輯器相容的保守政策，不是已證明的 Microsoft 後端硬上限。
+- 呼叫端文字預設上限為 `128000` 個 UTF-16 碼元。這是與官方 Web 編輯器相容的保守政策，不是 token context window，也不是已證明的 Microsoft 後端硬上限。Hermes 等 Agent 若無法正確偵測自訂 route 的 context，請使用 provider/model 級 override，不要用 M365 的限制污染其他 provider。
 - 文件與圖片使用不同的 Microsoft 傳輸路徑。文件可能經由 Graph、OneDrive 或 SharePoint 暫存；圖片則走專用圖片上傳路徑。
 - Code Interpreter 產出的檔案會由 Sidecar 以已登入身分擷取、存入本機私有儲存區，再轉成短期下載網址（capability URL）。網址本身具有存取能力，請勿公開轉傳。
 - 將服務暴露到 loopback 以外之前，必須另行配置 TLS、可信反向代理、網路存取限制及正確的公開來源設定。
 
-完整邊界請見 [已知限制](docs/已知限制.md)；安全注意事項請見 [SECURITY.md](SECURITY.md)。
+完整邊界請見 [已知限制](docs/已知限制.md)；Hermes 設定請見 [Hermes 整合指南](docs/Hermes整合指南.md)；長任務與 Synology/Nginx timeout 請見 [部署與反向代理](docs/部署與反向代理.md)；安全注意事項請見 [SECURITY.md](SECURITY.md)。
 
 ## Hermes 與 Hindsight 流量政策
 
-管理介面提供 Hermes／Hindsight 相容開關與 Memory 同時請求數、排隊逾時、Hermes 優先保留時間、Memory 429 初始／最大退避等控制。政策是：**互動式流量優先，Hindsight 背景工作讓位**。過渡期間，既有 Hermes 若仍使用 `/v1/chat/completions`，該路徑也會被視為互動式流量；切到 `/hermes/v1/*` 後則使用獨立的 `hermes` checkpoint namespace。
+管理介面提供 Hermes／Hindsight 相容開關與 Memory 同時請求數、排隊逾時、互動流量優先保留時間、Memory 429 初始／最大退避等控制。政策是：**互動式流量優先，Hindsight 背景工作讓位**。既有 Hermes 繼續使用 `/v1/chat/completions` 時，該路徑和其他標準 `/v1` caller 一樣分類為互動流量；只有 `/hermes/v1/*` 是受 Hermes 相容開關控制的專用 profile，並使用獨立的 `hermes` checkpoint namespace。
 
 Memory 排隊採 FIFO，已進場的 Memory 工作不會被強制中斷；若 Microsoft 回 429，Memory 會進入 cooldown 並逐步延長退避。真實 Microsoft 帳號不會用高併發故意觸發 429，相關行為以本地 deterministic test 驗證，線上只做低併發確認。
 

@@ -24,7 +24,10 @@ func TestAPIKeyAuthenticateReturnsRecordIDWithoutPersistingRawKey(t *testing.T) 
 		t.Fatal("successful authentication did not update LastUsedAt")
 	}
 	t.Setenv("M365_API_KEYS", path)
-	reloaded := openAPIKeys()
+	reloaded, err := openAPIKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(reloaded.Keys) != 1 || reloaded.Keys[0].LastUsedAt == nil {
 		t.Fatal("successful authentication did not persist LastUsedAt")
 	}

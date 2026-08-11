@@ -68,20 +68,22 @@ type artifactIndex struct {
 }
 
 type artifactStore struct {
-	mu           sync.Mutex
-	root         string
-	blobDir      string
-	indexPath    string
-	clock        func() time.Time
-	lifetime     time.Duration
-	maxEntries   int
-	maxBytes     int64
-	entries      map[string]artifactIndexEntry
-	totalBytes   int64
-	pending      map[string]struct{}
-	pendingBytes int64
-	timer        *time.Timer
-	closed       bool
+	mu                    sync.Mutex
+	root                  string
+	blobDir               string
+	indexPath             string
+	clock                 func() time.Time
+	lifetime              time.Duration
+	maxEntries            int
+	maxBytes              int64
+	entries               map[string]artifactIndexEntry
+	totalBytes            int64
+	pending               map[string]struct{}
+	pendingBytes          int64
+	verified              map[string]artifactBlobVerification
+	fullVerificationCount uint64
+	timer                 *time.Timer
+	closed                bool
 }
 
 func openArtifactStore(root string, options artifactStoreOptions) (*artifactStore, error) {
@@ -121,11 +123,12 @@ func openArtifactStore(root string, options artifactStoreOptions) (*artifactStor
 		maxBytes:   options.MaxBytes,
 		entries:    make(map[string]artifactIndexEntry),
 		pending:    make(map[string]struct{}),
+		verified:   make(map[string]artifactBlobVerification),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
-	if err := s.cleanupLocked(s.now()); err != nil {
+	if err := s.recoverStartupOrphansLocked(); err != nil {
 		return nil, err
 	}
 	s.scheduleLocked()
@@ -231,6 +234,7 @@ func (s *artifactStore) PutReader(filename string, reader io.Reader, maxBytes in
 		}
 		return artifactRecord{}, fmt.Errorf("persist artifact index: %w", err)
 	}
+	s.rememberIngestedVerificationLocked(entry)
 	s.scheduleLocked()
 	s.mu.Unlock()
 	return recordForArtifact(entry, token), nil
@@ -249,8 +253,11 @@ func (s *artifactStore) Open(token string) (artifactRecord, *os.File, error) {
 	if err != nil {
 		return artifactRecord{}, nil, err
 	}
-	file, err := openVerifiedArtifactBlob(s.blobPath(entry.BlobID), entry)
+	file, err := s.openIntegrityCheckedBlob(entry)
 	if err != nil {
+		if errors.Is(err, ErrArtifactCorrupt) {
+			s.quarantineCorruptArtifact(entry)
+		}
 		return artifactRecord{}, nil, err
 	}
 	return recordForArtifact(entry, token), file, nil
@@ -297,6 +304,7 @@ func (s *artifactStore) Delete(token string) error {
 		s.totalBytes += entry.Size
 		return fmt.Errorf("persist artifact deletion: %w", err)
 	}
+	delete(s.verified, entry.BlobID)
 	s.scheduleLocked()
 	if err := removeArtifactBlob(s.blobPath(entry.BlobID)); err != nil {
 		return err
@@ -353,25 +361,41 @@ func (s *artifactStore) load() error {
 		return ErrArtifactCapacity
 	}
 	seenBlobs := make(map[string]struct{}, len(index.Entries))
+	dirty := false
+	now := s.now()
 	for _, entry := range index.Entries {
-		if err := validateArtifactEntry(entry); err != nil {
-			return err
+		if validateArtifactEntry(entry) != nil {
+			dirty = true
+			continue
 		}
 		if _, exists := s.entries[entry.TokenSHA256]; exists {
-			return fmt.Errorf("%w: duplicate token identity", ErrArtifactCorrupt)
+			dirty = true
+			continue
 		}
 		if _, exists := seenBlobs[entry.BlobID]; exists {
-			return fmt.Errorf("%w: duplicate blob identity", ErrArtifactCorrupt)
+			dirty = true
+			continue
+		}
+		if !now.Before(entry.ExpiresAt) {
+			dirty = true
+			continue
 		}
 		if entry.Size > s.maxBytes-s.totalBytes {
-			return ErrArtifactCapacity
+			dirty = true
+			continue
 		}
-		if err := verifyArtifactBlob(s.blobPath(entry.BlobID), entry); err != nil {
-			return err
+		if !artifactBlobMetadataUsableAtStartup(s.blobPath(entry.BlobID), entry) {
+			dirty = true
+			continue
 		}
 		s.entries[entry.TokenSHA256] = entry
 		seenBlobs[entry.BlobID] = struct{}{}
 		s.totalBytes += entry.Size
+	}
+	if dirty {
+		if err := s.persistLocked(); err != nil {
+			return fmt.Errorf("persist recovered artifact index: %w", err)
+		}
 	}
 	return nil
 }
@@ -395,6 +419,7 @@ func (s *artifactStore) cleanupLocked(now time.Time) error {
 		}
 	}
 	for _, entry := range expired {
+		delete(s.verified, entry.BlobID)
 		if err := removeArtifactBlob(s.blobPath(entry.BlobID)); err != nil {
 			return err
 		}
@@ -410,6 +435,7 @@ func (s *artifactStore) removeExpiredLocked(digest string, entry artifactIndexEn
 		s.totalBytes += entry.Size
 		return err
 	}
+	delete(s.verified, entry.BlobID)
 	return removeArtifactBlob(s.blobPath(entry.BlobID))
 }
 
@@ -759,50 +785,18 @@ func openRegularArtifactFile(path string) (*os.File, os.FileInfo, error) {
 		file.Close()
 		return nil, nil, fmt.Errorf("%w: artifact file changed during open", ErrArtifactCorrupt)
 	}
-	if err := file.Chmod(0o600); err != nil {
-		file.Close()
-		return nil, nil, err
+	if opened.Mode().Perm() != 0o600 {
+		if err := file.Chmod(0o600); err != nil {
+			file.Close()
+			return nil, nil, err
+		}
+		opened, err = file.Stat()
+		if err != nil {
+			file.Close()
+			return nil, nil, err
+		}
 	}
 	return file, opened, nil
-}
-
-func verifyArtifactBlob(path string, entry artifactIndexEntry) error {
-	file, info, err := openRegularArtifactFile(path)
-	if err != nil {
-		return fmt.Errorf("%w: artifact blob unavailable", ErrArtifactCorrupt)
-	}
-	defer file.Close()
-	if info.Size() != entry.Size {
-		return fmt.Errorf("%w: artifact size mismatch", ErrArtifactCorrupt)
-	}
-	hash := sha256.New()
-	count, err := io.Copy(hash, io.LimitReader(file, entry.Size+1))
-	if err != nil || count != entry.Size || hex.EncodeToString(hash.Sum(nil)) != entry.SHA256 {
-		return fmt.Errorf("%w: artifact digest mismatch", ErrArtifactCorrupt)
-	}
-	return nil
-}
-
-func openVerifiedArtifactBlob(path string, entry artifactIndexEntry) (*os.File, error) {
-	file, info, err := openRegularArtifactFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("%w: artifact blob unavailable", ErrArtifactCorrupt)
-	}
-	if info.Size() != entry.Size {
-		file.Close()
-		return nil, fmt.Errorf("%w: artifact size mismatch", ErrArtifactCorrupt)
-	}
-	digest := sha256.New()
-	count, err := io.Copy(digest, io.LimitReader(file, entry.Size+1))
-	if err != nil || count != entry.Size || hex.EncodeToString(digest.Sum(nil)) != entry.SHA256 {
-		file.Close()
-		return nil, fmt.Errorf("%w: artifact digest mismatch", ErrArtifactCorrupt)
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		file.Close()
-		return nil, fmt.Errorf("open artifact bytes: %w", err)
-	}
-	return file, nil
 }
 
 func removeArtifactBlob(path string) error {

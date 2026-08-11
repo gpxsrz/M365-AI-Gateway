@@ -27,7 +27,6 @@ type Clients struct {
 var (
 	clientsMu sync.RWMutex
 	clients   = directClients()
-	proxyPool *Pool
 )
 
 func directClients() *Clients {
@@ -36,10 +35,6 @@ func directClients() *Clients {
 	return &Clients{HTTP: &http.Client{Transport: t}, WebSocket: &websocket.Dialer{HandshakeTimeout: 20 * time.Second, ReadBufferSize: 1024 * 1024, WriteBufferSize: 64 * 1024}}
 }
 func ConfigureFromEnv() error {
-	raw := strings.TrimSpace(os.Getenv("M365_PROXY_POOL"))
-	if raw != "" {
-		return ConfigurePool(strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '\r' || r == ',' }))
-	}
 	return Configure(os.Getenv(EnvProxy))
 }
 func Configure(raw string) error {
@@ -49,81 +44,13 @@ func Configure(raw string) error {
 	}
 	clientsMu.Lock()
 	clients = c
-	proxyPool = nil
 	clientsMu.Unlock()
 	return nil
-}
-func ConfigurePool(raw []string) error {
-	p, e := NewPool(raw)
-	if e != nil {
-		return e
-	}
-	clientsMu.Lock()
-	proxyPool = p
-	clientsMu.Unlock()
-	return nil
-}
-
-func CurrentPool() *Pool { clientsMu.RLock(); defer clientsMu.RUnlock(); return proxyPool }
-
-func ProxyPoolStatus() []map[string]any {
-	clientsMu.RLock()
-	p := proxyPool
-	clientsMu.RUnlock()
-	if p == nil {
-		return []map[string]any{}
-	}
-	return p.List()
-}
-
-func AddProxy(raw string) error {
-	clientsMu.RLock()
-	p := proxyPool
-	clientsMu.RUnlock()
-	if p == nil {
-		return ConfigurePool([]string{raw})
-	}
-	items := make([]string, 0)
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			items = append(items, v)
-		}
-	}
-	items = append(items, raw)
-	return ConfigurePool(items)
-}
-
-func RemoveProxy(raw string) error {
-	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
-	clientsMu.RLock()
-	p := proxyPool
-	clientsMu.RUnlock()
-	if p == nil {
-		return nil
-	}
-	items := make([]string, 0)
-	found := false
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			if strings.TrimRight(strings.TrimSpace(v), "/") == raw {
-				found = true
-				continue
-			}
-			items = append(items, v)
-		}
-	}
-	if !found {
-		return fmt.Errorf("proxy not found: %s", raw)
-	}
-	return ConfigurePool(items)
 }
 func HTTPClient() *http.Client {
 	clientsMu.RLock()
-	p, c := proxyPool, clients.HTTP
+	c := clients.HTTP
 	clientsMu.RUnlock()
-	if p != nil {
-		return p.HTTPClient()
-	}
 	return c
 }
 
@@ -132,14 +59,8 @@ func HTTPClient() *http.Client {
 // IP address. The configured outbound proxy path is preserved.
 func PinnedHTTPSClient(serverName string) *http.Client {
 	clientsMu.RLock()
-	p, configured := proxyPool, clients.HTTP
+	configured := clients.HTTP
 	clientsMu.RUnlock()
-	if p != nil {
-		if entry := p.pick(); entry != nil {
-			base := pinnedHTTPTransport(entry.clients.HTTP.Transport, serverName)
-			return &http.Client{Transport: &poolRoundTripper{pool: p, entry: entry, base: base}, Timeout: entry.clients.HTTP.Timeout}
-		}
-	}
 	return &http.Client{Transport: pinnedHTTPTransport(configured.Transport, serverName), Timeout: configured.Timeout}
 }
 
@@ -159,11 +80,8 @@ func pinnedHTTPTransport(roundTripper http.RoundTripper, serverName string) http
 }
 func WebSocketDialer() *websocket.Dialer {
 	clientsMu.RLock()
-	p, c := proxyPool, clients.WebSocket
+	c := clients.WebSocket
 	clientsMu.RUnlock()
-	if p != nil {
-		return p.WebSocketDialer()
-	}
 	d := *c
 	return &d
 }
@@ -202,9 +120,12 @@ func New(raw string) (*Clients, error) {
 		if e != nil {
 			return nil, fmt.Errorf("configure SOCKS5 proxy: %w", e)
 		}
-		x := socksContextDialer{dialer: d}
-		c.HTTP.Transport.(*http.Transport).DialContext = x.DialContext
-		c.WebSocket.NetDialContext = x.DialContext
+		contextDialer, ok := d.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("configure SOCKS5 proxy: context-aware dialer is unavailable")
+		}
+		c.HTTP.Transport.(*http.Transport).DialContext = contextDialer.DialContext
+		c.WebSocket.NetDialContext = contextDialer.DialContext
 	default:
 		return nil, fmt.Errorf("outbound proxy scheme %q is unsupported; use socks5, http, or https", u.Scheme)
 	}
@@ -264,31 +185,3 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
-
-type socksContextDialer struct{ dialer proxy.Dialer }
-
-func (d socksContextDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	ch := make(chan struct {
-		c net.Conn
-		e error
-	}, 1)
-	go func() {
-		c, e := d.dialer.Dial(network, address)
-		ch <- struct {
-			c net.Conn
-			e error
-		}{c, e}
-	}()
-	select {
-	case r := <-ch:
-		return r.c, r.e
-	case <-ctx.Done():
-		go func() {
-			r := <-ch
-			if r.c != nil {
-				r.c.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	}
-}

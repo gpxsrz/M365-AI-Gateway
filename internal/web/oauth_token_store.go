@@ -22,16 +22,29 @@ func (s *Server) storeOAuthTokenSetInStore(manifest auth.OAuthProfileManifest, t
 	s.checkpointLifecycle.Lock()
 	defer s.checkpointLifecycle.Unlock()
 	active := sameTokenStore(tokenStore, s.activeTokenStore())
+	var (
+		account       auth.AccountToken
+		tokenStoreErr error
+		commitStarted bool
+	)
+	commit := func() error {
+		commitStarted = true
+		account, tokenStoreErr = tokenStore.Upsert(tokenSet)
+		return tokenStoreErr
+	}
+	var err error
 	if active && s.checkpoints != nil {
-		if err := s.checkpoints.Clear(); err != nil {
+		err = s.checkpoints.ClearThen(commit)
+	} else {
+		err = commit()
+	}
+	if err != nil {
+		if !commitStarted {
 			return storedOAuthAccount{}, &oauthCallbackFailure{
 				Code:    "transport_checkpoint_clear_failed",
 				Message: "無法安全更新 Microsoft 帳號的聊天連線狀態",
 			}
 		}
-	}
-	account, err := tokenStore.Upsert(tokenSet)
-	if err != nil {
 		return storedOAuthAccount{}, &oauthCallbackFailure{
 			Code:    "oauth_token_store_failed",
 			Message: "無法安全儲存帳號權杖，請檢查資料目錄權限後重試",

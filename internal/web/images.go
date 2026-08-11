@@ -17,7 +17,6 @@ type imageGenerationRequest struct {
 	Size           string `json:"size"`
 	ResponseFormat string `json:"response_format"`
 	Model          string `json:"model"`
-	AccountID      string `json:"accountId"`
 	User           string `json:"user"`
 }
 
@@ -60,7 +59,9 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"response_format must be url or b64_json","type":"invalid_request_error"}}`, 400)
 		return
 	}
-	acc, err := s.activeAccount()
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ImageTimeoutSeconds)*time.Second)
+	defer cancel()
+	acc, err := s.activeAccountContext(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -72,8 +73,6 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "account missing oid/tid", 400)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ImageTimeoutSeconds)*time.Second)
-	defer cancel()
 	size := b.Size
 	if size == "" {
 		size = "1024x1024"

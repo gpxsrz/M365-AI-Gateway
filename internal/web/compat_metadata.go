@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"m365-native/internal/chathub"
 	"os"
 	"strings"
@@ -97,21 +98,46 @@ func mergeSearchEvidence(dst *chathub.Result, src chathub.Result) {
 }
 
 func normalizedToolChoiceMode(choice any) string {
+	mode, err := strictToolChoiceMode(choice)
+	if err != nil {
+		return "invalid"
+	}
+	return mode
+}
+
+func strictToolChoiceMode(choice any) (string, error) {
 	if choice == nil {
-		return "auto"
+		return "auto", nil
 	}
 	if s, ok := choice.(string); ok {
-		return s
+		s = strings.TrimSpace(s)
+		switch s {
+		case "auto", "none", "required":
+			return s, nil
+		default:
+			return "", fmt.Errorf("unsupported tool_choice %q", s)
+		}
 	}
 	if m, ok := choice.(map[string]any); ok {
 		if f, ok := m["function"].(map[string]any); ok {
-			if n, ok := f["name"].(string); ok {
-				return "named:" + n
+			n, _ := f["name"].(string)
+			n = strings.TrimSpace(n)
+			if n == "" {
+				return "", fmt.Errorf("tool_choice.function.name is required")
 			}
+			if typ, present := m["type"]; present && typ != "function" {
+				return "", fmt.Errorf("tool_choice.type must be function")
+			}
+			return "named:" + n, nil
 		}
 		if n, ok := m["name"].(string); ok {
-			return "named:" + n
+			n = strings.TrimSpace(n)
+			if n == "" {
+				return "", fmt.Errorf("tool_choice.name is required")
+			}
+			return "named:" + n, nil
 		}
+		return "", fmt.Errorf("invalid tool_choice object")
 	}
-	return "auto"
+	return "", fmt.Errorf("invalid tool_choice type")
 }

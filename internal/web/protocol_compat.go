@@ -11,7 +11,6 @@ import (
 // responsesRequest is the OpenAI Responses API request subset supported by the gateway.
 type responsesRequest struct {
 	Model              string           `json:"model"`
-	AccountID          string           `json:"accountId,omitempty"`
 	Instructions       string           `json:"instructions,omitempty"`
 	Input              any              `json:"input"`
 	Tools              []map[string]any `json:"tools,omitempty"`
@@ -29,7 +28,7 @@ type responsesRequest struct {
 const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Use the caller-provided exec tool only for local filesystem and command execution. Do not use Microsoft 365 native execution or file-mutation tools for those operations. Microsoft 365 native Bing web search, citations, grounding, and read-only information retrieval remain allowed. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
 
 func (r responsesRequest) openAI() (oaiReq, error) {
-	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, ParallelToolCalls: r.ParallelToolCalls, User: r.User, Verbosity: r.Verbosity}
+	o := oaiReq{Model: r.Model, Stream: r.Stream, ToolChoice: r.ToolChoice, ParallelToolCalls: r.ParallelToolCalls, User: r.User, Verbosity: r.Verbosity}
 	if instructions := strings.TrimSpace(r.Instructions); instructions != "" {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: instructions})
 	}
@@ -129,6 +128,9 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			continue
 		}
 		f := map[string]any{"name": t["name"], "description": t["description"], "parameters": t["parameters"]}
+		if annotations, ok := t["annotations"].(map[string]any); ok {
+			f["annotations"] = annotations
+		}
 		if typ == "custom" && name == "exec" {
 			// ChatHub accepts JSON function arguments while Codex exec accepts a
 			// grammar-constrained raw input string. Preserve the distinction in
@@ -155,10 +157,10 @@ type anthropicTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	InputSchema map[string]any `json:"input_schema"`
+	Annotations map[string]any `json:"annotations,omitempty"`
 }
 type anthropicRequest struct {
 	Model      string             `json:"model"`
-	AccountID  string             `json:"accountId,omitempty"`
 	System     any                `json:"system,omitempty"`
 	Messages   []anthropicMessage `json:"messages"`
 	Tools      []anthropicTool    `json:"tools,omitempty"`
@@ -168,7 +170,7 @@ type anthropicRequest struct {
 }
 
 func (r anthropicRequest) openAI() (oaiReq, error) {
-	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream}
+	o := oaiReq{Model: r.Model, Stream: r.Stream}
 	if r.System != nil {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: r.System})
 	}
@@ -219,7 +221,8 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 				calls = append(calls, map[string]any{"id": b["id"], "type": "function", "function": map[string]any{"name": b["name"], "arguments": mustJSON(b["input"])}})
 			case "tool_result":
 				id, _ := b["tool_use_id"].(string)
-				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: b["content"]})
+				isError, _ := b["is_error"].(bool)
+				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: b["content"], ToolResultIsError: isError})
 			}
 		}
 		if len(text) > 0 || len(calls) > 0 {
@@ -228,6 +231,9 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 	}
 	for _, t := range r.Tools {
 		f := map[string]any{"name": t.Name, "description": t.Description, "parameters": t.InputSchema}
+		if len(t.Annotations) > 0 {
+			f["annotations"] = t.Annotations
+		}
 		b, _ := json.Marshal(f)
 		o.Tools = append(o.Tools, chathub.Tool{Type: "function", Function: b})
 	}

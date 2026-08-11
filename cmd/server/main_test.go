@@ -20,6 +20,15 @@ func TestWP6HTTPServerAllowsBoundedLargeRequestIngest(t *testing.T) {
 	}
 }
 
+func TestShutdownGracePeriodCoversConfiguredChatTimeout(t *testing.T) {
+	if got := shutdownGracePeriod(30 * time.Minute); got != 30*time.Minute+30*time.Second {
+		t.Fatalf("shutdown grace=%v", got)
+	}
+	if got := shutdownGracePeriod(0); got != 30*time.Second {
+		t.Fatalf("minimum shutdown grace=%v", got)
+	}
+}
+
 func TestWP6ServerLifecycleShutsDownBeforeClosingRuntime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
@@ -34,7 +43,7 @@ func TestWP6ServerLifecycleShutsDownBeforeClosingRuntime(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- serveUntilSignal(ctx,
+		done <- serveUntilSignal(ctx, 2*time.Second,
 			func() error {
 				close(started)
 				<-stopListening
@@ -67,7 +76,7 @@ func TestWP6ServerLifecycleClosesRuntimeOnListenFailure(t *testing.T) {
 	closeErr := errors.New("runtime close failed")
 	shutdownCalled := false
 	runtimeClosed := false
-	err := serveUntilSignal(context.Background(),
+	err := serveUntilSignal(context.Background(), 2*time.Second,
 		func() error { return listenErr },
 		func(context.Context) error {
 			shutdownCalled = true

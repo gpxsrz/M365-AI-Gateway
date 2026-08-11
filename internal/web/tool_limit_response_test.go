@@ -2,33 +2,56 @@ package web
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"m365-native/internal/chathub"
 )
 
-func TestConfiguredLimitSerializesOneToolCall(t *testing.T) {
+func TestConfiguredLimitRejectsExcessToolCallsInsteadOfTruncating(t *testing.T) {
 	calls := []detectedToolCall{{ID: "call_1", Name: "first", Arguments: json.RawMessage(`{"x":1}`)}, {ID: "call_2", Name: "second", Arguments: json.RawMessage(`{"y":2}`)}}
-	w := httptest.NewRecorder()
-	limited := limitToolCalls(calls, 1)
-	if err := writeToolResponse(w, "chatcmpl_test", "test", false, limited, chathub.Result{}); err != nil {
+	if err := validateToolCallLimit(calls, 1); err == nil {
+		t.Fatal("expected excess tool calls to be rejected")
+	}
+	if err := validateToolCallLimit(calls, 2); err != nil {
+		t.Fatalf("calls within configured limit were rejected: %v", err)
+	}
+}
+
+func TestToolCallLimitViolationInvalidatesCheckpointContinuation(t *testing.T) {
+	chat := &wp1CandidateChat{result: chathub.Result{
+		Text:           `{"calls":[{"name":"read_file","arguments":{"path":"a"}},{"name":"search_code","arguments":{"query":"b"}}]}`,
+		ConversationID: "conv-overflow",
+		SessionID:      "session-overflow",
+	}}
+	server := newWP1CandidateServer(t, chat)
+	var err error
+	server.checkpoints, err = openTransportCheckpointStore(filepath.Join(t.TempDir(), "checkpoints.json"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	var out map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
-		t.Fatal(err)
+	server.settings.v.MaxToolCallsPerTurn = 1
+	tools := []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "read_file", "description": "Read file contents.", "parameters": map[string]any{"type": "object"}}},
+		map[string]any{"type": "function", "function": map[string]any{"name": "search_code", "description": "Search source code.", "parameters": map[string]any{"type": "object"}}},
 	}
-	choices := out["choices"].([]any)
-	msg := choices[0].(map[string]any)["message"].(map[string]any)
-	got := msg["tool_calls"].([]any)
-	if len(got) != 1 {
-		t.Fatalf("serialized %d calls: %s", len(got), w.Body.String())
+	body := map[string]any{
+		"model":       "gpt-5.6-sol",
+		"session_key": "overflow-session",
+		"messages":    []any{map[string]any{"role": "user", "content": "inspect"}},
+		"tools":       tools,
 	}
-	fn := got[0].(map[string]any)["function"].(map[string]any)
-	if fn["name"] != "first" {
-		t.Fatalf("wrong call: %#v", fn)
+	recorder := httptest.NewRecorder()
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(mustJSON(body))), "tool-limit-owner")
+	server.openaiChat(recorder, req)
+	if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "tool_call_limit_exceeded") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if records := checkpointViewsForTest(t, server.checkpoints); len(records) != 0 {
+		t.Fatalf("overflowed upstream conversation remained reusable: %#v", records)
 	}
 }
 

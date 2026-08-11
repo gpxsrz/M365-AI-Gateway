@@ -27,6 +27,8 @@ func (w *traceWriter) Write(b []byte) (int, error) {
 	w.bytes += n
 	return n, err
 }
+func (w *traceWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *traceWriter) Flush() {
 	if w.status == 0 {
 		w.status = http.StatusOK
@@ -55,7 +57,7 @@ func safeServiceLogPath(path string) string {
 	}
 	switch path {
 	case "/api/admin/login", "/api/admin/logout", "/api/admin/session", "/api/admin/change-password",
-		"/api/admin/keys", "/api/admin/settings", "/api/admin/proxy-pool", "/api/admin/deployments",
+		"/api/admin/keys", "/api/admin/settings", "/api/admin/deployments",
 		"/api/admin/deployment", "/api/admin/deployment/check", "/api/admin/debug/logs",
 		"/api/admin/debug/detail", "/api/admin/debug/session", "/api/admin/debug/export",
 		"/api/health", "/api/version", "/api/update", "/api/account", "/api/account/refresh", "/api/account/logout",

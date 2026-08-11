@@ -21,9 +21,12 @@ func callerMCPForChoice(serverURL string, choice any) string {
 	return serverURL
 }
 
-func clientPlugins(tools []Tool, mcpServerURL string) []any {
+func clientPlugins(tools []Tool, mcpServerURL string, disableBuiltInSearch ...bool) []any {
 	plugins := make([]any, 0, len(tools)+2)
-	plugins = append(plugins, map[string]any{"Id": "BingWebSearch", "Source": "BuiltIn"})
+	searchDisabled := len(disableBuiltInSearch) > 0 && disableBuiltInSearch[0]
+	if !searchDisabled {
+		plugins = append(plugins, map[string]any{"Id": "BingWebSearch", "Source": "BuiltIn"})
+	}
 	if mcpServerURL != "" {
 		plugins = append(plugins, map[string]any{
 			"Id":                "mcp-gateway",

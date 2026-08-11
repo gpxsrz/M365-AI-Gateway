@@ -43,7 +43,10 @@ func (s *Server) validateOAuthCandidateChat(w http.ResponseWriter, r *http.Reque
 		writeOpenAIError(w, http.StatusBadRequest, "account_not_found", "候選 OAuth profile 尚未完成登入")
 		return
 	}
-	account, err = store.EnsureValid(account.ID)
+	timeout := time.Duration(serverRuntimeSettings(s).ChatTimeoutSeconds) * time.Second
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	account, err = store.EnsureValidContext(ctx, account.ID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "token_refresh_error", "候選帳號權杖無法使用")
 		return
@@ -55,9 +58,6 @@ func (s *Server) validateOAuthCandidateChat(w http.ResponseWriter, r *http.Reque
 		writeOpenAIError(w, http.StatusBadRequest, "account_identity_error", "候選帳號缺少必要身分資訊")
 		return
 	}
-	timeout := time.Duration(serverRuntimeSettings(s).ChatTimeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
 	result, err := s.chat.Chat(ctx, chathub.Account{AccessToken: account.AccessToken, OID: account.OID, TID: account.TID}, chathub.Request{Text: "Reply with OK only.", Tone: "magic"})
 	if err != nil || strings.TrimSpace(result.Text) == "" {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "候選 ChatHub 驗證失敗")

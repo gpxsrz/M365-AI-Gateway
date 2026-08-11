@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -56,22 +57,20 @@ func filterAllowedToolCalls(calls []detectedToolCall, tools []map[string]any, ch
 }
 
 func toolChoiceAllows(choice any, name string) bool {
-	if choice == nil {
-		return true
+	mode, err := strictToolChoiceMode(choice)
+	if err != nil {
+		return false
 	}
-	if s, ok := choice.(string); ok {
-		return s != "none" && (s != "required" || name != "")
+	switch {
+	case mode == "none":
+		return false
+	case mode == "auto" || mode == "required":
+		return name != ""
+	case strings.HasPrefix(mode, "named:"):
+		return strings.TrimPrefix(mode, "named:") == name
+	default:
+		return false
 	}
-	if m, ok := choice.(map[string]any); ok {
-		if f, ok := m["function"].(map[string]any); ok {
-			n, _ := f["name"].(string)
-			return n == name
-		}
-		if n, ok := m["name"].(string); ok {
-			return n == name
-		}
-	}
-	return true
 }
 
 func callID(_ string, _ string, _ int) string {

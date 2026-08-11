@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -93,11 +94,21 @@ func TestAnthropicToOpenAI(t *testing.T) {
 	}
 }
 
-func TestAnthropicAccountIDIsPreserved(t *testing.T) {
-	r := anthropicRequest{Model: "m", AccountID: "account-b", Messages: []anthropicMessage{{Role: "user", Content: any("weather")}}}
-	o, err := r.openAI()
-	if err != nil || o.AccountID != "account-b" {
-		t.Fatalf("account_id=%q err=%v", o.AccountID, err)
+func TestAnthropicLegacyAccountIDDoesNotCreateRoutingState(t *testing.T) {
+	var request anthropicRequest
+	if err := json.Unmarshal([]byte(`{"model":"m","accountId":"legacy-selector","messages":[{"role":"user","content":"weather"}]}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	adapted, err := request.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(adapted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "accountId") || strings.Contains(string(raw), "legacy-selector") {
+		t.Fatalf("legacy accountId leaked into adapted routing state: %s", raw)
 	}
 }
 
@@ -106,5 +117,20 @@ func TestAnthropicToolResult(t *testing.T) {
 	o, err := r.openAI()
 	if err != nil || len(o.Messages) != 2 || o.Messages[1].ToolCallID != "x" {
 		t.Fatalf("%+v %v", o, err)
+	}
+}
+
+func TestAnthropicToolResultPreservesExplicitError(t *testing.T) {
+	r := anthropicRequest{Messages: []anthropicMessage{
+		{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "id": "x", "name": "f", "input": map[string]any{}}}},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "x", "content": "permission issue", "is_error": true}}},
+	}}
+	o, err := r.openAI()
+	if err != nil || len(o.Messages) != 2 || !o.Messages[1].ToolResultIsError {
+		t.Fatalf("explicit tool error lost: %+v err=%v", o.Messages, err)
+	}
+	ledger := buildAgentLedger(o.Messages)
+	if len(ledger.Completed) != 1 || !ledger.Completed[0].Failed {
+		t.Fatalf("explicit tool error was not carried into evidence: %+v", ledger)
 	}
 }

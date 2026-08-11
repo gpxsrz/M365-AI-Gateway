@@ -2,6 +2,8 @@ package web
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -25,6 +27,63 @@ func TestCompatibilityNamespacesAreIsolated(t *testing.T) {
 	hermes, ok := compatibilityCheckpointControl("/hermes/v1/chat/completions")
 	if !ok || hermes.Namespace != "hermes" || hermes.ForceNew {
 		t.Fatalf("Hermes checkpoint control = %#v, %t", hermes, ok)
+	}
+}
+
+func TestHermesCompatibilityToggleControlsOnlyDedicatedProfileRoute(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	server.chat = &captureSingleAccountChat{}
+	body := `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`
+	settings := server.settings.get()
+	settings.HermesCompatibilityEnabled = false
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	disabled := httptest.NewRecorder()
+	server.hermesOpenAIChat(disabled, httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)))
+	if disabled.Code != http.StatusServiceUnavailable || !strings.Contains(disabled.Body.String(), "Hermes compatibility profile is disabled") {
+		t.Fatalf("disabled status=%d body=%s", disabled.Code, disabled.Body.String())
+	}
+
+	settings.HermesCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("hermes-profile")); err != nil {
+		t.Fatal(err)
+	}
+	enabled := httptest.NewRecorder()
+	enabledRequest := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)), "hermes-owner")
+	server.hermesOpenAIChat(enabled, enabledRequest)
+	if enabled.Code != http.StatusOK {
+		t.Fatalf("enabled status=%d body=%s", enabled.Code, enabled.Body.String())
+	}
+}
+
+func TestMemoryCompatibilityRouteRequiresExplicitOptIn(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	server.chat = &captureSingleAccountChat{}
+	body := `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"remember this"}]}`
+
+	disabled := httptest.NewRecorder()
+	server.memoryOpenAIChat(disabled, httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)))
+	if disabled.Code != http.StatusServiceUnavailable || !strings.Contains(disabled.Body.String(), "Memory Provider compatibility profile is disabled") {
+		t.Fatalf("disabled status=%d body=%s", disabled.Code, disabled.Body.String())
+	}
+
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-opt-in")); err != nil {
+		t.Fatal(err)
+	}
+	enabled := httptest.NewRecorder()
+	server.memoryOpenAIChat(enabled, httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)))
+	if enabled.Code != http.StatusOK {
+		t.Fatalf("enabled status=%d body=%s", enabled.Code, enabled.Body.String())
 	}
 }
 
@@ -63,6 +122,38 @@ func TestMemorySchemaRepairPromptIsBoundedToPreviousCandidate(t *testing.T) {
 func TestMemoryRepairPreservesFactsAllowsKeyRepair(t *testing.T) {
 	if err := memoryRepairPreservesFacts(`{"城市":"台中","語言":"繁體中文"}`, `{"city":"台中","language":"繁體中文"}`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMemoryRepairPreservesFactsRejectsAmbiguousSchemaAssociation(t *testing.T) {
+	format := &responseFormat{Type: "json_schema", JSONSchema: map[string]any{
+		"schema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"city":     map[string]any{"type": "string"},
+				"language": map[string]any{"type": "string"},
+			},
+			"required": []any{"city", "language"},
+		},
+	}}
+	if err := memoryRepairPreservesFacts(`{"城市":"台中","語言":"繁體中文"}`, `{"language":"台中","city":"繁體中文"}`, format); err == nil {
+		t.Fatal("accepted ambiguous scalar-to-property swap")
+	}
+}
+
+func TestMemoryRepairPreservesFactsAllowsProvableSchemaAssociation(t *testing.T) {
+	format := &responseFormat{Type: "json_schema", JSONSchema: map[string]any{
+		"schema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"city": map[string]any{"type": "string"},
+				"age":  map[string]any{"type": "integer"},
+			},
+			"required": []any{"city", "age"},
+		},
+	}}
+	if err := memoryRepairPreservesFacts(`{"城市":"台中","年齡":30}`, `{"city":"台中","age":30}`, format); err != nil {
+		t.Fatalf("rejected provable key repair: %v", err)
 	}
 }
 

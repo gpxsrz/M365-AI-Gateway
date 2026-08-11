@@ -9,13 +9,29 @@ import (
 
 func TestWebSocketDialFailurePreservesStatusAndCause(t *testing.T) {
 	cause := errors.New("bad handshake")
-	withStatus := webSocketDialFailure(http.StatusForbidden, cause)
+	withStatus := webSocketDialFailure(http.StatusForbidden, "", cause)
 	if !errors.Is(withStatus, cause) || !strings.Contains(withStatus.Error(), "HTTP 403") {
 		t.Fatalf("status dial error=%q", withStatus)
 	}
-	withoutStatus := webSocketDialFailure(0, cause)
+	withoutStatus := webSocketDialFailure(0, "", cause)
 	if !errors.Is(withoutStatus, cause) || !strings.Contains(withoutStatus.Error(), "ws dial: bad handshake") {
 		t.Fatalf("statusless dial error=%q", withoutStatus)
+	}
+}
+
+func TestWebSocketDialFailurePreservesValidRetryAfter(t *testing.T) {
+	cause := errors.New("bad handshake")
+	err := webSocketDialFailure(http.StatusTooManyRequests, " 37 ", cause)
+	var rateLimit *RateLimitError
+	if !errors.As(err, &rateLimit) {
+		t.Fatalf("error=%T want RateLimitError", err)
+	}
+	if rateLimit.RetryAfter != "37" {
+		t.Fatalf("RetryAfter=%q want=37", rateLimit.RetryAfter)
+	}
+	invalid := webSocketDialFailure(http.StatusTooManyRequests, "not-a-retry-after", cause)
+	if !errors.As(invalid, &rateLimit) || rateLimit.RetryAfter != "" {
+		t.Fatalf("invalid Retry-After was retained: %#v", rateLimit)
 	}
 }
 

@@ -2,9 +2,11 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,7 +15,7 @@ func trafficTestSettings() runtimeSettings {
 	v := defaultRuntimeSettings()
 	v.MemoryMaxConcurrent = 1
 	v.MemoryQueueTimeoutSeconds = 1
-	v.HermesPriorityHoldoffSeconds = 0
+	v.InteractivePriorityHoldoffSeconds = 0
 	v.MemoryBackoffInitialSeconds = 1
 	v.MemoryBackoffMaxSeconds = 2
 	return v
@@ -40,6 +42,11 @@ func TestCompatibilityTrafficMemoryConcurrency(t *testing.T) {
 func TestLegacyV1ChatCountsAsInteractivePriority(t *testing.T) {
 	blocking := &phase3BlockingChat{started: make(chan struct{}), release: make(chan struct{})}
 	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.HermesCompatibilityEnabled = false
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := server.tokens.Upsert(testTokenSet("legacy-v1-priority")); err != nil {
 		t.Fatal(err)
 	}
@@ -52,8 +59,8 @@ func TestLegacyV1ChatCountsAsInteractivePriority(t *testing.T) {
 		chatDone <- recorder
 	}()
 	<-blocking.started
-	if snap := server.compatTraffic.snapshot(); snap.HermesInFlight != 1 {
-		t.Fatalf("interactive in flight=%d", snap.HermesInFlight)
+	if snap := server.compatTraffic.snapshot(); snap.InteractiveInFlight != 1 {
+		t.Fatalf("interactive in flight=%d", snap.InteractiveInFlight)
 	}
 	cfg := trafficTestSettings()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
@@ -67,16 +74,29 @@ func TestLegacyV1ChatCountsAsInteractivePriority(t *testing.T) {
 	}
 }
 
-func TestCompatibilityTrafficHermesPriority(t *testing.T) {
+func TestCompatibilityTrafficSnapshotUsesInteractiveMetricNames(t *testing.T) {
+	controller := newCompatibilityTrafficController()
+	release := controller.beginInteractive()
+	defer release(0)
+	raw, err := json.Marshal(controller.snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"interactiveInFlight":1`) || strings.Contains(string(raw), "hermesInFlight") {
+		t.Fatalf("traffic snapshot kept Hermes-specific generic metric: %s", raw)
+	}
+}
+
+func TestCompatibilityTrafficInteractivePriority(t *testing.T) {
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
-	endHermes := c.beginHermes()
+	endInteractive := c.beginInteractive()
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	if _, err := c.acquireMemory(ctx, cfg); err == nil {
 		t.Fatal("memory request unexpectedly started while Hermes was active")
 	}
-	endHermes(0)
+	endInteractive(0)
 	release, err := c.acquireMemory(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -137,12 +157,33 @@ func TestCompatibilityTrafficMemoryQueueIsFIFO(t *testing.T) {
 	second.release(http.StatusOK)
 }
 
+func TestCompatibilityTrafficMemoryQueueIsBounded(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	cfg.MemoryQueueTimeoutSeconds = 10
+	endInteractive := c.beginInteractive()
+	defer endInteractive(0)
+	for i := 0; i < memoryQueueMaxWaiting; i++ {
+		c.memoryQueue = append(c.memoryQueue, uint64(i))
+	}
+	c.memoryWaiting = len(c.memoryQueue)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := c.acquireMemory(ctx, cfg); err == nil || time.Since(start) > 20*time.Millisecond {
+		t.Fatalf("full queue did not fail fast: err=%v elapsed=%v", err, time.Since(start))
+	}
+	if snap := c.snapshot(); snap.MemoryWaiting != memoryQueueMaxWaiting {
+		t.Fatalf("queue size changed after rejection: %#v", snap)
+	}
+}
+
 func TestCompatibilityTrafficAdmissionRetryAfterIsNotFixedOneSecond(t *testing.T) {
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
 	cfg.MemoryQueueTimeoutSeconds = 10
-	endHermes := c.beginHermes()
-	defer endHermes(0)
+	endInteractive := c.beginInteractive()
+	defer endInteractive(0)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 	_, err := c.acquireMemory(ctx, cfg)

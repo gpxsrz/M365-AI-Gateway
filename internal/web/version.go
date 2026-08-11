@@ -1,7 +1,6 @@
 package web
 
 import (
-	"m365-native/internal/outbound"
 	"net/http"
 	"runtime"
 	"strings"
@@ -21,7 +20,7 @@ func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 	if store := s.activeTokenStore(); store != nil {
 		_, connected = store.First()
 	}
-	jsonOut(w, map[string]any{"version": Version, "commit": Commit, "buildTime": BuildTime, "go": runtime.Version(), "uptimeSeconds": int(time.Since(startedAt).Seconds()), "accountConnected": connected, "proxyPool": len(outbound.ProxyPoolStatus())})
+	jsonOut(w, map[string]any{"version": Version, "commit": Commit, "buildTime": BuildTime, "go": runtime.Version(), "uptimeSeconds": int(time.Since(startedAt).Seconds()), "accountConnected": connected})
 }
 
 func (s *Server) update(w http.ResponseWriter, r *http.Request) {

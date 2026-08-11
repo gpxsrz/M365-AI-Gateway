@@ -15,7 +15,14 @@ import (
 )
 
 const requestReadTimeout = 30 * time.Minute
-const shutdownTimeout = 30 * time.Second
+const minimumShutdownGrace = 30 * time.Second
+
+func shutdownGracePeriod(chatTimeout time.Duration) time.Duration {
+	if chatTimeout <= 0 {
+		return minimumShutdownGrace
+	}
+	return chatTimeout + minimumShutdownGrace
+}
 
 func sidecarHTTPServer(listen string, handler http.Handler) *http.Server {
 	return &http.Server{
@@ -28,14 +35,17 @@ func sidecarHTTPServer(listen string, handler http.Handler) *http.Server {
 	}
 }
 
-func serveUntilSignal(ctx context.Context, listen func() error, shutdown func(context.Context) error, closeRuntime func() error) (err error) {
+func serveUntilSignal(ctx context.Context, shutdownGrace time.Duration, listen func() error, shutdown func(context.Context) error, closeRuntime func() error) (err error) {
+	if shutdownGrace < minimumShutdownGrace {
+		shutdownGrace = minimumShutdownGrace
+	}
 	defer func() { err = errors.Join(err, closeRuntime()) }()
 	shutdownDone := make(chan error, 1)
 	stopShutdown := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			shutdownContext, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			shutdownContext, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 			defer cancel()
 			shutdownDone <- shutdown(shutdownContext)
 		case <-stopShutdown:
@@ -71,7 +81,7 @@ func run() error {
 	server := sidecarHTTPServer(listen, s.Routes())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serveUntilSignal(ctx, server.ListenAndServe, func(ctx context.Context) error {
+	return serveUntilSignal(ctx, shutdownGracePeriod(s.LongestRequestTimeout()), server.ListenAndServe, func(ctx context.Context) error {
 		if err := server.Shutdown(ctx); err != nil {
 			return errors.Join(err, server.Close())
 		}

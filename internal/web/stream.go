@@ -72,7 +72,9 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	defer turn.Abort()
 	body.ConversationID = turn.binding.ConversationID
 	body.SessionID = turn.binding.SessionID
-	acc, err := s.activeAccount()
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ChatTimeoutSeconds)*time.Second)
+	defer cancel()
+	acc, err := s.activeAccountContext(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -87,8 +89,6 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(settings.ChatTimeoutSeconds)*time.Second)
-	defer cancel()
 	account, err := s.chatHubAccount(ctx, acc, body.Attachments)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -139,7 +139,17 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
+const sseWriteTimeout = 30 * time.Second
+
+func setSSEWriteDeadline(w http.ResponseWriter) {
+	if w == nil {
+		return
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+}
+
 func writeSSE(w http.ResponseWriter, name string, value any) {
 	b, _ := json.Marshal(value)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b)
+	setSSEWriteDeadline(w)
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b)
 }

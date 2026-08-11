@@ -56,6 +56,19 @@ func TestHandoffV15ToolChoiceNoneDoesNotExposeCallerToolsToChatHub(t *testing.T)
 	}
 }
 
+func TestHandoffV15InternalRepairCanDisableBuiltInSearch(t *testing.T) {
+	payload := chatPayload("repair", "session", "conversation", "request", "magic", true, nil, nil, "none", 0, "", true)
+	var frame map[string]any
+	if err := json.Unmarshal([]byte(strings.Split(payload, rs)[0]), &frame); err != nil {
+		t.Fatal(err)
+	}
+	arguments := frame["arguments"].([]any)[0].(map[string]any)
+	plugins := arguments["plugins"].([]any)
+	if len(plugins) != 0 {
+		t.Fatalf("internal repair exposed plugins: %#v", plugins)
+	}
+}
+
 func TestHandoffV15SignalRCompletionStringErrorFails(t *testing.T) {
 	err := runHandoffChatHubTerminalFixture(t, `{"type":3,"error":"HubException: deterministic failure"}`)
 	if err == nil || !strings.Contains(err.Error(), "HubException: deterministic failure") {

@@ -312,8 +312,13 @@ func TestWP6ArtifactStoreRejectsCorruptOrUnsafeStorage(t *testing.T) {
 		if _, _, err := readStoredArtifact(store, artifact.Token); !errors.Is(err, ErrArtifactCorrupt) {
 			t.Fatalf("corrupt blob err=%v", err)
 		}
-		if _, err := openArtifactStore(root, artifactStoreOptions{}); !errors.Is(err, ErrArtifactCorrupt) {
-			t.Fatalf("restart corrupt blob err=%v", err)
+		restarted, err := openArtifactStore(root, artifactStoreOptions{})
+		if err != nil {
+			t.Fatalf("restart should isolate corrupt blob instead of failing store open: %v", err)
+		}
+		t.Cleanup(func() { _ = restarted.Close() })
+		if _, _, err := readStoredArtifact(restarted, artifact.Token); !errors.Is(err, ErrArtifactCorrupt) && !errors.Is(err, ErrArtifactNotFound) {
+			t.Fatalf("corrupt artifact became readable after restart: %v", err)
 		}
 	})
 
@@ -358,6 +363,184 @@ func TestWP6ArtifactStoreRejectsCorruptOrUnsafeStorage(t *testing.T) {
 			t.Fatalf("non-regular orphan err=%v", err)
 		}
 	})
+}
+
+func TestWP6ArtifactStoreRestartRecoveryIsArtifactScoped(t *testing.T) {
+	t.Run("expired missing blob", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "artifacts")
+		now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+		clock := func() time.Time { return now }
+		store, err := openArtifactStore(root, artifactStoreOptions{Clock: clock, Lifetime: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifact, err := store.Put("expired.txt", []byte("expired"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(onlyArtifactBlob(t, root)); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(2 * time.Hour)
+		restarted, err := openArtifactStore(root, artifactStoreOptions{Clock: clock, Lifetime: time.Hour})
+		if err != nil {
+			t.Fatalf("expired missing blob blocked restart: %v", err)
+		}
+		t.Cleanup(func() { _ = restarted.Close() })
+		if _, err := restarted.Stat(artifact.Token); !errors.Is(err, ErrArtifactNotFound) {
+			t.Fatalf("expired artifact survived recovery: %v", err)
+		}
+	})
+
+	t.Run("live missing blob", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "artifacts")
+		store, err := openArtifactStore(root, artifactStoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifact, err := store.Put("missing.txt", []byte("missing"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(onlyArtifactBlob(t, root)); err != nil {
+			t.Fatal(err)
+		}
+		restarted, err := openArtifactStore(root, artifactStoreOptions{})
+		if err != nil {
+			t.Fatalf("live missing blob blocked restart: %v", err)
+		}
+		t.Cleanup(func() { _ = restarted.Close() })
+		if _, err := restarted.Stat(artifact.Token); !errors.Is(err, ErrArtifactNotFound) {
+			t.Fatalf("missing artifact retained a live capability: %v", err)
+		}
+	})
+
+	t.Run("live digest mismatch", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "artifacts")
+		store, err := openArtifactStore(root, artifactStoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifact, err := store.Put("tampered.txt", []byte("good"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		blob := onlyArtifactBlob(t, root)
+		if err := os.WriteFile(blob, []byte("evil"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		future := time.Now().Add(2 * time.Second)
+		if err := os.Chtimes(blob, future, future); err != nil {
+			t.Fatal(err)
+		}
+		restarted, err := openArtifactStore(root, artifactStoreOptions{})
+		if err != nil {
+			t.Fatalf("live digest mismatch blocked unrelated startup: %v", err)
+		}
+		t.Cleanup(func() { _ = restarted.Close() })
+		if _, file, err := restarted.Open(artifact.Token); !errors.Is(err, ErrArtifactCorrupt) {
+			if file != nil {
+				_ = file.Close()
+			}
+			t.Fatalf("tampered artifact became readable after restart: %v", err)
+		}
+	})
+
+	t.Run("orphan blob", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "artifacts")
+		store, err := openArtifactStore(root, artifactStoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		orphan := filepath.Join(root, "blobs", strings.Repeat("a", 32))
+		if err := os.WriteFile(orphan, []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		restarted, err := openArtifactStore(root, artifactStoreOptions{})
+		if err != nil {
+			t.Fatalf("orphan blob blocked restart: %v", err)
+		}
+		t.Cleanup(func() { _ = restarted.Close() })
+		if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+			t.Fatalf("orphan blob survived restart cleanup: %v", err)
+		}
+	})
+}
+
+func TestWP6ArtifactStoreCachesVerifiedBlobIdentity(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "artifacts")
+	store, err := openArtifactStore(root, artifactStoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	payload := bytes.Repeat([]byte("artifact-block-"), 1<<17)
+	artifact, err := store.Put("large.bin", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, file, err := store.Open(artifact.Token); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = file.Close()
+	}
+	store.mu.Lock()
+	firstVerifications := store.fullVerificationCount
+	store.mu.Unlock()
+	if firstVerifications != 0 {
+		t.Fatalf("freshly ingested artifact repeated a full SHA before first GET: count=%d want=0", firstVerifications)
+	}
+	if _, file, err := store.Open(artifact.Token); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = file.Close()
+	}
+	store.mu.Lock()
+	secondVerifications := store.fullVerificationCount
+	store.mu.Unlock()
+	if secondVerifications != firstVerifications {
+		t.Fatalf("unchanged second GET repeated full SHA verification: first=%d second=%d", firstVerifications, secondVerifications)
+	}
+
+	blob := onlyArtifactBlob(t, root)
+	originalInfo, err := os.Stat(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := append([]byte(nil), payload...)
+	tampered[len(tampered)/2] ^= 0xff
+	if err := os.WriteFile(blob, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Restoring mtime reproduces a same-inode, same-size replacement that a
+	// metadata cache must not mistake for the previously verified bytes.
+	if err := os.Chtimes(blob, originalInfo.ModTime(), originalInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, file, err := store.Open(artifact.Token); !errors.Is(err, ErrArtifactCorrupt) {
+		if file != nil {
+			_ = file.Close()
+		}
+		t.Fatalf("tampered cached artifact err=%v", err)
+	}
+	store.mu.Lock()
+	tamperVerifications := store.fullVerificationCount
+	store.mu.Unlock()
+	if tamperVerifications != firstVerifications+1 {
+		t.Fatalf("tamper did not force one new full verification: got=%d want=%d", tamperVerifications, firstVerifications+1)
+	}
 }
 
 func TestWP6ArtifactStoreRollsBackFailedPersistence(t *testing.T) {

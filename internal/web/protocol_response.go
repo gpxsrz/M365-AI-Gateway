@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -32,28 +33,97 @@ func anthropicM365Metadata(src map[string]any) map[string]any {
 	return metadata
 }
 
-func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
-	id := "msg_" + uuid.NewString()
-	msg, finish := openAIChoice(src)
-	blocks := []any{}
+type anthropicResultProjection struct {
+	blocks []any
+	stop   string
+}
+
+func anthropicContentBlocks(content any) ([]any, error) {
+	appendText := func(blocks []any, text string) []any {
+		return append(blocks, map[string]any{"type": "text", "text": text})
+	}
+	var blocks []any
+	switch value := content.(type) {
+	case nil:
+		return blocks, nil
+	case string:
+		if value != "" {
+			blocks = appendText(blocks, value)
+		}
+		return blocks, nil
+	case []any:
+		for index, raw := range value {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("unsupported Anthropic assistant content block at index %d", index)
+			}
+			typ, _ := block["type"].(string)
+			switch typ {
+			case "text", "output_text":
+				text, ok := block["text"].(string)
+				if !ok {
+					return nil, fmt.Errorf("Anthropic assistant text block at index %d is missing string text", index)
+				}
+				blocks = appendText(blocks, text)
+			case "image", "image_url", "output_image":
+				return nil, fmt.Errorf("Anthropic assistant image content is unsupported; refusing to stringify structured image data")
+			default:
+				return nil, fmt.Errorf("unsupported Anthropic assistant content block type %q at index %d", typ, index)
+			}
+		}
+		return blocks, nil
+	default:
+		return nil, fmt.Errorf("unsupported Anthropic assistant content type %T", content)
+	}
+}
+
+func projectAnthropicResult(src map[string]any) (anthropicResultProjection, error) {
+	msg, _ := openAIChoice(src)
+	if msg == nil {
+		return anthropicResultProjection{}, fmt.Errorf("Anthropic result is missing an assistant message")
+	}
+	blocks, err := anthropicContentBlocks(msg["content"])
+	if err != nil {
+		return anthropicResultProjection{}, err
+	}
 	stop := "end_turn"
-	if calls, ok := msg["tool_calls"].([]any); ok {
+	calls, _ := msg["tool_calls"].([]any)
+	if len(calls) > 0 {
 		stop = "tool_use"
-		for _, raw := range calls {
-			tc, _ := raw.(map[string]any)
-			fn, _ := tc["function"].(map[string]any)
+		for index, raw := range calls {
+			tc, ok := raw.(map[string]any)
+			if !ok {
+				return anthropicResultProjection{}, fmt.Errorf("invalid Anthropic tool call at index %d", index)
+			}
+			fn, ok := tc["function"].(map[string]any)
+			if !ok {
+				return anthropicResultProjection{}, fmt.Errorf("invalid Anthropic tool call function at index %d", index)
+			}
 			var input any = map[string]any{}
-			if a, ok := fn["arguments"].(string); ok {
-				_ = json.Unmarshal([]byte(a), &input)
+			if arguments, ok := fn["arguments"].(string); ok && strings.TrimSpace(arguments) != "" {
+				if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+					return anthropicResultProjection{}, fmt.Errorf("invalid Anthropic tool call arguments at index %d: %w", index, err)
+				}
 			}
 			blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc["id"], "name": fn["name"], "input": input})
 		}
-	} else {
-		blocks = append(blocks, map[string]any{"type": "text", "text": fmt.Sprint(msg["content"])})
 	}
-	_ = finish
+	return anthropicResultProjection{blocks: blocks, stop: stop}, nil
+}
+
+func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src map[string]any) error {
+	projection, err := projectAnthropicResult(src)
+	if err != nil {
+		return err
+	}
+	writeAnthropicProjection(w, model, stream, src, projection)
+	return nil
+}
+
+func writeAnthropicProjection(w http.ResponseWriter, model string, stream bool, src map[string]any, projection anthropicResultProjection) {
+	id := "msg_" + uuid.NewString()
 	metadata := anthropicM365Metadata(src)
-	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}, "m365": metadata}
+	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": projection.blocks, "stop_reason": projection.stop, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}, "m365": metadata}
 	if !stream {
 		jsonOut(w, out)
 		return
@@ -67,7 +137,7 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		}
 	}
 	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}, "m365": metadata}})
-	for i, b := range blocks {
+	for i, b := range projection.blocks {
 		m, _ := b.(map[string]any)
 		startBlock := b
 		if m["type"] == "tool_use" {
@@ -82,6 +152,6 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		}
 		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
-	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
+	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": projection.stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
 	emit("message_stop", map[string]any{"type": "message_stop", "model": model, "m365": metadata})
 }

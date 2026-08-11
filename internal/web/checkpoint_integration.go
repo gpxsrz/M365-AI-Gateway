@@ -72,9 +72,7 @@ func (s *Server) resetTransportCheckpoints(change func() error) error {
 	s.checkpointLifecycle.Lock()
 	defer s.checkpointLifecycle.Unlock()
 	if s.checkpoints != nil {
-		if err := s.checkpoints.Clear(); err != nil {
-			return err
-		}
+		return s.checkpoints.ClearThen(change)
 	}
 	if change != nil {
 		return change()

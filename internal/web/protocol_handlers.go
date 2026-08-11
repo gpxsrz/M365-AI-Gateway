@@ -296,7 +296,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		})
 		return
 	}
-	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" && len(images) == 0 {
+	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" && len(images) == 0 && strings.TrimSpace(reasoning.String()) == "" {
 		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
@@ -507,6 +507,10 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if strings.TrimSpace(body.PreviousResponseID) != "" && strings.TrimSpace(body.Conversation) != "" {
+		writeResponsesErrorCode(w, http.StatusBadRequest, "invalid_request_error", "conflicting_continuation", "previous_response_id and conversation are mutually exclusive")
+		return
+	}
 	publicID := "resp_" + uuid.NewString()
 	control := checkpointRequestControl{Namespace: "responses", ResponseID: publicID, ForceNew: body.NewConversation}
 	switch {
@@ -591,6 +595,9 @@ func responsesOutputHasContent(src map[string]any) bool {
 	if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
 		return true
 	}
+	if responsesReasoningText(msg["reasoning_content"]) != "" {
+		return true
+	}
 	return len(responsesMessageContentBlocks(msg["content"])) > 0
 }
 
@@ -664,9 +671,14 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
 		return
 	}
+	projection, projectionErr := projectAnthropicResult(out)
+	if projectionErr != nil {
+		writeAnthropicErrorCode(w, http.StatusBadGateway, "api_error", "unsupported_content", projectionErr.Error())
+		return
+	}
 	if err := execution.Accept(); err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 		return
 	}
-	writeAnthropicResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
+	writeAnthropicProjection(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out, projection)
 }

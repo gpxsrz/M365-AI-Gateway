@@ -36,42 +36,53 @@ const (
 )
 
 type runtimeSettings struct {
-	ChatMode                     string         `json:"chatMode"`
-	HermesCompatibilityEnabled   bool           `json:"hermesCompatibilityEnabled"`
-	MemoryCompatibilityEnabled   bool           `json:"memoryCompatibilityEnabled"`
-	MemoryMaxConcurrent          int            `json:"memoryMaxConcurrent"`
-	MemoryQueueTimeoutSeconds    int            `json:"memoryQueueTimeoutSeconds"`
-	HermesPriorityHoldoffSeconds int            `json:"hermesPriorityHoldoffSeconds"`
-	MemoryBackoffInitialSeconds  int            `json:"memoryBackoffInitialSeconds"`
-	MemoryBackoffMaxSeconds      int            `json:"memoryBackoffMaxSeconds"`
-	TextInputLimitUTF16          int            `json:"textInputLimitUTF16"`
-	MaxToolCallsPerTurn          int            `json:"maxToolCallsPerTurn"`
-	MaxToolRounds                int            `json:"maxToolRounds"`
-	ContextWindow                int            `json:"contextWindow"`
-	MaxOutputTokens              int            `json:"maxOutputTokens"`
-	ChatTimeoutSeconds           int            `json:"chatTimeoutSeconds"`
-	ImageTimeoutSeconds          int            `json:"imageTimeoutSeconds"`
-	LogLevel                     string         `json:"logLevel"`
-	DebugLogPath                 string         `json:"debugLogPath"`
-	ListenAddress                string         `json:"listenAddress"`
-	ConfigPath                   string         `json:"configPath"`
-	TokenCachePath               string         `json:"tokenCachePath"`
-	SessionCachePath             string         `json:"sessionCachePath"`
-	OutboundProxy                string         `json:"outboundProxy"`
-	ProxyPool                    []string       `json:"proxyPool,omitempty"`
-	ClientID                     string         `json:"clientId"`
-	Authority                    string         `json:"authority"`
-	RedirectURI                  string         `json:"redirectUri"`
-	Scope                        string         `json:"scope"`
-	ModelMappings                []modelMapping `json:"modelMappings"`
-	ToolPlanningMode             string         `json:"toolPlanningMode"`
+	ChatMode                          string         `json:"chatMode"`
+	HermesCompatibilityEnabled        bool           `json:"hermesCompatibilityEnabled"`
+	MemoryCompatibilityEnabled        bool           `json:"memoryCompatibilityEnabled"`
+	MemoryMaxConcurrent               int            `json:"memoryMaxConcurrent"`
+	MemoryQueueTimeoutSeconds         int            `json:"memoryQueueTimeoutSeconds"`
+	InteractivePriorityHoldoffSeconds int            `json:"interactivePriorityHoldoffSeconds"`
+	MemoryBackoffInitialSeconds       int            `json:"memoryBackoffInitialSeconds"`
+	MemoryBackoffMaxSeconds           int            `json:"memoryBackoffMaxSeconds"`
+	TextInputLimitUTF16               int            `json:"textInputLimitUTF16"`
+	MaxToolCallsPerTurn               int            `json:"maxToolCallsPerTurn"`
+	MaxToolRounds                     int            `json:"maxToolRounds"`
+	ContextWindow                     int            `json:"contextWindow"`
+	MaxOutputTokens                   int            `json:"maxOutputTokens"`
+	ChatTimeoutSeconds                int            `json:"chatTimeoutSeconds"`
+	ImageTimeoutSeconds               int            `json:"imageTimeoutSeconds"`
+	LogLevel                          string         `json:"logLevel"`
+	DebugLogPath                      string         `json:"debugLogPath"`
+	ListenAddress                     string         `json:"listenAddress"`
+	ConfigPath                        string         `json:"configPath"`
+	TokenCachePath                    string         `json:"tokenCachePath"`
+	SessionCachePath                  string         `json:"sessionCachePath"`
+	OutboundProxy                     string         `json:"outboundProxy"`
+	ClientID                          string         `json:"clientId"`
+	Authority                         string         `json:"authority"`
+	RedirectURI                       string         `json:"redirectUri"`
+	Scope                             string         `json:"scope"`
+	ModelMappings                     []modelMapping `json:"modelMappings"`
+	ToolPlanningMode                  string         `json:"toolPlanningMode"`
 }
 
 type settingsStore struct {
-	mu      sync.RWMutex
-	path    string
-	v       runtimeSettings
-	loadErr error
+	mu                 sync.RWMutex
+	path               string
+	v                  runtimeSettings
+	loadErr            error
+	persist            func(string, []byte) error
+	persistedFields    map[string]struct{}
+	startupInjectedEnv map[string]string
+}
+
+type settingValueStatus struct {
+	Configured      any    `json:"configured"`
+	Effective       any    `json:"effective"`
+	Source          string `json:"source"`
+	Environment     string `json:"environment,omitempty"`
+	Locked          bool   `json:"locked"`
+	RestartRequired bool   `json:"restartRequired"`
 }
 
 func envInt(name string, fallback int) int {
@@ -93,18 +104,33 @@ func envNonNegativeInt(name string, fallback int) int {
 	}
 	return fallback
 }
+
+func interactivePriorityHoldoffEnvName() string {
+	if _, exists := os.LookupEnv("M365_INTERACTIVE_PRIORITY_HOLDOFF_SECONDS"); exists {
+		return "M365_INTERACTIVE_PRIORITY_HOLDOFF_SECONDS"
+	}
+	if _, exists := os.LookupEnv("M365_HERMES_PRIORITY_HOLDOFF_SECONDS"); exists {
+		return "M365_HERMES_PRIORITY_HOLDOFF_SECONDS"
+	}
+	return "M365_INTERACTIVE_PRIORITY_HOLDOFF_SECONDS"
+}
+
+func interactivePriorityHoldoffDefault() int {
+	return envNonNegativeInt(interactivePriorityHoldoffEnvName(), 30)
+}
+
 func defaultRuntimeSettings() runtimeSettings {
 	return runtimeSettings{
-		ChatMode:                     chatModePrivate,
-		HermesCompatibilityEnabled:   true,
-		MemoryCompatibilityEnabled:   true,
-		MemoryMaxConcurrent:          envInt("M365_MEMORY_MAX_CONCURRENT", 2),
-		MemoryQueueTimeoutSeconds:    envInt("M365_MEMORY_QUEUE_TIMEOUT_SECONDS", 60),
-		HermesPriorityHoldoffSeconds: envNonNegativeInt("M365_HERMES_PRIORITY_HOLDOFF_SECONDS", 30),
-		MemoryBackoffInitialSeconds:  envInt("M365_MEMORY_BACKOFF_INITIAL_SECONDS", 5),
-		MemoryBackoffMaxSeconds:      envInt("M365_MEMORY_BACKOFF_MAX_SECONDS", 60),
-		TextInputLimitUTF16:          defaultTextInputLimitUTF16,
-		MaxToolCallsPerTurn:          envInt("M365_MAX_TOOL_CALLS_PER_TURN", 2), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 16),
+		ChatMode:                          chatModePrivate,
+		HermesCompatibilityEnabled:        true,
+		MemoryCompatibilityEnabled:        false,
+		MemoryMaxConcurrent:               envInt("M365_MEMORY_MAX_CONCURRENT", 2),
+		MemoryQueueTimeoutSeconds:         envInt("M365_MEMORY_QUEUE_TIMEOUT_SECONDS", 60),
+		InteractivePriorityHoldoffSeconds: interactivePriorityHoldoffDefault(),
+		MemoryBackoffInitialSeconds:       envInt("M365_MEMORY_BACKOFF_INITIAL_SECONDS", 5),
+		MemoryBackoffMaxSeconds:           envInt("M365_MEMORY_BACKOFF_MAX_SECONDS", 60),
+		TextInputLimitUTF16:               defaultTextInputLimitUTF16,
+		MaxToolCallsPerTurn:               envInt("M365_MAX_TOOL_CALLS_PER_TURN", 2), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 16),
 		ContextWindow: envInt("M365_CONTEXT_WINDOW", 128000), MaxOutputTokens: envInt("M365_MAX_OUTPUT_TOKENS", 16384),
 		ChatTimeoutSeconds: envInt("M365_CHAT_TIMEOUT_SECONDS", 120), ImageTimeoutSeconds: envInt("M365_IMAGE_TIMEOUT_SECONDS", 150), LogLevel: firstNonEmptySetting(os.Getenv("M365_LOG_LEVEL"), "info"),
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
@@ -125,9 +151,14 @@ func settingsPath() string {
 	return filepath.Join(h, ".config", "m365-native", "settings.json")
 }
 
-var sharedSettings *settingsStore
+var (
+	sharedSettingsMu sync.Mutex
+	sharedSettings   *settingsStore
+)
 
 func openSettingsStore() *settingsStore {
+	sharedSettingsMu.Lock()
+	defer sharedSettingsMu.Unlock()
 	if sharedSettings != nil {
 		return sharedSettings
 	}
@@ -136,16 +167,47 @@ func openSettingsStore() *settingsStore {
 }
 
 func loadSettingsStore(path string) *settingsStore {
-	s := &settingsStore{path: path, v: defaultRuntimeSettings()}
+	s := &settingsStore{
+		path:               path,
+		v:                  defaultRuntimeSettings(),
+		persistedFields:    make(map[string]struct{}),
+		startupInjectedEnv: make(map[string]string),
+	}
+	migrateSettings := false
 	if b, err := os.ReadFile(s.path); err == nil {
 		if err := json.Unmarshal(b, &s.v); err != nil {
 			s.loadErr = fmt.Errorf("decode runtime settings: %w", err)
+		} else {
+			s.persistedFields = settingsJSONFields(b)
+			if !fieldPersisted(s.persistedFields, "memoryCompatibilityEnabled") {
+				s.v.MemoryCompatibilityEnabled = true
+				migrateSettings = true
+			}
+			var rawFields map[string]json.RawMessage
+			if err := json.Unmarshal(b, &rawFields); err == nil {
+				if legacy, exists := rawFields["hermesPriorityHoldoffSeconds"]; exists {
+					if !fieldPersisted(s.persistedFields, "interactivePriorityHoldoffSeconds") {
+						if err := json.Unmarshal(legacy, &s.v.InteractivePriorityHoldoffSeconds); err != nil {
+							s.loadErr = fmt.Errorf("decode legacy interactive priority holdoff: %w", err)
+						}
+					}
+					migrateSettings = true
+				}
+				if _, exists := rawFields["proxyPool"]; exists {
+					migrateSettings = true
+				}
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		s.loadErr = fmt.Errorf("read runtime settings: %w", err)
 	}
 	if s.loadErr == nil {
 		s.loadErr = validateSettings(s.v)
+	}
+	if s.loadErr == nil && migrateSettings {
+		if err := s.save(s.v); err != nil {
+			s.loadErr = fmt.Errorf("persist runtime settings migration: %w", err)
+		}
 	}
 	return s
 }
@@ -168,8 +230,8 @@ func validateSettings(v runtimeSettings) error {
 	if v.MemoryQueueTimeoutSeconds < 1 || v.MemoryQueueTimeoutSeconds > 600 {
 		return fmt.Errorf("Memory 排隊逾時必須為 1-600 秒")
 	}
-	if v.HermesPriorityHoldoffSeconds < 0 || v.HermesPriorityHoldoffSeconds > 300 {
-		return fmt.Errorf("Hermes 優先保留時間必須為 0-300 秒")
+	if v.InteractivePriorityHoldoffSeconds < 0 || v.InteractivePriorityHoldoffSeconds > 300 {
+		return fmt.Errorf("互動流量優先保留時間必須為 0-300 秒")
 	}
 	if v.MemoryBackoffInitialSeconds < 1 || v.MemoryBackoffInitialSeconds > 300 {
 		return fmt.Errorf("Memory 初始退避必須為 1-300 秒")
@@ -207,11 +269,6 @@ func validateSettings(v runtimeSettings) error {
 	if err := outbound.ValidateProxyURL(v.OutboundProxy); err != nil {
 		return err
 	}
-	for _, proxyURL := range v.ProxyPool {
-		if err := outbound.ValidateProxyURL(strings.TrimSpace(proxyURL)); err != nil {
-			return err
-		}
-	}
 	seen := make(map[string]struct{}, len(v.ModelMappings))
 	for _, mapping := range v.ModelMappings {
 		model := strings.TrimSpace(mapping.PublicModel)
@@ -248,20 +305,101 @@ func (s *settingsStore) get() runtimeSettings {
 	return v
 }
 func (s *settingsStore) save(v runtimeSettings) error {
-	if e := validateSettings(v); e != nil {
-		return e
+	if err := validateSettings(v); err != nil {
+		return err
 	}
-	b, _ := json.MarshalIndent(v, "", "  ")
-	if e := os.MkdirAll(filepath.Dir(s.path), 0700); e != nil {
-		return e
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
 	}
-	if e := os.WriteFile(s.path, b, 0600); e != nil {
-		return e
-	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	persist := s.persist
+	if persist == nil {
+		persist = atomicWriteSettingsFile
+	}
+	if err := persist(s.path, b); err != nil {
+		return err
+	}
 	s.v = v
 	s.loadErr = nil
+	s.persistedFields = settingsJSONFields(b)
+	return nil
+}
+
+func settingsJSONFields(raw []byte) map[string]struct{} {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return make(map[string]struct{})
+	}
+	out := make(map[string]struct{}, len(fields))
+	for field := range fields {
+		out[field] = struct{}{}
+	}
+	return out
+}
+
+func (s *settingsStore) provenanceSnapshot() (runtimeSettings, map[string]struct{}, map[string]string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	persisted := make(map[string]struct{}, len(s.persistedFields))
+	for field := range s.persistedFields {
+		persisted[field] = struct{}{}
+	}
+	injected := make(map[string]string, len(s.startupInjectedEnv))
+	for name, value := range s.startupInjectedEnv {
+		injected[name] = value
+	}
+	return s.v, persisted, injected
+}
+
+func (s *settingsStore) markStartupInjectedEnv(name, value string) {
+	s.mu.Lock()
+	if s.startupInjectedEnv == nil {
+		s.startupInjectedEnv = make(map[string]string)
+	}
+	s.startupInjectedEnv[name] = value
 	s.mu.Unlock()
+}
+
+func atomicWriteSettingsFile(path string, raw []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(dir, ".settings-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	removeTemporary := true
+	defer func() {
+		_ = temporary.Close()
+		if removeTemporary {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(raw); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	removeTemporary = false
+	if directory, err := os.Open(dir); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
+	}
 	return nil
 }
 func managementRouteIDs(mappings []modelMapping) []string {
@@ -273,6 +411,123 @@ func managementRouteIDs(mappings []modelMapping) []string {
 	return ids
 }
 
+func fieldPersisted(fields map[string]struct{}, field string) bool {
+	_, ok := fields[field]
+	return ok
+}
+
+func positiveIntegerEnvActive(name string) bool {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	return err == nil && n > 0
+}
+
+func nonNegativeIntegerEnvActive(name string) bool {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	return err == nil && n >= 0
+}
+
+func seededSettingStatus(configured any, field, environment string, persisted map[string]struct{}, environmentActive bool) settingValueStatus {
+	source := "default"
+	if fieldPersisted(persisted, field) {
+		source = "file"
+	} else if environmentActive {
+		source = "env"
+	}
+	return settingValueStatus{
+		Configured:  configured,
+		Effective:   configured,
+		Source:      source,
+		Environment: environment,
+	}
+}
+
+func directOverrideSettingStatus(configured, effective any, field, environment string, persisted map[string]struct{}) settingValueStatus {
+	if _, exists := os.LookupEnv(environment); exists {
+		return settingValueStatus{Configured: configured, Effective: effective, Source: "env", Environment: environment, Locked: true}
+	}
+	source := "default"
+	if fieldPersisted(persisted, field) {
+		source = "file"
+	}
+	return settingValueStatus{Configured: configured, Effective: effective, Source: source, Environment: environment}
+}
+
+func restartSettingStatus(configured any, field, environment string, persisted map[string]struct{}, injected map[string]string, parseEnvironment func(string) any) settingValueStatus {
+	status := settingValueStatus{
+		Configured:      configured,
+		Effective:       configured,
+		Source:          "default",
+		Environment:     environment,
+		RestartRequired: true,
+	}
+	if fieldPersisted(persisted, field) {
+		status.Source = "file"
+	}
+	if raw, exists := os.LookupEnv(environment); exists {
+		if parseEnvironment != nil {
+			status.Effective = parseEnvironment(raw)
+		} else {
+			status.Effective = raw
+		}
+		if injectedValue, fromFile := injected[environment]; fromFile && raw == injectedValue {
+			status.Source = "file"
+			return status
+		}
+		status.Source = "env"
+		status.Locked = true
+	}
+	return status
+}
+
+func settingsStatus(store *settingsStore) map[string]settingValueStatus {
+	if store == nil {
+		return map[string]settingValueStatus{}
+	}
+	cfg, persisted, injected := store.provenanceSnapshot()
+	status := map[string]settingValueStatus{
+		"memoryMaxConcurrent":               seededSettingStatus(cfg.MemoryMaxConcurrent, "memoryMaxConcurrent", "M365_MEMORY_MAX_CONCURRENT", persisted, positiveIntegerEnvActive("M365_MEMORY_MAX_CONCURRENT")),
+		"memoryQueueTimeoutSeconds":         seededSettingStatus(cfg.MemoryQueueTimeoutSeconds, "memoryQueueTimeoutSeconds", "M365_MEMORY_QUEUE_TIMEOUT_SECONDS", persisted, positiveIntegerEnvActive("M365_MEMORY_QUEUE_TIMEOUT_SECONDS")),
+		"interactivePriorityHoldoffSeconds": seededSettingStatus(cfg.InteractivePriorityHoldoffSeconds, "interactivePriorityHoldoffSeconds", interactivePriorityHoldoffEnvName(), persisted, nonNegativeIntegerEnvActive(interactivePriorityHoldoffEnvName())),
+		"memoryBackoffInitialSeconds":       seededSettingStatus(cfg.MemoryBackoffInitialSeconds, "memoryBackoffInitialSeconds", "M365_MEMORY_BACKOFF_INITIAL_SECONDS", persisted, positiveIntegerEnvActive("M365_MEMORY_BACKOFF_INITIAL_SECONDS")),
+		"memoryBackoffMaxSeconds":           seededSettingStatus(cfg.MemoryBackoffMaxSeconds, "memoryBackoffMaxSeconds", "M365_MEMORY_BACKOFF_MAX_SECONDS", persisted, positiveIntegerEnvActive("M365_MEMORY_BACKOFF_MAX_SECONDS")),
+		"maxToolCallsPerTurn":               directOverrideSettingStatus(cfg.MaxToolCallsPerTurn, configuredToolCallLimit(store), "maxToolCallsPerTurn", "M365_MAX_TOOL_CALLS_PER_TURN", persisted),
+		"maxToolRounds":                     directOverrideSettingStatus(cfg.MaxToolRounds, configuredMaxToolRounds(store), "maxToolRounds", "M365_MAX_TOOL_ROUNDS", persisted),
+		"contextWindow":                     seededSettingStatus(cfg.ContextWindow, "contextWindow", "M365_CONTEXT_WINDOW", persisted, positiveIntegerEnvActive("M365_CONTEXT_WINDOW")),
+		"maxOutputTokens":                   seededSettingStatus(cfg.MaxOutputTokens, "maxOutputTokens", "M365_MAX_OUTPUT_TOKENS", persisted, positiveIntegerEnvActive("M365_MAX_OUTPUT_TOKENS")),
+		"chatTimeoutSeconds":                seededSettingStatus(cfg.ChatTimeoutSeconds, "chatTimeoutSeconds", "M365_CHAT_TIMEOUT_SECONDS", persisted, positiveIntegerEnvActive("M365_CHAT_TIMEOUT_SECONDS")),
+		"imageTimeoutSeconds":               seededSettingStatus(cfg.ImageTimeoutSeconds, "imageTimeoutSeconds", "M365_IMAGE_TIMEOUT_SECONDS", persisted, positiveIntegerEnvActive("M365_IMAGE_TIMEOUT_SECONDS")),
+		"logLevel":                          seededSettingStatus(cfg.LogLevel, "logLevel", "M365_LOG_LEVEL", persisted, strings.TrimSpace(os.Getenv("M365_LOG_LEVEL")) != ""),
+		"toolPlanningMode":                  seededSettingStatus(cfg.ToolPlanningMode, "toolPlanningMode", "M365_TOOL_PLANNING_MODE", persisted, strings.TrimSpace(os.Getenv("M365_TOOL_PLANNING_MODE")) != ""),
+	}
+	for field, spec := range map[string]struct {
+		configured  any
+		environment string
+		parser      func(string) any
+	}{
+		"debugLogPath":     {cfg.DebugLogPath, "M365_DEBUG_LOG", nil},
+		"listenAddress":    {cfg.ListenAddress, "M365_LISTEN", nil},
+		"configPath":       {cfg.ConfigPath, "M365_CONFIG", nil},
+		"tokenCachePath":   {cfg.TokenCachePath, "M365_TOKEN_CACHE", nil},
+		"sessionCachePath": {cfg.SessionCachePath, "M365_SESSION_CACHE", nil},
+		"outboundProxy":    {cfg.OutboundProxy, outbound.EnvProxy, nil},
+		"clientId":         {cfg.ClientID, "M365_CLIENT_ID", nil},
+		"authority":        {cfg.Authority, "M365_AUTHORITY", nil},
+		"redirectUri":      {cfg.RedirectURI, "M365_REDIRECT_URI", nil},
+		"scope":            {cfg.Scope, "M365_SCOPE", nil},
+	} {
+		status[field] = restartSettingStatus(spec.configured, field, spec.environment, persisted, injected, spec.parser)
+	}
+	return status
+}
+
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -281,7 +536,7 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		if s.compatTraffic != nil {
 			traffic = s.compatTraffic.snapshot()
 		}
-		jsonOut(w, map[string]any{"settings": cfg, "compatibilityTraffic": traffic, "codexModels": managementRouteIDs(cfg.ModelMappings), "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
+		jsonOut(w, map[string]any{"settings": cfg, "settingStatus": settingsStatus(s.settings), "compatibilityTraffic": traffic, "codexModels": managementRouteIDs(cfg.ModelMappings), "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
 	case http.MethodPut:
 		current := s.settings.get()
 		v := current
@@ -298,18 +553,14 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		s.checkpointLifecycle.Lock()
 		var e error
+		commit := func() error { return s.settings.save(v) }
 		if current.ChatMode != v.ChatMode && s.checkpoints != nil {
-			e = s.checkpoints.Clear()
-		}
-		if e == nil {
-			e = s.settings.save(v)
+			e = s.checkpoints.ClearThen(commit)
+		} else {
+			e = commit()
 		}
 		s.checkpointLifecycle.Unlock()
 		if e != nil {
-			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
-			return
-		}
-		if e := outbound.ConfigurePool(v.ProxyPool); e != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
 		}
@@ -406,7 +657,7 @@ func toolDefinitionClearlyReadOnly(function map[string]any) bool {
 			}
 		}
 	}
-	return readOnlyHint || toolLooksReadOnly(description)
+	return readOnlyHint
 }
 
 func configuredRequestToolCallLimit(request oaiReq, settings *settingsStore) int {
@@ -442,14 +693,14 @@ func toolNameTokens(name string) []string {
 	})
 }
 
-func limitToolCalls(c []detectedToolCall, n int) []detectedToolCall {
+func validateToolCallLimit(c []detectedToolCall, n int) error {
 	if n < 1 {
 		n = 1
 	}
 	if len(c) > n {
-		return c[:n]
+		return fmt.Errorf("model returned %d tool calls, exceeding the allowed limit of %d; refusing to truncate upstream tool state", len(c), n)
 	}
-	return c
+	return nil
 }
 
 func currentSettings() runtimeSettings { return openSettingsStore().get() }
@@ -463,11 +714,15 @@ func ApplyStartupSettingsEnv() error {
 		return store.loadErr
 	}
 	s := store.get()
-	values := map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_PROXY_POOL": strings.Join(s.ProxyPool, "\n"), "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
+	values := map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
 	for k, v := range values {
-		if _, exists := os.LookupEnv(k); !exists && strings.TrimSpace(v) != "" {
-			_ = os.Setenv(k, v)
+		if _, exists := os.LookupEnv(k); exists || strings.TrimSpace(v) == "" {
+			continue
 		}
+		if err := os.Setenv(k, v); err != nil {
+			return fmt.Errorf("apply persisted setting %s: %w", k, err)
+		}
+		store.markStartupInjectedEnv(k, v)
 	}
 	return nil
 }
