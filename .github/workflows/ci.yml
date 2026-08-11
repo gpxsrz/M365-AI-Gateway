@@ -33,3 +33,13 @@ jobs:
         run: go vet ./...
       - name: Build
         run: go build ./...
+      - name: Cross-build Windows release targets
+        run: |
+          set -euo pipefail
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/m365-native-windows-amd64.exe ./cmd/server
+          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o /tmp/m365-native-windows-arm64.exe ./cmd/server
+      - name: Check NAS deployment automation
+        run: |
+          set -euo pipefail
+          bash -n scripts/deploy-nas-production.sh
+          bash scripts/deploy-nas-production.sh --help >/dev/null

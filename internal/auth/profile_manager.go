@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -197,10 +196,10 @@ func (manager *OAuthProfileManager) withLock(operation func() error) error {
 	if err := lock.Chmod(0o600); err != nil {
 		return fmt.Errorf("secure OAuth profile lock: %w", err)
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockOAuthProfileFile(lock); err != nil {
 		return fmt.Errorf("lock OAuth profiles: %w", err)
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	defer func() { _ = unlockOAuthProfileFile(lock) }()
 	return operation()
 }
 
