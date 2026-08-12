@@ -164,8 +164,18 @@ func TestAutoToolRouterOversizeRepairFailsClosedBeforeSecondUpstreamCall(t *test
 			if len(chat.requests) != 1 {
 				t.Fatalf("upstream requests=%d, oversize repair must fail before a second upstream call", len(chat.requests))
 			}
-			if !strings.Contains(rr.Body.String(), `"code":"tool_router_repair_input_too_large"`) {
-				t.Fatalf("missing machine-readable repair failure: %s", rr.Body.String())
+			response := wp1DecodeJSON(t, rr.Body.String())
+			errBody, _ := response["error"].(map[string]any)
+			limit, limitOK := errBody["limit"].(float64)
+			received, receivedOK := errBody["received"].(float64)
+			if errBody["code"] != "tool_router_repair_input_too_large" ||
+				errBody["limit_type"] != "repair_prompt_utf16" ||
+				errBody["terminal"] != true ||
+				errBody["retryable"] != false ||
+				errBody["recommended_action"] != "regenerate_tool_routing_decision" ||
+				!limitOK || int(limit) != defaultTextInputLimitUTF16 ||
+				!receivedOK || int(received) <= defaultTextInputLimitUTF16 {
+				t.Fatalf("unexpected machine-readable repair failure: %#v", errBody)
 			}
 		})
 	}
