@@ -32,9 +32,26 @@ func (e *callerTextLimitError) Error() string {
 }
 
 func writeOpenAITextPolicyError(w http.ResponseWriter, r *http.Request, err error) {
+	errBody := callerTextPolicyErrorObject(r, err)
+	if r.URL.Path == "/v1/messages" {
+		writeAnthropicErrorObject(w, http.StatusBadRequest, errBody)
+		return
+	}
+	writeOpenAIErrorObject(w, http.StatusBadRequest, errBody)
+}
+
+func callerTextPolicyErrorObject(r *http.Request, err error) map[string]any {
 	code := "text_policy_exceeded"
 	message := err.Error()
-	if hermesCompatibilityRequest(r.URL.Path) {
+	switch {
+	case memoryCompatibilityRequest(r.URL.Path):
+		// Hindsight's reflect agent recognizes both this error code and the
+		// input-overflow phrase, then can force a smaller final synthesis. Keep
+		// this profile separate from Hermes because Memory requests remain
+		// ForceNew/Untracked and use their own admission-control semantics.
+		code = "context_length_exceeded"
+		message = "input is too long for the Memory Provider caller-text policy; reduce retrieved or synthesized context before retrying; " + message
+	case hermesCompatibilityRequest(r.URL.Path):
 		// Hermes classifies HTTP 400 before consulting the structured error code,
 		// so the dedicated compatibility surface needs both its recognized code
 		// and a recognized input-overflow message marker. Keep the actual
@@ -43,7 +60,20 @@ func writeOpenAITextPolicyError(w http.ResponseWriter, r *http.Request, err erro
 		code = "context_length_exceeded"
 		message = "input is too long for the Sidecar caller-text policy; " + message
 	}
-	writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", code, message)
+	errBody := map[string]any{
+		"message": message,
+		"type":    "invalid_request_error",
+		"code":    code,
+	}
+	var limitErr *callerTextLimitError
+	if errors.As(err, &limitErr) {
+		errBody["limit_type"] = "caller_text_utf16"
+		errBody["limit"] = limitErr.Limit
+		errBody["received"] = limitErr.Units
+		errBody["retryable_after_reduction"] = true
+		errBody["recommended_action"] = "compact_or_split_and_retry"
+	}
+	return errBody
 }
 
 func utf16CodeUnits(text string) int {

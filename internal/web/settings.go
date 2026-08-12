@@ -579,56 +579,6 @@ func configuredToolCallLimit(s *settingsStore) int {
 	return s.get().MaxToolCallsPerTurn
 }
 
-// adaptiveToolCallLimit permits parallel calls only when every call is a
-// read-only, independently addressable operation. Any write, execution,
-// mutation, or ambiguous tool is serialized conservatively.
-func adaptiveToolCallLimit(c []detectedToolCall, definitions []map[string]any, configured int) int {
-	if len(c) < 2 || configured < 2 {
-		return 1
-	}
-	seenIDs := make(map[string]struct{}, len(c))
-	for _, call := range c {
-		if call.ID == "" {
-			return 1
-		}
-		if _, duplicate := seenIDs[call.ID]; duplicate {
-			return 1
-		}
-		seenIDs[call.ID] = struct{}{}
-		definition, ok := uniqueParallelToolDefinition(call, definitions)
-		if !ok || !toolDefinitionClearlyReadOnly(definition) {
-			return 1
-		}
-	}
-	return configured
-}
-
-func requestToolCallLimit(request oaiReq, calls []detectedToolCall, settings *settingsStore) int {
-	return adaptiveToolCallLimit(calls, toolDefinitionMaps(request.Tools), configuredRequestToolCallLimit(request, settings))
-}
-
-func uniqueParallelToolDefinition(call detectedToolCall, definitions []map[string]any) (map[string]any, bool) {
-	if strings.TrimSpace(call.Name) == "" || call.Type != "function" {
-		return nil, false
-	}
-	var match map[string]any
-	for _, definition := range definitions {
-		if typ, _ := definition["type"].(string); typ != "function" {
-			continue
-		}
-		function, _ := definition["function"].(map[string]any)
-		name, _ := function["name"].(string)
-		if name != call.Name {
-			continue
-		}
-		if match != nil {
-			return nil, false
-		}
-		match = function
-	}
-	return match, match != nil
-}
-
 func toolDefinitionClearlyReadOnly(function map[string]any) bool {
 	name, _ := function["name"].(string)
 	description, _ := function["description"].(string)
@@ -660,11 +610,49 @@ func toolDefinitionClearlyReadOnly(function map[string]any) bool {
 	return readOnlyHint
 }
 
+// configuredRequestToolCallLimit fixes the caller-visible ceiling before any
+// upstream model decision. Router prompts, native requests, and returned-call
+// count validation must all use this same value so checkpoint/tool state cannot
+// advance under one contract and then be rejected under a stricter one.
 func configuredRequestToolCallLimit(request oaiReq, settings *settingsStore) int {
-	if request.ParallelToolCalls != nil && !*request.ParallelToolCalls {
+	configured := configuredToolCallLimit(settings)
+	if configured < 2 || (request.ParallelToolCalls != nil && !*request.ParallelToolCalls) {
 		return 1
 	}
-	return configuredToolCallLimit(settings)
+	if !requestToolDefinitionsClearlyParallelSafe(toolDefinitionMaps(request.Tools), request.ToolChoice) {
+		return 1
+	}
+	return configured
+}
+
+// requestToolCallLimit is retained at returned-call validation sites, but the
+// calls are deliberately ignored: safety may not be tightened after the model
+// has already acted under configuredRequestToolCallLimit.
+func requestToolCallLimit(request oaiReq, _ []detectedToolCall, settings *settingsStore) int {
+	return configuredRequestToolCallLimit(request, settings)
+}
+
+func requestToolDefinitionsClearlyParallelSafe(definitions []map[string]any, choice any) bool {
+	seen := map[string]struct{}{}
+	selectable := 0
+	for _, definition := range definitions {
+		typ, _ := definition["type"].(string)
+		function, _ := definition["function"].(map[string]any)
+		name, _ := function["name"].(string)
+		name = strings.TrimSpace(name)
+		if typ != "function" || name == "" || !toolChoiceAllows(choice, name) {
+			continue
+		}
+		selectable++
+		if _, duplicate := seen[name]; duplicate {
+			return false
+		}
+		seen[name] = struct{}{}
+		if !toolDefinitionClearlyReadOnly(function) {
+			return false
+		}
+	}
+	return selectable > 0
 }
 
 func toolLooksMutating(name string) bool {

@@ -21,25 +21,37 @@ func writeOpenAIError(w http.ResponseWriter, status int, typ, msg string) {
 }
 
 func writeOpenAIErrorCode(w http.ResponseWriter, status int, typ, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
 	errBody := map[string]any{"message": msg, "type": typ}
 	if code != "" {
 		errBody["code"] = code
 	}
+	writeOpenAIErrorObject(w, status, errBody)
+}
+
+func writeOpenAIErrorObject(w http.ResponseWriter, status int, errBody map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": errBody})
 }
 
 func openAIErrorDetails(raw []byte) (typ, code, message string) {
-	var v map[string]any
-	if json.Unmarshal(raw, &v) != nil {
-		return "", "", ""
-	}
-	errBody, _ := v["error"].(map[string]any)
+	errBody := openAIErrorObject(raw)
 	typ, _ = errBody["type"].(string)
 	code, _ = errBody["code"].(string)
 	message, _ = errBody["message"].(string)
 	return typ, code, message
+}
+
+func openAIErrorObject(raw []byte) map[string]any {
+	var v map[string]any
+	if json.Unmarshal(raw, &v) != nil {
+		return nil
+	}
+	errBody, _ := v["error"].(map[string]any)
+	if errBody == nil {
+		return nil
+	}
+	return errBody
 }
 
 func writeResponsesError(w http.ResponseWriter, status int, typ, msg string) {
@@ -55,11 +67,15 @@ func writeAnthropicError(w http.ResponseWriter, status int, typ, msg string) {
 }
 
 func writeAnthropicErrorCode(w http.ResponseWriter, status int, typ, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
 	errBody := map[string]any{"type": typ, "message": msg}
 	if code != "" {
 		errBody["code"] = code
 	}
+	writeAnthropicErrorObject(w, status, errBody)
+}
+
+func writeAnthropicErrorObject(w http.ResponseWriter, status int, errBody map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": errBody})
 }

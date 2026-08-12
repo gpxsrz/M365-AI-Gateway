@@ -885,3 +885,26 @@ func TestWP6PublicParallelToolCallsRejectsMisleadingReadName(t *testing.T) {
 		t.Fatalf("mutating/ambiguous parallel result must be rejected instead of truncated: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestWP6RouterAdvertisesSerialLimitBeforeAmbiguousToolSelection(t *testing.T) {
+	tools := []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "read_file", "description": "Read file contents.", "parameters": map[string]any{"type": "object"}}},
+		map[string]any{"type": "function", "function": map[string]any{"name": "terminal", "description": "Run a terminal command.", "parameters": map[string]any{"type": "object"}}},
+	}
+	chat := &wp1CandidateChat{result: chathub.Result{Text: `{"calls":[{"name":"read_file","arguments":{}}]}`}}
+	server := newWP1CandidateServer(t, chat)
+	body := map[string]any{
+		"model":               "gpt-5.6-sol",
+		"messages":            []any{map[string]any{"role": "user", "content": "inspect"}},
+		"tools":               tools,
+		"parallel_tool_calls": true,
+	}
+	recorder := httptest.NewRecorder()
+	server.openaiChat(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(mustJSON(body))))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(chat.requests) != 1 || !strings.Contains(chat.requests[0].Text, "Maximum calls this turn: 1") {
+		t.Fatalf("router advertised a parallel limit before ambiguous tools were selected: %#v", chat.requests)
+	}
+}

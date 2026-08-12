@@ -1,8 +1,8 @@
 # M365-Copilot2API Memory Provider Compatibility Mode / 記憶體供應器相容模式
 
-Status / 狀態: **IMPLEMENTED COMPATIBILITY SURFACE — current hardening is not yet deployed / 相容介面已實作，本輪強化尚未部署**
+Status / 狀態: **IMPLEMENTED COMPATIBILITY SURFACE — Issues #42–#44 hardening is locally verified and not yet deployed / 相容介面已實作，Issue #42–#44 強化已完成本地驗證、尚未部署**
 
-Date / 日期: 2026-08-11
+Date / 日期: 2026-08-12
 
 ## 繁體中文
 
@@ -18,7 +18,7 @@ Memory traffic 使用獨立 transport checkpoint 規則：
 
 因此 Hindsight 的背景記憶工作不會沿用 Hermes / 一般互動流量的 continuation checkpoint。M365 不負責長期聊天記憶；長期 Memory 仍由 Hermes / Hindsight 負責。
 
-本輪 working tree 內的強化尚未部署 Production。Production baseline `0a7a513` 已有 Memory compatibility implementation，但本文件以下描述的是目前準備中的最新行為。
+目前 Production 與公開 `main` baseline 為 `d323216b3919fce61de5503b087e79ab04583188`，已包含既有 Memory compatibility implementation。本輪 #42–#44 強化從這個 exact commit 建立隔離 worktree；以下新增行為已通過本地 deterministic tests，但尚未部署 Production。
 
 ### 啟用方式與 migration
 
@@ -54,6 +54,26 @@ Fresh install 沒有既有 `settings.json` 時，預設為 **OFF**。
 10. Repair 後再次做本地 schema validation。
 11. Repair 必須保留原始 scalar facts；若無法依 caller schema 唯一證明 property 對應關係，就 fail closed，不猜測或交換值。
 12. 最終只有本地 validation 通過才回 success。
+
+### UTF-16 overflow recovery
+
+`/memory/v1` 的 caller-text overflow 不再沿用一般 `/v1` 的 `text_policy_exceeded`。Memory profile 會回 HTTP 400、`context_length_exceeded` 與 `input is too long` marker，讓 Hindsight 的既有 context-overflow classifier 能進入縮減／final-synthesis recovery；同一個 `error` 物件仍保留 `limit_type=caller_text_utf16`、實際 `limit`、`received`、`retryable_after_reduction` 與 `recommended_action`。這是 **Hindsight recovery 相容映射**，不是宣稱 `128000 UTF-16` 等於模型的 128K tokens，也不會把 `/memory/v1` 變成 Hermes route。
+
+本輪對 Hindsight 0.9.0 的唯讀程式檢查同時確認：
+
+- Reflect 的 overflow classifier 認得 `context_length_exceeded` 與 `input is too long`，遇到 overflow 後會停止 agent loop，改用已取得的 evidence 做 final synthesis。
+- Reflect 預設 `max_context_tokens=100000`，final synthesis 最多約 80% 用於 retrieved context；這與 Sidecar 的 UTF-16 policy 不是同一單位，因此 100K 對 M365 route 過寬。
+- OpenAI-compatible provider 對一般 HTTP 400 在 Reflect 收到例外前仍有自己的 retry loop；預設全域 retry budget 為 3。Hindsight 提供 Reflect-specific override，因此不需要修改 Hindsight source code。
+- Retain 預設以約 3000 chars 切 chunk；Consolidation 預設每個 LLM batch 8 facts，related observations recall 約 512 tokens、source facts 約 4096 tokens。就預設值而言，主要大型 prompt 風險仍集中在 Reflect / final synthesis，而不是 retain/consolidation。
+
+部署後 canary 建議先只調整 Hindsight **Reflect 專用**設定，不改全域 LLM retry：
+
+```text
+HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0
+HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
+```
+
+`40000` 是針對 M365 UTF-16 transport policy 的保守 canary 起始值，不是 Hindsight 或 M365 的通用規格。它讓 Reflect 的 80% retrieved-context 預算約落在 32K tokens，保留 system/tool/schema/回答 framing 空間。正式值必須由真實繁中、工具 JSON 與 retrieved-memory workload 再收斂；不要直接把 `100000` tokens 與 `128000 UTF-16` 作數值對照。`REFLECT_LLM_MAX_RETRIES=0` 的目的只是避免同一個 deterministic 400 在 provider 內部原封不動重送；其他 operation 的 retry 暫時維持原設定。
 
 ### 流量與 429
 
@@ -100,16 +120,17 @@ Hermes 與 Hindsight source code 不需要因 M365 相容性修正而修改。�
 - Production compose/settings effective value review
 - Hermes + Hindsight live integration qualification
 
-目前不在另外的隔離 worktree 開發；所有既有 dirty working-tree 修改都視為同一批開發現況，禁止 reset / clean / 丟棄。
+本輪從公開 `main` exact baseline 建立隔離 worktree，以避免舊 checkout 或其他工作中的 dirty state 混入；正式發佈仍必須回到同一個公開主線並通過 exact-head CI。
 
 ### 尚未做完的部署工作
 
-本輪 code hardening 尚未 commit / deploy。Production 部署前仍要處理：
+本輪 #42–#44 code hardening 尚未 commit / deploy。Production 部署前仍要處理：
 
-- Production compose 的 timeout default 與 persisted `settings.json` 對齊。
-- 決定 commit grouping 並確認 staged / unstaged 邊界。
-- 部署後做 Hermes interactive + Hindsight Memory live qualification。
-- 驗證公開 reverse proxy timeout 大於 M365 effective request timeout。
+- 完整 release gate、diff review、公開 commit 與 exact-head CI。
+- Production preflight、snapshot / rollback 準備與 exact-commit deployment。
+- 部署後做 generic `/v1` recovery metadata、Hermes tool/overflow continuation、Hindsight Memory overflow recovery 的 live qualification。
+- live qualification 通過後，才進行 Hermes 80K / proactive prune 40–42K 與 Hindsight Reflect 40K / retry 0 的設定 canary。
+- 驗證 M365 `textInputLimitUTF16` 仍為 `128000`，且公開 reverse proxy timeout 大於 M365 effective request timeout。
 
 ---
 
@@ -127,7 +148,7 @@ Memory traffic uses isolated transport-checkpoint semantics:
 
 This prevents Hindsight background memory work from continuing Hermes or ordinary interactive checkpoints. M365 does not own long-term conversational memory; Hermes/Hindsight remain responsible for that layer.
 
-Production baseline `0a7a513` already contains the Memory compatibility implementation. The current working-tree hardening described below has not yet been deployed.
+Production and public `main` currently share baseline `d323216b3919fce61de5503b087e79ab04583188`, which already contains the existing Memory compatibility implementation. The #42–#44 hardening was developed from that exact commit in an isolated worktree. The new behavior described below has passed deterministic local tests but is not yet deployed to Production.
 
 ### Activation and migration
 
@@ -159,6 +180,23 @@ For strict structured-output requests on `/memory/v1`:
 11. Scalar facts must be preserved. If the caller schema cannot prove a unique safe property association, fail closed rather than guessing or swapping values.
 12. Return success only after local validation passes.
 
+### UTF-16 overflow recovery
+
+`/memory/v1` caller-text overflow no longer inherits the generic `/v1` `text_policy_exceeded` contract. The Memory profile returns HTTP 400 with `context_length_exceeded` and an `input is too long` marker so Hindsight's existing context-overflow classifier can enter its reduction/final-synthesis recovery path. The same `error` object still reports `limit_type=caller_text_utf16`, the actual `limit` and `received` counts, `retryable_after_reduction`, and `recommended_action`. This is a **Hindsight recovery compatibility mapping**, not a claim that `128000 UTF-16` equals a 128K-token model context window, and it does not turn `/memory/v1` into the Hermes profile.
+
+Read-only inspection of Hindsight 0.9.0 confirms that Reflect recognizes `context_length_exceeded` and `input is too long`, stops its agent loop on context overflow, and falls back to final synthesis from already gathered evidence. Its default `max_context_tokens=100000` can devote roughly 80% to retrieved context, which is too permissive for an M365 route bounded by a separate UTF-16 policy. The OpenAI-compatible provider also has its own retry loop for ordinary HTTP 400 responses before Reflect sees the exception; the default global retry budget is 3, but Hindsight exposes a Reflect-specific override, so no Hindsight source-code change is required.
+
+Retain defaults to roughly 3000-character chunks. Consolidation defaults to 8 facts per LLM batch, about 512 tokens of related-observation recall, and about 4096 tokens of source facts. With those defaults, the primary large-prompt risk is Reflect/final synthesis rather than retain/consolidation.
+
+A post-deployment canary should initially change only the Reflect-specific integration settings:
+
+```text
+HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0
+HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
+```
+
+`40000` is a conservative M365-integration canary starting point, not a universal Hindsight or M365 specification. With the current 80% final-synthesis fraction, it targets roughly 32K tokens of retrieved context and leaves room for system/tool/schema/answer framing. Tune it with representative Traditional Chinese, tool JSON, and retrieved-memory workloads instead of numerically equating `100000` tokens with `128000 UTF-16`. Setting the Reflect-specific retry budget to zero only avoids identical deterministic 400 retries inside the provider; other operation retry policies remain unchanged initially.
+
 ### Traffic and 429 behavior
 
 Memory is background traffic; ordinary `/v1` and `/hermes/v1` interactive traffic remains higher priority.
@@ -175,8 +213,8 @@ Hermes and Hindsight source code are not modified to absorb M365 protocol-compat
 
 Before Production deployment, the batch must pass the full Go test suite, vet, build, race tests for the critical packages, `git diff --check`, staged/unstaged review, Production effective-settings review, and live Hermes + Hindsight qualification.
 
-This work is intentionally being performed in the existing dirty checkout as one integrated development state. Existing dirty files must not be reset, cleaned, or discarded.
+This batch is being developed in an isolated worktree created from the exact public-main baseline so stale checkout state or unrelated dirty files cannot enter the candidate. Publication still returns through the same public mainline and requires exact-head CI.
 
 ### Deployment work still pending
 
-The current hardening has not been committed or deployed. Remaining deployment work includes aligning Production compose timeout defaults with persisted settings, choosing commit grouping without losing existing staged changes, running live Hermes/Hindsight integration qualification, and confirming the public reverse-proxy timeout remains greater than the effective M365 request timeout.
+The #42–#44 hardening has not yet been committed or deployed. Remaining work is to pass the full release gate and diff review, publish the exact candidate and obtain exact-head CI success, run Production preflight plus snapshot/rollback preparation, deploy that exact commit, and perform live generic-route recovery, Hermes tool/overflow continuation, and Hindsight Memory overflow qualification. Only after those checks pass should the Hermes 80K / proactive-prune 40–42K and Hindsight Reflect 40K / retry-0 configuration canaries begin. `textInputLimitUTF16` must remain `128000` unless separately justified and tested.

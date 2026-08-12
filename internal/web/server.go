@@ -1710,7 +1710,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if _, candidateErr := decodeExactJSONValue([]byte(normalizeJSONText(res.Text))); candidateErr == nil {
 				repairPrompt := memorySchemaRepairPrompt(res.Text, responseFormat, formatErr)
 				if budgetErr := validateCallerString(repairPrompt, settings.TextInputLimitUTF16); budgetErr != nil {
-					writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", budgetErr.Error())
+					writeOpenAITextPolicyError(w, r, budgetErr)
 					return
 				}
 				repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, ToolChoice: "none", DisableBuiltInSearch: true}))

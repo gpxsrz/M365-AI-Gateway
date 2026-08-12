@@ -481,7 +481,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	setDowngradedParameters(w, downgraded)
 	if err := validateCallerText(o.Messages, settings.TextInputLimitUTF16); err != nil {
-		writeResponsesErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", err.Error())
+		writeOpenAITextPolicyError(w, r, err)
 		return
 	}
 	r = withCallerTextValidated(r)
@@ -543,14 +543,11 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
 	if status >= 400 {
-		typ, code, message := openAIErrorDetails(raw)
-		if typ == "" {
-			typ = "upstream_error"
+		if errBody := openAIErrorObject(raw); errBody != nil {
+			writeOpenAIErrorObject(w, status, errBody)
+			return
 		}
-		if message == "" {
-			message = errorMessage(raw, "upstream protocol error")
-		}
-		writeResponsesErrorCode(w, status, typ, code, message)
+		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
 		return
 	}
 	if err != nil {
@@ -645,7 +642,7 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if checkpointErr != nil {
 		var textLimitErr *callerTextLimitError
 		if errors.As(checkpointErr, &textLimitErr) {
-			writeAnthropicErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", checkpointErr.Error())
+			writeOpenAITextPolicyError(w, r, checkpointErr)
 			return
 		}
 		writeAnthropicError(w, http.StatusConflict, "checkpoint_error", checkpointErr.Error())
@@ -657,14 +654,11 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withCheckpointExecution(r.Context(), execution))
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
 	if status >= 400 {
-		typ, code, message := openAIErrorDetails(raw)
-		if typ == "" {
-			typ = "api_error"
+		if errBody := openAIErrorObject(raw); errBody != nil {
+			writeAnthropicErrorObject(w, status, errBody)
+			return
 		}
-		if message == "" {
-			message = errorMessage(raw, "upstream protocol error")
-		}
-		writeAnthropicErrorCode(w, status, typ, code, message)
+		writeAnthropicError(w, status, "api_error", errorMessage(raw, "upstream protocol error"))
 		return
 	}
 	if err != nil {

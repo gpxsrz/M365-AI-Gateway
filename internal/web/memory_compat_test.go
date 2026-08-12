@@ -77,6 +77,7 @@ func TestHermesTextPolicyOverflowUsesRecoverableContextCodeOnlyOnDedicatedRoute(
 	if !strings.Contains(hermesError, "input is too long") || !strings.Contains(hermes.Body.String(), "128000") || !strings.Contains(hermesError, "utf-16") {
 		t.Fatalf("Hermes compatibility error lacks the recoverable marker or real UTF-16 policy: %s", hermes.Body.String())
 	}
+	requireCallerTextRecoveryMetadata(t, textPolicyErrorObject(t, hermes), "context_length_exceeded", defaultTextInputLimitUTF16+1)
 
 	generic := httptest.NewRecorder()
 	genericRequest := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)), "generic-owner")
@@ -84,6 +85,7 @@ func TestHermesTextPolicyOverflowUsesRecoverableContextCodeOnlyOnDedicatedRoute(
 	if generic.Code != http.StatusBadRequest || wp1ErrorCode(t, generic) != "text_policy_exceeded" {
 		t.Fatalf("generic status=%d code=%q body=%s", generic.Code, wp1ErrorCode(t, generic), generic.Body.String())
 	}
+	requireCallerTextRecoveryMetadata(t, textPolicyErrorObject(t, generic), "text_policy_exceeded", defaultTextInputLimitUTF16+1)
 }
 
 func TestMemoryCompatibilityRouteRequiresExplicitOptIn(t *testing.T) {

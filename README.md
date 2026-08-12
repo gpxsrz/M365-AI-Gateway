@@ -77,6 +77,7 @@ curl -sS http://127.0.0.1:4141/v1/models \
 
 - 預設聊天模式為 `Private`。每次建立 ChatHub WebSocket 都會重新套用 `disableMemory=1`，但這不代表 Microsoft 完全不保留任何資料。
 - 呼叫端文字預設上限為 `128000` 個 UTF-16 碼元。這是與官方 Web 編輯器相容的保守政策，不是 token context window，也不是已證明的 Microsoft 後端硬上限。Hermes 等 Agent 若無法正確偵測自訂 route 的 context，請使用 provider/model 級 override，不要用 M365 的限制污染其他 provider。
+- 一般 `/v1` caller 超過此政策時維持 `text_policy_exceeded`，並在 `error` 物件附上 `limit_type=caller_text_utf16`、`limit`、`received`、`retryable_after_reduction` 與 `recommended_action`，讓呼叫端可以 compact／split 後重試，而不把 UTF-16 政策冒充成 model token context。`/hermes/v1` 與 `/memory/v1` 則各自提供 consumer 可辨識的 overflow recovery profile，同時保留真正的 UTF-16 限制說明。
 - 文件與圖片使用不同的 Microsoft 傳輸路徑。文件可能經由 Graph、OneDrive 或 SharePoint 暫存；圖片則走專用圖片上傳路徑。
 - Code Interpreter 產出的檔案會由 Sidecar 以已登入身分擷取、存入本機私有儲存區，再轉成短期下載網址（capability URL）。網址本身具有存取能力，請勿公開轉傳。
 - 將服務暴露到 loopback 以外之前，必須另行配置 TLS、可信反向代理、網路存取限制及正確的公開來源設定。
@@ -88,6 +89,10 @@ curl -sS http://127.0.0.1:4141/v1/models \
 管理介面提供 Hermes／Hindsight 相容開關與 Memory 同時請求數、排隊逾時、互動流量優先保留時間、Memory 429 初始／最大退避等控制。政策是：**互動式流量優先，Hindsight 背景工作讓位**。既有 Hermes 繼續使用 `/v1/chat/completions` 時，該路徑和其他標準 `/v1` caller 一樣分類為互動流量；只有 `/hermes/v1/*` 是受 Hermes 相容開關控制的專用 profile，並使用獨立的 `hermes` checkpoint namespace。
 
 Memory 排隊採 FIFO，已進場的 Memory 工作不會被強制中斷；若 Microsoft 回 429，Memory 會進入 cooldown 並逐步延長退避。真實 Microsoft 帳號不會用高併發故意觸發 429，相關行為以本地 deterministic test 驗證，線上只做低併發確認。
+
+## 呼叫端工具的平行安全契約
+
+`maxToolCallsPerTurn` 是上限，不代表每一輪都會向模型開放相同數量。Sidecar 會在送出模型請求**以前**，依 caller 暴露的 tool definitions 與 `tool_choice` 固定本輪 ceiling：只有所有可被選取的工具都明確帶有 `annotations.readOnlyHint=true`，而且沒有 mutation/destructive 訊號時，才會允許大於 1 的平行呼叫；缺少安全 metadata、可寫工具或語意不明的工具都會事前序列化為 1。模型回來後不會再事後把 2 降成 1，也不會截掉部分 `tool_calls`，因此 upstream conversation、checkpoint 與 caller tool state 使用同一份契約。
 
 ## 開發與驗證
 
@@ -189,10 +194,15 @@ curl -sS http://127.0.0.1:4141/v1/models \
 
 The management UI exposes compatibility controls for Hermes and Hindsight, including Memory concurrency, queue timeout, interactive-priority holdoff, and Memory 429 backoff. The policy is simple: **interactive traffic has priority; Hindsight background work yields instead of competing for the same Microsoft account.** During migration, legacy Hermes traffic on `/v1/chat/completions` also counts as interactive priority; after switching, `/hermes/v1/chat/completions` adds an isolated `hermes` checkpoint namespace. Memory admission is FIFO and already-running Memory work is not preempted. No production test should intentionally flood ChatHub to force a 429; rate-limit behavior is verified deterministically with local tests, while real Microsoft validation stays low-concurrency.
 
+## Caller-tool parallel safety contract
+
+`maxToolCallsPerTurn` is a ceiling, not a promise that every turn may emit that many calls. Before the upstream model is invoked, the sidecar fixes the turn's ceiling from the caller-exposed tool definitions and `tool_choice`. Parallel calls above 1 are advertised only when every selectable tool explicitly carries `annotations.readOnlyHint=true` and has no mutation/destructive signal. Missing safety metadata, writable tools, or ambiguous tools are serialized to 1 before model generation. The ceiling is not tightened after the model has acted, and returned `tool_calls` are never partially truncated, so upstream conversation state, checkpoints, and caller tool state share one contract.
+
 ## Privacy and limitations
 
 - The default chat mode is `Private`. Each new ChatHub WebSocket reapplies `disableMemory=1`, but this does not mean Microsoft retains no data at all.
 - The default caller-text policy is `128000` UTF-16 code units. This is a conservative policy compatible with the official web editor, not a proven ChatHub backend hard limit.
+- Generic `/v1` callers keep the `text_policy_exceeded` code and receive machine-readable recovery fields inside the `error` object: `limit_type=caller_text_utf16`, `limit`, `received`, `retryable_after_reduction`, and `recommended_action`. This lets consumers compact or split and retry without misrepresenting a UTF-16 transport policy as a model token-context limit. `/hermes/v1` and `/memory/v1` use their own consumer-recognizable overflow recovery profiles while still reporting the real UTF-16 policy.
 - Documents and images use different Microsoft transport paths. Documents may create temporary Graph, OneDrive, or SharePoint staging copies.
 - Code Interpreter artifacts are fetched by the authenticated sidecar, materialized into private local storage, and exposed through short-lived capability URLs. Treat those URLs as temporary credentials.
 - Before exposing the service beyond loopback, configure TLS, trusted reverse proxies, network access controls, and the correct public origin.

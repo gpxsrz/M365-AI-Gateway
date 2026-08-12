@@ -68,7 +68,7 @@ func TestMemorySchemaFinalOutboundBudgetFailsBeforeChatHub(t *testing.T) {
 	rr := httptest.NewRecorder()
 	body := `{"model":"gpt-5.6-reasoning","messages":[{"role":"user","content":"short"}],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"long_protocol_property_name":{"type":"string"}},"required":["long_protocol_property_name"]}}}}`
 	server.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)))
-	if rr.Code != http.StatusBadRequest || len(chat.requests) != 0 || !strings.Contains(rr.Body.String(), "text_policy_exceeded") {
+	if rr.Code != http.StatusBadRequest || len(chat.requests) != 0 || !strings.Contains(rr.Body.String(), "context_length_exceeded") || !strings.Contains(strings.ToLower(rr.Body.String()), "input is too long") {
 		t.Fatalf("status=%d upstream=%d body=%s", rr.Code, len(chat.requests), rr.Body.String())
 	}
 }

@@ -455,6 +455,52 @@ func TestWP6B4ToolContinuationThenBingOnlyReusesCheckpoint(t *testing.T) {
 	}
 }
 
+func TestWP6SerialToolSafetyContractPreservesHermesCheckpointContinuation(t *testing.T) {
+	first := chathub.Result{Text: `{"calls":[{"name":"read_file","arguments":{"path":"a"}}]}`, ConversationID: "conversation", SessionID: "session-1"}
+	second := chathub.Result{Text: `{"calls":[],"answer":"done"}`, ConversationID: "conversation", SessionID: "session-2"}
+	chat := &wp6Phase5SequenceChat{results: []chathub.Result{first, second}}
+	server := newWP1CandidateServer(t, &wp1CandidateChat{})
+	server.chat = chat
+	server.checkpoints, _ = openTransportCheckpointStore(filepath.Join(t.TempDir(), "checkpoints.json"))
+	settings := server.settings.get()
+	settings.ToolPlanningMode = "router"
+	server.settings.v = settings
+	tools := []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "read_file", "description": "Read a file.", "parameters": map[string]any{"type": "object", "required": []any{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}}}},
+		map[string]any{"type": "function", "function": map[string]any{"name": "terminal", "description": "Run a command.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}},
+	}
+	firstBody := map[string]any{"model": "gpt-5.6-sol", "session_key": "serial-safety", "messages": []any{map[string]any{"role": "user", "content": "inspect safely"}}, "tools": tools, "parallel_tool_calls": true}
+	firstRecorder := httptest.NewRecorder()
+	server.hermesOpenAIChat(firstRecorder, withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(mustJSON(firstBody))), "serial-owner"))
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+	firstOut := wp1DecodeJSON(t, firstRecorder.Body.String())
+	firstMessage, _ := openAIChoice(firstOut)
+	calls := firstMessage["tool_calls"].([]any)
+	callID := calls[0].(map[string]any)["id"].(string)
+	secondBody := map[string]any{"model": "gpt-5.6-sol", "session_key": "serial-safety", "messages": []any{
+		map[string]any{"role": "user", "content": "inspect safely"}, firstMessage,
+		map[string]any{"role": "tool", "tool_call_id": callID, "content": "file result"},
+	}, "tools": tools, "parallel_tool_calls": true}
+	secondRecorder := httptest.NewRecorder()
+	server.hermesOpenAIChat(secondRecorder, withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(mustJSON(secondBody))), "serial-owner"))
+	if secondRecorder.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+	secondOut := wp1DecodeJSON(t, secondRecorder.Body.String())
+	secondMessage, _ := openAIChoice(secondOut)
+	if secondMessage["content"] != "done" {
+		t.Fatalf("continuation response=%#v", secondMessage)
+	}
+	if len(chat.requests) != 2 || !strings.Contains(chat.requests[0].Text, "Maximum calls this turn: 1") || !strings.Contains(chat.requests[1].Text, "Maximum calls this turn: 1") {
+		t.Fatalf("serial contract was not stable across turns: %#v", chat.requests)
+	}
+	if chat.requests[1].ConversationID != "conversation" || chat.requests[1].SessionID != "session-1" {
+		t.Fatalf("checkpoint continuity diverged after the serialized tool call: %#v", chat.requests)
+	}
+}
+
 func TestWP6StreamingReasoningComesFromRealEventsOnly(t *testing.T) {
 	chat := &wp1CandidateChat{
 		result: chathub.Result{Text: "VISIBLE_FINAL", ConversationID: "conversation", SessionID: "session", Events: wp6Phase5RawEvents()},
