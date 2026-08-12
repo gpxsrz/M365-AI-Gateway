@@ -929,10 +929,23 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// operations as fresh proof in a newly appended user turn.
 	ledger := buildAgentLedger(body.Messages)
 	activeLedger := buildAgentLedger(activeMessages(body.Messages))
-	if err := activeLedger.CanContinue(maxToolRounds()); err != nil {
+	toolRoundProfile, toolRoundLimit := configuredToolRoundLimit(r.URL.Path, s.settings)
+	if err := activeLedger.CanContinue(toolRoundLimit); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"type": "tool_round_limit", "message": err.Error(), "completed_calls": len(activeLedger.Completed)}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+			"type":               "tool_round_limit",
+			"code":               "tool_round_limit",
+			"message":            err.Error(),
+			"profile":            toolRoundProfile,
+			"limit_type":         "tool_rounds",
+			"limit":              toolRoundLimit,
+			"completed_rounds":   activeLedger.ToolRounds,
+			"completed_calls":    len(activeLedger.Completed),
+			"terminal":           true,
+			"retryable":          false,
+			"recommended_action": "start_new_user_turn_or_raise_profile_limit_after_review",
+		}})
 		return
 	}
 	ownsCheckpoint := execution == nil

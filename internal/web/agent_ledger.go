@@ -285,7 +285,7 @@ func (l agentLedger) hasFailedCompletedEvidence() bool {
 }
 func (l agentLedger) CanContinue(maxRounds int) error {
 	if maxRounds <= 0 {
-		maxRounds = 32
+		maxRounds = 16
 	}
 	if l.ToolRounds >= maxRounds {
 		return fmt.Errorf("tool round limit reached: %d", maxRounds)
@@ -295,8 +295,30 @@ func (l agentLedger) CanContinue(maxRounds int) error {
 	}
 	return nil
 }
-func maxToolRounds() int {
-	return configuredMaxToolRounds(openSettingsStore())
+func configuredHermesMaxToolRounds(settings *settingsStore) int {
+	if raw, ok := os.LookupEnv("M365_HERMES_MAX_TOOL_ROUNDS"); ok {
+		if n, e := strconv.Atoi(strings.TrimSpace(raw)); e == nil && n > 0 && n <= 512 {
+			return n
+		}
+		return 128
+	}
+	if settings != nil {
+		if n := settings.get().HermesMaxToolRounds; n > 0 && n <= 512 {
+			return n
+		}
+	}
+	return 128
+}
+
+func configuredToolRoundLimit(path string, settings *settingsStore) (string, int) {
+	switch {
+	case hermesCompatibilityRequest(path):
+		return "hermes", configuredHermesMaxToolRounds(settings)
+	case memoryCompatibilityRequest(path):
+		return "memory", configuredMaxToolRounds(settings)
+	default:
+		return "generic", configuredMaxToolRounds(settings)
+	}
 }
 
 func configuredMaxToolRounds(settings *settingsStore) int {
@@ -304,14 +326,14 @@ func configuredMaxToolRounds(settings *settingsStore) int {
 		if n, e := strconv.Atoi(strings.TrimSpace(raw)); e == nil && n > 0 && n <= 512 {
 			return n
 		}
-		return 32
+		return 16
 	}
 	if settings != nil {
 		if n := settings.get().MaxToolRounds; n > 0 && n <= 512 {
 			return n
 		}
 	}
-	return 32
+	return 16
 }
 func activeMessages(messages []oaiMsg) []oaiMsg {
 	last := -1

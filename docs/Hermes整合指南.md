@@ -29,6 +29,14 @@ Hermes 應優先使用專用的 `/hermes/v1` base URL。當這個相容入口的
 
 Hermes 常見工具不一定提供 `readOnlyHint`。M365-Copilot2API 不會再先告訴模型「可呼叫 2 個工具」，等模型真的回 2 個後才事後降成 1。Sidecar 現在會在模型生成前固定本輪 tool-call ceiling：只有所有當輪可選工具都明確標記 `annotations.readOnlyHint=true`、且沒有 mutation/destructive 訊號時，才會允許大於 1；其餘情況事前序列化成 1。這個 ceiling 會同時用於 router prompt、native request 與回傳驗證，不截斷已產生的 `tool_calls`，以避免 Hermes、ChatHub conversation 與 checkpoint/tool state 分叉。
 
+### 長任務的工具回合上限
+
+Hermes 專用 `/hermes/v1` 不再和一般 `/v1` / `/memory/v1` 共用 `16` 個 tool rounds。Sidecar 會依 request profile 選擇上限：一般與 Memory 預設 `16`，Hermes 預設 `128`。Hermes 值可由管理 UI 的 `hermesMaxToolRounds` 或環境變數 `M365_HERMES_MAX_TOOL_ROUNDS` 調整，允許範圍 1–512，而且是 hot setting，不需要重啟服務。
+
+`128` 是有限的 Sidecar 最終安全欄，不是建議 Hermes 一定要跑到 128 輪。真正碰到上限時，Sidecar 仍以 HTTP `409` 結束該 active user turn，不自動 replay，也不重新綁定 conversation/session。錯誤會明確帶 `code=tool_round_limit`、`profile=hermes`、`limit_type=tool_rounds`、`limit`、`completed_rounds`、`terminal=true`、`retryable=false` 與 `recommended_action`。16 輪以上的正常 continuation 仍必須保留原本的 tool call ID、conversation ID 與 session ID。
+
+這個設定和 Hermes 的 token context / compression、M365 `128000 UTF-16` caller-text policy 是三種不同限制，不應因為數字同為 128 而互相換算。
+
 ### 兩層容量保護
 
 正常順序是：
@@ -74,6 +82,14 @@ Hermes should prefer the dedicated `/hermes/v1` base URL. When caller text on th
 ### Caller-tool safety contract
 
 Hermes tools do not always carry `readOnlyHint`. M365-Copilot2API no longer advertises a parallel limit of 2 and then lowers it to 1 only after the model returns two calls. The sidecar fixes the turn's tool-call ceiling before generation: limits above 1 are available only when every selectable tool explicitly has `annotations.readOnlyHint=true` and no mutation/destructive signal. Otherwise the turn is serialized to 1 in advance. Router prompts, native requests, and returned-call validation share that same ceiling, and already-generated `tool_calls` are not truncated, preventing Hermes, ChatHub conversation state, and checkpoint/tool state from diverging.
+
+### Tool-round limit for long-running work
+
+Dedicated `/hermes/v1` no longer shares the generic `/v1` / `/memory/v1` default of `16` tool rounds. The sidecar selects a ceiling by request profile: generic and Memory default to `16`, while Hermes defaults to `128`. The Hermes value is configurable through the management UI as `hermesMaxToolRounds` or through `M365_HERMES_MAX_TOOL_ROUNDS` (1–512), and it is a hot setting that does not require a service restart.
+
+`128` is a finite final sidecar safety guard, not a recommendation that Hermes should normally consume 128 rounds. If the ceiling is genuinely exhausted, the sidecar terminates the active user turn with HTTP `409`; it does not automatically replay the request or rebind the conversation/session. The error includes `code=tool_round_limit`, `profile=hermes`, `limit_type=tool_rounds`, `limit`, `completed_rounds`, `terminal=true`, `retryable=false`, and `recommended_action`. Legitimate continuation beyond round 16 must still preserve the original tool-call IDs, conversation ID, and session ID.
+
+This setting is independent from Hermes token context/compression and from the M365 `128000 UTF-16` caller-text policy. Similar-looking numbers must not be converted between these units.
 
 ### Two-layer capacity protection
 

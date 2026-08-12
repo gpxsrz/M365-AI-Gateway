@@ -31,11 +31,11 @@ func TestOpenAIErrorEnvelopeAndExtraction(t *testing.T) {
 }
 func TestMaxToolRoundsConfig(t *testing.T) {
 	t.Setenv("M365_MAX_TOOL_ROUNDS", "7")
-	if maxToolRounds() != 7 {
+	if configuredMaxToolRounds(openSettingsStore()) != 7 {
 		t.Fatal("configured limit ignored")
 	}
 	t.Setenv("M365_MAX_TOOL_ROUNDS", "9999")
-	if maxToolRounds() != 32 {
-		t.Fatal("invalid limit accepted")
+	if configuredMaxToolRounds(openSettingsStore()) != 16 {
+		t.Fatal("invalid limit did not fall back to the generic 16-round ceiling")
 	}
 }

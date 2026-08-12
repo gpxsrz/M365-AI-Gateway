@@ -85,6 +85,36 @@ func TestMemoryCompatibilityMigratesExistingMissingFieldToExplicitEnabled(t *tes
 	}
 }
 
+func TestHermesToolRoundLimitDefaultsWhenExistingSettingsLackNewField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	legacy := defaultRuntimeSettings()
+	legacy.HermesMaxToolRounds = 0
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "hermesMaxToolRounds")
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := loadSettingsStore(path)
+	if store.loadErr != nil {
+		t.Fatal(store.loadErr)
+	}
+	if got := store.get().HermesMaxToolRounds; got != 128 {
+		t.Fatalf("Hermes max tool rounds=%d want=128", got)
+	}
+}
+
 func TestMemoryCompatibilityExplicitDisabledSurvivesReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	store := &settingsStore{path: path, v: defaultRuntimeSettings()}
@@ -191,12 +221,14 @@ func TestOpenSettingsStoreConcurrentInitializationUsesSingleStore(t *testing.T) 
 func TestAdminSettingsReportsConfiguredEffectiveAndSource(t *testing.T) {
 	t.Setenv("M365_LISTEN", ":external")
 	t.Setenv("M365_MAX_TOOL_CALLS_PER_TURN", "3")
+	t.Setenv("M365_HERMES_MAX_TOOL_ROUNDS", "96")
 	t.Setenv("M365_CHAT_TIMEOUT_SECONDS", "120")
 	path := filepath.Join(t.TempDir(), "settings.json")
 	seed := &settingsStore{path: path, v: defaultRuntimeSettings()}
 	persisted := seed.v
 	persisted.ListenAddress = ":persisted"
 	persisted.MaxToolCallsPerTurn = 1
+	persisted.HermesMaxToolRounds = 128
 	persisted.ChatTimeoutSeconds = 1800
 	if err := seed.save(persisted); err != nil {
 		t.Fatal(err)
@@ -209,7 +241,8 @@ func TestAdminSettingsReportsConfiguredEffectiveAndSource(t *testing.T) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	var response struct {
-		SettingStatus map[string]settingValueStatus `json:"settingStatus"`
+		SettingStatus   map[string]settingValueStatus `json:"settingStatus"`
+		ToolRoundPolicy map[string]int                `json:"toolRoundPolicy"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
@@ -221,6 +254,13 @@ func TestAdminSettingsReportsConfiguredEffectiveAndSource(t *testing.T) {
 	toolCalls := response.SettingStatus["maxToolCallsPerTurn"]
 	if toolCalls.Configured != float64(1) || toolCalls.Effective != float64(3) || toolCalls.Source != "env" || !toolCalls.Locked {
 		t.Fatalf("tool-call status=%#v", toolCalls)
+	}
+	hermesRounds := response.SettingStatus["hermesMaxToolRounds"]
+	if hermesRounds.Configured != float64(128) || hermesRounds.Effective != float64(96) || hermesRounds.Source != "env" || !hermesRounds.Locked || hermesRounds.Environment != "M365_HERMES_MAX_TOOL_ROUNDS" {
+		t.Fatalf("Hermes round status=%#v", hermesRounds)
+	}
+	if response.ToolRoundPolicy["generic"] != 16 || response.ToolRoundPolicy["hermes"] != 96 || response.ToolRoundPolicy["memory"] != 16 {
+		t.Fatalf("effective tool round policy=%#v", response.ToolRoundPolicy)
 	}
 	chatTimeout := response.SettingStatus["chatTimeoutSeconds"]
 	if chatTimeout.Configured != float64(1800) || chatTimeout.Effective != float64(1800) || chatTimeout.Source != "file" || chatTimeout.Locked {

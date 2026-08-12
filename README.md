@@ -100,6 +100,12 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 
 `maxToolCallsPerTurn` 是上限，不代表每一輪都會向模型開放相同數量。Sidecar 會在送出模型請求**以前**，依 caller 暴露的 tool definitions 與 `tool_choice` 固定本輪 ceiling：只有所有可被選取的工具都明確帶有 `annotations.readOnlyHint=true`，而且沒有 mutation/destructive 訊號時，才會允許大於 1 的平行呼叫；缺少安全 metadata、可寫工具或語意不明的工具都會事前序列化為 1。模型回來後不會再事後把 2 降成 1，也不會截掉部分 `tool_calls`，因此 upstream conversation、checkpoint 與 caller tool state 使用同一份契約。
 
+### 工具回合總量安全邊界
+
+單一 assistant tool-call turn 不論包含 1 個或多個合法平行 calls，都只算 1 個 tool round。一般 `/v1` 與 `/memory/v1` 預設最多 `16` rounds；Hermes 專用 `/hermes/v1` 則使用獨立的 `hermesMaxToolRounds`，預設 `128`，可由管理 UI 或 `M365_HERMES_MAX_TOOL_ROUNDS` 調整（1–512）。這避免 Sidecar 在正常 Hermes 長任務尚未用完自己的 iteration budget 前就先以 16 rounds 中止，同時仍保留有限的 runaway-loop 最終保護。
+
+真正耗盡 profile ceiling 時仍回 HTTP `409`，不自動 replay 或重綁 checkpoint。`error` 物件會帶 `code=tool_round_limit`、`profile`、`limit_type=tool_rounds`、`limit`、`completed_rounds`、`terminal=true`、`retryable=false` 與 `recommended_action`。這個 rounds 數與 `128000 UTF-16` caller-text policy、model token context window 都是不同單位。
+
 ### Hermes / Hindsight live-qualified 起始設定
 
 2026-08-12 的 Production qualification 使用以下整合設定並通過真實 tool continuation、Hindsight retain/recall/reflect 與 overflow recovery 測試：
@@ -221,6 +227,12 @@ The retry currently covers HTTP `500`, `502`, `503`, and `504` upgrade failures 
 ## Caller-tool parallel safety contract
 
 `maxToolCallsPerTurn` is a ceiling, not a promise that every turn may emit that many calls. Before the upstream model is invoked, the sidecar fixes the turn's ceiling from the caller-exposed tool definitions and `tool_choice`. Parallel calls above 1 are advertised only when every selectable tool explicitly carries `annotations.readOnlyHint=true` and has no mutation/destructive signal. Missing safety metadata, writable tools, or ambiguous tools are serialized to 1 before model generation. The ceiling is not tightened after the model has acted, and returned `tool_calls` are never partially truncated, so upstream conversation state, checkpoints, and caller tool state share one contract.
+
+### Total tool-round safety boundary
+
+One assistant tool-call turn counts as one tool round regardless of whether it contains one call or multiple valid parallel calls. Generic `/v1` and `/memory/v1` default to `16` rounds. Dedicated `/hermes/v1` uses the independent `hermesMaxToolRounds` setting, defaulting to `128` and configurable from the management UI or `M365_HERMES_MAX_TOOL_ROUNDS` (1–512). This prevents the sidecar from terminating legitimate long-running Hermes work at 16 rounds while retaining a finite final runaway-loop guard.
+
+Exhausting the profile ceiling remains an HTTP `409` terminal condition and does not automatically replay the request or rebind a checkpoint. The `error` object includes `code=tool_round_limit`, `profile`, `limit_type=tool_rounds`, `limit`, `completed_rounds`, `terminal=true`, `retryable=false`, and `recommended_action`. Tool rounds are a separate unit from the `128000 UTF-16` caller-text policy and from model token context windows.
 
 ### Live-qualified Hermes / Hindsight starting settings
 

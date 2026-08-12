@@ -47,6 +47,7 @@ type runtimeSettings struct {
 	TextInputLimitUTF16               int            `json:"textInputLimitUTF16"`
 	MaxToolCallsPerTurn               int            `json:"maxToolCallsPerTurn"`
 	MaxToolRounds                     int            `json:"maxToolRounds"`
+	HermesMaxToolRounds               int            `json:"hermesMaxToolRounds"`
 	ContextWindow                     int            `json:"contextWindow"`
 	MaxOutputTokens                   int            `json:"maxOutputTokens"`
 	ChatTimeoutSeconds                int            `json:"chatTimeoutSeconds"`
@@ -130,7 +131,7 @@ func defaultRuntimeSettings() runtimeSettings {
 		MemoryBackoffInitialSeconds:       envInt("M365_MEMORY_BACKOFF_INITIAL_SECONDS", 5),
 		MemoryBackoffMaxSeconds:           envInt("M365_MEMORY_BACKOFF_MAX_SECONDS", 60),
 		TextInputLimitUTF16:               defaultTextInputLimitUTF16,
-		MaxToolCallsPerTurn:               envInt("M365_MAX_TOOL_CALLS_PER_TURN", 2), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 16),
+		MaxToolCallsPerTurn:               envInt("M365_MAX_TOOL_CALLS_PER_TURN", 2), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 16), HermesMaxToolRounds: envInt("M365_HERMES_MAX_TOOL_ROUNDS", 128),
 		ContextWindow: envInt("M365_CONTEXT_WINDOW", 128000), MaxOutputTokens: envInt("M365_MAX_OUTPUT_TOKENS", 16384),
 		ChatTimeoutSeconds: envInt("M365_CHAT_TIMEOUT_SECONDS", 120), ImageTimeoutSeconds: envInt("M365_IMAGE_TIMEOUT_SECONDS", 150), LogLevel: firstNonEmptySetting(os.Getenv("M365_LOG_LEVEL"), "info"),
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
@@ -246,7 +247,10 @@ func validateSettings(v runtimeSettings) error {
 		return fmt.Errorf("每輪工具呼叫數必須為 1-64")
 	}
 	if v.MaxToolRounds < 1 || v.MaxToolRounds > 512 {
-		return fmt.Errorf("最大工具輪次必須為 1-512")
+		return fmt.Errorf("一般 / Memory 最大工具輪次必須為 1-512")
+	}
+	if v.HermesMaxToolRounds < 1 || v.HermesMaxToolRounds > 512 {
+		return fmt.Errorf("Hermes 最大工具輪次必須為 1-512")
 	}
 	if v.ContextWindow < 1024 {
 		return fmt.Errorf("內容視窗不得小於 1024")
@@ -500,6 +504,7 @@ func settingsStatus(store *settingsStore) map[string]settingValueStatus {
 		"memoryBackoffMaxSeconds":           seededSettingStatus(cfg.MemoryBackoffMaxSeconds, "memoryBackoffMaxSeconds", "M365_MEMORY_BACKOFF_MAX_SECONDS", persisted, positiveIntegerEnvActive("M365_MEMORY_BACKOFF_MAX_SECONDS")),
 		"maxToolCallsPerTurn":               directOverrideSettingStatus(cfg.MaxToolCallsPerTurn, configuredToolCallLimit(store), "maxToolCallsPerTurn", "M365_MAX_TOOL_CALLS_PER_TURN", persisted),
 		"maxToolRounds":                     directOverrideSettingStatus(cfg.MaxToolRounds, configuredMaxToolRounds(store), "maxToolRounds", "M365_MAX_TOOL_ROUNDS", persisted),
+		"hermesMaxToolRounds":               directOverrideSettingStatus(cfg.HermesMaxToolRounds, configuredHermesMaxToolRounds(store), "hermesMaxToolRounds", "M365_HERMES_MAX_TOOL_ROUNDS", persisted),
 		"contextWindow":                     seededSettingStatus(cfg.ContextWindow, "contextWindow", "M365_CONTEXT_WINDOW", persisted, positiveIntegerEnvActive("M365_CONTEXT_WINDOW")),
 		"maxOutputTokens":                   seededSettingStatus(cfg.MaxOutputTokens, "maxOutputTokens", "M365_MAX_OUTPUT_TOKENS", persisted, positiveIntegerEnvActive("M365_MAX_OUTPUT_TOKENS")),
 		"chatTimeoutSeconds":                seededSettingStatus(cfg.ChatTimeoutSeconds, "chatTimeoutSeconds", "M365_CHAT_TIMEOUT_SECONDS", persisted, positiveIntegerEnvActive("M365_CHAT_TIMEOUT_SECONDS")),
@@ -536,7 +541,21 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		if s.compatTraffic != nil {
 			traffic = s.compatTraffic.snapshot()
 		}
-		jsonOut(w, map[string]any{"settings": cfg, "settingStatus": settingsStatus(s.settings), "compatibilityTraffic": traffic, "codexModels": managementRouteIDs(cfg.ModelMappings), "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
+		genericRounds := configuredMaxToolRounds(s.settings)
+		hermesRounds := configuredHermesMaxToolRounds(s.settings)
+		jsonOut(w, map[string]any{
+			"settings":             cfg,
+			"settingStatus":        settingsStatus(s.settings),
+			"compatibilityTraffic": traffic,
+			"toolRoundPolicy": map[string]int{
+				"generic": genericRounds,
+				"hermes":  hermesRounds,
+				"memory":  genericRounds,
+			},
+			"codexModels":           managementRouteIDs(cfg.ModelMappings),
+			"upstreamTones":         knownUpstreamTones(),
+			"restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "clientId", "authority", "redirectUri", "scope", "debugLogPath"},
+		})
 	case http.MethodPut:
 		current := s.settings.get()
 		v := current
