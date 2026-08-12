@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
 	"m365-native/internal/chathub"
 	"net/http"
@@ -21,6 +22,214 @@ const routerFallbackTool = `{
 		}
 	}
 }`
+
+const executeCodeRouterTool = `{
+	"type":"function",
+	"function":{
+		"name":"execute_code",
+		"description":"Execute Python code.",
+		"parameters":{
+			"type":"object",
+			"properties":{"code":{"type":"string"}},
+			"required":["code"]
+		}
+	}
+}`
+
+func longExecuteCodeRoutingOutput(t *testing.T, repeat int) (string, string) {
+	t.Helper()
+	const sentinel = "MIDDLE_SENTINEL_REQUIRED_FOR_VALID_PYTHON"
+	code := "print('BEGIN')\n" +
+		strings.Repeat("# padding before sentinel\n", repeat) +
+		"if " + sentinel + " := True:\n" +
+		strings.Repeat("    pass  # padding after sentinel\n", repeat) +
+		"print('END')\n"
+	raw, err := json.Marshal(map[string]any{
+		"calls": []any{map[string]any{
+			"name":      "execute_code",
+			"arguments": map[string]any{"code": code},
+		}},
+		"answer": "",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw), sentinel
+}
+
+func TestAutoToolRouterLongValidStructuredArgumentsBypassRepair(t *testing.T) {
+	routeOutput, sentinel := longExecuteCodeRoutingOutput(t, 180)
+	if len(routeOutput) <= 6000 {
+		t.Fatalf("fixture must exceed historical repair preview limit, got %d bytes", len(routeOutput))
+	}
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			chat := &continuationChat{results: []chathub.Result{{Text: routeOutput}}}
+			s := newWP1CandidateServer(t, &wp1CandidateChat{})
+			s.chat = chat
+			streamField := ""
+			if stream {
+				streamField = `"stream":true,`
+			}
+			body := `{` + streamField + `
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Run the supplied code."}],
+		"tools":[` + executeCodeRouterTool + `],
+		"tool_choice":"auto"
+	}`
+			rr := httptest.NewRecorder()
+			s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			if len(chat.requests) != 1 {
+				t.Fatalf("upstream requests=%d, valid routing JSON must not enter repair", len(chat.requests))
+			}
+			if !strings.Contains(rr.Body.String(), sentinel) || !strings.Contains(rr.Body.String(), `"name":"execute_code"`) {
+				t.Fatalf("long execute_code call lost identity or sentinel: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAutoToolRouterRepairReceivesCompleteLongStructuredArguments(t *testing.T) {
+	validOutput, sentinel := longExecuteCodeRoutingOutput(t, 180)
+	malformedOutput := strings.TrimSuffix(validOutput, "}")
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			chat := &continuationChat{results: []chathub.Result{
+				{Text: malformedOutput},
+				{Text: validOutput},
+			}}
+			s := newWP1CandidateServer(t, &wp1CandidateChat{})
+			s.chat = chat
+			streamField := ""
+			if stream {
+				streamField = `"stream":true,`
+			}
+			body := `{` + streamField + `
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Run the supplied code."}],
+		"tools":[` + executeCodeRouterTool + `],
+		"tool_choice":"auto"
+	}`
+			rr := httptest.NewRecorder()
+			s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			if len(chat.requests) != 2 {
+				t.Fatalf("upstream requests=%d, want router and repair", len(chat.requests))
+			}
+			repairPrompt := chat.requests[1].Text
+			if !strings.Contains(repairPrompt, sentinel) || !strings.HasSuffix(repairPrompt, malformedOutput) {
+				t.Fatalf("repair input was not lossless: prompt_len=%d output_len=%d sentinel=%t", len(repairPrompt), len(malformedOutput), strings.Contains(repairPrompt, sentinel))
+			}
+			if !strings.Contains(rr.Body.String(), sentinel) {
+				t.Fatalf("repaired execute_code call lost sentinel: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAutoToolRouterOversizeRepairFailsClosedBeforeSecondUpstreamCall(t *testing.T) {
+	validOutput, _ := longExecuteCodeRoutingOutput(t, 2300)
+	malformedOutput := strings.TrimSuffix(validOutput, "}")
+	if utf16CodeUnits(malformedOutput) <= defaultTextInputLimitUTF16 {
+		t.Fatalf("fixture must exceed repair budget before adding instructions, got %d UTF-16 units", utf16CodeUnits(malformedOutput))
+	}
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			chat := &continuationChat{results: []chathub.Result{{Text: malformedOutput}}}
+			s := newWP1CandidateServer(t, &wp1CandidateChat{})
+			s.chat = chat
+			streamField := ""
+			if stream {
+				streamField = `"stream":true,`
+			}
+			body := `{` + streamField + `
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Run the supplied code."}],
+		"tools":[` + executeCodeRouterTool + `],
+		"tool_choice":"auto"
+	}`
+			rr := httptest.NewRecorder()
+			s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+			if rr.Code != http.StatusBadGateway {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			if len(chat.requests) != 1 {
+				t.Fatalf("upstream requests=%d, oversize repair must fail before a second upstream call", len(chat.requests))
+			}
+			if !strings.Contains(rr.Body.String(), `"code":"tool_router_repair_input_too_large"`) {
+				t.Fatalf("missing machine-readable repair failure: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAutoToolRouterSchemaInvalidDecisionDoesNotEnterRepair(t *testing.T) {
+	chat := &continuationChat{results: []chathub.Result{
+		{Text: `{"calls":[{"name":"terminal","arguments":{"command":2}}],"answer":""}`},
+		{Text: "The proposed tool arguments were invalid."},
+	}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Check status."}],
+		"tools":[` + routerFallbackTool + `],
+		"tool_choice":"auto"
+	}`
+	rr := httptest.NewRecorder()
+	s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("upstream requests=%d, schema-invalid but parseable JSON must skip repair and continue to answer", len(chat.requests))
+	}
+	if strings.HasPrefix(chat.requests[1].Text, "Repair the previous tool-routing output") {
+		t.Fatalf("schema-invalid decision incorrectly entered repair: %s", chat.requests[1].Text)
+	}
+}
+
+func TestAutoToolRouterFilteredKnownCallDoesNotEnterRepair(t *testing.T) {
+	routeOutput := `{"calls":[{"name":"terminal","arguments":{"command":"status"}}],"answer":""}`
+	chat := &continuationChat{results: []chathub.Result{
+		{Text: routeOutput},
+		{Text: "Status was already checked."},
+	}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[
+			{"role":"user","content":"Check status."},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_status","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"status\"}"}}]},
+			{"role":"tool","tool_call_id":"call_status","content":"ok"},
+			{"role":"user","content":"Continue."}
+		],
+		"tools":[` + routerFallbackTool + `],
+		"tool_choice":"auto"
+	}`
+	rr := httptest.NewRecorder()
+	s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("upstream requests=%d, filtered duplicate must skip repair and continue to answer", len(chat.requests))
+	}
+	if strings.HasPrefix(chat.requests[1].Text, "Repair the previous tool-routing output") {
+		t.Fatalf("filtered duplicate incorrectly entered repair: %s", chat.requests[1].Text)
+	}
+}
 
 func TestAutoToolRouterInvalidDecisionFallsBackToText(t *testing.T) {
 	chat := &continuationChat{results: []chathub.Result{

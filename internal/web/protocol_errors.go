@@ -34,6 +34,20 @@ func writeOpenAIErrorObject(w http.ResponseWriter, status int, errBody map[strin
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": errBody})
 }
 
+func writeToolRouterRepairInputTooLarge(w http.ResponseWriter, received, limit int) {
+	writeOpenAIErrorObject(w, http.StatusBadGateway, map[string]any{
+		"message":            "tool router repair input exceeds the safe internal text budget; refusing to truncate structured arguments",
+		"type":               "upstream_error",
+		"code":               "tool_router_repair_input_too_large",
+		"limit_type":         "repair_prompt_utf16",
+		"limit":              limit,
+		"received":           received,
+		"terminal":           true,
+		"retryable":          false,
+		"recommended_action": "regenerate_tool_routing_decision",
+	})
+}
+
 func openAIErrorDetails(raw []byte) (typ, code, message string) {
 	errBody := openAIErrorObject(raw)
 	typ, _ = errBody["type"].(string)

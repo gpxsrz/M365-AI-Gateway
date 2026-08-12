@@ -39,7 +39,7 @@ User request and evidence:
 
 func modelToolRouterRepairPrompt(output string) string {
 	return `Repair the previous tool-routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}],"answer":""}. Do not invent calls. If no caller-side tool is needed, use {"calls":[],"answer":"direct final answer"} and preserve the complete user-facing answer in answer. OUTPUT:
-` + compactToolResult(output, 6000)
+` + output
 }
 
 func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {

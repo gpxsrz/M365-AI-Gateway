@@ -1138,7 +1138,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		calls = filterKnownCalls(calls, ledger)
 		if !parsed {
-			repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: modelToolRouterRepairPrompt(routeRes.Text), Tone: tone, Attachments: body.Attachments}))
+			repairPrompt := modelToolRouterRepairPrompt(routeRes.Text)
+			if repairUnits := utf16CodeUnits(repairPrompt); repairUnits > settings.TextInputLimitUTF16 {
+				writeToolRouterRepairInputTooLarge(w, repairUnits, settings.TextInputLimitUTF16)
+				return
+			}
+			repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments}))
 			if repairErr != nil && writeCanonicalTerminalError(w, repairErr) {
 				return
 			}
@@ -1501,7 +1506,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		calls = filterKnownCalls(calls, ledger)
 		if !parsed {
-			repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: modelToolRouterRepairPrompt(routeRes.Text), Tone: tone, Attachments: body.Attachments}))
+			repairPrompt := modelToolRouterRepairPrompt(routeRes.Text)
+			if repairUnits := utf16CodeUnits(repairPrompt); repairUnits > settings.TextInputLimitUTF16 {
+				writeToolRouterRepairInputTooLarge(w, repairUnits, settings.TextInputLimitUTF16)
+				return
+			}
+			repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments}))
 			if repairErr != nil && writeCanonicalTerminalError(w, repairErr) {
 				return
 			}

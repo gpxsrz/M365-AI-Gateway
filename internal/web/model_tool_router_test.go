@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -55,5 +56,37 @@ func TestParseModelToolDecisionRejectsBadSchema(t *testing.T) {
 	calls, ok := parseModelToolDecision("```json\n{\"calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":2}}]}\n```", testTools(), "auto")
 	if !ok || len(calls) != 0 {
 		t.Fatalf("calls=%v ok=%v", calls, ok)
+	}
+}
+
+func TestModelToolRouterRepairPromptPreservesLongStructuredArguments(t *testing.T) {
+	const sentinel = "MIDDLE_SENTINEL_REQUIRED_FOR_VALID_PYTHON"
+	code := "print('BEGIN')\n" +
+		strings.Repeat("# padding before sentinel\n", 180) +
+		"if " + sentinel + " := True:\n" +
+		strings.Repeat("    pass  # padding after sentinel\n", 180) +
+		"print('END')\n"
+	raw, err := json.Marshal(map[string]any{
+		"calls": []any{map[string]any{
+			"name": "execute_code",
+			"arguments": map[string]any{
+				"code": code,
+			},
+		}},
+		"answer": "",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= 6000 {
+		t.Fatalf("fixture must exceed historical repair preview limit, got %d bytes", len(raw))
+	}
+
+	prompt := modelToolRouterRepairPrompt(string(raw))
+	if !strings.Contains(prompt, sentinel) {
+		t.Fatalf("repair prompt lost load-bearing middle sentinel; prompt_len=%d raw_len=%d", len(prompt), len(raw))
+	}
+	if !strings.HasSuffix(prompt, string(raw)) {
+		t.Fatal("repair prompt must preserve the complete routing output as its source of truth")
 	}
 }
