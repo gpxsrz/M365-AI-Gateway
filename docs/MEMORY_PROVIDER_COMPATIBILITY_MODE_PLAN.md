@@ -69,11 +69,11 @@ Fresh install 沒有既有 `settings.json` 時，預設為 **OFF**。
 2026-08-12 Production canary 已套用並驗證 Hindsight **Reflect 專用**設定；全域 LLM retry 未修改：
 
 ```text
-HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0
+HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 ```
 
-`40000` 是針對 M365 UTF-16 transport policy 的保守 integration starting point，不是 Hindsight 或 M365 的通用規格。它讓 Reflect 的 80% retrieved-context 預算約落在 32K tokens，保留 system/tool/schema/回答 framing 空間。Production 以臨時 bank 實測 retain → recall → reflect 全部成功，且測試 bank 已刪除；`REFLECT_LLM_MAX_RETRIES=0` 只避免同一個 deterministic 400 在 Reflect provider loop 內原封不動重送，其他 operation 的 retry 維持原設定。仍不要直接把 `100000` tokens 與 `128000 UTF-16` 作數值對照，真實繁中、工具 JSON 與 retrieved-memory workload 若更重，應進一步收緊 consumer-side budget。
+`40000` 是針對 M365 UTF-16 transport policy 的保守 integration starting point，不是 Hindsight 或 M365 的通用規格。它讓 Reflect 的 80% retrieved-context 預算約落在 32K tokens，保留 system/tool/schema/回答 framing 空間。Production canary 最終使用 `REFLECT_LLM_MAX_RETRIES=1`：Reflect 最多嘗試 2 次，因此 deterministic 400 最多只多重送 1 次後就交回 Hindsight overflow recovery，同時保留一次 transient ChatHub／502 自癒機會。實測 retry `0` 曾因一次 ChatHub WebSocket handshake 500（M365 對外為 502）直接放大成 Hindsight reflect 500；改成 retry `1` 後，臨時 bank retain → recall → reflect 全部成功且測試 bank 已刪除。其他 operation 的 retry 維持原設定。仍不要直接把 `100000` tokens 與 `128000 UTF-16` 作數值對照，真實繁中、工具 JSON 與 retrieved-memory workload 若更重，應進一步收緊 consumer-side budget。
 
 ### 流量與 429
 
@@ -124,7 +124,7 @@ Hermes 與 Hindsight source code 不需要因 M365 相容性修正而修改。�
 
 ### 部署與設定 canary 結果
 
-#42–#44 code hardening 已 commit、發佈並部署。Production qualification 已完成：generic `/v1` recovery metadata、Hermes tool/overflow continuation 與 Hindsight Memory overflow recovery 均有 live evidence；Hermes M365 context 已 canary 到 `80000`、`proactive_prune_tokens=41000`，Hindsight Reflect 已 canary 到 `40000` / retry `0`。M365 `textInputLimitUTF16` 維持 `128000`；兩個 consumer canary 都使用設定調整而沒有修改 Hermes/Hindsight core。
+#42–#44 code hardening 已 commit、發佈並部署。Production qualification 已完成：generic `/v1` recovery metadata、Hermes tool/overflow continuation 與 Hindsight Memory overflow recovery 均有 live evidence；Hermes M365 context 已 canary 到 `80000`、`proactive_prune_tokens=41000`，Hindsight Reflect 已 canary 到 `40000` / retry `1`。M365 `textInputLimitUTF16` 維持 `128000`；兩個 consumer canary 都使用設定調整而沒有修改 Hermes/Hindsight core。
 
 ---
 
@@ -185,11 +185,11 @@ Retain defaults to roughly 3000-character chunks. Consolidation defaults to 8 fa
 The 2026-08-12 Production canary applied and validated only these Reflect-specific integration settings; global LLM retry behavior was left unchanged:
 
 ```text
-HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0
+HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 ```
 
-`40000` is a conservative M365-integration starting point, not a universal Hindsight or M365 specification. With the current 80% final-synthesis fraction, it targets roughly 32K tokens of retrieved context and leaves room for system/tool/schema/answer framing. A temporary Production bank completed retain → recall → reflect successfully and was deleted after the test. Setting the Reflect-specific retry budget to zero only avoids identical deterministic 400 retries inside the Reflect provider loop; other operation retry policies remain unchanged. Do not numerically equate `100000` tokens with `128000 UTF-16`; heavier Traditional Chinese, tool-JSON, or retrieved-memory workloads may still require a smaller consumer-side budget.
+`40000` is a conservative M365-integration starting point, not a universal Hindsight or M365 specification. With the current 80% final-synthesis fraction, it targets roughly 32K tokens of retrieved context and leaves room for system/tool/schema/answer framing. The final Production canary uses `REFLECT_LLM_MAX_RETRIES=1`, so Reflect makes at most two attempts: a deterministic 400 is repeated at most once before Hindsight overflow recovery takes over, while one retry remains for a transient ChatHub/502 failure. A retry-`0` canary exposed the trade-off when a single ChatHub WebSocket handshake 500 (surfaced by M365 as 502) became an immediate Hindsight reflect 500. After switching to retry `1`, a temporary bank completed retain → recall → reflect successfully and was deleted after the test. Other operation retry policies remain unchanged. Do not numerically equate `100000` tokens with `128000 UTF-16`; heavier Traditional Chinese, tool-JSON, or retrieved-memory workloads may still require a smaller consumer-side budget.
 
 ### Traffic and 429 behavior
 
@@ -211,4 +211,4 @@ This batch was developed in an isolated worktree created from the exact public-m
 
 ### Deployment and live-qualification evidence
 
-The #42–#44 functional hardening landed at `6889411bf59a7c4ad1c92d6c241c9d5d12ea530d` and passed the full local release gate, PR exact-head CI, `main` exact-head CI, NAS backup fast-forward, Production preflight/snapshot, exact-commit deployment, post-readback, and live verification. Generic `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` returned the expected UTF-16 recovery metadata at 128001 code units; `/memory/v1` returned the Hindsight-recognized recovery signal; Hermes completed a real ambiguous-tool serial turn plus continuation without `tool_call_limit_exceeded`. The Hermes 80K/41K and Hindsight Reflect 40K/retry-0 canaries also passed. `textInputLimitUTF16` remains `128000`.
+The #42–#44 functional hardening landed at `6889411bf59a7c4ad1c92d6c241c9d5d12ea530d` and passed the full local release gate, PR exact-head CI, `main` exact-head CI, NAS backup fast-forward, Production preflight/snapshot, exact-commit deployment, post-readback, and live verification. Generic `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` returned the expected UTF-16 recovery metadata at 128001 code units; `/memory/v1` returned the Hindsight-recognized recovery signal; Hermes completed a real ambiguous-tool serial turn plus continuation without `tool_call_limit_exceeded`. The Hermes 80K/41K canary and the final Hindsight Reflect 40K/retry-1 canary also passed. A retry-0 Hindsight canary was intentionally superseded after a transient ChatHub WebSocket handshake 500 surfaced as M365 502 and then as an immediate Hindsight reflect 500. `textInputLimitUTF16` remains `128000`.
