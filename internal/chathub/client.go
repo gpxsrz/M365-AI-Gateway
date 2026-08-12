@@ -3,7 +3,9 @@ package chathub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"m365-native/internal/outbound"
 	"net"
@@ -141,6 +143,11 @@ func (c *Client) privateModeEnabled() bool {
 	return c.PrivateMode()
 }
 
+const (
+	webSocketDialMaxAttempts = 2
+	webSocketDialRetryDelay  = 100 * time.Millisecond
+)
+
 func webSocketDialFailure(status int, retryAfter string, err error) error {
 	if status == http.StatusTooManyRequests {
 		return &RateLimitError{StatusCode: status, RetryAfter: normalizeRetryAfter(retryAfter), Err: err}
@@ -149,6 +156,60 @@ func webSocketDialFailure(status int, retryAfter string, err error) error {
 		return fmt.Errorf("ws dial failed: HTTP %d: %w", status, err)
 	}
 	return fmt.Errorf("ws dial: %w", err)
+}
+
+func retryableWebSocketDialFailure(status int, err error) bool {
+	switch status {
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	case 0:
+		var networkError net.Error
+		return errors.As(err, &networkError) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	default:
+		return false
+	}
+}
+
+func waitWebSocketDialRetry(ctx context.Context) error {
+	timer := time.NewTimer(webSocketDialRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *Client) dialChatWebSocket(ctx context.Context, wsURL string) (*websocket.Conn, error) {
+	for attempt := 1; attempt <= webSocketDialMaxAttempts; attempt++ {
+		conn, response, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+		if err == nil {
+			return conn, nil
+		}
+		status := 0
+		retryAfter := ""
+		if response != nil {
+			status = response.StatusCode
+			retryAfter = response.Header.Get("Retry-After")
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+		}
+		if contextErr := callerContextError(ctx, err); contextErr != nil {
+			return nil, contextErr
+		}
+		failure := webSocketDialFailure(status, retryAfter, err)
+		if attempt == webSocketDialMaxAttempts || !retryableWebSocketDialFailure(status, err) {
+			log.Printf("chathub ws_dial_failed status=%d attempt=%d", status, attempt)
+			return nil, failure
+		}
+		log.Printf("chathub ws_dial_retry status=%d attempt=%d next_attempt=%d", status, attempt, attempt+1)
+		if err := waitWebSocketDialRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("ws dial failed without a terminal result")
 }
 
 func normalizeRetryAfter(value string) string {
@@ -231,20 +292,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	dialStarted := time.Now()
-	conn, response, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+	conn, err := c.dialChatWebSocket(ctx, wsURL)
 	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
 	if err != nil {
-		status := 0
-		retryAfter := ""
-		if response != nil {
-			status = response.StatusCode
-			retryAfter = response.Header.Get("Retry-After")
-			if response.Body != nil {
-				_ = response.Body.Close()
-			}
-		}
-		log.Printf("chathub ws_dial_failed status=%d", status)
-		return Result{}, webSocketDialFailure(status, retryAfter, err)
+		return Result{}, err
 	}
 	defer conn.Close()
 	stopContextClose := context.AfterFunc(ctx, func() { _ = conn.Close() })

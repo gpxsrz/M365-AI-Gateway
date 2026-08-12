@@ -90,6 +90,12 @@ curl -sS http://127.0.0.1:4141/v1/models \
 
 Memory 排隊採 FIFO，已進場的 Memory 工作不會被強制中斷；若 Microsoft 回 429，Memory 會進入 cooldown 並逐步延長退避。真實 Microsoft 帳號不會用高併發故意觸發 429，相關行為以本地 deterministic test 驗證，線上只做低併發確認。
 
+## ChatHub WebSocket 暫時性失敗的 retry 邊界
+
+Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始、chat payload 尚未送出**的 dial/HTTP-upgrade 階段提供一次有界 retry。單一 caller request 最多嘗試 2 次 dial，中間有短暫且可被 caller context 取消的 backoff；兩次嘗試沿用同一組 conversation/session/request identity，而且不會重跑 attachment upload。
+
+目前只有 HTTP `500`、`502`、`503`、`504` 與沒有 HTTP response 的 transient network dial error 會補一次。HTTP `429` 不由這層重試，仍保留既有 `RateLimitError` / `Retry-After` 流程；`401`、`403` 與其他明確 HTTP 拒絕也不重試。WebSocket 一旦 upgrade 成功，後續 SignalR handshake、chat payload send 或 response stream 的錯誤都**不會**使用這個機制 replay caller request，以避免 upstream/checkpoint/tool state 分叉。
+
 ## 呼叫端工具的平行安全契約
 
 `maxToolCallsPerTurn` 是上限，不代表每一輪都會向模型開放相同數量。Sidecar 會在送出模型請求**以前**，依 caller 暴露的 tool definitions 與 `tool_choice` 固定本輪 ceiling：只有所有可被選取的工具都明確帶有 `annotations.readOnlyHint=true`，而且沒有 mutation/destructive 訊號時，才會允許大於 1 的平行呼叫；缺少安全 metadata、可寫工具或語意不明的工具都會事前序列化為 1。模型回來後不會再事後把 2 降成 1，也不會截掉部分 `tool_calls`，因此 upstream conversation、checkpoint 與 caller tool state 使用同一份契約。
@@ -205,6 +211,12 @@ curl -sS http://127.0.0.1:4141/v1/models \
 ## Hermes and Hindsight traffic policy
 
 The management UI exposes compatibility controls for Hermes and Hindsight, including Memory concurrency, queue timeout, interactive-priority holdoff, and Memory 429 backoff. The policy is simple: **interactive traffic has priority; Hindsight background work yields instead of competing for the same Microsoft account.** During migration, legacy Hermes traffic on `/v1/chat/completions` also counts as interactive priority; after switching, `/hermes/v1/chat/completions` adds an isolated `hermes` checkpoint namespace. Memory admission is FIFO and already-running Memory work is not preempted. No production test should intentionally flood ChatHub to force a 429; rate-limit behavior is verified deterministically with local tests, while real Microsoft validation stays low-concurrency.
+
+## ChatHub WebSocket transient-retry boundary
+
+The sidecar performs one bounded retry only while the **WebSocket has not been established, the SignalR handshake has not started, and the chat payload has not been sent**. One caller request therefore makes at most two dial attempts with a short context-cancelable backoff. Both attempts reuse the same conversation/session/request identity, and attachment upload is not repeated.
+
+The retry currently covers HTTP `500`, `502`, `503`, and `504` upgrade failures plus transient network dial failures that return no HTTP response. HTTP `429` is not retried here and continues through the existing `RateLimitError` / `Retry-After` path; `401`, `403`, and other explicit HTTP rejections are also not retried. Once the WebSocket upgrade succeeds, later SignalR-handshake, chat-payload-send, or response-stream failures are **not** replayed by this mechanism, preserving upstream/checkpoint/tool-state consistency.
 
 ## Caller-tool parallel safety contract
 
