@@ -33,14 +33,17 @@ func (e *callerTextLimitError) Error() string {
 
 func writeOpenAITextPolicyError(w http.ResponseWriter, r *http.Request, err error) {
 	code := "text_policy_exceeded"
+	message := err.Error()
 	if hermesCompatibilityRequest(r.URL.Path) {
-		// Hermes already treats context_length_exceeded as a recoverable
-		// context-overflow signal and will compact then retry. Keep the message
-		// explicit that the actual Sidecar constraint is UTF-16 caller text;
-		// only the dedicated Hermes compatibility surface gets this mapping.
+		// Hermes classifies HTTP 400 before consulting the structured error code,
+		// so the dedicated compatibility surface needs both its recognized code
+		// and a recognized input-overflow message marker. Keep the actual
+		// constraint explicit as UTF-16 caller text, and avoid wording that could
+		// be parsed as a model token-context limit.
 		code = "context_length_exceeded"
+		message = "input is too long for the Sidecar caller-text policy; " + message
 	}
-	writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", code, err.Error())
+	writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", code, message)
 }
 
 func utf16CodeUnits(text string) int {

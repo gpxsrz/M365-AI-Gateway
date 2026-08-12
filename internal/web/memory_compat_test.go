@@ -73,8 +73,9 @@ func TestHermesTextPolicyOverflowUsesRecoverableContextCodeOnlyOnDedicatedRoute(
 	if hermes.Code != http.StatusBadRequest || wp1ErrorCode(t, hermes) != "context_length_exceeded" {
 		t.Fatalf("Hermes status=%d code=%q body=%s", hermes.Code, wp1ErrorCode(t, hermes), hermes.Body.String())
 	}
-	if !strings.Contains(hermes.Body.String(), "128000") || !strings.Contains(strings.ToLower(hermes.Body.String()), "utf-16") {
-		t.Fatalf("Hermes compatibility error hid the real UTF-16 policy: %s", hermes.Body.String())
+	hermesError := strings.ToLower(hermes.Body.String())
+	if !strings.Contains(hermesError, "input is too long") || !strings.Contains(hermes.Body.String(), "128000") || !strings.Contains(hermesError, "utf-16") {
+		t.Fatalf("Hermes compatibility error lacks the recoverable marker or real UTF-16 policy: %s", hermes.Body.String())
 	}
 
 	generic := httptest.NewRecorder()

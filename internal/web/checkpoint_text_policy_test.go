@@ -163,8 +163,9 @@ func TestHermesTextPolicyMapsOversizedCheckpointDeltaToRecoverableContextCode(t 
 	if secondRecorder.Code != http.StatusBadRequest || wp1ErrorCode(t, secondRecorder) != "context_length_exceeded" {
 		t.Fatalf("oversized Hermes delta status=%d code=%q body=%s", secondRecorder.Code, wp1ErrorCode(t, secondRecorder), secondRecorder.Body.String())
 	}
-	if !strings.Contains(strings.ToLower(secondRecorder.Body.String()), "utf-16") {
-		t.Fatalf("Hermes delta error hid the real UTF-16 policy: %s", secondRecorder.Body.String())
+	hermesError := strings.ToLower(secondRecorder.Body.String())
+	if !strings.Contains(hermesError, "input is too long") || !strings.Contains(hermesError, "utf-16") {
+		t.Fatalf("Hermes delta error lacks the recoverable marker or real UTF-16 policy: %s", secondRecorder.Body.String())
 	}
 	if len(chat.requests) != 1 {
 		t.Fatalf("oversized Hermes delta reached upstream: calls=%d", len(chat.requests))
