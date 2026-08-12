@@ -21,7 +21,7 @@ providers:
 
 不要把此值寫成全域 `model.context_length`，也不要為了 M365 將全域 `compression.threshold_tokens` 壓低；同一個 Hermes 若切換 OpenAI、OpenRouter 或其他 provider，這些全域設定可能造成不必要的提前壓縮。provider/model override 只限制指定 M365 route。
 
-目前 64K 是已驗證的保守基線。若要放寬，應在 Sidecar 相容性修正與 live canary 完成後再逐步測試；例如 `80K` 可以作為工具密集 workload 的 canary 目標，但在完成真實負載驗證前不應直接當成通用建議或提高到 128K。`proactive_prune_tokens` 也應以實際 UTF-16 膨脹量一起調整，而不是只看 token context；40–42K 可作為 80K canary 的起始觀察區間，仍須依實測收斂。
+2026-08-12 的 Production canary 已將 M365 `gpt-5.6-reasoning.context_length` 從 64K 提高到 `80000`，並把 `proactive_prune_tokens` 從 48K 降到 `41000`；真實 Hermes oneshot terminal tool continuation 成功完成 2 次 API call，且 Hermes 原生 `ContextCompressor` boundary test 驗證 40999 不 prune、41000 會進入 deterministic old-tool-result prune。全域 `compression.threshold_tokens` 仍不設定。這組數字是目前 M365 整合的 live-qualified 起始值，不是其他 provider 的通用建議，也不應直接提高到 128K；不同語言與 tool JSON 比例仍可能需要更保守的 pruning。
 
 Hermes 應優先使用專用的 `/hermes/v1` base URL。當這個相容入口的 caller text 確實超過 Sidecar UTF-16 政策時，Sidecar 仍以 HTTP 400 拒絕，但會同時使用 Hermes 相容的 `context_length_exceeded` 錯誤碼與 `input is too long` 恢復提示，讓 Hermes 走既有的 context compression → retry 流程。錯誤訊息仍明確保留真正的 UTF-16 政策與上限，而且不會把 `128000` 描述成模型 token context window。一般 `/v1` caller 仍收到 `text_policy_exceeded`，因此這個相容映射不會改變其他 OpenAI-compatible client 的錯誤契約。
 
@@ -67,7 +67,7 @@ providers:
 
 Avoid using a global `model.context_length` or lowering global `compression.threshold_tokens` only for M365. A Hermes installation that also switches to OpenAI, OpenRouter, or other providers could otherwise compress those routes unnecessarily. A provider/model override remains scoped to the selected M365 route.
 
-The currently verified conservative baseline is 64K. Raise it only after the sidecar compatibility fixes and a live canary have passed. For example, `80K` can be used as a canary target for tool-heavy workloads, but it should not become a universal recommendation—or be pushed directly to 128K—without representative validation. `proactive_prune_tokens` should be tuned together with observed UTF-16 expansion rather than token context alone; 40–42K is a reasonable starting observation band for an 80K canary, subject to live validation.
+The 2026-08-12 Production canary raised the M365 `gpt-5.6-reasoning.context_length` from 64K to `80000` and lowered `proactive_prune_tokens` from 48K to `41000`. A real Hermes oneshot terminal-tool turn completed its two API calls successfully, and a native `ContextCompressor` boundary test confirmed no prune at 40999 and deterministic old-tool-result pruning at 41000. Global `compression.threshold_tokens` remains unset. These values are the current live-qualified starting point for the M365 integration, not a universal recommendation for other providers and not a reason to jump directly to 128K; different languages and tool-JSON ratios may still require more conservative pruning.
 
 Hermes should prefer the dedicated `/hermes/v1` base URL. When caller text on that compatibility surface genuinely exceeds the Sidecar UTF-16 policy, the Sidecar still rejects the request with HTTP 400 but supplies both the Hermes-compatible `context_length_exceeded` code and an `input is too long` recovery marker so Hermes can follow its existing context-compression → retry path. The message continues to identify the real UTF-16 policy and configured limit without describing `128000` as a model token context window. Generic `/v1` callers continue to receive `text_policy_exceeded`, so this compatibility mapping does not change the error contract for other OpenAI-compatible clients.
 

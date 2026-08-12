@@ -94,6 +94,18 @@ Memory 排隊採 FIFO，已進場的 Memory 工作不會被強制中斷；若 Mi
 
 `maxToolCallsPerTurn` 是上限，不代表每一輪都會向模型開放相同數量。Sidecar 會在送出模型請求**以前**，依 caller 暴露的 tool definitions 與 `tool_choice` 固定本輪 ceiling：只有所有可被選取的工具都明確帶有 `annotations.readOnlyHint=true`，而且沒有 mutation/destructive 訊號時，才會允許大於 1 的平行呼叫；缺少安全 metadata、可寫工具或語意不明的工具都會事前序列化為 1。模型回來後不會再事後把 2 降成 1，也不會截掉部分 `tool_calls`，因此 upstream conversation、checkpoint 與 caller tool state 使用同一份契約。
 
+### Hermes / Hindsight live-qualified 起始設定
+
+2026-08-12 的 Production qualification 使用以下整合設定並通過真實 tool continuation、Hindsight retain/recall/reflect 與 overflow recovery 測試：
+
+- Hermes 的 M365 model-specific `context_length=80000`。
+- Hermes `proactive_prune_tokens=41000`；不要為 M365 額外設定全域 `compression.threshold_tokens`。
+- Hindsight `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000`。
+- Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0`，只避免 deterministic HTTP 400 在 Reflect provider loop 內原封不動重送；其他 operation 的 retry policy 不變。
+- M365 `textInputLimitUTF16` 維持 `128000`。
+
+這些是目前對 **M365 transport 特性**做過 live qualification 的起始值，不是 Hermes/Hindsight 的通用上限，更不代表 `128000 UTF-16` 等於 `128000 tokens`。不同語言、tool JSON 比例與 memory workload 仍可能需要更保守的 consumer-side pruning/reduction。
+
 ## 開發與驗證
 
 變更應從公開 `main` 建立分支，並以最小、可驗證的修正回到同一個公開倉庫。Go 程式變更至少執行：
@@ -197,6 +209,18 @@ The management UI exposes compatibility controls for Hermes and Hindsight, inclu
 ## Caller-tool parallel safety contract
 
 `maxToolCallsPerTurn` is a ceiling, not a promise that every turn may emit that many calls. Before the upstream model is invoked, the sidecar fixes the turn's ceiling from the caller-exposed tool definitions and `tool_choice`. Parallel calls above 1 are advertised only when every selectable tool explicitly carries `annotations.readOnlyHint=true` and has no mutation/destructive signal. Missing safety metadata, writable tools, or ambiguous tools are serialized to 1 before model generation. The ceiling is not tightened after the model has acted, and returned `tool_calls` are never partially truncated, so upstream conversation state, checkpoints, and caller tool state share one contract.
+
+### Live-qualified Hermes / Hindsight starting settings
+
+The 2026-08-12 Production qualification passed real tool continuation, Hindsight retain/recall/reflect, and overflow-recovery checks with these integration settings:
+
+- Hermes M365 model-specific `context_length=80000`.
+- Hermes `proactive_prune_tokens=41000`; do not add a global `compression.threshold_tokens` just for M365.
+- Hindsight `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000`.
+- Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0`, scoped to avoiding identical deterministic HTTP 400 retries inside the Reflect provider loop; other operation retry policies remain unchanged.
+- M365 `textInputLimitUTF16` remains `128000`.
+
+These are live-qualified starting points for the **M365 transport characteristics**, not universal Hermes/Hindsight limits, and they do not imply that `128000 UTF-16` equals `128000 tokens`. Different languages, tool-JSON ratios, and memory workloads may still require more conservative consumer-side pruning or reduction.
 
 ## Privacy and limitations
 

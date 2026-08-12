@@ -1,6 +1,6 @@
 # M365-Copilot2API Memory Provider Compatibility Mode / 記憶體供應器相容模式
 
-Status / 狀態: **IMPLEMENTED COMPATIBILITY SURFACE — Issues #42–#44 hardening is locally verified and not yet deployed / 相容介面已實作，Issue #42–#44 強化已完成本地驗證、尚未部署**
+Status / 狀態: **DEPLOYED AND LIVE-QUALIFIED — Issues #42–#44 / 已部署並完成 Production live qualification**
 
 Date / 日期: 2026-08-12
 
@@ -18,7 +18,7 @@ Memory traffic 使用獨立 transport checkpoint 規則：
 
 因此 Hindsight 的背景記憶工作不會沿用 Hermes / 一般互動流量的 continuation checkpoint。M365 不負責長期聊天記憶；長期 Memory 仍由 Hermes / Hindsight 負責。
 
-目前 Production 與公開 `main` baseline 為 `d323216b3919fce61de5503b087e79ab04583188`，已包含既有 Memory compatibility implementation。本輪 #42–#44 強化從這個 exact commit 建立隔離 worktree；以下新增行為已通過本地 deterministic tests，但尚未部署 Production。
+#42–#44 從 `d323216b3919fce61de5503b087e79ab04583188` exact baseline 建立隔離 worktree，功能修復 commit `6889411bf59a7c4ad1c92d6c241c9d5d12ea530d` 已通過 PR exact-head CI、`main` push exact-head CI、NAS bare-repo fast-forward、Production snapshot/deploy/readback 與 live qualification。後續只允許以不改變此協議語意的文件／維運更新前進；Production 仍必須與公開 `main` exact commit 對齊。
 
 ### 啟用方式與 migration
 
@@ -66,14 +66,14 @@ Fresh install 沒有既有 `settings.json` 時，預設為 **OFF**。
 - OpenAI-compatible provider 對一般 HTTP 400 在 Reflect 收到例外前仍有自己的 retry loop；預設全域 retry budget 為 3。Hindsight 提供 Reflect-specific override，因此不需要修改 Hindsight source code。
 - Retain 預設以約 3000 chars 切 chunk；Consolidation 預設每個 LLM batch 8 facts，related observations recall 約 512 tokens、source facts 約 4096 tokens。就預設值而言，主要大型 prompt 風險仍集中在 Reflect / final synthesis，而不是 retain/consolidation。
 
-部署後 canary 建議先只調整 Hindsight **Reflect 專用**設定，不改全域 LLM retry：
+2026-08-12 Production canary 已套用並驗證 Hindsight **Reflect 專用**設定；全域 LLM retry 未修改：
 
 ```text
 HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0
 HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 ```
 
-`40000` 是針對 M365 UTF-16 transport policy 的保守 canary 起始值，不是 Hindsight 或 M365 的通用規格。它讓 Reflect 的 80% retrieved-context 預算約落在 32K tokens，保留 system/tool/schema/回答 framing 空間。正式值必須由真實繁中、工具 JSON 與 retrieved-memory workload 再收斂；不要直接把 `100000` tokens 與 `128000 UTF-16` 作數值對照。`REFLECT_LLM_MAX_RETRIES=0` 的目的只是避免同一個 deterministic 400 在 provider 內部原封不動重送；其他 operation 的 retry 暫時維持原設定。
+`40000` 是針對 M365 UTF-16 transport policy 的保守 integration starting point，不是 Hindsight 或 M365 的通用規格。它讓 Reflect 的 80% retrieved-context 預算約落在 32K tokens，保留 system/tool/schema/回答 framing 空間。Production 以臨時 bank 實測 retain → recall → reflect 全部成功，且測試 bank 已刪除；`REFLECT_LLM_MAX_RETRIES=0` 只避免同一個 deterministic 400 在 Reflect provider loop 內原封不動重送，其他 operation 的 retry 維持原設定。仍不要直接把 `100000` tokens 與 `128000 UTF-16` 作數值對照，真實繁中、工具 JSON 與 retrieved-memory workload 若更重，應進一步收緊 consumer-side budget。
 
 ### 流量與 429
 
@@ -109,28 +109,22 @@ Hermes 與 Hindsight source code 不需要因 M365 相容性修正而修改。�
 
 ### 本輪 release gate
 
-本輪 hardening 在正式部署前必須至少通過：
+本輪 hardening 在正式部署前已通過：
 
 - `go test ./... -count=1`
 - `go vet ./...`
 - `go build ./...`
-- `go test -race`：`internal/auth`、`internal/chathub`、`internal/mcp`、`internal/outbound`、`cmd/server`、`internal/web`
+- critical packages 的 `go test -race`；`internal/web` 另以本輪受影響的 TextPolicy / Memory / Hermes / ToolCall / Parallel / Checkpoint 範圍做 fresh race 驗證
 - `git diff --check`
 - staged / unstaged diff review
 - Production compose/settings effective value review
 - Hermes + Hindsight live integration qualification
 
-本輪從公開 `main` exact baseline 建立隔離 worktree，以避免舊 checkout 或其他工作中的 dirty state 混入；正式發佈仍必須回到同一個公開主線並通過 exact-head CI。
+本輪從公開 `main` exact baseline 建立隔離 worktree，以避免舊 checkout 或其他工作中的 dirty state 混入；正式發佈回到同一個公開主線並通過 exact-head CI。
 
-### 尚未做完的部署工作
+### 部署與設定 canary 結果
 
-本輪 #42–#44 code hardening 尚未 commit / deploy。Production 部署前仍要處理：
-
-- 完整 release gate、diff review、公開 commit 與 exact-head CI。
-- Production preflight、snapshot / rollback 準備與 exact-commit deployment。
-- 部署後做 generic `/v1` recovery metadata、Hermes tool/overflow continuation、Hindsight Memory overflow recovery 的 live qualification。
-- live qualification 通過後，才進行 Hermes 80K / proactive prune 40–42K 與 Hindsight Reflect 40K / retry 0 的設定 canary。
-- 驗證 M365 `textInputLimitUTF16` 仍為 `128000`，且公開 reverse proxy timeout 大於 M365 effective request timeout。
+#42–#44 code hardening 已 commit、發佈並部署。Production qualification 已完成：generic `/v1` recovery metadata、Hermes tool/overflow continuation 與 Hindsight Memory overflow recovery 均有 live evidence；Hermes M365 context 已 canary 到 `80000`、`proactive_prune_tokens=41000`，Hindsight Reflect 已 canary 到 `40000` / retry `0`。M365 `textInputLimitUTF16` 維持 `128000`；兩個 consumer canary 都使用設定調整而沒有修改 Hermes/Hindsight core。
 
 ---
 
@@ -148,7 +142,7 @@ Memory traffic uses isolated transport-checkpoint semantics:
 
 This prevents Hindsight background memory work from continuing Hermes or ordinary interactive checkpoints. M365 does not own long-term conversational memory; Hermes/Hindsight remain responsible for that layer.
 
-Production and public `main` currently share baseline `d323216b3919fce61de5503b087e79ab04583188`, which already contains the existing Memory compatibility implementation. The #42–#44 hardening was developed from that exact commit in an isolated worktree. The new behavior described below has passed deterministic local tests but is not yet deployed to Production.
+Issues #42–#44 were developed in an isolated worktree from exact baseline `d323216b3919fce61de5503b087e79ab04583188`. Functional fix commit `6889411bf59a7c4ad1c92d6c241c9d5d12ea530d` passed PR exact-head CI, `main` push exact-head CI, NAS bare-repository fast-forward, Production snapshot/deploy/readback, and live qualification. Later documentation/operations updates must preserve these protocol semantics, and Production must remain aligned with the exact public-`main` commit.
 
 ### Activation and migration
 
@@ -188,14 +182,14 @@ Read-only inspection of Hindsight 0.9.0 confirms that Reflect recognizes `contex
 
 Retain defaults to roughly 3000-character chunks. Consolidation defaults to 8 facts per LLM batch, about 512 tokens of related-observation recall, and about 4096 tokens of source facts. With those defaults, the primary large-prompt risk is Reflect/final synthesis rather than retain/consolidation.
 
-A post-deployment canary should initially change only the Reflect-specific integration settings:
+The 2026-08-12 Production canary applied and validated only these Reflect-specific integration settings; global LLM retry behavior was left unchanged:
 
 ```text
 HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=0
 HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 ```
 
-`40000` is a conservative M365-integration canary starting point, not a universal Hindsight or M365 specification. With the current 80% final-synthesis fraction, it targets roughly 32K tokens of retrieved context and leaves room for system/tool/schema/answer framing. Tune it with representative Traditional Chinese, tool JSON, and retrieved-memory workloads instead of numerically equating `100000` tokens with `128000 UTF-16`. Setting the Reflect-specific retry budget to zero only avoids identical deterministic 400 retries inside the provider; other operation retry policies remain unchanged initially.
+`40000` is a conservative M365-integration starting point, not a universal Hindsight or M365 specification. With the current 80% final-synthesis fraction, it targets roughly 32K tokens of retrieved context and leaves room for system/tool/schema/answer framing. A temporary Production bank completed retain → recall → reflect successfully and was deleted after the test. Setting the Reflect-specific retry budget to zero only avoids identical deterministic 400 retries inside the Reflect provider loop; other operation retry policies remain unchanged. Do not numerically equate `100000` tokens with `128000 UTF-16`; heavier Traditional Chinese, tool-JSON, or retrieved-memory workloads may still require a smaller consumer-side budget.
 
 ### Traffic and 429 behavior
 
@@ -211,10 +205,10 @@ Hermes and Hindsight source code are not modified to absorb M365 protocol-compat
 
 ### Release gates for this hardening batch
 
-Before Production deployment, the batch must pass the full Go test suite, vet, build, race tests for the critical packages, `git diff --check`, staged/unstaged review, Production effective-settings review, and live Hermes + Hindsight qualification.
+Before Production deployment, the batch passed the full Go test suite, vet, build, fresh race checks for the critical packages plus the changed TextPolicy / Memory / Hermes / ToolCall / Parallel / Checkpoint paths in `internal/web`, `git diff --check`, staged/unstaged review, Production effective-settings review, and live Hermes + Hindsight qualification.
 
-This batch is being developed in an isolated worktree created from the exact public-main baseline so stale checkout state or unrelated dirty files cannot enter the candidate. Publication still returns through the same public mainline and requires exact-head CI.
+This batch was developed in an isolated worktree created from the exact public-main baseline so stale checkout state or unrelated dirty files could not enter the candidate. Publication returned through the same public mainline and passed exact-head CI.
 
-### Deployment work still pending
+### Deployment and live-qualification evidence
 
-The #42–#44 hardening has not yet been committed or deployed. Remaining work is to pass the full release gate and diff review, publish the exact candidate and obtain exact-head CI success, run Production preflight plus snapshot/rollback preparation, deploy that exact commit, and perform live generic-route recovery, Hermes tool/overflow continuation, and Hindsight Memory overflow qualification. Only after those checks pass should the Hermes 80K / proactive-prune 40–42K and Hindsight Reflect 40K / retry-0 configuration canaries begin. `textInputLimitUTF16` must remain `128000` unless separately justified and tested.
+The #42–#44 functional hardening landed at `6889411bf59a7c4ad1c92d6c241c9d5d12ea530d` and passed the full local release gate, PR exact-head CI, `main` exact-head CI, NAS backup fast-forward, Production preflight/snapshot, exact-commit deployment, post-readback, and live verification. Generic `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` returned the expected UTF-16 recovery metadata at 128001 code units; `/memory/v1` returned the Hindsight-recognized recovery signal; Hermes completed a real ambiguous-tool serial turn plus continuation without `tool_call_limit_exceeded`. The Hermes 80K/41K and Hindsight Reflect 40K/retry-0 canaries also passed. `textInputLimitUTF16` remains `128000`.
