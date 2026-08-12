@@ -100,6 +100,12 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 
 `maxToolCallsPerTurn` 是上限，不代表每一輪都會向模型開放相同數量。Sidecar 會在送出模型請求**以前**，依 caller 暴露的 tool definitions 與 `tool_choice` 固定本輪 ceiling：只有所有可被選取的工具都明確帶有 `annotations.readOnlyHint=true`，而且沒有 mutation/destructive 訊號時，才會允許大於 1 的平行呼叫；缺少安全 metadata、可寫工具或語意不明的工具都會事前序列化為 1。模型回來後不會再事後把 2 降成 1，也不會截掉部分 `tool_calls`，因此 upstream conversation、checkpoint 與 caller tool state 使用同一份契約。
 
+### Model tool router repair 與大型 arguments
+
+當 model tool router 的第一個候選連外層 JSON 都無法解析、必須進入單次 bounded repair 時，Sidecar 會把**完整的原始 router output**帶入 repair prompt，不再以固定 6000 字元截短。這避免大型 `execute_code`、SQL 或其他結構化 arguments 在 repair 階段被從中切斷後變成另一份無效工具呼叫。
+
+完整 repair prompt 仍會在第二次 upstream call **之前**重新套用目前的 `textInputLimitUTF16`。若 repair input 本身超過上限，Sidecar 會 fail closed，不會為了塞進預算再截斷 arguments；回應為 HTTP `502` / `upstream_error`，並帶 `code=tool_router_repair_input_too_large`、`limit_type=repair_prompt_utf16`、`limit`、`received`、`terminal=true`、`retryable=false` 與 `recommended_action`。這是內部 repair 的安全預算，不是新的 caller 設定，也不是提高 `128000 UTF-16` 的理由；Production 建議仍維持 `textInputLimitUTF16=128000`，由 Hermes/Hindsight 在 consumer 端更早做 token-based pruning/reduction。
+
 ### 工具回合總量安全邊界
 
 單一 assistant tool-call turn 不論包含 1 個或多個合法平行 calls，都只算 1 個 tool round。一般 `/v1` 與 `/memory/v1` 預設最多 `16` rounds；Hermes 專用 `/hermes/v1` 則使用獨立的 `hermesMaxToolRounds`，預設 `128`，可由管理 UI 或 `M365_HERMES_MAX_TOOL_ROUNDS` 調整（1–512）。這避免 Sidecar 在正常 Hermes 長任務尚未用完自己的 iteration budget 前就先以 16 rounds 中止，同時仍保留有限的 runaway-loop 最終保護。
@@ -116,7 +122,7 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 - Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`。這讓 Reflect 最多嘗試 2 次：deterministic HTTP 400 最多只多重送 1 次後就交回 Hindsight overflow recovery，同時保留一次暫時性 ChatHub／502 自癒機會；其他 operation 的 retry policy 不變。
 - M365 `textInputLimitUTF16` 維持 `128000`。
 
-這些是目前對 **M365 transport 特性**做過 live qualification 的起始值，不是 Hermes/Hindsight 的通用上限，更不代表 `128000 UTF-16` 等於 `128000 tokens`。不同語言、tool JSON 比例與 memory workload 仍可能需要更保守的 consumer-side pruning/reduction。
+Model tool router repair 不新增另一個容量設定，也不建議為 #54 調高 `textInputLimitUTF16`。這些是目前對 **M365 transport 特性**做過 live qualification 的起始值，不是 Hermes/Hindsight 的通用上限，更不代表 `128000 UTF-16` 等於 `128000 tokens`。不同語言、tool JSON 比例與 memory workload 仍可能需要更保守的 consumer-side pruning/reduction。
 
 ## 開發與驗證
 
@@ -228,6 +234,12 @@ The retry currently covers HTTP `500`, `502`, `503`, and `504` upgrade failures 
 
 `maxToolCallsPerTurn` is a ceiling, not a promise that every turn may emit that many calls. Before the upstream model is invoked, the sidecar fixes the turn's ceiling from the caller-exposed tool definitions and `tool_choice`. Parallel calls above 1 are advertised only when every selectable tool explicitly carries `annotations.readOnlyHint=true` and has no mutation/destructive signal. Missing safety metadata, writable tools, or ambiguous tools are serialized to 1 before model generation. The ceiling is not tightened after the model has acted, and returned `tool_calls` are never partially truncated, so upstream conversation state, checkpoints, and caller tool state share one contract.
 
+### Model-tool-router repair and large arguments
+
+If the model tool router's first candidate is not even parseable as outer JSON and must enter its single bounded repair pass, the sidecar now places the **complete raw router output** into the repair prompt instead of compacting it to a fixed 6000 characters. This prevents large `execute_code`, SQL, or other structured arguments from being cut in the middle and turned into a different invalid tool call during repair.
+
+The complete repair prompt is still checked against the current `textInputLimitUTF16` **before** a second upstream call. If the repair input itself exceeds that budget, the sidecar fails closed instead of truncating arguments to make them fit. It returns HTTP `502` / `upstream_error` with `code=tool_router_repair_input_too_large`, `limit_type=repair_prompt_utf16`, `limit`, `received`, `terminal=true`, `retryable=false`, and `recommended_action`. This is an internal repair safety budget, not a new caller setting and not a reason to raise the `128000 UTF-16` policy. Production guidance remains `textInputLimitUTF16=128000`, with Hermes/Hindsight performing token-based pruning or reduction earlier on the consumer side.
+
 ### Total tool-round safety boundary
 
 One assistant tool-call turn counts as one tool round regardless of whether it contains one call or multiple valid parallel calls. Generic `/v1` and `/memory/v1` default to `16` rounds. Dedicated `/hermes/v1` uses the independent `hermesMaxToolRounds` setting, defaulting to `128` and configurable from the management UI or `M365_HERMES_MAX_TOOL_ROUNDS` (1–512). This prevents the sidecar from terminating legitimate long-running Hermes work at 16 rounds while retaining a finite final runaway-loop guard.
@@ -244,7 +256,7 @@ The 2026-08-12 Production qualification passed real tool continuation, Hindsight
 - Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`. Reflect therefore makes at most two attempts: a deterministic HTTP 400 can be repeated at most once before Hindsight overflow recovery takes over, while one retry remains available for transient ChatHub/502 failures. Other operation retry policies remain unchanged.
 - M365 `textInputLimitUTF16` remains `128000`.
 
-These are live-qualified starting points for the **M365 transport characteristics**, not universal Hermes/Hindsight limits, and they do not imply that `128000 UTF-16` equals `128000 tokens`. Different languages, tool-JSON ratios, and memory workloads may still require more conservative consumer-side pruning or reduction.
+Model-tool-router repair adds no separate capacity setting, and #54 is not a reason to raise `textInputLimitUTF16`. These are live-qualified starting points for the **M365 transport characteristics**, not universal Hermes/Hindsight limits, and they do not imply that `128000 UTF-16` equals `128000 tokens`. Different languages, tool-JSON ratios, and memory workloads may still require more conservative consumer-side pruning or reduction.
 
 ## Privacy and limitations
 

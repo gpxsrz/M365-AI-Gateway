@@ -14,10 +14,10 @@ providers:
     base_url: https://m365.example.com/hermes/v1
     models:
       gpt-5.6-reasoning:
-        context_length: 64000
+        context_length: 80000
 ```
 
-`64000` 是目前可用的保守整合起始值，不是 M365-Copilot2API 或 Microsoft 的 API 規格。Hermes 本身硬性要求主模型 context window **至少 64000 tokens**；低於此值（例如 `60000`）雖然可以被設定檔解析，但建立 Agent 時會直接拒絕並回報 context window below the minimum 64K。設定 64K 的目的，是在符合 Hermes 最低需求的同時，讓原生 compression/pruning 儘量早於 Sidecar 的 `128000 UTF-16` 最終保護線啟動。實際值若要提高，仍應依語言、工具輸出大小、啟用工具 schema 與安全餘裕實測調整。
+`80000` 是目前對 M365 路徑做過 Production live qualification 的起始值，不是 M365-Copilot2API 或 Microsoft 的 API 規格。Hermes 本身硬性要求主模型 context window **至少 64000 tokens**；64K 是 Hermes 的最低可用 floor，不再是本整合目前的建議值。低於 64K（例如 `60000`）雖然可以被設定檔解析，但建立 Agent 時會直接拒絕並回報 context window below the minimum 64K。80K 仍應搭配 `proactive_prune_tokens=41000`，讓 Hermes 原生 pruning 早於 Sidecar 的 `128000 UTF-16` 最終保護線啟動；若 workload 的繁中比例、tool JSON 或 memory payload 更重，應優先把 consumer-side pruning 調得更保守，而不是提高 Sidecar 的 UTF-16 上限。
 
 不要把此值寫成全域 `model.context_length`，也不要為了 M365 將全域 `compression.threshold_tokens` 壓低；同一個 Hermes 若切換 OpenAI、OpenRouter 或其他 provider，這些全域設定可能造成不必要的提前壓縮。provider/model override 只限制指定 M365 route。
 
@@ -28,6 +28,12 @@ Hermes 應優先使用專用的 `/hermes/v1` base URL。當這個相容入口的
 ### 呼叫端工具安全契約
 
 Hermes 常見工具不一定提供 `readOnlyHint`。M365-Copilot2API 不會再先告訴模型「可呼叫 2 個工具」，等模型真的回 2 個後才事後降成 1。Sidecar 現在會在模型生成前固定本輪 tool-call ceiling：只有所有當輪可選工具都明確標記 `annotations.readOnlyHint=true`、且沒有 mutation/destructive 訊號時，才會允許大於 1；其餘情況事前序列化成 1。這個 ceiling 會同時用於 router prompt、native request 與回傳驗證，不截斷已產生的 `tool_calls`，以避免 Hermes、ChatHub conversation 與 checkpoint/tool state 分叉。
+
+### 大型 tool arguments 與 router repair
+
+若 model tool router 的第一個候選連外層 JSON 都無法解析，Sidecar 最多只做一次 bounded repair。#54 之後，repair prompt 會保留完整原始 router output，不再用固定 6000 字元 compact，因此大型 `execute_code.arguments.code` 或其他結構化 arguments 不會在 Sidecar repair 階段被從中截斷。
+
+完整 repair prompt 仍受現有 `textInputLimitUTF16` 約束；若它本身超過 `128000` 的 Production 設定，Sidecar 會在第二次 upstream call 前以 `tool_router_repair_input_too_large` / `repair_prompt_utf16` fail closed，而不是截短 arguments。**不需要也不建議為此新增 Hermes 設定或提高 M365 `textInputLimitUTF16`。**另外，Sidecar 保證的是「不截斷模型實際產生的 router arguments」，不是保證模型一定逐位元組複製使用者提示詞中的程式碼；模型本身仍可能改寫、展開或重新格式化 arguments。
 
 ### 長任務的工具回合上限
 
@@ -68,10 +74,10 @@ providers:
     base_url: https://m365.example.com/hermes/v1
     models:
       gpt-5.6-reasoning:
-        context_length: 64000
+        context_length: 80000
 ```
 
-`64000` is the current conservative usable starting point, not an M365-Copilot2API or Microsoft API specification. Hermes itself requires the main model context window to be **at least 64000 tokens**. A lower value such as `60000` can be parsed from configuration but is rejected when Hermes constructs the Agent with a below-minimum-64K error. Using 64K satisfies that floor while encouraging native compression/pruning to engage before the Sidecar's `128000 UTF-16` final guard. If you raise the value, tune it using representative language, tool-output size, enabled tool schemas, and desired safety margin.
+`80000` is the current Production-live-qualified starting point for the M365 route, not an M365-Copilot2API or Microsoft API specification. Hermes itself requires the main model context window to be **at least 64000 tokens**; 64K is the Hermes minimum usable floor, not the current recommendation for this integration. A lower value such as `60000` can be parsed from configuration but is rejected when Hermes constructs the Agent with a below-minimum-64K error. The 80K setting should still be paired with `proactive_prune_tokens=41000` so Hermes native pruning engages before the Sidecar's `128000 UTF-16` final guard. Workloads with heavier Traditional Chinese, tool JSON, or memory payloads should make consumer-side pruning more conservative rather than raising the Sidecar UTF-16 limit.
 
 Avoid using a global `model.context_length` or lowering global `compression.threshold_tokens` only for M365. A Hermes installation that also switches to OpenAI, OpenRouter, or other providers could otherwise compress those routes unnecessarily. A provider/model override remains scoped to the selected M365 route.
 
@@ -82,6 +88,12 @@ Hermes should prefer the dedicated `/hermes/v1` base URL. When caller text on th
 ### Caller-tool safety contract
 
 Hermes tools do not always carry `readOnlyHint`. M365-Copilot2API no longer advertises a parallel limit of 2 and then lowers it to 1 only after the model returns two calls. The sidecar fixes the turn's tool-call ceiling before generation: limits above 1 are available only when every selectable tool explicitly has `annotations.readOnlyHint=true` and no mutation/destructive signal. Otherwise the turn is serialized to 1 in advance. Router prompts, native requests, and returned-call validation share that same ceiling, and already-generated `tool_calls` are not truncated, preventing Hermes, ChatHub conversation state, and checkpoint/tool state from diverging.
+
+### Large tool arguments and router repair
+
+If the model tool router's first candidate cannot even be parsed as outer JSON, the sidecar performs at most one bounded repair. Since #54, that repair prompt preserves the complete raw router output instead of compacting it to a fixed 6000 characters, so large `execute_code.arguments.code` or other structured arguments are not cut in the middle by the sidecar's repair path.
+
+The complete repair prompt remains subject to the existing `textInputLimitUTF16` budget. If it exceeds the Production setting of `128000`, the sidecar fails closed before the second upstream call with `tool_router_repair_input_too_large` / `repair_prompt_utf16` instead of truncating arguments. **No additional Hermes setting is required, and raising M365 `textInputLimitUTF16` for this behavior is not recommended.** The preservation guarantee applies to the router arguments actually generated by the model; it does not promise byte-for-byte identity with code embedded in the user's prompt, because the model may itself rewrite, expand, or reformat arguments.
 
 ### Tool-round limit for long-running work
 
