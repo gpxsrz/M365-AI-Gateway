@@ -11,7 +11,7 @@ M365-Copilot2API 對 Hermes 提供 OpenAI-compatible API。Sidecar 的 `128000` 
 ```yaml
 providers:
   m365-copilot:
-    base_url: https://m365.example.com/v1
+    base_url: https://m365.example.com/hermes/v1
     models:
       gpt-5.6-reasoning:
         context_length: 64000
@@ -20,6 +20,8 @@ providers:
 `64000` 是目前可用的保守整合起始值，不是 M365-Copilot2API 或 Microsoft 的 API 規格。Hermes 本身硬性要求主模型 context window **至少 64000 tokens**；低於此值（例如 `60000`）雖然可以被設定檔解析，但建立 Agent 時會直接拒絕並回報 context window below the minimum 64K。設定 64K 的目的，是在符合 Hermes 最低需求的同時，讓原生 compression/pruning 儘量早於 Sidecar 的 `128000 UTF-16` 最終保護線啟動。實際值若要提高，仍應依語言、工具輸出大小、啟用工具 schema 與安全餘裕實測調整。
 
 不要把此值寫成全域 `model.context_length`，也不要為了 M365 將全域 `compression.threshold_tokens` 壓低；同一個 Hermes 若切換 OpenAI、OpenRouter 或其他 provider，這些全域設定可能造成不必要的提前壓縮。provider/model override 只限制指定 M365 route。
+
+Hermes 應優先使用專用的 `/hermes/v1` base URL。當這個相容入口的 caller text 確實超過 Sidecar UTF-16 政策時，Sidecar 仍以 HTTP 400 拒絕，但會使用 Hermes 已支援的 `context_length_exceeded` 相容錯誤碼，讓 Hermes 走既有的 context compression → retry 流程；錯誤訊息仍明確保留真正的 UTF-16 政策與上限。一般 `/v1` caller 仍收到 `text_policy_exceeded`，因此這個相容映射不會改變其他 OpenAI-compatible client 的錯誤契約。
 
 ### 兩層容量保護
 
@@ -49,7 +51,7 @@ When Hermes cannot resolve accurate context metadata for a custom model name, pr
 ```yaml
 providers:
   m365-copilot:
-    base_url: https://m365.example.com/v1
+    base_url: https://m365.example.com/hermes/v1
     models:
       gpt-5.6-reasoning:
         context_length: 64000
@@ -58,6 +60,8 @@ providers:
 `64000` is the current conservative usable starting point, not an M365-Copilot2API or Microsoft API specification. Hermes itself requires the main model context window to be **at least 64000 tokens**. A lower value such as `60000` can be parsed from configuration but is rejected when Hermes constructs the Agent with a below-minimum-64K error. Using 64K satisfies that floor while encouraging native compression/pruning to engage before the Sidecar's `128000 UTF-16` final guard. If you raise the value, tune it using representative language, tool-output size, enabled tool schemas, and desired safety margin.
 
 Avoid using a global `model.context_length` or lowering global `compression.threshold_tokens` only for M365. A Hermes installation that also switches to OpenAI, OpenRouter, or other providers could otherwise compress those routes unnecessarily. A provider/model override remains scoped to the selected M365 route.
+
+Hermes should prefer the dedicated `/hermes/v1` base URL. When caller text on that compatibility surface genuinely exceeds the Sidecar UTF-16 policy, the Sidecar still rejects the request with HTTP 400 but uses Hermes' already-supported `context_length_exceeded` compatibility code so Hermes can follow its existing context-compression → retry path. The error message continues to identify the real UTF-16 policy and configured limit. Generic `/v1` callers continue to receive `text_policy_exceeded`, so this compatibility mapping does not change the error contract for other OpenAI-compatible clients.
 
 ### Two-layer capacity protection
 

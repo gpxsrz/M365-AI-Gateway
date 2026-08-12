@@ -31,6 +31,18 @@ func (e *callerTextLimitError) Error() string {
 	return fmt.Sprintf("caller text exceeds the configured Sidecar Web-compatibility policy of %d UTF-16 code units (received %d)", e.Limit, e.Units)
 }
 
+func writeOpenAITextPolicyError(w http.ResponseWriter, r *http.Request, err error) {
+	code := "text_policy_exceeded"
+	if hermesCompatibilityRequest(r.URL.Path) {
+		// Hermes already treats context_length_exceeded as a recoverable
+		// context-overflow signal and will compact then retry. Keep the message
+		// explicit that the actual Sidecar constraint is UTF-16 caller text;
+		// only the dedicated Hermes compatibility surface gets this mapping.
+		code = "context_length_exceeded"
+	}
+	writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", code, err.Error())
+}
+
 func utf16CodeUnits(text string) int {
 	units := 0
 	for _, r := range text {

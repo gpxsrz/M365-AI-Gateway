@@ -947,7 +947,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if checkpointErr != nil {
 			var textLimitErr *callerTextLimitError
 			if errors.As(checkpointErr, &textLimitErr) {
-				writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", checkpointErr.Error())
+				writeOpenAITextPolicyError(w, r, checkpointErr)
 				return
 			}
 			writeOpenAIError(w, http.StatusConflict, "checkpoint_error", checkpointErr.Error())
@@ -961,7 +961,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		defer execution.Abort()
 	} else if needsTextValidation {
 		if err := validateCallerText(body.Messages, settings.TextInputLimitUTF16); err != nil {
-			writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", err.Error())
+			writeOpenAITextPolicyError(w, r, err)
 			return
 		}
 		r = withCallerTextValidated(r)
@@ -1036,7 +1036,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if prompt != "" {
 		if err := validateCallerString(prompt, settings.TextInputLimitUTF16); err != nil {
-			writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "text_policy_exceeded", err.Error())
+			writeOpenAITextPolicyError(w, r, err)
 			return
 		}
 	}

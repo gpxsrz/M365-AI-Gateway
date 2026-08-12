@@ -61,6 +61,30 @@ func TestHermesCompatibilityToggleControlsOnlyDedicatedProfileRoute(t *testing.T
 	}
 }
 
+func TestHermesTextPolicyOverflowUsesRecoverableContextCodeOnlyOnDedicatedRoute(t *testing.T) {
+	over := strings.Repeat("x", defaultTextInputLimitUTF16+1)
+	body := `{"model":"gpt-5.6-sol","session_key":"hermes-text-policy","messages":[{"role":"user","content":` + mustJSON(over) + `}]}`
+	server := newAdminSecurityServer(t, "administrator-password")
+	server.chat = &captureSingleAccountChat{}
+
+	hermes := httptest.NewRecorder()
+	hermesRequest := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)), "hermes-owner")
+	server.hermesOpenAIChat(hermes, hermesRequest)
+	if hermes.Code != http.StatusBadRequest || wp1ErrorCode(t, hermes) != "context_length_exceeded" {
+		t.Fatalf("Hermes status=%d code=%q body=%s", hermes.Code, wp1ErrorCode(t, hermes), hermes.Body.String())
+	}
+	if !strings.Contains(hermes.Body.String(), "128000") || !strings.Contains(strings.ToLower(hermes.Body.String()), "utf-16") {
+		t.Fatalf("Hermes compatibility error hid the real UTF-16 policy: %s", hermes.Body.String())
+	}
+
+	generic := httptest.NewRecorder()
+	genericRequest := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)), "generic-owner")
+	server.openaiChat(generic, genericRequest)
+	if generic.Code != http.StatusBadRequest || wp1ErrorCode(t, generic) != "text_policy_exceeded" {
+		t.Fatalf("generic status=%d code=%q body=%s", generic.Code, wp1ErrorCode(t, generic), generic.Body.String())
+	}
+}
+
 func TestMemoryCompatibilityRouteRequiresExplicitOptIn(t *testing.T) {
 	server := newAdminSecurityServer(t, "administrator-password")
 	server.chat = &captureSingleAccountChat{}

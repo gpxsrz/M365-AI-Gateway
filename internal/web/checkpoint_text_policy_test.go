@@ -131,3 +131,42 @@ func TestChatCompletionsTextPolicyStillRejectsOversizedCheckpointDelta(t *testin
 		t.Fatalf("policy rejection discarded the existing checkpoint binding: calls=%d conversation=%q", len(chat.requests), chat.requests[len(chat.requests)-1].ConversationID)
 	}
 }
+
+func TestHermesTextPolicyMapsOversizedCheckpointDeltaToRecoverableContextCode(t *testing.T) {
+	chat := &wp1CandidateChat{result: chathub.Result{
+		Text:           "ok",
+		ConversationID: "conversation-hermes",
+		SessionID:      "session-hermes",
+		RequestID:      "request-hermes",
+	}}
+	server := newWP1CandidateServer(t, chat)
+	var err error
+	server.checkpoints, err = openTransportCheckpointStore(filepath.Join(t.TempDir(), "checkpoints.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := `{"model":"gpt-5.6-reasoning","session_key":"hermes-text-policy-delta","messages":[{"role":"user","content":"first"}]}`
+	firstRecorder := httptest.NewRecorder()
+	server.hermesOpenAIChat(firstRecorder, withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(first)), "owner"))
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+
+	over := strings.Repeat("x", defaultTextInputLimitUTF16+1)
+	second := `{"model":"gpt-5.6-reasoning","session_key":"hermes-text-policy-delta","messages":[` +
+		`{"role":"user","content":"first"},` +
+		`{"role":"assistant","content":"ok"},` +
+		`{"role":"user","content":` + mustJSON(over) + `}]}`
+	secondRecorder := httptest.NewRecorder()
+	server.hermesOpenAIChat(secondRecorder, withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(second)), "owner"))
+	if secondRecorder.Code != http.StatusBadRequest || wp1ErrorCode(t, secondRecorder) != "context_length_exceeded" {
+		t.Fatalf("oversized Hermes delta status=%d code=%q body=%s", secondRecorder.Code, wp1ErrorCode(t, secondRecorder), secondRecorder.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(secondRecorder.Body.String()), "utf-16") {
+		t.Fatalf("Hermes delta error hid the real UTF-16 policy: %s", secondRecorder.Body.String())
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("oversized Hermes delta reached upstream: calls=%d", len(chat.requests))
+	}
+}
