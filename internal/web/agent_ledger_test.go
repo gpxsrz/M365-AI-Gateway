@@ -14,6 +14,58 @@ func TestCompactToolResultKeepsHeadTailAndError(t *testing.T) {
 	}
 }
 
+func TestAgentLedgerStructuredTerminalResultUsesExplicitFailureFields(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		toolName   string
+		content    string
+		explicit   bool
+		wantFailed bool
+	}{
+		{name: "success null error", content: `{"output":"ok","exit_code":0,"error":null}`},
+		{name: "success empty error", content: `{"output":"ok","exit_code":0,"error":""}`},
+		{name: "structured success overrides output wording", content: `{"output":"ERROR: diagnostic text only","exit_code":0,"error":null}`},
+		{name: "nonzero exit", content: `{"output":"bad","exit_code":1,"error":null}`, wantFailed: true},
+		{name: "nonempty error", content: `{"output":"bad","exit_code":0,"error":"permission denied"}`, wantFailed: true},
+		{name: "explicit protocol error wins", content: `{"output":"ok","exit_code":0,"error":null}`, explicit: true, wantFailed: true},
+		{name: "unrelated structured result keeps fallback", toolName: "lookup", content: `{"output":"ok","exit_code":0,"error":null}`, wantFailed: true},
+		{name: "missing terminal discriminator keeps fallback", content: `{"exit_code":0,"error":null}`, wantFailed: true},
+		{name: "malformed terminal nonzero exit fails closed", content: `{"output":"bad","exit_code":1`, wantFailed: true},
+		{name: "plaintext fallback", content: "ERROR: command failed", wantFailed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			toolName := tc.toolName
+			if toolName == "" {
+				toolName = "terminal"
+			}
+			ledger := buildAgentLedger([]oaiMsg{
+				{Role: "assistant", ToolCalls: []map[string]any{{"id": "c1", "type": "function", "function": map[string]any{"name": toolName, "arguments": `{"command":"printf ok"}`}}}},
+				{Role: "tool", ToolCallID: "c1", Content: tc.content, ToolResultIsError: tc.explicit},
+			})
+			if len(ledger.Completed) != 1 {
+				t.Fatalf("completed=%#v", ledger.Completed)
+			}
+			if got := ledger.Completed[0].Failed; got != tc.wantFailed {
+				t.Fatalf("Failed=%v want=%v result=%s", got, tc.wantFailed, tc.content)
+			}
+		})
+	}
+}
+
+func TestCompletionGuardAllowsSuccessForStructuredTerminalSuccess(t *testing.T) {
+	ledger := buildAgentLedger([]oaiMsg{
+		{Role: "assistant", ToolCalls: []map[string]any{{
+			"id":       "c1",
+			"type":     "function",
+			"function": map[string]any{"name": "terminal", "arguments": `{"command":"printf ok"}`},
+		}}},
+		{Role: "tool", ToolCallID: "c1", Content: `{"output":"ok","exit_code":0,"error":null}`},
+	})
+	if !completionEvidenceAllows("Completed successfully.", ledger) {
+		t.Fatalf("structured successful evidence was rejected: %+v", ledger)
+	}
+}
+
 func TestAgentLedgerDetectsRepeatedFailure(t *testing.T) {
 	msgs := []oaiMsg{
 		{Role: "assistant", ToolCalls: []map[string]any{{"id": "c1", "type": "function", "function": map[string]any{"name": "run", "arguments": "{\"cmd\":\"build\"}"}}}},

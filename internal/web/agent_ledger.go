@@ -35,7 +35,51 @@ type agentLedger struct {
 	KnownCallDigests    []string       `json:"-"`
 }
 
-var failureSignal = regexp.MustCompile(`(?i)(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)`)
+var failureSignal = regexp.MustCompile(`(?i)(["']?exit[\s_]*(code|status)?["']?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)`)
+
+func structuredTerminalResultFailed(toolName, result string) (failed, recognized bool) {
+	if toolName != "terminal" {
+		return false, false
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal([]byte(strings.TrimSpace(result)), &payload) != nil {
+		return false, false
+	}
+	if _, ok := payload["output"]; !ok {
+		return false, false
+	}
+	rawExit, ok := payload["exit_code"]
+	if !ok {
+		return false, false
+	}
+	var exitCode int
+	if json.Unmarshal(rawExit, &exitCode) != nil {
+		return false, false
+	}
+	if exitCode != 0 {
+		return true, true
+	}
+	rawError, present := payload["error"]
+	if !present || string(rawError) == "null" {
+		return false, true
+	}
+	var errorText string
+	if json.Unmarshal(rawError, &errorText) == nil {
+		return strings.TrimSpace(errorText) != "", true
+	}
+	return true, true
+}
+
+func toolResultFailed(explicitError bool, toolName, result string) bool {
+	if explicitError {
+		return true
+	}
+	if failed, recognized := structuredTerminalResultFailed(toolName, result); recognized {
+		return failed
+	}
+	return failureSignal.MatchString(result)
+}
+
 var unsupportedSuccess = regexp.MustCompile(`(?i)\b(installed|created|written|executed|ran|started|deployed|deleted|verified|completed|succeeded|success(?:ful(?:ly)?)?|done|finished|passed|applied)\b`)
 var unsupportedServiceState = regexp.MustCompile(`(?i)\b(service|server|daemon|application|app|deployment)\s+(is|was)\s+(currently\s+|now\s+)?(running|active)\b`)
 var unsupportedResolvedState = regexp.MustCompile(`(?i)\b(issue|bug|problem|failure)\s+(is|was|has been)\s+(fixed|resolved)\b`)
@@ -163,7 +207,7 @@ func buildAgentLedger(messages []oaiMsg, prior ...agentLedger) agentLedger {
 				result := contentToString(m.Content)
 				e.ResultLength = len(result)
 				e.ResultSHA256 = stringSHA256(result)
-				e.Failed = m.ToolResultIsError || failureSignal.MatchString(result)
+				e.Failed = toolResultFailed(m.ToolResultIsError, e.Name, result)
 				e.Preview = boundedUTF8Preview(result, toolResultPreviewBytes)
 				e.hasResult = true
 				calls[m.ToolCallID] = e

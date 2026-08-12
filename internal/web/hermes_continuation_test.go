@@ -652,6 +652,40 @@ func TestHermesCompletedNativeToolCallIsNotReissuedInStream(t *testing.T) {
 	}
 }
 
+func TestHermesStructuredSuccessfulTerminalEvidenceAuthorizesStreamingSuccess(t *testing.T) {
+	chat := &wp1CandidateChat{
+		result: chathub.Result{Text: "Deployment completed successfully."},
+		events: []chathub.StreamEvent{{Kind: "text", Text: "Deployment completed successfully."}},
+	}
+	s := newWP1CandidateServer(t, chat)
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"stream":true,
+		"messages":[
+			{"role":"user","content":"Deploy the service."},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"c1","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"printf ok\"}"}}
+			]},
+			{"role":"tool","tool_call_id":"c1","content":"{\"output\":\"ok\",\"exit_code\":0,\"error\":null}"}
+		]
+	}`
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.hermesOpenAIChat(rr, r)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	stream := rr.Body.String()
+	if got := continuationStreamText(t, stream); got != "Deployment completed successfully." {
+		t.Fatalf("successful evidence was suppressed: text=%q stream=%s", got, stream)
+	}
+	if strings.Contains(stream, unconfirmedToolOutcomeResponse) {
+		t.Fatalf("successful evidence was rewritten as unconfirmed: %s", stream)
+	}
+}
+
 func TestHermesFailedCompletedToolDoesNotAuthorizeStreamingSuccess(t *testing.T) {
 	chat := &wp1CandidateChat{
 		result: chathub.Result{Text: "Deployment completed successfully."},
