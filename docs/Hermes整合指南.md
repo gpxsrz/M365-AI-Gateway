@@ -14,14 +14,21 @@ providers:
     base_url: https://m365.example.com/hermes/v1
     models:
       gpt-5.6-reasoning:
-        context_length: 80000
+        context_length: 64000
+
+compression:
+  proactive_prune_tokens: 41000
+  max_attempts: 3
+  protect_last_n: 20
 ```
 
-`80000` 是目前對 M365 路徑做過 Production live qualification 的起始值，不是 M365-Copilot2API 或 Microsoft 的 API 規格。Hermes 本身硬性要求主模型 context window **至少 64000 tokens**；64K 是 Hermes 的最低可用 floor，不再是本整合目前的建議值。低於 64K（例如 `60000`）雖然可以被設定檔解析，但建立 Agent 時會直接拒絕並回報 context window below the minimum 64K。80K 仍應搭配 `proactive_prune_tokens=41000`，讓 Hermes 原生 pruning 早於 Sidecar 的 `128000 UTF-16` 最終保護線啟動；若 workload 的繁中比例、tool JSON 或 memory payload 更重，應優先把 consumer-side pruning 調得更保守，而不是提高 Sidecar 的 UTF-16 上限。
+`64000` 是目前 M365 路徑的 Production 整合起始值，也是 Hermes 主模型可用的最低 floor。`proactive_prune_tokens=41000` 讓舊 tool result 更早被整理；`max_attempts=3` 暫時維持目前 recovery budget；`protect_last_n=20` 保留近期對話尾端。先以這組值觀察自然長任務，只有在 **64K 已真正生效**後仍能重現「有效壓縮 3 次後再次撞上 M365 `128000 UTF-16`」時，才有理由考慮增加 `max_attempts`，而不是預先把 recovery 次數調大。
 
-不要把此值寫成全域 `model.context_length`，也不要為了 M365 將全域 `compression.threshold_tokens` 壓低；同一個 Hermes 若切換 OpenAI、OpenRouter 或其他 provider，這些全域設定可能造成不必要的提前壓縮。provider/model override 只限制指定 M365 route。
+不要把 context 值寫成全域 `model.context_length`，也不要為了 M365 額外設定全域 `compression.threshold_tokens`；provider/model context override 只限制指定 M365 route。`proactive_prune_tokens`、`max_attempts`、`protect_last_n` 則屬 Hermes compression 的共用設定；若同一個 Hermes 還服務行為差異很大的其他 provider，應另外評估這些全域 compression 值是否合適。
 
-2026-08-12 的 Production canary 已將 M365 `gpt-5.6-reasoning.context_length` 從 64K 提高到 `80000`，並把 `proactive_prune_tokens` 從 48K 降到 `41000`；真實 Hermes oneshot terminal tool continuation 成功完成 2 次 API call，且 Hermes 原生 `ContextCompressor` boundary test 驗證 40999 不 prune、41000 會進入 deterministic old-tool-result prune。全域 `compression.threshold_tokens` 仍不設定。這組數字是目前 M365 整合的 live-qualified 起始值，不是其他 provider 的通用建議，也不應直接提高到 128K；不同語言與 tool JSON 比例仍可能需要更保守的 pruning。
+2026-08-12 的 Production canary 曾將 M365 `gpt-5.6-reasoning.context_length` 從 64K 提高到 `80000`，並把 `proactive_prune_tokens` 從 48K 降到 `41000`；真實 Hermes oneshot terminal tool continuation 成功完成 2 次 API call，且 Hermes 原生 `ContextCompressor` boundary test 驗證 40999 不 prune、41000 會進入 deterministic old-tool-result prune。這項歷史證據仍成立，但 2026-08-13 的真實 tool-heavy 長任務顯示：80K 下即使多次壓縮到約 49K–52K rough tokens，新增的大型 tool results 仍能讓實際 outbound text 反覆超過 `128000 UTF-16`，最後耗盡 3 次 compression recovery。因此目前 Production 建議已回調為 `64000 / 41000 / max_attempts=3 / protect_last_n=20`；80K 是曾驗證可用的較寬鬆設定，不再是目前建議基線。
+
+部分 Hermes CLI 版本會把 dotted config path 裡模型名稱本身的 `.` 當成層級分隔符。例如直接執行 `hermes config set providers.m365-copilot.models.gpt-5.6-reasoning.context_length 64000`，可能錯寫成 `gpt-5 -> 6-reasoning -> context_length`，而真正的 `gpt-5.6-reasoning` 仍保留舊值。對含 `.` 的 model ID，應確認設定工具支援 literal key；不確定時直接檢查 YAML 的實際 key 結構，並以 Hermes runtime 使用的 provider/model context resolver 驗證最終有效值，不要只相信同樣使用 dotted path 的 `config get`。
 
 Hermes 應優先使用專用的 `/hermes/v1` base URL。當這個相容入口的 caller text 確實超過 Sidecar UTF-16 政策時，Sidecar 仍以 HTTP 400 拒絕，但會同時使用 Hermes 相容的 `context_length_exceeded` 錯誤碼與 `input is too long` 恢復提示，讓 Hermes 走既有的 context compression → retry 流程。錯誤訊息仍明確保留真正的 UTF-16 政策與上限，而且不會把 `128000` 描述成模型 token context window。一般 `/v1` caller 仍收到 `text_policy_exceeded`，因此這個相容映射不會改變其他 OpenAI-compatible client 的錯誤契約。
 
@@ -34,6 +41,10 @@ Hermes 常見工具不一定提供 `readOnlyHint`。M365-Copilot2API 不會再�
 若 model tool router 的第一個候選連外層 JSON 都無法解析，Sidecar 最多只做一次 bounded repair。#54 之後，repair prompt 會保留完整原始 router output，不再用固定 6000 字元 compact，因此大型 `execute_code.arguments.code` 或其他結構化 arguments 不會在 Sidecar repair 階段被從中截斷。
 
 完整 repair prompt 仍受現有 `textInputLimitUTF16` 約束；若它本身超過 `128000` 的 Production 設定，Sidecar 會在第二次 upstream call 前以 `tool_router_repair_input_too_large` / `repair_prompt_utf16` fail closed，而不是截短 arguments。**不需要也不建議為此新增 Hermes 設定或提高 M365 `textInputLimitUTF16`。**另外，Sidecar 保證的是「不截斷模型實際產生的 router arguments」，不是保證模型一定逐位元組複製使用者提示詞中的程式碼；模型本身仍可能改寫、展開或重新格式化 arguments。
+
+### Final-answer router envelope
+
+#57 之後，若 final-answer model 再次回傳內部 `{"calls":[],"answer":"..."}`，Sidecar 會在 completion evidence、response-format、checkpoint 與 consumer serialization 之前安全解包。只有完整且明確的 direct-answer envelope 會被解開；普通 JSON 保持原樣，non-empty `calls` 或 ambiguous router-like JSON 會 fail closed，malformed JSON 不會猜測式剝殼。`/hermes/v1/chat/completions` 的 streaming / non-streaming 均已在 Production 實測，consumer 不再看到內部 envelope 或字面 `\n`。
 
 ### 長任務的工具回合上限
 
@@ -74,14 +85,21 @@ providers:
     base_url: https://m365.example.com/hermes/v1
     models:
       gpt-5.6-reasoning:
-        context_length: 80000
+        context_length: 64000
+
+compression:
+  proactive_prune_tokens: 41000
+  max_attempts: 3
+  protect_last_n: 20
 ```
 
-`80000` is the current Production-live-qualified starting point for the M365 route, not an M365-Copilot2API or Microsoft API specification. Hermes itself requires the main model context window to be **at least 64000 tokens**; 64K is the Hermes minimum usable floor, not the current recommendation for this integration. A lower value such as `60000` can be parsed from configuration but is rejected when Hermes constructs the Agent with a below-minimum-64K error. The 80K setting should still be paired with `proactive_prune_tokens=41000` so Hermes native pruning engages before the Sidecar's `128000 UTF-16` final guard. Workloads with heavier Traditional Chinese, tool JSON, or memory payloads should make consumer-side pruning more conservative rather than raising the Sidecar UTF-16 limit.
+`64000` is the current Production integration starting point for the M365 route and is also Hermes' minimum usable main-model floor. `proactive_prune_tokens=41000` reclaims older tool results earlier; `max_attempts=3` keeps the current recovery budget; and `protect_last_n=20` preserves the recent conversation tail. Start with this combination for natural long-running workloads. Only consider increasing `max_attempts` if the **effective 64K setting** still reproduces a fourth transport overflow after three successful compression recoveries.
 
-Avoid using a global `model.context_length` or lowering global `compression.threshold_tokens` only for M365. A Hermes installation that also switches to OpenAI, OpenRouter, or other providers could otherwise compress those routes unnecessarily. A provider/model override remains scoped to the selected M365 route.
+Avoid using a global `model.context_length` or adding a global `compression.threshold_tokens` only for M365. The provider/model context override remains scoped to the selected M365 route. `proactive_prune_tokens`, `max_attempts`, and `protect_last_n` are shared Hermes compression settings, so an installation that also serves substantially different providers should evaluate whether those global compression values remain appropriate.
 
-The 2026-08-12 Production canary raised the M365 `gpt-5.6-reasoning.context_length` from 64K to `80000` and lowered `proactive_prune_tokens` from 48K to `41000`. A real Hermes oneshot terminal-tool turn completed its two API calls successfully, and a native `ContextCompressor` boundary test confirmed no prune at 40999 and deterministic old-tool-result pruning at 41000. Global `compression.threshold_tokens` remains unset. These values are the current live-qualified starting point for the M365 integration, not a universal recommendation for other providers and not a reason to jump directly to 128K; different languages and tool-JSON ratios may still require more conservative pruning.
+The 2026-08-12 Production canary raised M365 `gpt-5.6-reasoning.context_length` from 64K to `80000` and lowered `proactive_prune_tokens` from 48K to `41000`. A real Hermes oneshot terminal-tool turn completed two API calls, and a native `ContextCompressor` boundary test confirmed no prune at 40999 and deterministic old-tool-result pruning at 41000. That historical evidence remains valid, but a real tool-heavy long task on 2026-08-13 showed that, at 80K, repeated compression to roughly 49K–52K rough tokens could still be followed by large tool results that regrew outbound text beyond `128000 UTF-16` until all three compression recoveries were consumed. The current Production recommendation is therefore `64000 / 41000 / max_attempts=3 / protect_last_n=20`; 80K remains a previously validated looser configuration, not the current baseline.
+
+Some Hermes CLI versions interpret dots inside a dotted configuration path as hierarchy separators even when the dot belongs to a model ID. Running `hermes config set providers.m365-copilot.models.gpt-5.6-reasoning.context_length 64000` can therefore create a nested `gpt-5 -> 6-reasoning -> context_length` key while leaving the literal `gpt-5.6-reasoning` entry unchanged. For model IDs containing `.`, use a configuration method that preserves literal keys; when in doubt, inspect the YAML structure and verify the effective value with the same provider/model context resolver used by the Hermes runtime rather than relying only on a dotted-path `config get`.
 
 Hermes should prefer the dedicated `/hermes/v1` base URL. When caller text on that compatibility surface genuinely exceeds the Sidecar UTF-16 policy, the Sidecar still rejects the request with HTTP 400 but supplies both the Hermes-compatible `context_length_exceeded` code and an `input is too long` recovery marker so Hermes can follow its existing context-compression → retry path. The message continues to identify the real UTF-16 policy and configured limit without describing `128000` as a model token context window. Generic `/v1` callers continue to receive `text_policy_exceeded`, so this compatibility mapping does not change the error contract for other OpenAI-compatible clients.
 
@@ -94,6 +112,10 @@ Hermes tools do not always carry `readOnlyHint`. M365-Copilot2API no longer adve
 If the model tool router's first candidate cannot even be parsed as outer JSON, the sidecar performs at most one bounded repair. Since #54, that repair prompt preserves the complete raw router output instead of compacting it to a fixed 6000 characters, so large `execute_code.arguments.code` or other structured arguments are not cut in the middle by the sidecar's repair path.
 
 The complete repair prompt remains subject to the existing `textInputLimitUTF16` budget. If it exceeds the Production setting of `128000`, the sidecar fails closed before the second upstream call with `tool_router_repair_input_too_large` / `repair_prompt_utf16` instead of truncating arguments. **No additional Hermes setting is required, and raising M365 `textInputLimitUTF16` for this behavior is not recommended.** The preservation guarantee applies to the router arguments actually generated by the model; it does not promise byte-for-byte identity with code embedded in the user's prompt, because the model may itself rewrite, expand, or reformat arguments.
+
+### Final-answer router envelope
+
+Since #57, if the final-answer model returns the internal `{"calls":[],"answer":"..."}` envelope again, the sidecar safely unwraps it before completion evidence, response-format handling, checkpointing, and consumer serialization. Only a complete, unambiguous direct-answer envelope is unwrapped. Ordinary JSON remains unchanged, non-empty `calls` or ambiguous router-like JSON fails closed, and malformed JSON is not heuristically stripped. Production streaming and non-streaming `/hermes/v1/chat/completions` canaries confirm that consumers no longer receive the internal envelope or literal `\n` escapes.
 
 ### Tool-round limit for long-running work
 

@@ -106,6 +106,10 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 
 完整 repair prompt 仍會在第二次 upstream call **之前**重新套用目前的 `textInputLimitUTF16`。若 repair input 本身超過上限，Sidecar 會 fail closed，不會為了塞進預算再截斷 arguments；回應為 HTTP `502` / `upstream_error`，並帶 `code=tool_router_repair_input_too_large`、`limit_type=repair_prompt_utf16`、`limit`、`received`、`terminal=true`、`retryable=false` 與 `recommended_action`。這是內部 repair 的安全預算，不是新的 caller 設定，也不是提高 `128000 UTF-16` 的理由；Production 建議仍維持 `textInputLimitUTF16=128000`，由 Hermes/Hindsight 在 consumer 端更早做 token-based pruning/reduction。
 
+### Final-answer router envelope
+
+#57 修正了 final-answer model 再次回傳內部 `{"calls":[],"answer":"..."}` envelope 時的外漏問題。Sidecar 只會解開完整且明確的 direct-answer envelope；一般使用者 JSON 保持原樣，含 non-empty `calls`、重複 internal keys、額外欄位或錯誤型別的 router-like JSON 會 fail closed，malformed JSON 不做猜測式剝殼。Generic `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Memory `/memory/v1/chat/completions` 的 streaming 與 non-streaming 均已完成 Production live qualification，Memory JSON Schema 輸出也另外通過 live canary。
+
 ### 工具回合總量安全邊界
 
 單一 assistant tool-call turn 不論包含 1 個或多個合法平行 calls，都只算 1 個 tool round。一般 `/v1` 與 `/memory/v1` 預設最多 `16` rounds；Hermes 專用 `/hermes/v1` 則使用獨立的 `hermesMaxToolRounds`，預設 `128`，可由管理 UI 或 `M365_HERMES_MAX_TOOL_ROUNDS` 調整（1–512）。這避免 Sidecar 在正常 Hermes 長任務尚未用完自己的 iteration budget 前就先以 16 rounds 中止，同時仍保留有限的 runaway-loop 最終保護。
@@ -114,15 +118,17 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 
 ### Hermes / Hindsight live-qualified 起始設定
 
-2026-08-12 的 Production qualification 使用以下整合設定並通過真實 tool continuation、Hindsight retain/recall/reflect 與 overflow recovery 測試：
+截至 2026-08-13，目前 Production 整合起始設定為：
 
-- Hermes 的 M365 model-specific `context_length=80000`。
-- Hermes `proactive_prune_tokens=41000`；不要為 M365 額外設定全域 `compression.threshold_tokens`。
+- Hermes 的 M365 model-specific `context_length=64000`。
+- Hermes `proactive_prune_tokens=41000`、`compression.max_attempts=3`、`compression.protect_last_n=20`；不要為 M365 額外設定全域 `compression.threshold_tokens`。
 - Hindsight `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000`。
 - Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`。這讓 Reflect 最多嘗試 2 次：deterministic HTTP 400 最多只多重送 1 次後就交回 Hindsight overflow recovery，同時保留一次暫時性 ChatHub／502 自癒機會；其他 operation 的 retry policy 不變。
 - M365 `textInputLimitUTF16` 維持 `128000`。
 
-Model tool router repair 不新增另一個容量設定，也不建議為 #54 調高 `textInputLimitUTF16`。這些是目前對 **M365 transport 特性**做過 live qualification 的起始值，不是 Hermes/Hindsight 的通用上限，更不代表 `128000 UTF-16` 等於 `128000 tokens`。不同語言、tool JSON 比例與 memory workload 仍可能需要更保守的 consumer-side pruning/reduction。
+2026-08-12 的短／中型 Hermes canary 曾驗證 `context_length=80000` 搭配 `proactive_prune_tokens=41000` 可正常完成 tool continuation；但 2026-08-13 的真實 tool-heavy 長任務在 80K 設定下，即使多次壓縮到約 49K–52K rough tokens，新增的大型 tool results 仍可讓實際 outbound text 反覆超過 `128000 UTF-16`，最後耗盡 3 次 compression recovery。因此目前建議回到 Hermes 可用 floor `64000`，先維持 `max_attempts=3`，用更早的 pruning/compression 留出 transport headroom；這不代表 80K 從未可用，而是 64K 對繁中、tool JSON 與長任務更保守。
+
+Model tool router repair 不新增另一個容量設定，也不建議為 #54 調高 `textInputLimitUTF16`。這些是目前對 **M365 transport 特性**做過驗證的整合起始值，不是 Hermes/Hindsight 的通用上限，更不代表 `128000 UTF-16` 等於 `128000 tokens`。不同語言、tool JSON 比例與 memory workload 仍可能需要更保守的 consumer-side pruning/reduction。
 
 ## 開發與驗證
 
@@ -240,6 +246,10 @@ If the model tool router's first candidate is not even parseable as outer JSON a
 
 The complete repair prompt is still checked against the current `textInputLimitUTF16` **before** a second upstream call. If the repair input itself exceeds that budget, the sidecar fails closed instead of truncating arguments to make them fit. It returns HTTP `502` / `upstream_error` with `code=tool_router_repair_input_too_large`, `limit_type=repair_prompt_utf16`, `limit`, `received`, `terminal=true`, `retryable=false`, and `recommended_action`. This is an internal repair safety budget, not a new caller setting and not a reason to raise the `128000 UTF-16` policy. Production guidance remains `textInputLimitUTF16=128000`, with Hermes/Hindsight performing token-based pruning or reduction earlier on the consumer side.
 
+### Final-answer router envelope
+
+#57 fixes leakage when the final-answer model returns the internal `{"calls":[],"answer":"..."}` envelope again. The sidecar unwraps only a complete, unambiguous direct-answer envelope. Ordinary user JSON remains unchanged; router-like JSON with non-empty `calls`, duplicate internal keys, extra fields, or invalid types fails closed, while malformed JSON is not heuristically stripped. Generic `/v1/chat/completions`, Hermes `/hermes/v1/chat/completions`, and Memory `/memory/v1/chat/completions` have all passed Production live qualification in streaming and non-streaming modes, with a separate live JSON Schema canary for Memory.
+
 ### Total tool-round safety boundary
 
 One assistant tool-call turn counts as one tool round regardless of whether it contains one call or multiple valid parallel calls. Generic `/v1` and `/memory/v1` default to `16` rounds. Dedicated `/hermes/v1` uses the independent `hermesMaxToolRounds` setting, defaulting to `128` and configurable from the management UI or `M365_HERMES_MAX_TOOL_ROUNDS` (1–512). This prevents the sidecar from terminating legitimate long-running Hermes work at 16 rounds while retaining a finite final runaway-loop guard.
@@ -248,15 +258,17 @@ Exhausting the profile ceiling remains an HTTP `409` terminal condition and does
 
 ### Live-qualified Hermes / Hindsight starting settings
 
-The 2026-08-12 Production qualification passed real tool continuation, Hindsight retain/recall/reflect, and overflow-recovery checks with these integration settings:
+As of 2026-08-13, the current Production integration starting settings are:
 
-- Hermes M365 model-specific `context_length=80000`.
-- Hermes `proactive_prune_tokens=41000`; do not add a global `compression.threshold_tokens` just for M365.
+- Hermes M365 model-specific `context_length=64000`.
+- Hermes `proactive_prune_tokens=41000`, `compression.max_attempts=3`, and `compression.protect_last_n=20`; do not add a global `compression.threshold_tokens` just for M365.
 - Hindsight `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000`.
 - Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`. Reflect therefore makes at most two attempts: a deterministic HTTP 400 can be repeated at most once before Hindsight overflow recovery takes over, while one retry remains available for transient ChatHub/502 failures. Other operation retry policies remain unchanged.
 - M365 `textInputLimitUTF16` remains `128000`.
 
-Model-tool-router repair adds no separate capacity setting, and #54 is not a reason to raise `textInputLimitUTF16`. These are live-qualified starting points for the **M365 transport characteristics**, not universal Hermes/Hindsight limits, and they do not imply that `128000 UTF-16` equals `128000 tokens`. Different languages, tool-JSON ratios, and memory workloads may still require more conservative consumer-side pruning or reduction.
+The 2026-08-12 short/medium Hermes canary did validate `context_length=80000` with `proactive_prune_tokens=41000` for tool continuation. A real tool-heavy long task on 2026-08-13 later showed that, at 80K, repeated compression to roughly 49K–52K rough tokens could still be followed by large tool results that regrew outbound text beyond the `128000 UTF-16` policy until all three compression-recovery attempts were consumed. The current recommendation therefore returns to Hermes' usable 64K floor while keeping `max_attempts=3`, so pruning/compression begins earlier and leaves more transport headroom. This does not mean 80K never works; 64K is simply the safer baseline for Traditional Chinese, tool-JSON-heavy, long-running workloads.
+
+Model-tool-router repair adds no separate capacity setting, and #54 is not a reason to raise `textInputLimitUTF16`. These are validated integration starting points for the **M365 transport characteristics**, not universal Hermes/Hindsight limits, and they do not imply that `128000 UTF-16` equals `128000 tokens`. Different languages, tool-JSON ratios, and memory workloads may still require more conservative consumer-side pruning or reduction.
 
 ## Privacy and limitations
 
