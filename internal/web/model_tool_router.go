@@ -111,3 +111,85 @@ func parseModelToolDirectAnswer(text string) (string, bool) {
 	answer := strings.TrimSpace(envelope.Answer)
 	return answer, answer != ""
 }
+
+type modelToolEnvelope struct {
+	Calls  []json.RawMessage `json:"calls"`
+	Answer string            `json:"answer"`
+}
+
+func parseExactModelToolEnvelope(text string) (modelToolEnvelope, bool, bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return modelToolEnvelope{}, false, false
+	}
+	decoder := json.NewDecoder(strings.NewReader(text))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return modelToolEnvelope{}, false, false
+	}
+	var envelope modelToolEnvelope
+	seenCalls := false
+	seenAnswer := false
+	duplicateKnown := false
+	unknownField := false
+	invalidKnownType := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return modelToolEnvelope{}, false, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return modelToolEnvelope{}, false, false
+		}
+		var raw json.RawMessage
+		if decoder.Decode(&raw) != nil {
+			return modelToolEnvelope{}, false, false
+		}
+		rawText := strings.TrimSpace(string(raw))
+		switch key {
+		case "calls":
+			if seenCalls {
+				duplicateKnown = true
+				continue
+			}
+			seenCalls = true
+			if len(rawText) < 2 || rawText[0] != '[' || rawText[len(rawText)-1] != ']' || json.Unmarshal(raw, &envelope.Calls) != nil {
+				invalidKnownType = true
+			}
+		case "answer":
+			if seenAnswer {
+				duplicateKnown = true
+				continue
+			}
+			seenAnswer = true
+			if len(rawText) < 2 || rawText[0] != '"' || json.Unmarshal(raw, &envelope.Answer) != nil {
+				invalidKnownType = true
+			}
+		default:
+			unknownField = true
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') || strings.TrimSpace(text[decoder.InputOffset():]) != "" {
+		return modelToolEnvelope{}, false, false
+	}
+	if !seenCalls || !seenAnswer {
+		return modelToolEnvelope{}, false, false
+	}
+	if duplicateKnown || unknownField || invalidKnownType {
+		return modelToolEnvelope{}, false, true
+	}
+	return envelope, true, false
+}
+
+func parseModelToolFinalAnswerEnvelope(text string) (answer string, hasCalls bool, ok bool, ambiguous bool) {
+	envelope, ok, ambiguous := parseExactModelToolEnvelope(text)
+	if ambiguous {
+		return "", false, false, true
+	}
+	if !ok {
+		return "", false, false, false
+	}
+	return envelope.Answer, len(envelope.Calls) > 0, true, false
+}

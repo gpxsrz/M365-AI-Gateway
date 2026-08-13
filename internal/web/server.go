@@ -1093,6 +1093,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	answerTools := []chathub.Tool(nil)
 	answerToolChoice := any(nil)
 	allowAnswerToolCalls := planningMode == "native"
+	routerFinalEnvelopePossible := planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none"
 	if allowAnswerToolCalls {
 		answerTools = body.Tools
 		answerToolChoice = body.ToolChoice
@@ -1350,6 +1351,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			artifactStreamBuffer.WriteString(ev.Text)
 			pending.WriteString(releaseArtifactSafePrefix(&artifactStreamBuffer))
 			v := pending.String()
+			if routerFinalEnvelopePossible && visible.Len() == 0 {
+				candidate := strings.TrimSpace(text.String())
+				if candidate == "" || strings.HasPrefix(candidate, "{") {
+					return nil
+				}
+			}
 			// If the text contains a bash block or a JSON command, don't emit it as text
 			// It will be caught by fencedToolCalls after the stream completes
 			if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
@@ -1387,6 +1394,24 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			writeChatStreamError(w, "upstream_error", upstreamError(err))
 			return
+		}
+		if routerFinalEnvelopePossible {
+			candidate := res.Text
+			if strings.TrimSpace(candidate) == "" {
+				candidate = text.String()
+			}
+			answer, hasCalls, ok, ambiguous := parseModelToolFinalAnswerEnvelope(candidate)
+			if ambiguous {
+				writeChatStreamError(w, "invalid_tool_call_stream", "final answer returned an ambiguous caller-side tool router envelope")
+				return
+			}
+			if ok {
+				if hasCalls {
+					writeChatStreamError(w, "invalid_tool_call_stream", "final answer returned a caller-side tool router envelope containing tool calls")
+					return
+				}
+				res.Text = answer
+			}
 		}
 		mergeSearchEvidence(&res, routerSearchEvidence)
 		res.Images = validImageURLs(res.Images)
@@ -1640,6 +1665,20 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	nativeScan, safe := requireSafeNativeToolEmission(w, res, body.Tools)
 	if !safe {
 		return
+	}
+	if routerFinalEnvelopePossible {
+		answer, hasCalls, ok, ambiguous := parseModelToolFinalAnswerEnvelope(res.Text)
+		if ambiguous {
+			writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "invalid_tool_call", "final answer returned an ambiguous caller-side tool router envelope")
+			return
+		}
+		if ok {
+			if hasCalls {
+				writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "invalid_tool_call", "final answer returned a caller-side tool router envelope containing tool calls")
+				return
+			}
+			res.Text = answer
+		}
 	}
 	mergeSearchEvidence(&res, routerSearchEvidence)
 	res.Images = validImageURLs(res.Images)

@@ -59,6 +59,49 @@ func TestParseModelToolDecisionRejectsBadSchema(t *testing.T) {
 	}
 }
 
+func TestParseExactModelToolEnvelopeRejectsAmbiguousJSON(t *testing.T) {
+	cases := map[string]struct {
+		text      string
+		ambiguous bool
+	}{
+		"ordinary json":                  {text: `{"status":"ok","items":[]}`},
+		"duplicate calls nonempty empty": {text: `{"calls":[{"name":"terminal"}],"calls":[],"answer":"done"}`, ambiguous: true},
+		"duplicate calls empty nonempty": {text: `{"calls":[],"calls":[{"name":"terminal"}],"answer":"done"}`, ambiguous: true},
+		"duplicate calls around extra":   {text: `{"calls":[{"name":"terminal"}],"extra":true,"calls":[],"answer":"done"}`, ambiguous: true},
+		"duplicate answer":               {text: `{"calls":[],"answer":"first","answer":"second"}`, ambiguous: true},
+		"extra field":                    {text: `{"calls":[],"answer":"done","extra":true}`, ambiguous: true},
+		"leading garbage":                {text: `prefix {"calls":[],"answer":"done"}`},
+		"trailing garbage":               {text: `{"calls":[],"answer":"done"} suffix`},
+		"calls null":                     {text: `{"calls":null,"answer":"done"}`, ambiguous: true},
+		"calls object":                   {text: `{"calls":{},"answer":"done"}`, ambiguous: true},
+		"answer null":                    {text: `{"calls":[],"answer":null}`, ambiguous: true},
+		"answer number":                  {text: `{"calls":[],"answer":3}`, ambiguous: true},
+	}
+	for name, text := range cases {
+		t.Run(name, func(t *testing.T) {
+			envelope, ok, ambiguous := parseExactModelToolEnvelope(text.text)
+			if ok {
+				t.Fatalf("unexpected envelope=%#v", envelope)
+			}
+			if ambiguous != text.ambiguous {
+				t.Fatalf("ambiguous=%v want=%v", ambiguous, text.ambiguous)
+			}
+		})
+	}
+}
+
+func TestParseModelToolFinalAnswerEnvelopePreservesAnswerWhitespace(t *testing.T) {
+	want := "  line 1\n\nline 2  \n"
+	raw, err := json.Marshal(map[string]any{"calls": []any{}, "answer": want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, hasCalls, ok, ambiguous := parseModelToolFinalAnswerEnvelope(string(raw))
+	if !ok || ambiguous || hasCalls || answer != want {
+		t.Fatalf("answer=%q hasCalls=%v ok=%v ambiguous=%v", answer, hasCalls, ok, ambiguous)
+	}
+}
+
 func TestModelToolRouterRepairPromptPreservesLongStructuredArguments(t *testing.T) {
 	const sentinel = "MIDDLE_SENTINEL_REQUIRED_FOR_VALID_PYTHON"
 	code := "print('BEGIN')\n" +

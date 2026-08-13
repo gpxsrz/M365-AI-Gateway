@@ -73,6 +73,260 @@ func continuationStreamText(t *testing.T, stream string) string {
 	return text.String()
 }
 
+func TestFinalAnswerUnwrapsRouterEnvelopeAcrossOpenAIProfiles(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		run  func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{name: "generic", path: "/v1/chat/completions", run: func(s *Server, w http.ResponseWriter, r *http.Request) { s.interactiveOpenAIChat(w, r) }},
+		{name: "hermes", path: "/hermes/v1/chat/completions", run: func(s *Server, w http.ResponseWriter, r *http.Request) { s.hermesOpenAIChat(w, r) }},
+		{name: "memory", path: "/memory/v1/chat/completions", run: func(s *Server, w http.ResponseWriter, r *http.Request) { s.memoryOpenAIChat(w, r) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chat := &continuationChat{results: []chathub.Result{
+				{Text: `{"calls":[],"answer":""}`},
+				{Text: `{"calls":[],"answer":"  line 1\n\nline 2  \n"}`},
+			}}
+			s := newWP1CandidateServer(t, &wp1CandidateChat{})
+			s.chat = chat
+			settings := s.settings.get()
+			settings.MemoryCompatibilityEnabled = true
+			s.settings.v = settings
+			body := `{
+				"model":"gpt-5.6-reasoning",
+				"messages":[{"role":"user","content":"Summarize the result."}],
+				"tools":[{
+					"type":"function",
+					"function":{
+						"name":"terminal",
+						"description":"Run a command.",
+						"parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+					}
+				}],
+				"tool_choice":"auto"
+			}`
+			r := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(body))
+			rr := httptest.NewRecorder()
+
+			tc.run(s, rr, r)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			if len(chat.requests) != 2 {
+				t.Fatalf("upstream requests=%d, want router plus final answer", len(chat.requests))
+			}
+			response := wp1DecodeJSON(t, rr.Body.String())
+			choices, _ := response["choices"].([]any)
+			choice, _ := choices[0].(map[string]any)
+			message, _ := choice["message"].(map[string]any)
+			if got := message["content"]; got != "  line 1\n\nline 2  \n" {
+				t.Fatalf("content=%q response=%s", got, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestFinalAnswerStreamUnwrapsRouterEnvelopeAcrossOpenAIProfiles(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		run  func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{name: "generic", path: "/v1/chat/completions", run: func(s *Server, w http.ResponseWriter, r *http.Request) { s.interactiveOpenAIChat(w, r) }},
+		{name: "hermes", path: "/hermes/v1/chat/completions", run: func(s *Server, w http.ResponseWriter, r *http.Request) { s.hermesOpenAIChat(w, r) }},
+		{name: "memory", path: "/memory/v1/chat/completions", run: func(s *Server, w http.ResponseWriter, r *http.Request) { s.memoryOpenAIChat(w, r) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chat := &continuationChat{results: []chathub.Result{
+				{Text: `{"calls":[],"answer":""}`},
+				{Text: `{"calls":[],"answer":"  line 1\n\nline 2  \n"}`},
+			}}
+			s := newWP1CandidateServer(t, &wp1CandidateChat{})
+			s.chat = chat
+			settings := s.settings.get()
+			settings.MemoryCompatibilityEnabled = true
+			s.settings.v = settings
+			body := `{
+				"model":"gpt-5.6-reasoning",
+				"stream":true,
+				"messages":[{"role":"user","content":"Summarize the result."}],
+				"tools":[{
+					"type":"function",
+					"function":{
+						"name":"terminal",
+						"description":"Run a command.",
+						"parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+					}
+				}],
+				"tool_choice":"auto"
+			}`
+			r := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(body))
+			rr := httptest.NewRecorder()
+
+			tc.run(s, rr, r)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			if got := continuationStreamText(t, rr.Body.String()); got != "  line 1\n\nline 2  \n" {
+				t.Fatalf("stream text=%q stream=%s", got, rr.Body.String())
+			}
+			if strings.Contains(rr.Body.String(), `\"calls\"`) || strings.Contains(rr.Body.String(), `\\n`) {
+				t.Fatalf("router envelope leaked into stream: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestHermesFinalAnswerPreservesOrdinaryJSON(t *testing.T) {
+	chat := &continuationChat{results: []chathub.Result{
+		{Text: `{"calls":[],"answer":""}`},
+		{Text: `{"status":"ok","items":[]}`},
+	}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Return JSON status."}],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"terminal",
+				"description":"Run a command.",
+				"parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+			}
+		}],
+		"tool_choice":"auto"
+	}`
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.hermesOpenAIChat(rr, r)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	response := wp1DecodeJSON(t, rr.Body.String())
+	choices, _ := response["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if got := message["content"]; got != `{"status":"ok","items":[]}` {
+		t.Fatalf("content=%q response=%s", got, rr.Body.String())
+	}
+}
+
+func TestHermesFinalAnswerRejectsRouterEnvelopeWithCalls(t *testing.T) {
+	chat := &continuationChat{results: []chathub.Result{
+		{Text: `{"calls":[],"answer":""}`},
+		{Text: `{"calls":[{"name":"terminal","arguments":{"command":"printf late"}}],"answer":""}`},
+	}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Summarize the result."}],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"terminal",
+				"description":"Run a command.",
+				"parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+			}
+		}],
+		"tool_choice":"auto"
+	}`
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.hermesOpenAIChat(rr, r)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := wp1ErrorCode(t, rr); got != "invalid_tool_call" {
+		t.Fatalf("error code=%q body=%s", got, rr.Body.String())
+	}
+}
+
+func TestHermesFinalAnswerStreamRejectsDuplicateRouterCalls(t *testing.T) {
+	chat := &continuationChat{results: []chathub.Result{
+		{Text: `{"calls":[],"answer":""}`},
+		{Text: `{"calls":[{"name":"terminal","arguments":{"command":"printf unsafe"}}],"calls":[],"answer":"done"}`},
+	}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"stream":true,
+		"messages":[{"role":"user","content":"Summarize the result."}],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"terminal",
+				"description":"Run a command.",
+				"parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+			}
+		}],
+		"tool_choice":"auto"
+	}`
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.hermesOpenAIChat(rr, r)
+
+	stream := rr.Body.String()
+	if !strings.Contains(stream, `"code":"invalid_tool_call_stream"`) {
+		t.Fatalf("missing fail-closed stream error: %s", stream)
+	}
+	if strings.Contains(stream, `"content":"done"`) || strings.Contains(stream, `\"calls\"`) {
+		t.Fatalf("ambiguous router envelope leaked as final text: %s", stream)
+	}
+	if got := strings.Count(stream, "data: [DONE]"); got != 1 {
+		t.Fatalf("done count=%d stream=%s", got, stream)
+	}
+}
+
+func TestHermesFinalAnswerPreservesMalformedJSON(t *testing.T) {
+	chat := &continuationChat{results: []chathub.Result{
+		{Text: `{"calls":[],"answer":""}`},
+		{Text: `{"calls":[],"answer":"line 1"`},
+	}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Return the text exactly."}],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"terminal",
+				"description":"Run a command.",
+				"parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+			}
+		}],
+		"tool_choice":"auto"
+	}`
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.hermesOpenAIChat(rr, r)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	response := wp1DecodeJSON(t, rr.Body.String())
+	choices, _ := response["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if got := message["content"]; got != `{"calls":[],"answer":"line 1"` {
+		t.Fatalf("content=%q response=%s", got, rr.Body.String())
+	}
+}
+
 func TestHermesInterruptedToolSequenceReturnsUnconfirmedAnswer(t *testing.T) {
 	chat := &wp1CandidateChat{
 		result: chathub.Result{Text: "Deployment completed successfully."},
