@@ -137,17 +137,19 @@ Content-Type: application/json
 
 ### 流量與 429
 
-Memory 是背景流量，一般 `/v1` 與 `/hermes/v1` 互動請求維持優先權。
+Memory 是背景流量。一般 `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Responses 與 Anthropic 先經同一個帳號級 interactive admission controller，再由 Memory 最後讓位。
 
 目前 controller 行為：
 
+- Interactive 同時執行數與 queue timeout 可設定；waiting queue 有 64 個 waiter 的硬上限，full/timeout 回可重試的 503 + `Retry-After`。
 - Memory 同時執行數有上限。
 - 等待 queue 有 64 個 waiter 的硬上限。
 - queue timeout 可設定。
-- interactive traffic 執行中或 holdoff 期間，Memory 會等待。
+- interactive traffic 執行中、排隊中或 holdoff 期間，Memory 會等待。
 - Microsoft 429 不論由 interactive 或 Memory traffic 收到，都會回饋同一個 shared cooldown。
 - 若 Microsoft 提供 `Retry-After`，shared cooldown 至少尊重該上游等待時間，不會只依本機較短 backoff 提早重撞。
-- 已經執行中的 Memory request 不會因另一條流量收到 429 而被強制殺掉。
+- 已經執行中的 Interactive／Memory request 不會因另一條流量收到 429 而被強制殺掉。
+- M365 不靠 prompt 或 User-Agent 猜主代理、subagent、CLI；基本保護是單一 Microsoft 帳號的全域上限。
 
 ### 非回歸邊界
 
@@ -317,9 +319,9 @@ Then read back `GET /v1/default/banks/{bank_id}/config` and verify the resolved 
 
 ### Traffic and 429 behavior
 
-Memory is background traffic; ordinary `/v1` and `/hermes/v1` interactive traffic remains higher priority.
+Memory is background traffic. Generic `/v1/chat/completions`, Hermes `/hermes/v1/chat/completions`, Responses, and Anthropic first share one account-level interactive admission controller; Memory yields after that class.
 
-The controller now provides bounded Memory concurrency, a hard waiting-queue limit of 64, configurable queue timeout, interactive holdoff, shared 429 cooldown, and propagation of Microsoft `Retry-After` into that cooldown. An already-running Memory request is not forcibly cancelled merely because another request receives a 429.
+The controller provides configurable interactive concurrency and queue timeout with a hard waiting limit of 64 and retryable 503 + `Retry-After` on saturation/timeout. Memory retains its own bounded concurrency, hard waiting limit of 64, queue timeout, and FIFO ordering, but enters only when no interactive request is running or waiting and the interactive holdoff has expired. Microsoft 429 / `Retry-After` creates shared cooldown for subsequent admission in both classes. Work already in flight is not forcibly cancelled. The sidecar does not infer main-agent, subagent, or CLI roles from prompts or User-Agent strings; the basic protection is account-global.
 
 ### Non-regression boundary
 

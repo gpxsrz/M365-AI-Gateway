@@ -372,6 +372,50 @@ func TestServiceLogSanitizersNeverEmitSensitiveValues(t *testing.T) {
 	}
 }
 
+func TestCompatibilityRoutesEnterStructuredDiagnostics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "debug-summary.json")
+	store := openDebugStoreWithPolicy(path, testDebugPolicy())
+	server := newAdminSecurityServer(t, "administrator-password")
+	server.debug = store
+	handler := server.debugMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, target := range []string{"/hermes/v1/chat/completions", "/memory/v1/chat/completions"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, target, strings.NewReader(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`)))
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("route %s status=%d", target, recorder.Code)
+		}
+		if got := safeServiceLogPath(target); got != target {
+			t.Fatalf("safe service path %q=%q", target, got)
+		}
+	}
+	records := store.list()
+	if len(records) != 2 {
+		t.Fatalf("compatibility route records=%d want=2", len(records))
+	}
+	protocols := map[string]bool{}
+	for _, record := range records {
+		protocols[record.Protocol] = true
+		if record.Path != "/hermes/v1/chat/completions" && record.Path != "/memory/v1/chat/completions" {
+			t.Fatalf("unexpected compatibility diagnostic path: %#v", record)
+		}
+	}
+	if !protocols["hermes_chat_completions"] || !protocols["memory_chat_completions"] {
+		t.Fatalf("compatibility protocols were not classified: %#v", protocols)
+	}
+
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previous)
+	trace := httpTrace(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	trace.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", nil))
+	if !strings.Contains(logs.String(), "path=/hermes/v1/chat/completions") {
+		t.Fatalf("Hermes route was omitted from HTTP trace: %s", logs.String())
+	}
+}
+
 func TestDebugAuditEventsAreRedactedAndExposed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "debug-summary.json")
 	store := openDebugStoreWithPolicy(path, testDebugPolicy())

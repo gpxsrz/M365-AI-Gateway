@@ -3,11 +3,13 @@ package web
 import (
 	"context"
 	"fmt"
+	"log"
 	"m365-native/internal/chathub"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 type checkpointRequestMode uint8
@@ -182,26 +184,30 @@ func (s *Server) beginOpenAICheckpoint(ctx context.Context, body *oaiReq, valida
 		}
 		return &publicCheckpointTurn{}, nil
 	}
+	control := checkpointRequestFrom(ctx)
+	if control.Namespace == "" {
+		control.Namespace = "chat-completions"
+	}
+	startedAt := time.Now()
 	s.checkpointLifecycle.RLock()
+	lifecycleWait := time.Since(startedAt)
 	unlock := true
 	defer func() {
 		if unlock {
 			s.checkpointLifecycle.RUnlock()
 		}
 	}()
-	control := checkpointRequestFrom(ctx)
-	if control.Namespace == "" {
-		control.Namespace = "chat-completions"
-	}
 	if control.Untracked {
 		if validateOutbound != nil {
 			if err := validateOutbound(body.Messages); err != nil {
+				logCheckpointBegin(control.Namespace, lifecycleWait, time.Since(startedAt), err)
 				return nil, err
 			}
 		}
 		body.ConversationID = ""
 		body.SessionID = ""
 		body.SessionKey = ""
+		logCheckpointBegin(control.Namespace, lifecycleWait, time.Since(startedAt), nil)
 		return &publicCheckpointTurn{}, nil
 	}
 	owner := apiKeyOwnerFromContext(ctx)
@@ -234,13 +240,26 @@ func (s *Server) beginOpenAICheckpoint(ctx context.Context, body *oaiReq, valida
 		turn, err = s.checkpoints.BeginFullValidated(control.Namespace, owner, key, body.Messages, control.ForceNew, validateOutbound)
 	}
 	if err != nil {
+		logCheckpointBegin(control.Namespace, lifecycleWait, time.Since(startedAt), err)
 		return nil, err
 	}
 	body.Messages = append([]oaiMsg(nil), turn.Outbound...)
 	body.ConversationID = turn.Binding.ConversationID
 	body.SessionID = turn.Binding.SessionID
+	logCheckpointBegin(control.Namespace, lifecycleWait, time.Since(startedAt), nil)
 	unlock = false
 	return &publicCheckpointTurn{turn: turn, binding: turn.Binding, responseID: control.ResponseID, unlock: s.checkpointLifecycle.RUnlock}, nil
+}
+
+func logCheckpointBegin(namespace string, lifecycleWait, total time.Duration, err error) {
+	if lifecycleWait < 100*time.Millisecond && total < 100*time.Millisecond {
+		return
+	}
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	log.Printf("[checkpoint-trace] operation=begin namespace=%s lifecycle_wait_ms=%d total_ms=%d result=%s", namespace, lifecycleWait.Milliseconds(), total.Milliseconds(), result)
 }
 
 func (s *Server) beginLegacyCheckpoint(key, text string) (*publicCheckpointTurn, error) {

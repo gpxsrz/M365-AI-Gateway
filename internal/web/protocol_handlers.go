@@ -443,6 +443,12 @@ func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
+	s.serveInteractiveRequest(w, r, func(w http.ResponseWriter, status int, message string) {
+		writeResponsesError(w, status, "rate_limit_error", message)
+	}, s.responsesCore)
+}
+
+func (s *Server) responsesCore(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeResponsesError(w, 405, "invalid_request_error", "method not allowed")
 		return
@@ -599,6 +605,12 @@ func responsesOutputHasContent(src map[string]any) bool {
 }
 
 func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
+	s.serveInteractiveRequest(w, r, func(w http.ResponseWriter, status int, message string) {
+		writeAnthropicError(w, status, "rate_limit_error", message)
+	}, s.anthropicMessagesCore)
+}
+
+func (s *Server) anthropicMessagesCore(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeAnthropicError(w, 405, "invalid_request_error", "method not allowed")
 		return

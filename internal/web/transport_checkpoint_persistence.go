@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -272,6 +274,7 @@ func (s *transportCheckpointStore) ensureGenerationLocked() error {
 }
 
 func (s *transportCheckpointStore) switchCheckpointGenerationLocked(records map[string]*transportCheckpointRecord) (checkpointGenerationTransition, error) {
+	startedAt := time.Now()
 	transition := checkpointGenerationTransition{
 		oldGeneration:     s.generation,
 		oldRecordBytes:    cloneCheckpointRecordBytes(s.recordBytes),
@@ -287,6 +290,8 @@ func (s *transportCheckpointStore) switchCheckpointGenerationLocked(records map[
 	generationDir := checkpointGenerationPath(s.path, generation)
 	newSizes := make(map[string]int64, len(records))
 	var total int64
+	reusedRecords := 0
+	writtenRecords := 0
 	ids := make([]string, 0, len(records))
 	for id := range records {
 		ids = append(ids, id)
@@ -303,11 +308,29 @@ func (s *transportCheckpointStore) switchCheckpointGenerationLocked(records map[
 			_ = os.RemoveAll(generationDir)
 			return transition, ErrCheckpointCapacity
 		}
-		if err := writeCheckpointFileAtomic(checkpointRecordPath(s.path, generation, id), raw); err != nil {
-			_ = os.RemoveAll(generationDir)
-			return transition, fmt.Errorf("%w: write generation record: %v", ErrCheckpointPersistence, err)
+		destination := checkpointRecordPath(s.path, generation, id)
+		reused := false
+		if transition.oldGeneration != "" && s.recordBytes[id] == int64(len(raw)) {
+			source := checkpointRecordPath(s.path, transition.oldGeneration, id)
+			reused = reuseCheckpointRecordFile(source, destination, raw)
+		}
+		if !reused {
+			if err := writeCheckpointFileAtomic(destination, raw); err != nil {
+				_ = os.RemoveAll(generationDir)
+				return transition, fmt.Errorf("%w: write generation record: %v", ErrCheckpointPersistence, err)
+			}
+			writtenRecords++
+		} else {
+			reusedRecords++
 		}
 		newSizes[id] = int64(len(raw))
+	}
+	// Unchanged records may have been hard-linked from the active generation.
+	// Flush the new directory once before publishing its manifest so a crash
+	// cannot expose a generation whose directory entries were never durable.
+	if err := syncCheckpointDirectory(generationDir); err != nil {
+		_ = os.RemoveAll(generationDir)
+		return transition, fmt.Errorf("%w: sync generation directory: %v", ErrCheckpointPersistence, err)
 	}
 	if err := writeCheckpointManifest(s.path, generation); err != nil {
 		_ = os.RemoveAll(generationDir)
@@ -317,7 +340,35 @@ func (s *transportCheckpointStore) switchCheckpointGenerationLocked(records map[
 	s.generation = generation
 	s.recordBytes = newSizes
 	s.persistedBytes = total
+	s.generationSwitchCount++
+	s.lastGenerationRecordCount = len(records)
+	s.lastGenerationReusedRecordCount = reusedRecords
+	s.lastGenerationWrittenRecordCount = writtenRecords
+	s.lastGenerationDuration = time.Since(startedAt)
+	if len(records) > 0 || s.lastGenerationDuration >= 100*time.Millisecond {
+		log.Printf("[checkpoint-trace] operation=generation_switch records=%d reused=%d written=%d bytes=%d total_ms=%d", len(records), reusedRecords, writtenRecords, total, s.lastGenerationDuration.Milliseconds())
+	}
 	return transition, nil
+}
+
+func reuseCheckpointRecordFile(source, destination string, expected []byte) bool {
+	info, err := os.Lstat(source)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(expected)) {
+		return false
+	}
+	raw, err := os.ReadFile(source)
+	if err != nil || !bytes.Equal(raw, expected) {
+		return false
+	}
+	if err := os.Link(source, destination); err != nil {
+		return false
+	}
+	linked, err := os.ReadFile(destination)
+	if err == nil && bytes.Equal(linked, expected) {
+		return true
+	}
+	_ = os.Remove(destination)
+	return false
 }
 
 func (s *transportCheckpointStore) rollbackCheckpointGenerationLocked(transition checkpointGenerationTransition) error {
@@ -480,6 +531,9 @@ func cleanupCheckpointGenerations(path, active string) {
 }
 
 func syncCheckpointDirectory(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	handle, err := os.Open(dir)
 	if err != nil {
 		return err

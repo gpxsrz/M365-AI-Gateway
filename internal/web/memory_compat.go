@@ -36,29 +36,60 @@ func compatibilityCheckpointControl(path string) (checkpointRequestControl, bool
 }
 
 func (s *Server) interactiveOpenAIChat(w http.ResponseWriter, r *http.Request) {
-	cfg := s.settings.get()
-	if s.compatTraffic == nil {
-		s.compatTraffic = newCompatibilityTrafficController()
+	s.serveInteractiveOpenAI(w, r, s.openaiChat)
+}
+
+func (s *Server) serveInteractiveOpenAI(w http.ResponseWriter, r *http.Request, handler http.HandlerFunc) {
+	s.serveInteractiveRequest(w, r, func(w http.ResponseWriter, status int, message string) {
+		writeOpenAIError(w, status, "rate_limit_error", message)
+	}, handler)
+}
+
+func (s *Server) serveInteractiveRequest(w http.ResponseWriter, r *http.Request, reject func(http.ResponseWriter, int, string), handler http.HandlerFunc) {
+	cfg := serverRuntimeSettings(s)
+	traffic := s.compatibilityTrafficRuntime()
+	release, err := traffic.acquireInteractive(r.Context(), cfg)
+	if err != nil {
+		retryAfter := 1
+		if admission, ok := err.(*interactiveAdmissionError); ok && admission.retryAfter > 0 {
+			retryAfter = admission.retryAfter
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		reject(w, http.StatusServiceUnavailable, "Interactive request is waiting for shared Microsoft account capacity")
+		return
 	}
-	release := s.compatTraffic.beginInteractive()
 	defer release(time.Duration(cfg.InteractivePriorityHoldoffSeconds) * time.Second)
 	tracked := &statusTrackingResponseWriter{ResponseWriter: w}
 	defer func() {
-		s.compatTraffic.observeInteractiveStatus(tracked.finalStatus(), cfg, tracked.Header().Get("Retry-After"))
+		traffic.observeInteractiveStatus(tracked.finalStatus(), cfg, tracked.Header().Get("Retry-After"))
 	}()
-	s.openaiChat(tracked, r)
+	handler(tracked, r)
+}
+
+func (s *Server) compatibilityTrafficRuntime() *compatibilityTrafficController {
+	if s == nil {
+		return newCompatibilityTrafficController()
+	}
+	// One Server instance owns exactly one Microsoft 365 account. The shared
+	// process-local controller is therefore account-scoped by construction;
+	// API-key owners isolate caller/checkpoint state, not upstream capacity.
+	s.mu.Lock()
+	if s.compatTraffic == nil {
+		s.compatTraffic = newCompatibilityTrafficController()
+	}
+	traffic := s.compatTraffic
+	s.mu.Unlock()
+	return traffic
 }
 
 func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
-	cfg := s.settings.get()
+	cfg := serverRuntimeSettings(s)
 	if !cfg.MemoryCompatibilityEnabled {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", "Memory Provider compatibility profile is disabled")
 		return
 	}
-	if s.compatTraffic == nil {
-		s.compatTraffic = newCompatibilityTrafficController()
-	}
-	release, err := s.compatTraffic.acquireMemory(r.Context(), cfg)
+	traffic := s.compatibilityTrafficRuntime()
+	release, err := traffic.acquireMemory(r.Context(), cfg)
 	if err != nil {
 		retryAfter := 1
 		if admission, ok := err.(*memoryAdmissionError); ok && admission.retryAfter > 0 {
@@ -73,7 +104,7 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		status := tracked.finalStatus()
 		release(status)
 		if status == http.StatusTooManyRequests {
-			s.compatTraffic.honorRetryAfter(tracked.Header().Get("Retry-After"))
+			traffic.honorRetryAfter(tracked.Header().Get("Retry-After"))
 		}
 	}()
 	control, _ := compatibilityCheckpointControl(r.URL.Path)
@@ -82,23 +113,14 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) hermesOpenAIChat(w http.ResponseWriter, r *http.Request) {
-	cfg := s.settings.get()
+	cfg := serverRuntimeSettings(s)
 	if !cfg.HermesCompatibilityEnabled {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", "Hermes compatibility profile is disabled")
 		return
 	}
-	if s.compatTraffic == nil {
-		s.compatTraffic = newCompatibilityTrafficController()
-	}
-	release := s.compatTraffic.beginInteractive()
-	defer release(time.Duration(cfg.InteractivePriorityHoldoffSeconds) * time.Second)
-	tracked := &statusTrackingResponseWriter{ResponseWriter: w}
-	defer func() {
-		s.compatTraffic.observeInteractiveStatus(tracked.finalStatus(), cfg, tracked.Header().Get("Retry-After"))
-	}()
 	control, _ := compatibilityCheckpointControl(r.URL.Path)
 	control.Mode = checkpointFullHistory
-	s.openaiChat(tracked, r.WithContext(withCheckpointRequest(r.Context(), control)))
+	s.serveInteractiveOpenAI(w, r.WithContext(withCheckpointRequest(r.Context(), control)), s.openaiChat)
 }
 
 func memorySchemaInstruction(format *responseFormat) string {

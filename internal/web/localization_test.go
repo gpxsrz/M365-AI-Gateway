@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 var forbiddenSimplifiedAdministrationTerms = []string{
@@ -223,6 +224,38 @@ func TestRootPageServesLocalizedTemplates(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedRootInjectsCompatibilitySettingsAsset(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+
+	s := newAdminSecurityServer(t, "administrator-password")
+	now := s.adminNow()
+	s.adminSessions["localized-admin"] = adminSession{CreatedAt: now, LastSeenAt: now, ExpiresAt: now.Add(time.Hour)}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(&http.Cookie{Name: "m365_admin_session", Value: "localized-admin"})
+	recorder := httptest.NewRecorder()
+	s.rootPage(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `<script src="/assets/compat-settings.js"></script>`) {
+		t.Fatalf("compatibility settings asset was not injected: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	asset := httptest.NewRecorder()
+	s.compatibilitySettingsScript(asset, httptest.NewRequest(http.MethodGet, "/assets/compat-settings.js", nil))
+	if asset.Code != http.StatusOK || !strings.HasPrefix(asset.Header().Get("Content-Type"), "text/javascript") || !strings.Contains(asset.Body.String(), "interactiveMaxConcurrent") || !strings.Contains(asset.Body.String(), "interactiveQueueTimeoutSeconds") {
+		t.Fatalf("compatibility settings asset is unavailable: status=%d type=%q body=%s", asset.Code, asset.Header().Get("Content-Type"), asset.Body.String())
+	}
+}
+
 func TestCanonicalManagementIdentifiersRemainEnglish(t *testing.T) {
 	expected := map[string][]string{
 		"web/index.html": {"expiresAt", "updatedAt", "durationMs"},
@@ -268,6 +301,17 @@ func TestLocalizedAdministrationInlineJavaScriptIsValid(t *testing.T) {
 		if output, err := exec.Command(node, "--check", jsPath).CombinedOutput(); err != nil {
 			t.Fatalf("%s localized JavaScript is invalid: %v\n%s", path, err, output)
 		}
+	}
+	raw, err := os.ReadFile(filepath.Join("assets", "compat-settings.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsPath := filepath.Join(t.TempDir(), "compat-settings.js")
+	if err := os.WriteFile(jsPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(node, "--check", jsPath).CombinedOutput(); err != nil {
+		t.Fatalf("embedded compatibility settings JavaScript is invalid: %v\n%s", err, output)
 	}
 }
 

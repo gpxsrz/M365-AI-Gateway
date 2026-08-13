@@ -9,30 +9,38 @@ import (
 	"time"
 )
 
-const memoryQueueMaxWaiting = 64
+const (
+	interactiveQueueMaxWaiting = 64
+	memoryQueueMaxWaiting      = 64
+)
 
 type compatibilityTrafficSnapshot struct {
 	InteractiveInFlight     int       `json:"interactiveInFlight"`
+	InteractiveWaiting      int       `json:"interactiveWaiting"`
 	MemoryInFlight          int       `json:"memoryInFlight"`
 	MemoryWaiting           int       `json:"memoryWaiting"`
 	Memory429Count          uint64    `json:"memory429Count"`
 	Shared429Count          uint64    `json:"shared429Count"`
 	Last429Source           string    `json:"last429Source,omitempty"`
-	MemoryCooldownUntil     time.Time `json:"memoryCooldownUntil,omitempty"`
-	InteractiveHoldoffUntil time.Time `json:"interactiveHoldoffUntil,omitempty"`
+	SharedCooldownUntil     time.Time `json:"sharedCooldownUntil,omitzero"`
+	MemoryCooldownUntil     time.Time `json:"memoryCooldownUntil,omitzero"`
+	InteractiveHoldoffUntil time.Time `json:"interactiveHoldoffUntil,omitzero"`
 }
 
 type compatibilityTrafficController struct {
 	mu                      sync.Mutex
 	interactiveInFlight     int
+	interactiveWaiting      int
 	memoryInFlight          int
 	memoryWaiting           int
 	memory429Count          uint64
 	shared429Count          uint64
 	last429Source           string
-	memoryBackoff           time.Duration
-	memoryCooldownUntil     time.Time
+	sharedBackoff           time.Duration
+	sharedCooldownUntil     time.Time
 	interactiveHoldoffUntil time.Time
+	nextInteractiveWaiterID uint64
+	interactiveQueue        []uint64
 	nextWaiterID            uint64
 	memoryQueue             []uint64
 }
@@ -49,12 +57,14 @@ func (c *compatibilityTrafficController) snapshot() compatibilityTrafficSnapshot
 	defer c.mu.Unlock()
 	return compatibilityTrafficSnapshot{
 		InteractiveInFlight:     c.interactiveInFlight,
+		InteractiveWaiting:      c.interactiveWaiting,
 		MemoryInFlight:          c.memoryInFlight,
 		MemoryWaiting:           c.memoryWaiting,
 		Memory429Count:          c.memory429Count,
 		Shared429Count:          c.shared429Count,
 		Last429Source:           c.last429Source,
-		MemoryCooldownUntil:     c.memoryCooldownUntil,
+		SharedCooldownUntil:     c.sharedCooldownUntil,
+		MemoryCooldownUntil:     c.sharedCooldownUntil,
 		InteractiveHoldoffUntil: c.interactiveHoldoffUntil,
 	}
 }
@@ -66,17 +76,22 @@ func (c *compatibilityTrafficController) beginInteractive() func(time.Duration) 
 	c.mu.Lock()
 	c.interactiveInFlight++
 	c.mu.Unlock()
-	return func(holdoff time.Duration) {
-		c.mu.Lock()
-		if c.interactiveInFlight > 0 {
-			c.interactiveInFlight--
-		}
-		until := time.Now().Add(holdoff)
-		if until.After(c.interactiveHoldoffUntil) {
-			c.interactiveHoldoffUntil = until
-		}
-		c.mu.Unlock()
+	return c.releaseInteractive
+}
+
+func (c *compatibilityTrafficController) releaseInteractive(holdoff time.Duration) {
+	if c == nil {
+		return
 	}
+	c.mu.Lock()
+	if c.interactiveInFlight > 0 {
+		c.interactiveInFlight--
+	}
+	until := time.Now().Add(holdoff)
+	if until.After(c.interactiveHoldoffUntil) {
+		c.interactiveHoldoffUntil = until
+	}
+	c.mu.Unlock()
 }
 
 type memoryAdmissionError struct {
@@ -86,6 +101,24 @@ type memoryAdmissionError struct {
 
 func (e *memoryAdmissionError) Error() string { return e.err.Error() }
 func (e *memoryAdmissionError) Unwrap() error { return e.err }
+
+type interactiveAdmissionError struct {
+	err        error
+	retryAfter int
+}
+
+func (e *interactiveAdmissionError) Error() string { return e.err.Error() }
+func (e *interactiveAdmissionError) Unwrap() error { return e.err }
+
+func (c *compatibilityTrafficController) removeInteractiveWaiterLocked(id uint64) {
+	for i, queued := range c.interactiveQueue {
+		if queued == id {
+			c.interactiveQueue = append(c.interactiveQueue[:i], c.interactiveQueue[i+1:]...)
+			break
+		}
+	}
+	c.interactiveWaiting = len(c.interactiveQueue)
+}
 
 func (c *compatibilityTrafficController) removeWaiterLocked(id uint64) {
 	for i, queued := range c.memoryQueue {
@@ -100,8 +133,8 @@ func (c *compatibilityTrafficController) removeWaiterLocked(id uint64) {
 func (c *compatibilityTrafficController) retryAfterLocked(cfg runtimeSettings, id uint64) int {
 	now := time.Now()
 	until := c.interactiveHoldoffUntil
-	if c.memoryCooldownUntil.After(until) {
-		until = c.memoryCooldownUntil
+	if c.sharedCooldownUntil.After(until) {
+		until = c.sharedCooldownUntil
 	}
 	seconds := 2 + int(id%4)
 	if until.After(now) {
@@ -119,29 +152,50 @@ func (c *compatibilityTrafficController) retryAfterLocked(cfg runtimeSettings, i
 	return seconds
 }
 
+func (c *compatibilityTrafficController) interactiveRetryAfterLocked(cfg runtimeSettings, id uint64) int {
+	seconds := 2 + int(id%4)
+	if c.sharedCooldownUntil.After(time.Now()) {
+		remaining := int(time.Until(c.sharedCooldownUntil).Seconds()) + 1
+		if remaining > seconds {
+			seconds = remaining
+		}
+	}
+	if seconds > cfg.InteractiveQueueTimeoutSeconds {
+		seconds = cfg.InteractiveQueueTimeoutSeconds
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
+}
+
 func (c *compatibilityTrafficController) applyRateLimitLocked(cfg runtimeSettings, source string) {
 	initial := time.Duration(cfg.MemoryBackoffInitialSeconds) * time.Second
 	maximum := time.Duration(cfg.MemoryBackoffMaxSeconds) * time.Second
-	if c.memoryBackoff < initial {
-		c.memoryBackoff = initial
+	if c.sharedBackoff < initial {
+		c.sharedBackoff = initial
 	} else {
-		c.memoryBackoff *= 2
-		if c.memoryBackoff > maximum {
-			c.memoryBackoff = maximum
+		c.sharedBackoff *= 2
+		if c.sharedBackoff > maximum {
+			c.sharedBackoff = maximum
 		}
 	}
-	c.memoryCooldownUntil = time.Now().Add(c.memoryBackoff)
+	c.sharedCooldownUntil = time.Now().Add(c.sharedBackoff)
 	c.shared429Count++
 	c.last429Source = source
 }
 
 func (c *compatibilityTrafficController) observeInteractiveStatus(status int, cfg runtimeSettings, retryAfter string) {
-	if c == nil || status != http.StatusTooManyRequests {
+	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	c.applyRateLimitLocked(cfg, "interactive")
-	c.extendCooldownLocked(retryAfter, time.Now())
+	if status == http.StatusTooManyRequests {
+		c.applyRateLimitLocked(cfg, "interactive")
+		c.extendCooldownLocked(retryAfter, time.Now())
+	} else if status >= 200 && status < 500 {
+		c.sharedBackoff = 0
+	}
 	c.mu.Unlock()
 }
 
@@ -170,8 +224,56 @@ func (c *compatibilityTrafficController) extendCooldownLocked(retryAfter string,
 		return
 	}
 	until := now.Add(delay)
-	if until.After(c.memoryCooldownUntil) {
-		c.memoryCooldownUntil = until
+	if until.After(c.sharedCooldownUntil) {
+		c.sharedCooldownUntil = until
+	}
+}
+
+func (c *compatibilityTrafficController) acquireInteractive(ctx context.Context, cfg runtimeSettings) (func(time.Duration), error) {
+	if c == nil {
+		return func(time.Duration) {}, nil
+	}
+	queueTimeout := time.Duration(cfg.InteractiveQueueTimeoutSeconds) * time.Second
+	queueCtx, cancel := context.WithTimeout(ctx, queueTimeout)
+	defer cancel()
+
+	c.mu.Lock()
+	if len(c.interactiveQueue) >= interactiveQueueMaxWaiting {
+		retryAfter := c.interactiveRetryAfterLocked(cfg, c.nextInteractiveWaiterID)
+		c.mu.Unlock()
+		return nil, &interactiveAdmissionError{err: errors.New("interactive waiting queue is full"), retryAfter: retryAfter}
+	}
+	id := c.nextInteractiveWaiterID
+	c.nextInteractiveWaiterID++
+	c.interactiveQueue = append(c.interactiveQueue, id)
+	c.interactiveWaiting = len(c.interactiveQueue)
+	c.mu.Unlock()
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		now := time.Now()
+		c.mu.Lock()
+		atHead := len(c.interactiveQueue) > 0 && c.interactiveQueue[0] == id
+		allowed := atHead && c.interactiveInFlight < cfg.InteractiveMaxConcurrent && !now.Before(c.sharedCooldownUntil)
+		if allowed {
+			c.interactiveQueue = c.interactiveQueue[1:]
+			c.interactiveWaiting = len(c.interactiveQueue)
+			c.interactiveInFlight++
+			c.mu.Unlock()
+			return c.releaseInteractive, nil
+		}
+		c.mu.Unlock()
+
+		select {
+		case <-queueCtx.Done():
+			c.mu.Lock()
+			retryAfter := c.interactiveRetryAfterLocked(cfg, id)
+			c.removeInteractiveWaiterLocked(id)
+			c.mu.Unlock()
+			return nil, &interactiveAdmissionError{err: queueCtx.Err(), retryAfter: retryAfter}
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -201,9 +303,9 @@ func (c *compatibilityTrafficController) acquireMemory(ctx context.Context, cfg 
 		now := time.Now()
 		c.mu.Lock()
 		atHead := len(c.memoryQueue) > 0 && c.memoryQueue[0] == id
-		allowed := atHead && c.interactiveInFlight == 0 &&
+		allowed := atHead && c.interactiveInFlight == 0 && c.interactiveWaiting == 0 &&
 			!now.Before(c.interactiveHoldoffUntil) &&
-			!now.Before(c.memoryCooldownUntil) &&
+			!now.Before(c.sharedCooldownUntil) &&
 			c.memoryInFlight < cfg.MemoryMaxConcurrent
 		if allowed {
 			c.memoryQueue = c.memoryQueue[1:]
@@ -219,7 +321,7 @@ func (c *compatibilityTrafficController) acquireMemory(ctx context.Context, cfg 
 					c.memory429Count++
 					c.applyRateLimitLocked(cfg, "memory")
 				} else if status >= 200 && status < 500 {
-					c.memoryBackoff = 0
+					c.sharedBackoff = 0
 				}
 				c.mu.Unlock()
 			}, nil

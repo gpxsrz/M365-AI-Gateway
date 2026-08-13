@@ -20,11 +20,14 @@ func TestAdminSettingsHTTP(t *testing.T) {
 		t.Fatalf("GET=%d %s", w.Code, w.Body.String())
 	}
 	var getBody struct {
-		Settings              runtimeSettings `json:"settings"`
-		ToolRoundPolicy       map[string]int  `json:"toolRoundPolicy"`
-		CodexModels           []string        `json:"codexModels"`
-		UpstreamTones         []string        `json:"upstreamTones"`
-		RestartRequiredFields []string        `json:"restartRequiredFields"`
+		Settings              runtimeSettings                        `json:"settings"`
+		SettingStatus         map[string]settingValueStatus          `json:"settingStatus"`
+		CompatibilityTraffic  compatibilityTrafficSnapshot           `json:"compatibilityTraffic"`
+		CheckpointPersistence transportCheckpointPersistenceSnapshot `json:"checkpointPersistence"`
+		ToolRoundPolicy       map[string]int                         `json:"toolRoundPolicy"`
+		CodexModels           []string                               `json:"codexModels"`
+		UpstreamTones         []string                               `json:"upstreamTones"`
+		RestartRequiredFields []string                               `json:"restartRequiredFields"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &getBody); err != nil {
 		t.Fatal(err)
@@ -32,8 +35,11 @@ func TestAdminSettingsHTTP(t *testing.T) {
 	if len(getBody.Settings.ModelMappings) == 0 || len(getBody.CodexModels) == 0 || len(getBody.UpstreamTones) == 0 {
 		t.Fatalf("missing model mapping settings: %#v", getBody)
 	}
-	if getBody.Settings.ChatMode != chatModePrivate || getBody.Settings.TextInputLimitUTF16 != defaultTextInputLimitUTF16 || getBody.Settings.HermesMaxToolRounds != 128 {
+	if getBody.Settings.ChatMode != chatModePrivate || getBody.Settings.TextInputLimitUTF16 != defaultTextInputLimitUTF16 || getBody.Settings.HermesMaxToolRounds != 128 || getBody.Settings.InteractiveMaxConcurrent != 2 || getBody.Settings.InteractiveQueueTimeoutSeconds != 300 {
 		t.Fatalf("missing WP6 defaults: %#v", getBody.Settings)
+	}
+	if _, ok := getBody.SettingStatus["interactiveMaxConcurrent"]; !ok {
+		t.Fatalf("interactive admission provenance missing: %#v", getBody.SettingStatus)
 	}
 	if getBody.ToolRoundPolicy["generic"] != 16 || getBody.ToolRoundPolicy["hermes"] != 128 || getBody.ToolRoundPolicy["memory"] != 16 {
 		t.Fatalf("tool round policy=%#v", getBody.ToolRoundPolicy)
@@ -49,6 +55,8 @@ func TestAdminSettingsHTTP(t *testing.T) {
 	v.MaxToolCallsPerTurn = 1
 	v.MaxToolRounds = 24
 	v.HermesMaxToolRounds = 96
+	v.InteractiveMaxConcurrent = 3
+	v.InteractiveQueueTimeoutSeconds = 240
 	v.ChatTimeoutSeconds = 75
 	v.ImageTimeoutSeconds = 180
 	b, _ := json.Marshal(v)
@@ -58,7 +66,7 @@ func TestAdminSettingsHTTP(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("PUT=%d %s", w.Code, w.Body.String())
 	}
-	if st.get().ChatTimeoutSeconds != 75 || st.get().ChatMode != chatModeNormal || st.get().TextInputLimitUTF16 != 262144 || st.get().HermesMaxToolRounds != 96 {
+	if st.get().ChatTimeoutSeconds != 75 || st.get().ChatMode != chatModeNormal || st.get().TextInputLimitUTF16 != 262144 || st.get().HermesMaxToolRounds != 96 || st.get().InteractiveMaxConcurrent != 3 || st.get().InteractiveQueueTimeoutSeconds != 240 {
 		t.Fatal("hot setting not updated")
 	}
 	beforeInvalid := st.get()
@@ -102,7 +110,7 @@ func TestAdminSettingsHTTPPartialPUTPreservesNewCompatibilityFields(t *testing.T
 		t.Fatalf("partial PUT=%d %s", w.Code, w.Body.String())
 	}
 	got := st.get()
-	if got.ChatMode != chatModeNormal || got.MemoryMaxConcurrent != before.MemoryMaxConcurrent || got.MemoryBackoffInitialSeconds != before.MemoryBackoffInitialSeconds || got.HermesCompatibilityEnabled != before.HermesCompatibilityEnabled || got.HermesMaxToolRounds != before.HermesMaxToolRounds {
+	if got.ChatMode != chatModeNormal || got.InteractiveMaxConcurrent != before.InteractiveMaxConcurrent || got.InteractiveQueueTimeoutSeconds != before.InteractiveQueueTimeoutSeconds || got.MemoryMaxConcurrent != before.MemoryMaxConcurrent || got.MemoryBackoffInitialSeconds != before.MemoryBackoffInitialSeconds || got.HermesCompatibilityEnabled != before.HermesCompatibilityEnabled || got.HermesMaxToolRounds != before.HermesMaxToolRounds {
 		t.Fatalf("partial PUT did not preserve compatibility fields: before=%#v after=%#v", before, got)
 	}
 }

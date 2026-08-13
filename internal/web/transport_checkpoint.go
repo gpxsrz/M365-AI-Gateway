@@ -73,6 +73,16 @@ type transportCheckpointView struct {
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
+type transportCheckpointPersistenceSnapshot struct {
+	RecordCount                      int    `json:"recordCount"`
+	PersistedBytes                   int64  `json:"persistedBytes"`
+	GenerationSwitchCount            uint64 `json:"generationSwitchCount"`
+	LastGenerationRecordCount        int    `json:"lastGenerationRecordCount"`
+	LastGenerationReusedRecordCount  int    `json:"lastGenerationReusedRecordCount"`
+	LastGenerationWrittenRecordCount int    `json:"lastGenerationWrittenRecordCount"`
+	LastGenerationDurationMS         int64  `json:"lastGenerationDurationMs"`
+}
+
 type checkpointTurn struct {
 	Binding                   checkpointBinding
 	Outbound                  []oaiMsg
@@ -113,14 +123,19 @@ func (t *checkpointTurn) Abort() error {
 }
 
 type transportCheckpointStore struct {
-	mu             sync.Mutex
-	path           string
-	records        map[string]*transportCheckpointRecord
-	now            func() time.Time
-	generation     string
-	recordBytes    map[string]int64
-	persistedBytes int64
-	nextPruneAt    time.Time
+	mu                               sync.Mutex
+	path                             string
+	records                          map[string]*transportCheckpointRecord
+	now                              func() time.Time
+	generation                       string
+	recordBytes                      map[string]int64
+	persistedBytes                   int64
+	nextPruneAt                      time.Time
+	generationSwitchCount            uint64
+	lastGenerationRecordCount        int
+	lastGenerationReusedRecordCount  int
+	lastGenerationWrittenRecordCount int
+	lastGenerationDuration           time.Duration
 }
 
 type transportCheckpointFile struct {
@@ -215,6 +230,23 @@ func (s *transportCheckpointStore) List() ([]transportCheckpointView, error) {
 		return views[i].CreatedAt.Before(views[j].CreatedAt)
 	})
 	return views, nil
+}
+
+func (s *transportCheckpointStore) persistenceSnapshot() transportCheckpointPersistenceSnapshot {
+	if s == nil {
+		return transportCheckpointPersistenceSnapshot{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return transportCheckpointPersistenceSnapshot{
+		RecordCount:                      len(s.records),
+		PersistedBytes:                   s.persistedBytes,
+		GenerationSwitchCount:            s.generationSwitchCount,
+		LastGenerationRecordCount:        s.lastGenerationRecordCount,
+		LastGenerationReusedRecordCount:  s.lastGenerationReusedRecordCount,
+		LastGenerationWrittenRecordCount: s.lastGenerationWrittenRecordCount,
+		LastGenerationDurationMS:         s.lastGenerationDuration.Milliseconds(),
+	}
 }
 
 func (s *transportCheckpointStore) Delete(recordID string) (bool, error) {

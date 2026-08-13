@@ -39,6 +39,8 @@ type runtimeSettings struct {
 	ChatMode                          string         `json:"chatMode"`
 	HermesCompatibilityEnabled        bool           `json:"hermesCompatibilityEnabled"`
 	MemoryCompatibilityEnabled        bool           `json:"memoryCompatibilityEnabled"`
+	InteractiveMaxConcurrent          int            `json:"interactiveMaxConcurrent"`
+	InteractiveQueueTimeoutSeconds    int            `json:"interactiveQueueTimeoutSeconds"`
 	MemoryMaxConcurrent               int            `json:"memoryMaxConcurrent"`
 	MemoryQueueTimeoutSeconds         int            `json:"memoryQueueTimeoutSeconds"`
 	InteractivePriorityHoldoffSeconds int            `json:"interactivePriorityHoldoffSeconds"`
@@ -125,6 +127,8 @@ func defaultRuntimeSettings() runtimeSettings {
 		ChatMode:                          chatModePrivate,
 		HermesCompatibilityEnabled:        true,
 		MemoryCompatibilityEnabled:        false,
+		InteractiveMaxConcurrent:          envInt("M365_INTERACTIVE_MAX_CONCURRENT", 2),
+		InteractiveQueueTimeoutSeconds:    envInt("M365_INTERACTIVE_QUEUE_TIMEOUT_SECONDS", 300),
 		MemoryMaxConcurrent:               envInt("M365_MEMORY_MAX_CONCURRENT", 2),
 		MemoryQueueTimeoutSeconds:         envInt("M365_MEMORY_QUEUE_TIMEOUT_SECONDS", 60),
 		InteractivePriorityHoldoffSeconds: interactivePriorityHoldoffDefault(),
@@ -186,6 +190,12 @@ func loadSettingsStore(path string) *settingsStore {
 			}
 			var rawFields map[string]json.RawMessage
 			if err := json.Unmarshal(b, &rawFields); err == nil {
+				if _, exists := rawFields["interactiveMaxConcurrent"]; !exists {
+					migrateSettings = true
+				}
+				if _, exists := rawFields["interactiveQueueTimeoutSeconds"]; !exists {
+					migrateSettings = true
+				}
 				if legacy, exists := rawFields["hermesPriorityHoldoffSeconds"]; exists {
 					if !fieldPersisted(s.persistedFields, "interactivePriorityHoldoffSeconds") {
 						if err := json.Unmarshal(legacy, &s.v.InteractivePriorityHoldoffSeconds); err != nil {
@@ -224,6 +234,12 @@ func firstNonEmptySetting(values ...string) string {
 func validateSettings(v runtimeSettings) error {
 	if v.ChatMode != chatModePrivate && v.ChatMode != chatModeNormal {
 		return fmt.Errorf("聊天模式必須為 private 或 normal")
+	}
+	if v.InteractiveMaxConcurrent < 1 || v.InteractiveMaxConcurrent > 16 {
+		return fmt.Errorf("互動流量同時請求上限必須為 1-16")
+	}
+	if v.InteractiveQueueTimeoutSeconds < 1 || v.InteractiveQueueTimeoutSeconds > 600 {
+		return fmt.Errorf("互動流量排隊逾時必須為 1-600 秒")
 	}
 	if v.MemoryMaxConcurrent < 1 || v.MemoryMaxConcurrent > 16 {
 		return fmt.Errorf("Memory 同時請求上限必須為 1-16")
@@ -497,6 +513,8 @@ func settingsStatus(store *settingsStore) map[string]settingValueStatus {
 	}
 	cfg, persisted, injected := store.provenanceSnapshot()
 	status := map[string]settingValueStatus{
+		"interactiveMaxConcurrent":          seededSettingStatus(cfg.InteractiveMaxConcurrent, "interactiveMaxConcurrent", "M365_INTERACTIVE_MAX_CONCURRENT", persisted, positiveIntegerEnvActive("M365_INTERACTIVE_MAX_CONCURRENT")),
+		"interactiveQueueTimeoutSeconds":    seededSettingStatus(cfg.InteractiveQueueTimeoutSeconds, "interactiveQueueTimeoutSeconds", "M365_INTERACTIVE_QUEUE_TIMEOUT_SECONDS", persisted, positiveIntegerEnvActive("M365_INTERACTIVE_QUEUE_TIMEOUT_SECONDS")),
 		"memoryMaxConcurrent":               seededSettingStatus(cfg.MemoryMaxConcurrent, "memoryMaxConcurrent", "M365_MEMORY_MAX_CONCURRENT", persisted, positiveIntegerEnvActive("M365_MEMORY_MAX_CONCURRENT")),
 		"memoryQueueTimeoutSeconds":         seededSettingStatus(cfg.MemoryQueueTimeoutSeconds, "memoryQueueTimeoutSeconds", "M365_MEMORY_QUEUE_TIMEOUT_SECONDS", persisted, positiveIntegerEnvActive("M365_MEMORY_QUEUE_TIMEOUT_SECONDS")),
 		"interactivePriorityHoldoffSeconds": seededSettingStatus(cfg.InteractivePriorityHoldoffSeconds, "interactivePriorityHoldoffSeconds", interactivePriorityHoldoffEnvName(), persisted, nonNegativeIntegerEnvActive(interactivePriorityHoldoffEnvName())),
@@ -537,16 +555,18 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		cfg := s.settings.get()
-		traffic := compatibilityTrafficSnapshot{}
-		if s.compatTraffic != nil {
-			traffic = s.compatTraffic.snapshot()
+		traffic := s.compatibilityTrafficRuntime().snapshot()
+		checkpointPersistence := transportCheckpointPersistenceSnapshot{}
+		if s.checkpoints != nil {
+			checkpointPersistence = s.checkpoints.persistenceSnapshot()
 		}
 		genericRounds := configuredMaxToolRounds(s.settings)
 		hermesRounds := configuredHermesMaxToolRounds(s.settings)
 		jsonOut(w, map[string]any{
-			"settings":             cfg,
-			"settingStatus":        settingsStatus(s.settings),
-			"compatibilityTraffic": traffic,
+			"settings":              cfg,
+			"settingStatus":         settingsStatus(s.settings),
+			"compatibilityTraffic":  traffic,
+			"checkpointPersistence": checkpointPersistence,
 			"toolRoundPolicy": map[string]int{
 				"generic": genericRounds,
 				"hermes":  hermesRounds,

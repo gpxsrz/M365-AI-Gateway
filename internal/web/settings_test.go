@@ -115,6 +115,48 @@ func TestHermesToolRoundLimitDefaultsWhenExistingSettingsLackNewField(t *testing
 	}
 }
 
+func TestInteractiveAdmissionDefaultsWhenExistingSettingsLackNewFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	legacy := defaultRuntimeSettings()
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "interactiveMaxConcurrent")
+	delete(fields, "interactiveQueueTimeoutSeconds")
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := loadSettingsStore(path)
+	if store.loadErr != nil {
+		t.Fatal(store.loadErr)
+	}
+	settings := store.get()
+	if settings.InteractiveMaxConcurrent != 2 || settings.InteractiveQueueTimeoutSeconds != 300 {
+		t.Fatalf("interactive admission defaults=%d,%d want=2,300", settings.InteractiveMaxConcurrent, settings.InteractiveQueueTimeoutSeconds)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrated map[string]any
+	if err := json.Unmarshal(persisted, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated["interactiveMaxConcurrent"] != float64(2) || migrated["interactiveQueueTimeoutSeconds"] != float64(300) {
+		t.Fatalf("interactive admission migration was not persisted: %#v", migrated)
+	}
+}
+
 func TestMemoryCompatibilityExplicitDisabledSurvivesReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	store := &settingsStore{path: path, v: defaultRuntimeSettings()}
@@ -327,6 +369,18 @@ func TestLongestRequestTimeoutIncludesMemoryQueueBeforeChat(t *testing.T) {
 	settings := defaultRuntimeSettings()
 	settings.MemoryCompatibilityEnabled = true
 	settings.MemoryQueueTimeoutSeconds = 600
+	settings.ChatTimeoutSeconds = 3600
+	settings.ImageTimeoutSeconds = 150
+	server := &Server{settings: &settingsStore{v: settings}}
+	if got := server.LongestRequestTimeout(); got != 4200*time.Second {
+		t.Fatalf("longest request timeout=%v want=%v", got, 4200*time.Second)
+	}
+}
+
+func TestLongestRequestTimeoutIncludesInteractiveQueueBeforeChat(t *testing.T) {
+	settings := defaultRuntimeSettings()
+	settings.MemoryCompatibilityEnabled = false
+	settings.InteractiveQueueTimeoutSeconds = 600
 	settings.ChatTimeoutSeconds = 3600
 	settings.ImageTimeoutSeconds = 150
 	server := &Server{settings: &settingsStore{v: settings}}

@@ -172,6 +172,86 @@ func TestTransportCheckpointExistingTurnPersistsOnlyTouchedRecordNearCapacity(t 
 	_ = turn.Abort()
 }
 
+func TestTransportCheckpointCapacityReusesUnchangedRecordFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoints", "transport.json")
+	store, err := openTransportCheckpointStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := checkpointDigest(transportCheckpointOwnerDomain, "owner")
+	now := store.now()
+	stableID := fmt.Sprintf("record-%03d", transportCheckpointMaxRecords-1)
+
+	store.mu.Lock()
+	for i := 0; i < transportCheckpointMaxRecords; i++ {
+		id := fmt.Sprintf("record-%03d", i)
+		store.records[id] = &transportCheckpointRecord{
+			ID:             id,
+			Namespace:      "hermes",
+			OwnerDigest:    owner,
+			KeyDigest:      checkpointDigest(transportCheckpointKeyDomain, id),
+			ConversationID: "conversation-" + id,
+			MessageDigests: []string{},
+			HashChain:      []string{},
+			CreatedAt:      now.Add(time.Duration(i) * time.Second),
+			UpdatedAt:      now.Add(time.Duration(i) * time.Second),
+			Revision:       2,
+		}
+	}
+	if err := store.persistLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	oldGeneration := store.generation
+	stableBefore, err := os.Stat(checkpointRecordPath(path, oldGeneration, stableID))
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	turn, err := store.BeginFull("hermes", "owner", "new-key", []oaiMsg{{Role: "user", Content: "new"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	newGeneration := store.generation
+	store.mu.Unlock()
+	if newGeneration == oldGeneration {
+		t.Fatal("capacity eviction did not atomically switch checkpoint generation")
+	}
+	stableAfter, err := os.Stat(checkpointRecordPath(path, newGeneration, stableID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(stableBefore, stableAfter) {
+		t.Fatal("capacity eviction rewrote an unchanged checkpoint record")
+	}
+	snapshot := store.persistenceSnapshot()
+	if snapshot.RecordCount != transportCheckpointMaxRecords || snapshot.LastGenerationRecordCount != transportCheckpointMaxRecords || snapshot.LastGenerationReusedRecordCount != transportCheckpointMaxRecords-1 || snapshot.LastGenerationWrittenRecordCount != 1 {
+		t.Fatalf("unexpected checkpoint persistence snapshot after capacity eviction: %#v", snapshot)
+	}
+	acceptForTest(t, turn, "conversation-new", "session-new", []oaiMsg{{Role: "assistant", Content: "answer"}}, "")
+
+	reopened, err := openTransportCheckpointStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	views := checkpointViewsForTest(t, reopened)
+	if len(views) != transportCheckpointMaxRecords {
+		t.Fatalf("checkpoint count after restart=%d want=%d", len(views), transportCheckpointMaxRecords)
+	}
+	foundStable := false
+	for _, view := range views {
+		if view.ID == stableID {
+			foundStable = true
+			break
+		}
+	}
+	if !foundStable {
+		t.Fatal("unchanged checkpoint record was lost during capacity eviction")
+	}
+}
+
 func TestTransportCheckpointCapacityEvictsRequestingOwnerBeforeOtherOwners(t *testing.T) {
 	store := openCheckpointForTest(t)
 	now := store.now()

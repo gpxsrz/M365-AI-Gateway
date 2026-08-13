@@ -8,7 +8,7 @@
 - 不要在任何公開紀錄中提交 token、cookies、HAR、OneDrive / SharePoint 私有連結、artifact 原始位址或帳號快取。
 - `Private / Temporary Chat` 只代表 no-ordinary-history transport policy，不代表 Microsoft 完全不保留任何資料；一般文件上傳仍可能建立 OneDrive / SharePoint staging copy。
 - `Code Interpreter` 產生的 artifact 若要回傳給 consumer，必須走 authenticated artifact fetch；不要直接暴露瀏覽器 `blob:` URL 或未驗證的上游暫時連結。
-- Hermes 與 Hindsight 可以共用同一個 Microsoft 365 帳號，但 checkpoint 邊界與相容入口必須彼此隔離。帳號級吞吐量仍然共用，因此新的 Memory 背景工作必須讓位給互動式 `/v1/chat/completions` 與 `/hermes/v1/chat/completions` 流量，不應用大量併發壓 ChatHub。
+- Hermes 與 Hindsight 可以共用同一個 Microsoft 365 帳號，但 checkpoint 邊界與相容入口必須彼此隔離。帳號級吞吐量仍然共用，因此所有 chat 類 interactive route 必須經有界 admission，新的 Memory 背景工作再讓位；不得以主代理、subagent、CLI 或一般 caller 的大量併發壓 ChatHub。
 - 不要用真實 Microsoft 帳號故意製造高併發來探 429 上限；429／退避行為應以本地 deterministic test 驗證，線上驗證維持低併發。
 
 ## 回報方式
@@ -29,7 +29,7 @@ This public snapshot is intended only for Microsoft 365 accounts and tenants you
 - Never publish tokens, cookies, HAR files, private OneDrive / SharePoint URLs, original artifact URLs, or account caches.
 - `Private / Temporary Chat` means a no-ordinary-history transport policy; it does not mean Microsoft retains no data. Ordinary document uploads may still create OneDrive / SharePoint staging copies.
 - Code Interpreter artifacts returned to consumers must use authenticated artifact fetch. Never expose browser `blob:` URLs or unverified upstream temporary links directly.
-- Hermes and Hindsight may share one Microsoft 365 account, but their checkpoint boundaries and compatibility endpoints must remain isolated. Account-level throughput is still shared, so Memory background work must yield to interactive `/v1/chat/completions` and `/hermes/v1/chat/completions` traffic rather than intentionally stress ChatHub.
+- Hermes and Hindsight may share one Microsoft 365 account, but their checkpoint boundaries and compatibility endpoints must remain isolated. Account-level throughput is still shared, so all chat-like interactive routes must use bounded admission before Memory yields; main-agent, subagent, CLI, and ordinary callers must not be used to intentionally stress ChatHub concurrently.
 - Do not deliberately create high concurrency against a real Microsoft account to discover rate limits. Verify 429/backoff behavior with deterministic local tests and keep live validation low-concurrency.
 
 ## Reporting

@@ -86,9 +86,11 @@ curl -sS http://127.0.0.1:4141/v1/models \
 
 ## Hermes 與 Hindsight 流量政策
 
-管理介面提供 Hermes／Hindsight 相容開關與 Memory 同時請求數、排隊逾時、互動流量優先保留時間、Memory 429 初始／最大退避等控制。政策是：**互動式流量優先，Hindsight 背景工作讓位**。既有 Hermes 繼續使用 `/v1/chat/completions` 時，該路徑和其他標準 `/v1` caller 一樣分類為互動流量；只有 `/hermes/v1/*` 是受 Hermes 相容開關控制的專用 profile，並使用獨立的 `hermes` checkpoint namespace。
+管理介面提供 Hermes／Hindsight 相容開關、帳號級互動流量同時請求上限與排隊逾時，以及 Memory 同時請求數、排隊逾時、互動流量優先保留時間與共享 429 初始／最大退避等控制。政策是：**互動式流量有界進場，Hindsight 背景工作最後讓位**。一般 `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Responses `/v1/responses` 與 Anthropic `/v1/messages` 共用同一個帳號級 interactive admission controller；內建起始值為同時 `2` 個、排隊逾時 `300` 秒，等待佇列另有 `64` 個 waiter 的硬上限。超時或佇列已滿時會回可重試的 HTTP 503 與 `Retry-After`，不會先把請求送進 ChatHub。外層 proxy、Hermes stale/request timeout 與 graceful shutdown 必須以「interactive queue timeout + chat timeout」作為完整 request budget，而不是只看 `chatTimeoutSeconds`。
 
-Memory 排隊採 FIFO，已進場的 Memory 工作不會被強制中斷；若 Microsoft 回 429，Memory 會進入 cooldown 並逐步延長退避。真實 Microsoft 帳號不會用高併發故意觸發 429，相關行為以本地 deterministic test 驗證，線上只做低併發確認。
+Memory 排隊採 FIFO，且只有在沒有執行中或排隊中的 interactive request 時才能入場；已進場的 Interactive／Memory 工作都不會被強制中斷。Microsoft 429 與 `Retry-After` 會形成共享帳號 cooldown，後續新的 Interactive 與 Memory admission 都必須尊重它。MCP、圖片與 artifact 路徑不經這個 chat admission controller。真實 Microsoft 帳號不會用高併發故意觸發 429，相關行為以本地 deterministic test 驗證，線上只做低併發確認。
+
+Checkpoint 容量淘汰仍以原子 generation manifest 切換維持 crash safety，但未變更的 record 會重用既有實體檔案，不再因淘汰一筆就逐筆重寫並同步整個 store。管理診斷可讀取 interactive／Memory in-flight 與 waiting、共享 cooldown、最後 429 來源，以及最近一次 checkpoint generation 的 record、重用／寫入數與耗時。
 
 對「單一 Microsoft 365 帳號、Hermes 正確性優先、Hindsight 可慢但不可搶主代理」的部署，2026-08-13 採用的 correctness-first operating profile 是：`memoryMaxConcurrent=1`、`memoryQueueTimeoutSeconds=60`、`interactivePriorityHoldoffSeconds=300`、Memory backoff `30→600` 秒。這是目前 Production 的運行基線，不是所有部署的通用預設；已在執行中的 Memory request 仍不會被 preempt。
 
@@ -233,7 +235,11 @@ curl -sS http://127.0.0.1:4141/v1/models \
 
 ## Hermes and Hindsight traffic policy
 
-The management UI exposes compatibility controls for Hermes and Hindsight, including Memory concurrency, queue timeout, interactive-priority holdoff, and Memory 429 backoff. The policy is simple: **interactive traffic has priority; Hindsight background work yields instead of competing for the same Microsoft account.** During migration, legacy Hermes traffic on `/v1/chat/completions` also counts as interactive priority; after switching, `/hermes/v1/chat/completions` adds an isolated `hermes` checkpoint namespace. Memory admission is FIFO and already-running Memory work is not preempted. No production test should intentionally flood ChatHub to force a 429; rate-limit behavior is verified deterministically with local tests, while real Microsoft validation stays low-concurrency.
+The management UI exposes Hermes/Hindsight compatibility controls, account-level interactive concurrency and queue timeout, Memory concurrency and queue timeout, interactive-priority holdoff, and shared 429 backoff. The policy is: **interactive traffic is admitted within a bound, and Hindsight background work yields last.** Generic `/v1/chat/completions`, Hermes `/hermes/v1/chat/completions`, Responses `/v1/responses`, and Anthropic `/v1/messages` share one account-level interactive admission controller. Built-in starting values allow `2` concurrent interactive requests with a `300`-second queue timeout; the waiting queue also has a hard limit of `64`. Queue timeout or saturation returns a retryable HTTP 503 with `Retry-After` before the request reaches ChatHub. Outer proxies, Hermes stale/request timeouts, and graceful shutdown must budget the interactive queue timeout plus the chat timeout rather than considering `chatTimeoutSeconds` alone.
+
+Memory admission remains FIFO and proceeds only when no interactive request is running or waiting. Already-running Interactive and Memory work is not preempted. A Microsoft 429 or `Retry-After` creates shared-account cooldown that blocks subsequent admission for both traffic classes. MCP, image, and artifact routes do not pass through this chat admission controller. Rate-limit behavior is verified deterministically; real Microsoft validation remains low-concurrency.
+
+Checkpoint capacity eviction still uses an atomic generation-manifest switch for crash safety, but unchanged records reuse their existing physical files instead of being rewritten and synced one by one. Diagnostics expose interactive/Memory in-flight and waiting counts, shared cooldown and latest 429 source, plus the latest checkpoint generation's record, reuse/write, and duration metrics.
 
 For a single-account, correctness-first deployment where Hermes must win and Hindsight may wait, the 2026-08-13 operating profile uses `memoryMaxConcurrent=1`, `memoryQueueTimeoutSeconds=60`, `interactivePriorityHoldoffSeconds=300`, and Memory backoff from `30` to `600` seconds. This is the current Production operating baseline, not a universal default; Memory requests already in flight are still cooperative rather than preempted.
 

@@ -53,15 +53,15 @@ compression:
 
 `nudge_interval=0` 不會關閉 `MEMORY.md` / `USER.md` 或 `memory` tool，只取消週期 background review；前景主代理仍可保存穩定事實。`intent_ack_continuation=true` 只針對短的 future-action acknowledgment 做有界續行，不是所有純文字回答都強制呼叫工具。
 
-如果 M365 Sidecar `chatTimeoutSeconds=1800`、外層 reverse proxy 約 `2100` 秒，correctness-first 例子可使用：
+如果 M365 Sidecar `interactiveQueueTimeoutSeconds=300`、`chatTimeoutSeconds=1800`，interactive request 在進入 ChatHub 前後合計最長約 `2100` 秒。外層 reverse proxy 約 `2400` 秒時，correctness-first 例子可使用：
 
 ```text
-HERMES_STREAM_STALE_TIMEOUT=1950
-HERMES_API_CALL_STALE_TIMEOUT=1950
-HERMES_API_TIMEOUT=2000
+HERMES_STREAM_STALE_TIMEOUT=2200
+HERMES_API_CALL_STALE_TIMEOUT=2200
+HERMES_API_TIMEOUT=2300
 ```
 
-目標是讓 M365 的 1800 秒上游 timeout 先決定請求是否真的超時，Hermes 不要在 180 秒就誤殺正常的長 reasoning；同時 Hermes 自己仍要比外層 proxy 更早結束。這三個數字只適用於相同 timeout 階層，若 Sidecar 或 proxy 值不同必須一起重算。使用 custom-provider route 時要讀回 effective runtime，不能只看到 provider-specific stale timeout 寫在設定檔就假設已套用。
+目標是讓 M365 的 queue admission 與 1800 秒上游 timeout 先決定請求是否真的超時，Hermes 不要在合法排隊或正常長 reasoning 期間誤殺請求；同時 Hermes 自己仍要比外層 proxy 更早結束。這三個數字只適用於相同 timeout 階層，若 queue、Sidecar 或 proxy 值不同必須一起重算。使用 custom-provider route 時要讀回 effective runtime，不能只看到 provider-specific stale timeout 寫在設定檔就假設已套用。
 
 ### 呼叫端工具安全契約
 
@@ -155,15 +155,15 @@ compression:
 
 `nudge_interval=0` does not disable `MEMORY.md` / `USER.md` or the `memory` tool; it only disables the periodic background review fork. The foreground agent can still save durable facts. `intent_ack_continuation=true` applies a bounded continuation only to short future-action acknowledgments and does not force every text answer to use a tool.
 
-With an M365 `chatTimeoutSeconds=1800` and an outer reverse proxy around `2100` seconds, one correctness-first timeout stack is:
+With M365 `interactiveQueueTimeoutSeconds=300` and `chatTimeoutSeconds=1800`, an interactive request can spend about `2100` seconds across admission and ChatHub work. With an outer reverse proxy around `2400` seconds, one correctness-first timeout stack is:
 
 ```text
-HERMES_STREAM_STALE_TIMEOUT=1950
-HERMES_API_CALL_STALE_TIMEOUT=1950
-HERMES_API_TIMEOUT=2000
+HERMES_STREAM_STALE_TIMEOUT=2200
+HERMES_API_CALL_STALE_TIMEOUT=2200
+HERMES_API_TIMEOUT=2300
 ```
 
-This lets M365's 1800-second upstream timeout decide whether a long reasoning request has truly timed out instead of letting Hermes kill a healthy request at 180 seconds, while Hermes still ends before the outer proxy. Recalculate these values whenever the Sidecar or proxy timeout changes. For custom-provider routes, verify the effective runtime values instead of assuming a provider-specific stale timeout was consumed merely because it appears in the config file.
+This lets M365 admission and its 1800-second upstream timeout decide whether a request has truly timed out instead of letting Hermes kill a legitimately queued or healthy long-reasoning request, while Hermes still ends before the outer proxy. Recalculate these values whenever queue, Sidecar, or proxy timeouts change. For custom-provider routes, verify the effective runtime values instead of assuming a provider-specific stale timeout was consumed merely because it appears in the config file.
 
 ### Caller-tool safety contract
 

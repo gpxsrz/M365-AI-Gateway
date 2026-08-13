@@ -88,7 +88,7 @@ func (s *Server) LongestRequestTimeout() time.Duration {
 		return 0
 	}
 	settings := s.settings.get()
-	seconds := settings.ChatTimeoutSeconds
+	seconds := settings.InteractiveQueueTimeoutSeconds + settings.ChatTimeoutSeconds
 	if settings.MemoryCompatibilityEnabled {
 		memorySeconds := settings.MemoryQueueTimeoutSeconds + settings.ChatTimeoutSeconds
 		if memorySeconds > seconds {
@@ -211,6 +211,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/mcp/sse", s.mcpLegacySSE)
 	m.HandleFunc("/v1/mcp/message", s.mcpLegacyMessage)
 	m.HandleFunc(artifactRoutePrefix, s.artifactContent)
+	m.HandleFunc("/assets/compat-settings.js", s.compatibilitySettingsScript)
 	m.HandleFunc("/", s.rootPage)
 	return requestID(httpTrace(securityHeaders(s.adminRequestSecurity(s.adminMiddleware(s.debugMiddleware(m))))))
 }

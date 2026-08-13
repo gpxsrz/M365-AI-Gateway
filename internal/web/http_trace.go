@@ -51,7 +51,7 @@ func safeServiceLogPath(path string) string {
 	if _, artifact := artifactCapabilityToken(path); artifact {
 		return "/v1/artifacts/{redacted}/content"
 	}
-	if strings.HasPrefix(path, "/v1/") {
+	if strings.HasPrefix(path, "/v1/") || hermesCompatibilityRequest(path) || memoryCompatibilityRequest(path) {
 		_, safePath := debugProtocolAndPath(path)
 		return safePath
 	}
@@ -71,7 +71,7 @@ func safeServiceLogPath(path string) string {
 
 func httpTrace(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/v1/") {
+		if !strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/v1/") && !hermesCompatibilityRequest(r.URL.Path) && !memoryCompatibilityRequest(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

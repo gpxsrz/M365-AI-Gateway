@@ -875,6 +875,14 @@ func debugProtocolAndPath(path string) (string, string) {
 		return "openai_models", path
 	case "/v1/chat/completions":
 		return "openai_chat_completions", path
+	case "/hermes/v1/models":
+		return "hermes_models", path
+	case "/hermes/v1/chat/completions":
+		return "hermes_chat_completions", path
+	case "/memory/v1/models":
+		return "memory_models", path
+	case "/memory/v1/chat/completions":
+		return "memory_chat_completions", path
 	case "/v1/responses":
 		return "openai_responses", path
 	case "/v1/messages":
@@ -1040,7 +1048,7 @@ func (server *Server) debugMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !strings.HasPrefix(r.URL.Path, "/v1/") {
+		if !strings.HasPrefix(r.URL.Path, "/v1/") && !hermesCompatibilityRequest(r.URL.Path) && !memoryCompatibilityRequest(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
