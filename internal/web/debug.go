@@ -202,12 +202,16 @@ func normalizeDebugStorePolicy(policy debugStorePolicy) debugStorePolicy {
 	return policy
 }
 
-func openDebugStore() *debugStore {
+func debugStorePath() string {
 	path := strings.TrimSpace(os.Getenv("M365_DEBUG_LOG"))
-	if path == "" {
-		path = "debug-logs.json"
+	if path != "" {
+		return path
 	}
-	store := openDebugStoreWithPolicy(path, defaultDebugStorePolicy())
+	return filepath.Join(filepath.Dir(settingsPath()), "debug-logs.json")
+}
+
+func openDebugStore() *debugStore {
+	store := openDebugStoreWithPolicy(debugStorePath(), defaultDebugStorePolicy())
 	store.startAutoExpiry()
 	return store
 }

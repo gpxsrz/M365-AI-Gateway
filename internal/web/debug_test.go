@@ -49,6 +49,65 @@ func testDebugPolicy() debugStorePolicy {
 	}
 }
 
+func TestDebugStorePathFollowsDurablePathPrecedence(t *testing.T) {
+	dataDir := t.TempDir()
+	explicitPath := filepath.Join(t.TempDir(), "explicit-debug.json")
+	settingsFile := filepath.Join(t.TempDir(), "settings", "settings.json")
+	t.Setenv("M365_DATA_DIR", dataDir)
+	t.Setenv("M365_SETTINGS_FILE", settingsFile)
+	t.Setenv("M365_DEBUG_LOG", explicitPath)
+	if got := debugStorePath(); got != explicitPath {
+		t.Fatalf("explicit debug path=%q want=%q", got, explicitPath)
+	}
+
+	t.Setenv("M365_DEBUG_LOG", "")
+	if got, want := debugStorePath(), filepath.Join(dataDir, "debug-logs.json"); got != want {
+		t.Fatalf("data-dir debug path=%q want=%q", got, want)
+	}
+
+	t.Setenv("M365_DATA_DIR", "")
+	if got, want := debugStorePath(), filepath.Join(filepath.Dir(settingsFile), "debug-logs.json"); got != want {
+		t.Fatalf("settings-dir debug path=%q want=%q", got, want)
+	}
+}
+
+func TestDefaultDebugStorePersistsInDataDirectoryAndReopens(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("M365_DEBUG_LOG", "")
+	t.Setenv("M365_DATA_DIR", dataDir)
+	path := filepath.Join(dataDir, "debug-logs.json")
+	now := time.Now().UTC()
+
+	store := openDebugStore()
+	defer store.stopAutoExpiry()
+	store.mu.Lock()
+	store.data.Records = append(store.data.Records, debugRecord{
+		ID:        "dbg_default_path_test",
+		Level:     "info",
+		Protocol:  "test",
+		At:        now,
+		ExpiresAt: now.Add(time.Hour),
+	})
+	err := store.persistLocked()
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("debug store mode=%#o want=0600", info.Mode().Perm())
+	}
+
+	reopened := openDebugStoreWithPolicy(path, defaultDebugStorePolicy())
+	records := reopened.list()
+	if len(records) != 1 || records[0].ID != "dbg_default_path_test" {
+		t.Fatalf("reopened records=%+v", records)
+	}
+}
+
 func TestDebugDefaultPersistsOnlySummaryWithoutSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "debug-summary.json")
 	store := openDebugStoreWithPolicy(path, testDebugPolicy())

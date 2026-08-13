@@ -59,6 +59,8 @@ docker build -t m365-copilot2api .
 
 `Dockerfile` 可作為自訂部署的建置基礎，但本專案不提供通用 Compose 快速啟動。管理 bootstrap 僅允許真正的 loopback 請求；一般 bridge/NAT 會被視為非 loopback，必須先設計 HTTPS、可信反向代理、資料卷權限與持久管理員密碼的安全佈署流程。
 
+容器部署應將 `M365_DATA_DIR` 指向可寫且持久化的資料卷。未明確設定 `M365_DEBUG_LOG` 時，安全偵錯摘要會自動存放為該資料目錄內的 `debug-logs.json`，而不依賴可能是唯讀的應用程式工作目錄。
+
 ## 首次設定
 
 1. 開啟 `http://127.0.0.1:4141`。
@@ -218,6 +220,8 @@ docker build -t m365-copilot2api .
 ```
 
 The `Dockerfile` is a base for custom deployments. The project intentionally does not ship an unsafe universal Compose shortcut: management bootstrap is loopback-only, so bridge/NAT deployments must correctly configure HTTPS, trusted reverse proxies, persistent volumes, and a durable administrator password.
+
+Container deployments should point `M365_DATA_DIR` at a writable persistent volume. Unless `M365_DEBUG_LOG` explicitly overrides it, redacted diagnostic summaries are stored as `debug-logs.json` inside that data directory instead of relying on a potentially read-only application working directory.
 
 ## First-time setup
 
