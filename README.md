@@ -90,6 +90,8 @@ curl -sS http://127.0.0.1:4141/v1/models \
 
 Memory 排隊採 FIFO，已進場的 Memory 工作不會被強制中斷；若 Microsoft 回 429，Memory 會進入 cooldown 並逐步延長退避。真實 Microsoft 帳號不會用高併發故意觸發 429，相關行為以本地 deterministic test 驗證，線上只做低併發確認。
 
+對「單一 Microsoft 365 帳號、Hermes 正確性優先、Hindsight 可慢但不可搶主代理」的部署，2026-08-13 採用的 correctness-first operating profile 是：`memoryMaxConcurrent=1`、`memoryQueueTimeoutSeconds=60`、`interactivePriorityHoldoffSeconds=300`、Memory backoff `30→600` 秒。這是目前 Production 的運行基線，不是所有部署的通用預設；已在執行中的 Memory request 仍不會被 preempt。
+
 ## ChatHub WebSocket 暫時性失敗的 retry 邊界
 
 Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始、chat payload 尚未送出**的 dial/HTTP-upgrade 階段提供一次有界 retry。單一 caller request 最多嘗試 2 次 dial，中間有短暫且可被 caller context 取消的 backoff；兩次嘗試沿用同一組 conversation/session/request identity，而且不會重跑 attachment upload。
@@ -116,17 +118,20 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 
 真正耗盡 profile ceiling 時仍回 HTTP `409`，不自動 replay 或重綁 checkpoint。`error` 物件會帶 `code=tool_round_limit`、`profile`、`limit_type=tool_rounds`、`limit`、`completed_rounds`、`terminal=true`、`retryable=false` 與 `recommended_action`。這個 rounds 數與 `128000 UTF-16` caller-text policy、model token context window 都是不同單位。
 
-### Hermes / Hindsight live-qualified 起始設定
+### Hermes / Hindsight 整合基線
 
-截至 2026-08-13，目前 Production 整合起始設定為：
+2026-08-12 曾以 Hermes `context_length=80000` / `proactive_prune_tokens=41000` 完成真實 tool continuation canary；這仍是有效的歷史驗證證據，但**不再是目前建議的操作基線**。2026-08-13 在 tool-heavy 長任務與 Hindsight replay 膨脹事件分析後，Production 改採 correctness-first profile：
 
-- Hermes 的 M365 model-specific `context_length=64000`。
-- Hermes `proactive_prune_tokens=41000`、`compression.max_attempts=3`、`compression.protect_last_n=20`；不要為 M365 額外設定全域 `compression.threshold_tokens`。
-- Hindsight `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000`。
-- Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`。這讓 Reflect 最多嘗試 2 次：deterministic HTTP 400 最多只多重送 1 次後就交回 Hindsight overflow recovery，同時保留一次暫時性 ChatHub／502 自癒機會；其他 operation 的 retry policy 不變。
-- M365 `textInputLimitUTF16` 維持 `128000`。
+- Hermes M365 model-specific `context_length=64000`。
+- Hermes `proactive_prune_tokens=41000`、`compression.max_attempts=3`、`protect_last_n=20`；全域 `compression.threshold_tokens` 維持未設定。
+- Hermes 保留 `MEMORY.md` / `USER.md`，但 `memory.nudge_interval=0`、`skills.creation_nudge_interval=0`，避免額外 background reviewer 與主代理競用同一個 M365；`agent.intent_ack_continuation=true` 用來攔截「只宣告要做、卻沒有真的呼叫工具」的短回覆。
+- Hindsight 維持 `hybrid`、`auto_recall=true`、`auto_retain=true`，自動注入收斂為 `recall_types=["observation"]`、`recall_max_tokens=2048`，並等待前一輪 retain 完成後再預取。
+- Hindsight Reflect 維持已驗證的 `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000`、`HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`。
+- M365 `textInputLimitUTF16=128000`、Hermes tool-round ceiling `128`、generic/Memory `16` 均不變。
 
-2026-08-12 的短／中型 Hermes canary 曾驗證 `context_length=80000` 搭配 `proactive_prune_tokens=41000` 可正常完成 tool continuation；但 2026-08-13 的真實 tool-heavy 長任務在 80K 設定下，即使多次壓縮到約 49K–52K rough tokens，新增的大型 tool results 仍可讓實際 outbound text 反覆超過 `128000 UTF-16`，最後耗盡 3 次 compression recovery。因此目前建議回到 Hermes 可用 floor `64000`，先維持 `max_attempts=3`，用更早的 pruning/compression 留出 transport headroom；這不代表 80K 從未可用，而是 64K 對繁中、tool JSON 與長任務更保守。
+這組 2026-08-13 值是目前正式運行的 correctness-first profile；route/runtime/health 已讀回，但不要把它描述成「所有長任務都已重新完整 live-qualified」。`128000 UTF-16` 仍不等於 `128000 tokens`。
+
+另外，Hermes 最新穩定版 v0.20.0 / v2026.8.3 目前仍受 upstream [#18774](https://github.com/NousResearch/hermes-agent/issues/18774) 影響：`bank_mission` / `bank_retain_mission` 會被 plugin 讀取，卻可能沒有同步到 Hindsight Banks API。修復合併前，應直接透過 Hindsight Banks Config API 設定並 `GET` 讀回 `reflect_mission` / `retain_mission`；詳見 [Memory Provider 相容模式](docs/MEMORY_PROVIDER_COMPATIBILITY_MODE_PLAN.md)。
 
 Model tool router repair 不新增另一個容量設定，也不建議為 #54 調高 `textInputLimitUTF16`。這些是目前對 **M365 transport 特性**做過驗證的整合起始值，不是 Hermes/Hindsight 的通用上限，更不代表 `128000 UTF-16` 等於 `128000 tokens`。不同語言、tool JSON 比例與 memory workload 仍可能需要更保守的 consumer-side pruning/reduction。
 
@@ -230,6 +235,8 @@ curl -sS http://127.0.0.1:4141/v1/models \
 
 The management UI exposes compatibility controls for Hermes and Hindsight, including Memory concurrency, queue timeout, interactive-priority holdoff, and Memory 429 backoff. The policy is simple: **interactive traffic has priority; Hindsight background work yields instead of competing for the same Microsoft account.** During migration, legacy Hermes traffic on `/v1/chat/completions` also counts as interactive priority; after switching, `/hermes/v1/chat/completions` adds an isolated `hermes` checkpoint namespace. Memory admission is FIFO and already-running Memory work is not preempted. No production test should intentionally flood ChatHub to force a 429; rate-limit behavior is verified deterministically with local tests, while real Microsoft validation stays low-concurrency.
 
+For a single-account, correctness-first deployment where Hermes must win and Hindsight may wait, the 2026-08-13 operating profile uses `memoryMaxConcurrent=1`, `memoryQueueTimeoutSeconds=60`, `interactivePriorityHoldoffSeconds=300`, and Memory backoff from `30` to `600` seconds. This is the current Production operating baseline, not a universal default; Memory requests already in flight are still cooperative rather than preempted.
+
 ## ChatHub WebSocket transient-retry boundary
 
 The sidecar performs one bounded retry only while the **WebSocket has not been established, the SignalR handshake has not started, and the chat payload has not been sent**. One caller request therefore makes at most two dial attempts with a short context-cancelable backoff. Both attempts reuse the same conversation/session/request identity, and attachment upload is not repeated.
@@ -256,17 +263,20 @@ One assistant tool-call turn counts as one tool round regardless of whether it c
 
 Exhausting the profile ceiling remains an HTTP `409` terminal condition and does not automatically replay the request or rebind a checkpoint. The `error` object includes `code=tool_round_limit`, `profile`, `limit_type=tool_rounds`, `limit`, `completed_rounds`, `terminal=true`, `retryable=false`, and `recommended_action`. Tool rounds are a separate unit from the `128000 UTF-16` caller-text policy and from model token context windows.
 
-### Live-qualified Hermes / Hindsight starting settings
+### Hermes / Hindsight integration baselines
 
-As of 2026-08-13, the current Production integration starting settings are:
+A 2026-08-12 Production canary successfully exercised real Hermes tool continuation with `context_length=80000` and `proactive_prune_tokens=41000`. That remains valid historical evidence, but it is **no longer the recommended operating baseline**. After analysis of a tool-heavy long task and persistent Hindsight replay growth, Production moved on 2026-08-13 to a correctness-first profile:
 
 - Hermes M365 model-specific `context_length=64000`.
-- Hermes `proactive_prune_tokens=41000`, `compression.max_attempts=3`, and `compression.protect_last_n=20`; do not add a global `compression.threshold_tokens` just for M365.
-- Hindsight `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000`.
-- Hindsight `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`. Reflect therefore makes at most two attempts: a deterministic HTTP 400 can be repeated at most once before Hindsight overflow recovery takes over, while one retry remains available for transient ChatHub/502 failures. Other operation retry policies remain unchanged.
-- M365 `textInputLimitUTF16` remains `128000`.
+- Hermes `proactive_prune_tokens=41000`, `compression.max_attempts=3`, and `protect_last_n=20`; global `compression.threshold_tokens` remains unset.
+- Built-in `MEMORY.md` / `USER.md` remain enabled, while `memory.nudge_interval=0` and `skills.creation_nudge_interval=0` suppress periodic background review forks that would otherwise compete with the foreground agent. `agent.intent_ack_continuation=true` catches short "I will check" acknowledgments that emit no tool call.
+- Hindsight remains `hybrid` with automatic retain/recall enabled, while automatic recall is narrowed to observations with `recall_max_tokens=2048` and waits for prior retain completion before prefetch.
+- Hindsight Reflect keeps the live-validated `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000` and `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1`.
+- M365 `textInputLimitUTF16=128000`, the Hermes tool-round ceiling of `128`, and generic/Memory `16` remain unchanged.
 
-The 2026-08-12 short/medium Hermes canary did validate `context_length=80000` with `proactive_prune_tokens=41000` for tool continuation. A real tool-heavy long task on 2026-08-13 later showed that, at 80K, repeated compression to roughly 49K–52K rough tokens could still be followed by large tool results that regrew outbound text beyond the `128000 UTF-16` policy until all three compression-recovery attempts were consumed. The current recommendation therefore returns to Hermes' usable 64K floor while keeping `max_attempts=3`, so pruning/compression begins earlier and leaves more transport headroom. This does not mean 80K never works; 64K is simply the safer baseline for Traditional Chinese, tool-JSON-heavy, long-running workloads.
+These 2026-08-13 values are the current correctness-first operating profile. Route/runtime/health readback has been completed, but this should not be described as a fresh end-to-end qualification of every long-running workload. `128000 UTF-16` still does not mean `128000 tokens`.
+
+The latest stable Hermes release v0.20.0 / v2026.8.3 is also still affected by upstream [#18774](https://github.com/NousResearch/hermes-agent/issues/18774): the plugin may read `bank_mission` / `bank_retain_mission` without synchronizing them to Hindsight's Banks API. Until the upstream fix lands, apply the desired `reflect_mission` / `retain_mission` through the Hindsight Banks Config API and verify them with a `GET`; see [Memory Provider Compatibility Mode](docs/MEMORY_PROVIDER_COMPATIBILITY_MODE_PLAN.md).
 
 Model-tool-router repair adds no separate capacity setting, and #54 is not a reason to raise `textInputLimitUTF16`. These are validated integration starting points for the **M365 transport characteristics**, not universal Hermes/Hindsight limits, and they do not imply that `128000 UTF-16` equals `128000 tokens`. Different languages, tool-JSON ratios, and memory workloads may still require more conservative consumer-side pruning or reduction.
 

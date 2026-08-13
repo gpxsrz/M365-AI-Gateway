@@ -75,6 +75,66 @@ HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 
 `40000` 是針對 M365 UTF-16 transport policy 的保守 integration starting point，不是 Hindsight 或 M365 的通用規格。它讓 Reflect 的 80% retrieved-context 預算約落在 32K tokens，保留 system/tool/schema/回答 framing 空間。Production canary 最終使用 `REFLECT_LLM_MAX_RETRIES=1`：Reflect 最多嘗試 2 次，因此 deterministic 400 最多只多重送 1 次後就交回 Hindsight overflow recovery，同時保留一次 transient ChatHub／502 自癒機會。實測 retry `0` 曾因一次 ChatHub WebSocket handshake 500（M365 對外為 502）直接放大成 Hindsight reflect 500；改成 retry `1` 後，臨時 bank retain → recall → reflect 全部成功且測試 bank 已刪除。其他 operation 的 retry 維持原設定。仍不要直接把 `100000` tokens 與 `128000 UTF-16` 作數值對照，真實繁中、工具 JSON 與 retrieved-memory workload 若更重，應進一步收緊 consumer-side budget。
 
+### 2026-08-13 correctness-first 單帳號設定
+
+目前 Production 以「Hermes 正確行動優先，Hindsight 可以延後」為操作原則。Hindsight 功能沒有關閉，而是降低每輪自動注入的噪音與同帳號競爭：
+
+```text
+# Hermes-side Hindsight plugin
+memory_mode=hybrid
+auto_recall=true
+auto_retain=true
+retain_every_n_turns=1
+recall_prefetch_method=recall
+recall_types=observation
+recall_max_tokens=2048
+recall_max_input_chars=800
+prefetch_waits_for_retain=true
+prefetch_retain_drain_timeout=600
+
+# Hindsight server
+HINDSIGHT_API_WORKER_MAX_SLOTS=2
+HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=1
+HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
+HINDSIGHT_API_WORKER_MAX_RETRIES=12
+HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=120
+HINDSIGHT_API_LLM_TIMEOUT=120
+HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
+HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
+
+# M365 Memory admission
+memoryMaxConcurrent=1
+memoryQueueTimeoutSeconds=60
+interactivePriorityHoldoffSeconds=300
+memoryBackoffInitialSeconds=30
+memoryBackoffMaxSeconds=600
+```
+
+`observation` 是 Hindsight consolidation 後的高密度知識層，因此適合每輪自動注入。此 plugin 的 `recall_types` 同時影響 `hindsight_recall` tool；需要跨完整 bank 做較深綜合時應使用 `hindsight_reflect`，不要為了讓 `hindsight_recall` 看 raw `world` / `experience` 就把所有原始 facts 每輪重新注入。`prefetch_retain_drain_timeout=600` 是 freshness 上限，不代表每輪固定等待 600 秒；超過上限時寧可暫時少一份新記憶，也不要把尚未完成 retain 的狀態當成最新事實。
+
+Hindsight 的單次 LLM timeout 保留 `120` 秒是刻意的：Sidecar 的 admission control 只能阻止**新的** Memory 工作，無法搶占已經開始的 Memory request。把 Memory LLM 自身保持有限，可限制「Memory 先進場、下一個 Hermes round 後到」時的重疊時間。
+
+### Hermes upstream #18774：Bank mission 暫時 workaround
+
+截至 2026-08-13，Hermes 最新穩定版 v0.20.0 / v2026.8.3 仍有 [NousResearch/hermes-agent#18774](https://github.com/NousResearch/hermes-agent/issues/18774)：Hindsight plugin 會讀取 `bank_mission` / `bank_retain_mission`，README 也宣稱會透過 Banks API 套用，但實際程式只把值存進 instance field，沒有同步到 live bank。這不是 M365-Copilot2API 或 Hindsight server bug。
+
+修復合併前，可保留 Hermes config 內的 desired value 當宣告，但**不能把設定檔存在視為已生效**。應直接呼叫 Hindsight Banks Config API，使用與正常 Hindsight client 相同的 Bearer API key：
+
+```http
+PATCH /v1/default/banks/{bank_id}/config
+Authorization: Bearer <HINDSIGHT_API_KEY>
+Content-Type: application/json
+
+{
+  "updates": {
+    "reflect_mission": "<desired bank_mission>",
+    "retain_mission": "<desired bank_retain_mission>"
+  }
+}
+```
+
+之後必須再以 `GET /v1/default/banks/{bank_id}/config` 讀回 `overrides` / resolved config；只有 API readback 相符才算套用完成。官方 Issue 已有修復 PR 在審查，因此不要在本專案維護 Hermes core patch。
+
 ### 流量與 429
 
 Memory 是背景流量，一般 `/v1` 與 `/hermes/v1` 互動請求維持優先權。
@@ -127,6 +187,8 @@ Hermes 與 Hindsight source code 不需要因 M365 相容性修正而修改。�
 #42–#44 code hardening 已 commit、發佈並部署。當時的 Production qualification 已完成：generic `/v1` recovery metadata、Hermes tool/overflow continuation 與 Hindsight Memory overflow recovery 均有 live evidence；2026-08-12 Hermes canary 曾驗證 `context_length=80000` / `proactive_prune_tokens=41000`，Hindsight Reflect 則驗證 `40000` / retry `1`。後續 2026-08-13 的真實 tool-heavy 長任務證明 80K 對 M365 `128000 UTF-16` transport policy 不夠保守，因此目前 Hermes Production 基線已回調為 `context_length=64000`、`proactive_prune_tokens=41000`、`compression.max_attempts=3`、`compression.protect_last_n=20`；這不推翻 80K canary 的歷史結果，只取代它作為現行建議值。Hindsight `40000` / retry `1` 與 M365 `textInputLimitUTF16=128000` 維持不變，Hermes/Hindsight core 仍未修改。
 
 #57 也已在 2026-08-13 完成 Production qualification：generic `/v1`、Hermes `/hermes/v1`、Memory `/memory/v1` 的 streaming / non-streaming final-answer path 都能安全解開 internal direct-answer router envelope，普通 JSON 保持不變，ambiguous 或 non-empty calls fail closed；Memory JSON Schema 另有 live canary。
+
+2026-08-13 correctness-first profile 另將 Hindsight 自動 recall 收斂為 observation-only / 2048 tokens，M365 Memory admission 設為 concurrency 1、queue 60 秒、interactive holdoff 300 秒；route/runtime/health 已讀回，但不把這次設定調整描述成所有長任務的重新完整 live qualification。
 
 ---
 
@@ -193,6 +255,66 @@ HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 
 `40000` is a conservative M365-integration starting point, not a universal Hindsight or M365 specification. With the current 80% final-synthesis fraction, it targets roughly 32K tokens of retrieved context and leaves room for system/tool/schema/answer framing. The final Production canary uses `REFLECT_LLM_MAX_RETRIES=1`, so Reflect makes at most two attempts: a deterministic 400 is repeated at most once before Hindsight overflow recovery takes over, while one retry remains for a transient ChatHub/502 failure. A retry-`0` canary exposed the trade-off when a single ChatHub WebSocket handshake 500 (surfaced by M365 as 502) became an immediate Hindsight reflect 500. After switching to retry `1`, a temporary bank completed retain → recall → reflect successfully and was deleted after the test. Other operation retry policies remain unchanged. Do not numerically equate `100000` tokens with `128000 UTF-16`; heavier Traditional Chinese, tool-JSON, or retrieved-memory workloads may still require a smaller consumer-side budget.
 
+### 2026-08-13 correctness-first single-account profile
+
+The current Production operating principle is that Hermes correctness wins and Hindsight may wait. Hindsight remains fully enabled while per-turn injection noise and same-account contention are reduced:
+
+```text
+# Hermes-side Hindsight plugin
+memory_mode=hybrid
+auto_recall=true
+auto_retain=true
+retain_every_n_turns=1
+recall_prefetch_method=recall
+recall_types=observation
+recall_max_tokens=2048
+recall_max_input_chars=800
+prefetch_waits_for_retain=true
+prefetch_retain_drain_timeout=600
+
+# Hindsight server
+HINDSIGHT_API_WORKER_MAX_SLOTS=2
+HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=1
+HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
+HINDSIGHT_API_WORKER_MAX_RETRIES=12
+HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=120
+HINDSIGHT_API_LLM_TIMEOUT=120
+HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
+HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
+
+# M365 Memory admission
+memoryMaxConcurrent=1
+memoryQueueTimeoutSeconds=60
+interactivePriorityHoldoffSeconds=300
+memoryBackoffInitialSeconds=30
+memoryBackoffMaxSeconds=600
+```
+
+`observation` is Hindsight's consolidated high-density knowledge layer and is therefore the preferred automatic injection source. The plugin's `recall_types` setting also affects the `hindsight_recall` tool; use `hindsight_reflect` for broader synthesis over the bank rather than re-enabling raw `world` / `experience` facts for every turn. `prefetch_retain_drain_timeout=600` is a freshness ceiling, not a fixed per-turn delay. If freshness cannot be established in time, missing one injection is preferable to treating an unfinished retain as current truth.
+
+Keeping the Hindsight LLM timeout at `120` seconds is deliberate. M365 admission control can block **new** Memory work but cannot preempt a request that already started. A bounded Memory LLM call limits overlap when Memory entered just before a later Hermes round.
+
+### Hermes upstream #18774: temporary Bank-mission workaround
+
+As of 2026-08-13, the latest stable Hermes release v0.20.0 / v2026.8.3 remains affected by [NousResearch/hermes-agent#18774](https://github.com/NousResearch/hermes-agent/issues/18774): the Hindsight plugin reads `bank_mission` / `bank_retain_mission` and documents them as Banks-API settings, but the live plugin does not synchronize those instance fields into the bank. This is not an M365-Copilot2API or Hindsight-server defect.
+
+Until the upstream fix lands, the Hermes config may retain the desired values as declarations, but **configuration presence is not proof of application**. Apply the values directly through the Hindsight Banks Config API with the same Bearer API key used by the normal Hindsight client:
+
+```http
+PATCH /v1/default/banks/{bank_id}/config
+Authorization: Bearer <HINDSIGHT_API_KEY>
+Content-Type: application/json
+
+{
+  "updates": {
+    "reflect_mission": "<desired bank_mission>",
+    "retain_mission": "<desired bank_retain_mission>"
+  }
+}
+```
+
+Then read back `GET /v1/default/banks/{bank_id}/config` and verify the resolved config / `overrides`. Only matching API readback proves the setting is active. Upstream already has candidate fixes under review, so this project should not carry a Hermes-core patch.
+
 ### Traffic and 429 behavior
 
 Memory is background traffic; ordinary `/v1` and `/hermes/v1` interactive traffic remains higher priority.
@@ -216,3 +338,5 @@ This batch was developed in an isolated worktree created from the exact public-m
 The #42–#44 functional hardening landed at `6889411bf59a7c4ad1c92d6c241c9d5d12ea530d` and passed the full local release gate, PR exact-head CI, `main` exact-head CI, NAS backup fast-forward, Production preflight/snapshot, exact-commit deployment, post-readback, and live verification. Generic `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` returned the expected UTF-16 recovery metadata at 128001 code units; `/memory/v1` returned the Hindsight-recognized recovery signal; Hermes completed a real ambiguous-tool serial turn plus continuation without `tool_call_limit_exceeded`. The 2026-08-12 Hermes 80K/41K canary and the final Hindsight Reflect 40K/retry-1 canary also passed. Later tool-heavy long-task evidence on 2026-08-13 showed that 80K was too permissive for the M365 `128000 UTF-16` transport policy, so the current Hermes Production baseline is `context_length=64000`, `proactive_prune_tokens=41000`, `compression.max_attempts=3`, and `compression.protect_last_n=20`. This supersedes 80K as the recommendation without invalidating the earlier canary. Hindsight remains at 40K/retry-1 and `textInputLimitUTF16` remains `128000`.
 
 #57 was also Production-qualified on 2026-08-13. Generic `/v1`, Hermes `/hermes/v1`, and Memory `/memory/v1` streaming and non-streaming final-answer paths safely unwrap the internal direct-answer router envelope; ordinary JSON remains intact, ambiguous/non-empty calls fail closed, and a separate Memory JSON Schema live canary passed.
+
+The 2026-08-13 correctness-first profile also narrows automatic Hindsight recall to observation-only / 2048 tokens and sets M365 Memory admission to concurrency 1, a 60-second queue timeout, and a 300-second interactive holdoff. Route/runtime/health readback is complete, but this settings change is not a fresh qualification of every long-running workload.

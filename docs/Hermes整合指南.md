@@ -32,6 +32,37 @@ compression:
 
 Hermes 應優先使用專用的 `/hermes/v1` base URL。當這個相容入口的 caller text 確實超過 Sidecar UTF-16 政策時，Sidecar 仍以 HTTP 400 拒絕，但會同時使用 Hermes 相容的 `context_length_exceeded` 錯誤碼與 `input is too long` 恢復提示，讓 Hermes 走既有的 context compression → retry 流程。錯誤訊息仍明確保留真正的 UTF-16 政策與上限，而且不會把 `128000` 描述成模型 token context window。一般 `/v1` caller 仍收到 `text_policy_exceeded`，因此這個相容映射不會改變其他 OpenAI-compatible client 的錯誤契約。
 
+### 正確性優先的自主代理設定
+
+對「寧可慢，也要真的執行與查證」的 Hermes，建議保留內建記憶，但停掉會另外啟動 LLM fork 的週期 reviewer：
+
+```yaml
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  nudge_interval: 0
+skills:
+  creation_nudge_interval: 0
+agent:
+  intent_ack_continuation: true
+compression:
+  proactive_prune_tokens: 41000
+  max_attempts: 3
+  protect_last_n: 20
+```
+
+`nudge_interval=0` 不會關閉 `MEMORY.md` / `USER.md` 或 `memory` tool，只取消週期 background review；前景主代理仍可保存穩定事實。`intent_ack_continuation=true` 只針對短的 future-action acknowledgment 做有界續行，不是所有純文字回答都強制呼叫工具。
+
+如果 M365 Sidecar `chatTimeoutSeconds=1800`、外層 reverse proxy 約 `2100` 秒，correctness-first 例子可使用：
+
+```text
+HERMES_STREAM_STALE_TIMEOUT=1950
+HERMES_API_CALL_STALE_TIMEOUT=1950
+HERMES_API_TIMEOUT=2000
+```
+
+目標是讓 M365 的 1800 秒上游 timeout 先決定請求是否真的超時，Hermes 不要在 180 秒就誤殺正常的長 reasoning；同時 Hermes 自己仍要比外層 proxy 更早結束。這三個數字只適用於相同 timeout 階層，若 Sidecar 或 proxy 值不同必須一起重算。使用 custom-provider route 時要讀回 effective runtime，不能只看到 provider-specific stale timeout 寫在設定檔就假設已套用。
+
 ### 呼叫端工具安全契約
 
 Hermes 常見工具不一定提供 `readOnlyHint`。M365-Copilot2API 不會再先告訴模型「可呼叫 2 個工具」，等模型真的回 2 個後才事後降成 1。Sidecar 現在會在模型生成前固定本輪 tool-call ceiling：只有所有當輪可選工具都明確標記 `annotations.readOnlyHint=true`、且沒有 mutation/destructive 訊號時，才會允許大於 1；其餘情況事前序列化成 1。這個 ceiling 會同時用於 router prompt、native request 與回傳驗證，不截斷已產生的 `tool_calls`，以避免 Hermes、ChatHub conversation 與 checkpoint/tool state 分叉。
@@ -102,6 +133,37 @@ The 2026-08-12 Production canary raised M365 `gpt-5.6-reasoning.context_length` 
 Some Hermes CLI versions interpret dots inside a dotted configuration path as hierarchy separators even when the dot belongs to a model ID. Running `hermes config set providers.m365-copilot.models.gpt-5.6-reasoning.context_length 64000` can therefore create a nested `gpt-5 -> 6-reasoning -> context_length` key while leaving the literal `gpt-5.6-reasoning` entry unchanged. For model IDs containing `.`, use a configuration method that preserves literal keys; when in doubt, inspect the YAML structure and verify the effective value with the same provider/model context resolver used by the Hermes runtime rather than relying only on a dotted-path `config get`.
 
 Hermes should prefer the dedicated `/hermes/v1` base URL. When caller text on that compatibility surface genuinely exceeds the Sidecar UTF-16 policy, the Sidecar still rejects the request with HTTP 400 but supplies both the Hermes-compatible `context_length_exceeded` code and an `input is too long` recovery marker so Hermes can follow its existing context-compression → retry path. The message continues to identify the real UTF-16 policy and configured limit without describing `128000` as a model token context window. Generic `/v1` callers continue to receive `text_policy_exceeded`, so this compatibility mapping does not change the error contract for other OpenAI-compatible clients.
+
+### Correctness-first autonomous-agent settings
+
+For deployments where correct action matters more than latency, keep built-in memory enabled but disable periodic LLM review forks:
+
+```yaml
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  nudge_interval: 0
+skills:
+  creation_nudge_interval: 0
+agent:
+  intent_ack_continuation: true
+compression:
+  proactive_prune_tokens: 41000
+  max_attempts: 3
+  protect_last_n: 20
+```
+
+`nudge_interval=0` does not disable `MEMORY.md` / `USER.md` or the `memory` tool; it only disables the periodic background review fork. The foreground agent can still save durable facts. `intent_ack_continuation=true` applies a bounded continuation only to short future-action acknowledgments and does not force every text answer to use a tool.
+
+With an M365 `chatTimeoutSeconds=1800` and an outer reverse proxy around `2100` seconds, one correctness-first timeout stack is:
+
+```text
+HERMES_STREAM_STALE_TIMEOUT=1950
+HERMES_API_CALL_STALE_TIMEOUT=1950
+HERMES_API_TIMEOUT=2000
+```
+
+This lets M365's 1800-second upstream timeout decide whether a long reasoning request has truly timed out instead of letting Hermes kill a healthy request at 180 seconds, while Hermes still ends before the outer proxy. Recalculate these values whenever the Sidecar or proxy timeout changes. For custom-provider routes, verify the effective runtime values instead of assuming a provider-specific stale timeout was consumed merely because it appears in the config file.
 
 ### Caller-tool safety contract
 
