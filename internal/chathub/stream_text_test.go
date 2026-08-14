@@ -47,3 +47,29 @@ func TestFoldStreamTextAppendsCursorUpdates(t *testing.T) {
 		t.Fatalf("next=%q duplicate=%q", next, duplicate)
 	}
 }
+
+func TestReconcileCompletionTextPrefersProvablyMoreCompletePrefix(t *testing.T) {
+	tests := []struct {
+		name         string
+		final        string
+		streamed     string
+		wantText     string
+		wantRelation string
+		wantSource   string
+	}{
+		{name: "equal", final: "complete", streamed: "complete", wantText: "complete", wantRelation: "equal", wantSource: "final"},
+		{name: "short final prefix", final: `{"calls":[`, streamed: `{"calls":[{"name":"terminal","arguments":{"command":"status"}}],"answer":""}`, wantText: `{"calls":[{"name":"terminal","arguments":{"command":"status"}}],"answer":""}`, wantRelation: "final_prefix_of_stream", wantSource: "stream"},
+		{name: "short stream prefix", final: "complete answer", streamed: "complete", wantText: "complete answer", wantRelation: "stream_prefix_of_final", wantSource: "final"},
+		{name: "divergent preserves final", final: "final snapshot", streamed: "different streamed text with more bytes", wantText: "final snapshot", wantRelation: "divergent", wantSource: "final"},
+		{name: "final only", final: "final", streamed: "", wantText: "final", wantRelation: "final_only", wantSource: "final"},
+		{name: "stream only", final: "", streamed: "stream", wantText: "stream", wantRelation: "stream_only", wantSource: "stream"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotText, gotRelation, gotSource := reconcileCompletionText(tc.final, tc.streamed)
+			if gotText != tc.wantText || gotRelation != tc.wantRelation || gotSource != tc.wantSource {
+				t.Fatalf("reconcileCompletionText(%q,%q)=(%q,%q,%q), want (%q,%q,%q)", tc.final, tc.streamed, gotText, gotRelation, gotSource, tc.wantText, tc.wantRelation, tc.wantSource)
+			}
+		})
+	}
+}

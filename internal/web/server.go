@@ -1134,9 +1134,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		execution.Observe(routeRes)
 		mergeSearchEvidence(&routerSearchEvidence, routeRes)
+		routeRes, calls, parsed, parseSource := selectModelToolDecisionResult(routeRes, toolMaps, body.ToolChoice)
+		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, len(calls))
 		carrier := routeRes
 		carrierIsRouteResult := true
-		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		calls = filterKnownCalls(calls, ledger)
 		if !parsed {
 			repairPrompt := modelToolRouterRepairPrompt(routeRes.Text)
@@ -1154,9 +1155,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				execution.Observe(repairRes)
 				mergeSearchEvidence(&routerSearchEvidence, repairRes)
+				repairRes, calls, parsed, parseSource = selectModelToolDecisionResult(repairRes, toolMaps, body.ToolChoice)
+				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, len(calls))
 				carrier = repairRes
 				carrierIsRouteResult = false
-				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				calls = filterKnownCalls(calls, ledger)
 			}
 		}
@@ -1232,7 +1234,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 				execution.Observe(retryRes)
-				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice)
+				retryRes, calls, parsed, parseSource = selectModelToolDecisionResult(retryRes, toolMaps, body.ToolChoice)
+				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, len(calls))
 				calls = filterKnownCalls(calls, ledger)
 				if parsed && len(calls) > 0 {
 					scope := fmt.Sprintf("%d:%v:stream-required-retry", len(body.Messages), completedCallIDs(ledger))
@@ -1526,9 +1529,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		execution.Observe(routeRes)
 		mergeSearchEvidence(&routerSearchEvidence, routeRes)
+		routeRes, calls, parsed, parseSource := selectModelToolDecisionResult(routeRes, toolMaps, body.ToolChoice)
+		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, len(calls))
 		carrier := routeRes
 		carrierIsRouteResult := true
-		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		calls = filterKnownCalls(calls, ledger)
 		if !parsed {
 			repairPrompt := modelToolRouterRepairPrompt(routeRes.Text)
@@ -1546,9 +1550,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 				execution.Observe(repairRes)
 				mergeSearchEvidence(&routerSearchEvidence, repairRes)
+				repairRes, calls, parsed, parseSource = selectModelToolDecisionResult(repairRes, toolMaps, body.ToolChoice)
+				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, len(calls))
 				carrier = repairRes
 				carrierIsRouteResult = false
-				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				calls = filterKnownCalls(calls, ledger)
 			}
 			if !parsed {
@@ -1627,7 +1632,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 				execution.Observe(retryRes)
-				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice)
+				retryRes, calls, parsed, parseSource = selectModelToolDecisionResult(retryRes, toolMaps, body.ToolChoice)
+				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, len(calls))
 				calls = filterKnownCalls(calls, ledger)
 				if parsed && len(calls) > 0 {
 					scope := fmt.Sprintf("%d:%v:required-retry", len(body.Messages), completedCallIDs(ledger))
@@ -1767,36 +1773,64 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	created := time.Now().Unix()
 
 	if responseFormat != nil {
-		formatted, formatErr := validateResponseFormatText(res.Text, responseFormat)
+		var (
+			formatted    string
+			formatErr    error
+			formatSource string
+		)
+		res, formatted, formatErr, formatSource = validateResponseFormatResultEvidence(res, responseFormat)
+		log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=%t final_len=%d stream_len=%d canonical_len=%d", requestID, formatSource, res.TextRelation, formatErr == nil, len(res.FinalText), len(res.StreamedText), len(res.Text))
 		if formatErr != nil && memoryCompatibilityRequest(r.URL.Path) && responseFormat.Type == "json_schema" {
-			if candidate, ok := memoryStructuredJSONCandidate(res.Text); ok {
-				formatted, formatErr = validateResponseFormatText(candidate, responseFormat)
-				if formatErr == nil {
+			var (
+				repairCandidate string
+				repairFormatErr error
+			)
+			for _, evidence := range resultTextEvidenceCandidates(res) {
+				candidate, ok := memoryStructuredJSONCandidate(evidence.text)
+				if !ok {
+					continue
+				}
+				candidateFormatted, candidateErr := validateResponseFormatText(candidate, responseFormat)
+				if candidateErr == nil {
 					res.Text = candidate
-				} else {
-					repairPrompt := memorySchemaRepairPrompt(candidate, responseFormat, formatErr)
-					if budgetErr := validateCallerString(repairPrompt, settings.TextInputLimitUTF16); budgetErr != nil {
-						writeOpenAITextPolicyError(w, r, budgetErr)
+					res.TextSource = evidence.source
+					formatted = candidateFormatted
+					formatErr = nil
+					log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=true extraction=single_json final_len=%d stream_len=%d canonical_len=%d", requestID, evidence.source, res.TextRelation, len(res.FinalText), len(res.StreamedText), len(res.Text))
+					break
+				}
+				if repairCandidate == "" {
+					repairCandidate = candidate
+					repairFormatErr = candidateErr
+				}
+			}
+			if formatErr != nil && repairCandidate != "" {
+				candidate := repairCandidate
+				formatErr = repairFormatErr
+				repairPrompt := memorySchemaRepairPrompt(candidate, responseFormat, formatErr)
+				if budgetErr := validateCallerString(repairPrompt, settings.TextInputLimitUTF16); budgetErr != nil {
+					writeOpenAITextPolicyError(w, r, budgetErr)
+					return
+				}
+				repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, ToolChoice: "none", DisableBuiltInSearch: true}))
+				if repairErr != nil {
+					if writeCanonicalTerminalError(w, repairErr) {
 						return
 					}
-					repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, ToolChoice: "none", DisableBuiltInSearch: true}))
-					if repairErr != nil {
-						if writeCanonicalTerminalError(w, repairErr) {
-							return
+				} else {
+					execution.Observe(repairRes)
+					repairRes, repaired, repairedErr, repairSource := validateResponseFormatResultEvidence(repairRes, responseFormat)
+					log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=%t phase=repair final_len=%d stream_len=%d canonical_len=%d", requestID, repairSource, repairRes.TextRelation, repairedErr == nil, len(repairRes.FinalText), len(repairRes.StreamedText), len(repairRes.Text))
+					if repairedErr == nil {
+						if factErr := memoryRepairPreservesFacts(candidate, repaired, responseFormat); factErr == nil {
+							res = repairRes
+							formatted = repaired
+							formatErr = nil
+						} else {
+							formatErr = factErr
 						}
 					} else {
-						execution.Observe(repairRes)
-						if repaired, repairedErr := validateResponseFormatText(repairRes.Text, responseFormat); repairedErr == nil {
-							if factErr := memoryRepairPreservesFacts(candidate, repaired, responseFormat); factErr == nil {
-								res = repairRes
-								formatted = repaired
-								formatErr = nil
-							} else {
-								formatErr = factErr
-							}
-						} else {
-							formatErr = repairedErr
-						}
+						formatErr = repairedErr
 					}
 				}
 			}

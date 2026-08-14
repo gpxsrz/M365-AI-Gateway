@@ -93,6 +93,116 @@ func TestAutoToolRouterLongValidStructuredArgumentsBypassRepair(t *testing.T) {
 	}
 }
 
+func TestAutoToolRouterUsesValidatedStreamWhenFinalSnapshotIsMalformed(t *testing.T) {
+	validOutput, sentinel := longExecuteCodeRoutingOutput(t, 80)
+	malformedFinal := validOutput[:len(validOutput)-900]
+	if json.Valid([]byte(malformedFinal)) {
+		t.Fatal("fixture final snapshot must be malformed")
+	}
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			chat := &continuationChat{results: []chathub.Result{{
+				Text:         malformedFinal,
+				FinalText:    malformedFinal,
+				StreamedText: validOutput,
+				TextRelation: "divergent",
+				TextSource:   "final",
+			}}}
+			s := newWP1CandidateServer(t, &wp1CandidateChat{})
+			s.chat = chat
+			streamField := ""
+			if stream {
+				streamField = `"stream":true,`
+			}
+			body := `{` + streamField + `
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Run the supplied code."}],
+		"tools":[` + executeCodeRouterTool + `],
+		"tool_choice":"auto"
+	}`
+			rr := httptest.NewRecorder()
+			s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)))
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			if len(chat.requests) != 1 {
+				t.Fatalf("upstream requests=%d, validated streamed router decision must bypass repair", len(chat.requests))
+			}
+			if !strings.Contains(rr.Body.String(), sentinel) || !strings.Contains(rr.Body.String(), `"name":"execute_code"`) {
+				t.Fatalf("validated streamed tool call lost identity or sentinel: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAutoToolRouterUsesValidatedStreamDirectAnswerWhenFinalSnapshotIsMalformed(t *testing.T) {
+	final := `{"calls":[]`
+	streamed := `{"calls":[],"answer":"STREAM_RECOVERED_DIRECT_ANSWER"}`
+	chat := &continuationChat{results: []chathub.Result{{
+		Text:         final,
+		FinalText:    final,
+		StreamedText: streamed,
+		TextRelation: "divergent",
+		TextSource:   "final",
+	}}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Give the grounded answer."}],
+		"tools":[` + routerFallbackTool + `],
+		"tool_choice":"auto"
+	}`
+	rr := httptest.NewRecorder()
+	s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("upstream requests=%d, validated streamed direct answer must bypass repair", len(chat.requests))
+	}
+	response := wp1DecodeJSON(t, rr.Body.String())
+	message := response["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if message["content"] != "STREAM_RECOVERED_DIRECT_ANSWER" {
+		t.Fatalf("content=%#v body=%s", message["content"], rr.Body.String())
+	}
+}
+
+func TestAutoToolRouterDoesNotLongestWinDivergentInvalidStream(t *testing.T) {
+	validOutput := `{"calls":[{"name":"terminal","arguments":{"command":"status"}}],"answer":""}`
+	malformedFinal := strings.TrimSuffix(validOutput, "}")
+	invalidStream := `{"calls":[{"name":"terminal","arguments":{"command":2}}],"answer":""}` + strings.Repeat(" ", 2000)
+	chat := &continuationChat{results: []chathub.Result{
+		{Text: malformedFinal, FinalText: malformedFinal, StreamedText: invalidStream, TextRelation: "divergent", TextSource: "final"},
+		{Text: validOutput},
+	}}
+	s := newWP1CandidateServer(t, &wp1CandidateChat{})
+	s.chat = chat
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[{"role":"user","content":"Check status."}],
+		"tools":[` + routerFallbackTool + `],
+		"tool_choice":"auto"
+	}`
+	rr := httptest.NewRecorder()
+	s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("upstream requests=%d, divergent schema-invalid stream must not bypass repair", len(chat.requests))
+	}
+	if strings.Contains(chat.requests[1].Text, invalidStream) {
+		t.Fatal("repair incorrectly used divergent schema-invalid streamed text")
+	}
+	if !strings.HasSuffix(chat.requests[1].Text, malformedFinal) {
+		t.Fatalf("repair did not preserve the primary malformed final snapshot: %s", chat.requests[1].Text)
+	}
+}
+
 func TestAutoToolRouterRepairReceivesCompleteLongStructuredArguments(t *testing.T) {
 	validOutput, sentinel := longExecuteCodeRoutingOutput(t, 180)
 	malformedOutput := strings.TrimSuffix(validOutput, "}")

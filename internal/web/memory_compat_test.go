@@ -153,6 +153,119 @@ func (c *memoryWrappedJSONChat) Chat(_ context.Context, _ chathub.Account, _ cha
 	}, nil
 }
 
+type memorySplitEvidenceChat struct {
+	calls    int
+	final    string
+	streamed string
+}
+
+func (c *memorySplitEvidenceChat) Chat(_ context.Context, _ chathub.Account, _ chathub.Request) (chathub.Result, error) {
+	c.calls++
+	final := c.final
+	if final == "" {
+		final = `{"city":"台中"`
+	}
+	streamed := c.streamed
+	if streamed == "" {
+		streamed = `{"city":"台中"}`
+	}
+	return chathub.Result{
+		Text:           final,
+		FinalText:      final,
+		StreamedText:   streamed,
+		TextRelation:   "divergent",
+		TextSource:     "final",
+		ConversationID: "memory-split-evidence",
+		SessionID:      "memory-split-evidence-session",
+	}, nil
+}
+
+func TestMemorySchemaExtractsWrappedJSONFromAlternateStreamEvidence(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-wrapped-stream-evidence")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memorySplitEvidenceChat{
+		final:    "Partial JSON: {",
+		streamed: "Here is the requested object:\n{\"city\":\"台中\"}\nDone.",
+	}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"我住台中"}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK || chat.calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rr.Code, chat.calls, rr.Body.String())
+	}
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Choices) != 1 || response.Choices[0].Message.Content != `{"city":"台中"}` {
+		t.Fatalf("wrapped streamed evidence was not extracted safely: %s", rr.Body.String())
+	}
+}
+
+func (c *memorySplitEvidenceChat) ChatWithDelta(ctx context.Context, account chathub.Account, req chathub.Request, _ func(string) error) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func (c *memorySplitEvidenceChat) ChatWithEvents(ctx context.Context, account chathub.Account, req chathub.Request, _ chathub.StreamHandler) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func TestMemorySchemaUsesValidatedStreamEvidenceBeforeRepair(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-split-evidence")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memorySplitEvidenceChat{}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"我住台中"}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if chat.calls != 1 {
+		t.Fatalf("chat calls=%d, valid streamed schema evidence must bypass repair", chat.calls)
+	}
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Choices) != 1 || response.Choices[0].Message.Content != `{"city":"台中"}` {
+		t.Fatalf("response did not select valid streamed JSON evidence: %s", rr.Body.String())
+	}
+}
+
 func (c *memoryWrappedJSONChat) ChatWithDelta(ctx context.Context, account chathub.Account, req chathub.Request, _ func(string) error) (chathub.Result, error) {
 	return c.Chat(ctx, account, req)
 }

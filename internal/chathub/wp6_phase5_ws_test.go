@@ -28,6 +28,78 @@ type deadlineRecordingConn struct {
 	writeDeadlines []time.Time
 }
 
+func TestChatHubPreservesStreamAndShorterFinalEvidence(t *testing.T) {
+	const streamed = `{"calls":[{"name":"execute_code","arguments":{"code":"print('BEGIN')\nprint('LOAD_BEARING_MIDDLE')\nprint('END')"}}],"answer":""}`
+	const final = `{"calls":[`
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err = conn.ReadMessage(); err != nil {
+			return
+		}
+		if err = conn.WriteMessage(websocket.TextMessage, []byte(`{}`+rs)); err != nil {
+			return
+		}
+		if _, _, err = conn.ReadMessage(); err != nil {
+			return
+		}
+		update, _ := json.Marshal(map[string]any{
+			"type":   1,
+			"target": "update",
+			"arguments": []any{map[string]any{
+				"messages": []any{map[string]any{"author": "bot", "text": streamed}},
+			}},
+		})
+		completion, _ := json.Marshal(map[string]any{
+			"type": 2,
+			"item": map[string]any{"result": map[string]any{"message": final, "value": ""}},
+		})
+		for _, frame := range [][]byte{update, completion, []byte(`{"type":99,"future":"kept"}`), []byte(`{"type":3}`)} {
+			if err = conn.WriteMessage(websocket.TextMessage, append(frame, []byte(rs)...)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	address := strings.TrimPrefix(server.URL, "https://")
+	client := NewClient()
+	client.Dialer = &websocket.Dialer{
+		NetDialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "tcp", address)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Test server certificate only.
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := client.Chat(ctx, Account{AccessToken: "token", OID: "oid", TID: "tid"}, Request{Text: "route", ConversationID: "conversation", SessionID: "session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != streamed || result.StreamedText != streamed || result.FinalText != final {
+		t.Fatalf("text evidence mismatch: text=%q stream=%q final=%q", result.Text, result.StreamedText, result.FinalText)
+	}
+	if result.TextRelation != "final_prefix_of_stream" || result.TextSource != "stream" {
+		t.Fatalf("relation=%q source=%q", result.TextRelation, result.TextSource)
+	}
+	if len(result.Events) != 4 {
+		t.Fatalf("raw frame count=%d, want 4", len(result.Events))
+	}
+	for i, typ := range []string{`"type":1`, `"type":2`, `"type":99`, `"type":3`} {
+		if !strings.Contains(string(result.Events[i]), typ) {
+			t.Fatalf("raw frame %d=%s, want %s", i, result.Events[i], typ)
+		}
+	}
+	if len(result.UnknownEvents) != 1 || result.UnknownEvents[0].Type != 99 {
+		t.Fatalf("unknown events=%#v, want preserved type=99 frame", result.UnknownEvents)
+	}
+}
+
 func (conn *deadlineRecordingConn) SetReadDeadline(deadline time.Time) error {
 	conn.readDeadlines = append(conn.readDeadlines, deadline)
 	return conn.Conn.SetReadDeadline(deadline)

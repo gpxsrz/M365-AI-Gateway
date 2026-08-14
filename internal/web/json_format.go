@@ -3,6 +3,7 @@ package web
 import (
 	"errors"
 	"fmt"
+	"m365-native/internal/chathub"
 	"strings"
 )
 
@@ -63,4 +64,62 @@ func validateResponseFormatText(text string, format *responseFormat) (string, er
 	default:
 		return "", fmt.Errorf("unsupported response_format type %q", format.Type)
 	}
+}
+
+type resultTextEvidenceCandidate struct {
+	text   string
+	source string
+}
+
+func resultTextEvidenceCandidates(result chathub.Result) []resultTextEvidenceCandidate {
+	source := result.TextSource
+	if source == "" {
+		source = "canonical"
+	}
+	out := []resultTextEvidenceCandidate{{text: result.Text, source: source}}
+
+	// Once a higher layer has intentionally replaced Text with a safety or
+	// protocol response, raw upstream candidates are evidence only and must not
+	// be resurrected as caller-visible content.
+	if result.FinalText != "" || result.StreamedText != "" {
+		if result.Text != result.FinalText && result.Text != result.StreamedText {
+			return out
+		}
+	}
+	seen := map[string]bool{result.Text: true}
+	for _, candidate := range []resultTextEvidenceCandidate{
+		{text: result.FinalText, source: "final"},
+		{text: result.StreamedText, source: "stream"},
+	} {
+		if strings.TrimSpace(candidate.text) == "" || seen[candidate.text] {
+			continue
+		}
+		seen[candidate.text] = true
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func validateResponseFormatResultEvidence(result chathub.Result, format *responseFormat) (chathub.Result, string, error, string) {
+	candidates := resultTextEvidenceCandidates(result)
+	var primaryErr error
+	for i, candidate := range candidates {
+		candidateFormatted, candidateErr := validateResponseFormatText(candidate.text, format)
+		if candidateErr != nil {
+			if i == 0 {
+				primaryErr = candidateErr
+			}
+			continue
+		}
+		if i > 0 {
+			result.Text = candidate.text
+			result.TextSource = candidate.source
+		}
+		return result, candidateFormatted, nil, candidate.source
+	}
+	source := "canonical"
+	if len(candidates) > 0 {
+		source = candidates[0].source
+	}
+	return result, "", primaryErr, source
 }

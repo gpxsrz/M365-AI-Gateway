@@ -112,6 +112,14 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 
 完整 repair prompt 仍會在第二次 upstream call **之前**重新套用目前的 `textInputLimitUTF16`。若 repair input 本身超過上限，Sidecar 會 fail closed，不會為了塞進預算再截斷 arguments；回應為 HTTP `502` / `upstream_error`，並帶 `code=tool_router_repair_input_too_large`、`limit_type=repair_prompt_utf16`、`limit`、`received`、`terminal=true`、`retryable=false` 與 `recommended_action`。這是內部 repair 的安全預算，不是新的 caller 設定，也不是提高 `128000 UTF-16` 的理由；Production 建議仍維持 `textInputLimitUTF16=128000`，由 Hermes/Hindsight 在 consumer 端更早做 token-based pruning/reduction。
 
+### ChatHub completion evidence 與協議投影
+
+ChatHub transport 會在單次 request 存活期間保留 ordered raw SignalR/ChatHub frames，以及 Microsoft completion 的兩條獨立文字 evidence：WebSocket 累積的 `streamedText` 與 type-2 `item.result.message` 的 `finalText`。`Result.Text` 只是由這些 evidence 產生的 canonical projection，不再是唯一保留的文字來源；未知/future frame 也會留在 raw `Events` / `UnknownEvents`，不能因目前 adapter 尚未使用就提前丟棄。
+
+`finalText` 與 `streamedText` 相同時直接使用；一方可證明是另一方 prefix 時可採較完整版本；真正 divergent 時不做 generic longest-wins。Tool router 會先驗證 canonical/final decision，只有失敗時才嘗試另一份 evidence，而且仍須完整通過 JSON、tool name、schema、`tool_choice` 與 call-limit 安全契約。Memory `/memory/v1` 的 `response_format/json_schema` 也會先驗證 final/stream evidence（包含唯一 wrapped JSON candidate），兩邊都不能安全滿足 schema 時才進既有 bounded repair / fail-closed 路徑。
+
+這裡的 lossless 指 **request-scoped processing evidence**，不等於把 Microsoft raw frames 原封不動回傳 Hermes，也不等於永久記錄私人內容、token 或 protected metadata。對外仍由 OpenAI/Hermes/Memory/Responses/Anthropic adapter 做安全 projection；Production debug storage 仍受 redaction、TTL 與 bounded-size 規則約束。
+
 ### Final-answer router envelope
 
 #57 修正了 final-answer model 再次回傳內部 `{"calls":[],"answer":"..."}` envelope 時的外漏問題。Sidecar 只會解開完整且明確的 direct-answer envelope；一般使用者 JSON 保持原樣，含 non-empty `calls`、重複 internal keys、額外欄位或錯誤型別的 router-like JSON 會 fail closed，malformed JSON 不做猜測式剝殼。Generic `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Memory `/memory/v1/chat/completions` 的 streaming 與 non-streaming 均已完成 Production live qualification，Memory JSON Schema 輸出也另外通過 live canary。
@@ -262,6 +270,14 @@ The retry currently covers HTTP `500`, `502`, `503`, and `504` upgrade failures 
 If the model tool router's first candidate is not even parseable as outer JSON and must enter its single bounded repair pass, the sidecar now places the **complete raw router output** into the repair prompt instead of compacting it to a fixed 6000 characters. This prevents large `execute_code`, SQL, or other structured arguments from being cut in the middle and turned into a different invalid tool call during repair.
 
 The complete repair prompt is still checked against the current `textInputLimitUTF16` **before** a second upstream call. If the repair input itself exceeds that budget, the sidecar fails closed instead of truncating arguments to make them fit. It returns HTTP `502` / `upstream_error` with `code=tool_router_repair_input_too_large`, `limit_type=repair_prompt_utf16`, `limit`, `received`, `terminal=true`, `retryable=false`, and `recommended_action`. This is an internal repair safety budget, not a new caller setting and not a reason to raise the `128000 UTF-16` policy. Production guidance remains `textInputLimitUTF16=128000`, with Hermes/Hindsight performing token-based pruning or reduction earlier on the consumer side.
+
+### ChatHub completion evidence and protocol projection
+
+For the lifetime of one request, the ChatHub transport retains ordered raw SignalR/ChatHub frames plus both independent Microsoft completion text channels: accumulated WebSocket `streamedText` and the type-2 `item.result.message` `finalText`. `Result.Text` is a canonical projection derived from that evidence rather than the only retained text source. Unknown/future frames also remain available through raw `Events` / `UnknownEvents` instead of being discarded simply because a current adapter does not yet understand them.
+
+Equal final/stream text is used directly. A provable prefix relationship may select the more complete candidate, while genuinely divergent text is never resolved by a generic longest-wins rule. The tool router validates the canonical/final decision first and tries alternate evidence only after failure; any selected alternate still has to satisfy JSON parsing, tool-name/schema validation, `tool_choice`, and call limits. Memory `/memory/v1` `response_format/json_schema` likewise validates final/stream evidence, including a single safely extractable wrapped JSON candidate, before falling back to the existing bounded repair / fail-closed path.
+
+"Lossless" here means **request-scoped processing evidence**. It does not mean raw Microsoft frames are passed through to Hermes, nor does it mean private content, tokens, or protected metadata are permanently logged. Public OpenAI/Hermes/Memory/Responses/Anthropic adapters still perform safe protocol projection, while Production debug storage remains redacted, TTL-bound, and size-bounded.
 
 ### Final-answer router envelope
 

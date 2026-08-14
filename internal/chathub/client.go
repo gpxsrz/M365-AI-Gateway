@@ -87,7 +87,15 @@ type StreamEvent struct {
 type StreamHandler func(StreamEvent) error
 
 type Result struct {
-	Text           string
+	Text string
+	// FinalText and StreamedText retain the two independent textual evidence
+	// channels emitted by ChatHub for the lifetime of this request. Text is a
+	// canonical projection selected from them; it must never be the only copy
+	// of upstream evidence available to protocol adapters.
+	FinalText      string
+	StreamedText   string
+	TextRelation   string
+	TextSource     string
 	ConversationID string
 	SessionID      string
 	RequestID      string
@@ -100,6 +108,29 @@ type Result struct {
 	Attributions   []Attribution
 	UnknownEvents  []Event
 	Terminal       TerminalState
+}
+
+func reconcileCompletionText(final, streamed string) (text, relation, source string) {
+	switch {
+	case final == "" && streamed == "":
+		return "", "empty", ""
+	case final == "":
+		return streamed, "stream_only", "stream"
+	case streamed == "":
+		return final, "final_only", "final"
+	case final == streamed:
+		return final, "equal", "final"
+	case strings.HasPrefix(streamed, final):
+		return streamed, "final_prefix_of_stream", "stream"
+	case strings.HasPrefix(final, streamed):
+		return final, "stream_prefix_of_final", "final"
+	default:
+		// Divergent snapshots are ambiguous. Keep the provider-designated final
+		// as the canonical text, but retain both candidates so higher protocol
+		// layers can validate them against their own schema before repairing or
+		// failing closed. Do not implement a generic longest-wins policy here.
+		return final, "divergent", "final"
+	}
 }
 
 type Client struct {
@@ -490,20 +521,22 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				event := normalize(json.RawMessage(part))
 				if event.ErrorText != "" {
 					state := TerminalState{Kind: "error", Error: event.ErrorText}
-					result := Result{ConversationID: req.ConversationID, SessionID: req.SessionID, RequestID: requestID, Events: events, Terminal: state}
+					text, relation, source := reconcileCompletionText(final, streamedText)
+					result := Result{Text: text, FinalText: final, StreamedText: streamedText, TextRelation: relation, TextSource: source, ConversationID: req.ConversationID, SessionID: req.SessionID, RequestID: requestID, Events: events, Terminal: state}
 					if err := CanonicalizeResult(&result); err != nil {
 						return result, err
 					}
 					return result, &TerminalError{State: result.Terminal}
 				}
 				// end of stream
-				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), len(streamedText), len(events))
-				text := final
-				if text == "" {
-					text = streamedText
-				}
+				text, relation, source := reconcileCompletionText(final, streamedText)
+				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d final_text=%d text_relation=%s text_source=%s events=%d", time.Since(payloadSentAt).Milliseconds(), len(streamedText), len(final), relation, source, len(events))
 				result := Result{
 					Text:           text,
+					FinalText:      final,
+					StreamedText:   streamedText,
+					TextRelation:   relation,
+					TextSource:     source,
 					ConversationID: req.ConversationID,
 					SessionID:      req.SessionID,
 					RequestID:      requestID,
@@ -522,7 +555,8 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			if int(t) == 7 {
 				event := normalize(json.RawMessage(part))
 				state := TerminalState{Kind: "close", Error: event.ErrorText, AllowReconnect: event.AllowReconnect}
-				result := Result{ConversationID: req.ConversationID, SessionID: req.SessionID, RequestID: requestID, Events: events, Terminal: state}
+				text, relation, source := reconcileCompletionText(final, streamedText)
+				result := Result{Text: text, FinalText: final, StreamedText: streamedText, TextRelation: relation, TextSource: source, ConversationID: req.ConversationID, SessionID: req.SessionID, RequestID: requestID, Events: events, Terminal: state}
 				if err := CanonicalizeResult(&result); err != nil {
 					return result, err
 				}

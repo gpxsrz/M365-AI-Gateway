@@ -3,6 +3,8 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"m365-native/internal/chathub"
 	"strings"
 )
 
@@ -90,6 +92,58 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 		out = append(out, detectedToolCall{ID: callID(c.Name, string(c.Arguments), i), Type: toolType(c.Name, tools), Name: c.Name, Arguments: append(json.RawMessage(nil), c.Arguments...)})
 	}
 	return out, true
+}
+
+func alternateModelToolDecisionUsable(text string, calls []detectedToolCall) bool {
+	if len(calls) > 0 {
+		return true
+	}
+	if _, ok := parseModelToolDirectAnswer(text); ok {
+		return true
+	}
+	if envelope, ok, ambiguous := parseExactModelToolEnvelope(text); ok && !ambiguous && len(envelope.Calls) == 0 {
+		return true
+	}
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "no_tool_needed")
+}
+
+func selectModelToolDecisionResult(result chathub.Result, tools []map[string]any, choice any) (chathub.Result, []detectedToolCall, bool, string) {
+	calls, parsed := parseModelToolDecision(result.Text, tools, choice)
+	source := result.TextSource
+	if source == "" {
+		source = "canonical"
+	}
+	if parsed {
+		return result, calls, true, source
+	}
+
+	seen := map[string]bool{result.Text: true}
+	candidates := []struct {
+		text   string
+		source string
+	}{
+		{text: result.FinalText, source: "final"},
+		{text: result.StreamedText, source: "stream"},
+	}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.text) == "" || seen[candidate.text] {
+			continue
+		}
+		seen[candidate.text] = true
+		candidateCalls, candidateParsed := parseModelToolDecision(candidate.text, tools, choice)
+		if !candidateParsed || !alternateModelToolDecisionUsable(candidate.text, candidateCalls) {
+			continue
+		}
+		result.Text = candidate.text
+		result.TextSource = candidate.source
+		return result, candidateCalls, true, candidate.source
+	}
+	return result, calls, false, source
+}
+
+func logModelToolDecisionSelection(requestID, phase string, result chathub.Result, source string, parsed bool, calls int) {
+	log.Printf("[req-trace] id=%s stage=router_candidate phase=%s source=%s relation=%s parsed=%t calls=%d final_len=%d stream_len=%d canonical_len=%d", requestID, phase, source, result.TextRelation, parsed, calls, len(result.FinalText), len(result.StreamedText), len(result.Text))
 }
 
 func parseModelToolDirectAnswer(text string) (string, bool) {
