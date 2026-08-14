@@ -93,3 +93,25 @@ func TestPrivateModeReappliesOnReconnectAndToolContinuationDialPaths(t *testing.
 		t.Fatalf("normal continuation exposed disableMemory: %#v", queries[2]["disableMemory"])
 	}
 }
+
+func TestPrivateModeAppliesToFreshScratchConversationDial(t *testing.T) {
+	stopDial := errors.New("stop before network")
+	var query url.Values
+	client := NewClient()
+	client.Dialer = &websocket.Dialer{Proxy: func(request *http.Request) (*url.URL, error) {
+		query = request.URL.Query()
+		return nil, stopDial
+	}}
+	client.PrivateMode = func() bool { return true }
+	account := Account{AccessToken: "token", OID: "oid", TID: "tid"}
+
+	if _, err := client.Chat(context.Background(), account, Request{Text: "isolated router scratch", Started: true}); !errors.Is(err, stopDial) {
+		t.Fatalf("scratch dial error=%v, want sentinel", err)
+	}
+	if values := query["disableMemory"]; len(values) != 1 || values[0] != "1" {
+		t.Fatalf("scratch private dial disableMemory=%#v", values)
+	}
+	if query.Get("ConversationId") == "" || query.Get("X-SessionId") == "" {
+		t.Fatalf("scratch dial did not generate fresh conversation/session identity: %#v", query)
+	}
+}

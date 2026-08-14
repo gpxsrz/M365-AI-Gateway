@@ -142,8 +142,76 @@ func selectModelToolDecisionResult(result chathub.Result, tools []map[string]any
 	return result, calls, false, source
 }
 
-func logModelToolDecisionSelection(requestID, phase string, result chathub.Result, source string, parsed bool, calls int) {
-	log.Printf("[req-trace] id=%s stage=router_candidate phase=%s source=%s relation=%s parsed=%t calls=%d final_len=%d stream_len=%d canonical_len=%d", requestID, phase, source, result.TextRelation, parsed, calls, len(result.FinalText), len(result.StreamedText), len(result.Text))
+type modelToolCallDedup struct {
+	Calls               []detectedToolCall
+	Before              int
+	After               int
+	KnownCallSuppressed bool
+}
+
+func deduplicateModelToolCalls(calls []detectedToolCall, ledger agentLedger, parsed bool) modelToolCallDedup {
+	before := len(calls)
+	filtered := filterKnownCalls(calls, ledger)
+	after := len(filtered)
+	return modelToolCallDedup{
+		Calls:               filtered,
+		Before:              before,
+		After:               after,
+		KnownCallSuppressed: parsed && before > after,
+	}
+}
+
+func modelToolDecisionParseReason(result chathub.Result, calls []detectedToolCall, parsed bool) string {
+	if parsed {
+		if len(calls) > 0 {
+			return "tool_calls"
+		}
+		if _, ok := parseModelToolDirectAnswer(result.Text); ok {
+			return "direct_answer"
+		}
+		if envelope, ok, ambiguous := parseExactModelToolEnvelope(strings.TrimSpace(result.Text)); ambiguous {
+			return "envelope_shape"
+		} else if ok && len(envelope.Calls) == 0 {
+			return "empty_calls"
+		}
+		if strings.Contains(strings.ToLower(result.Text), "no_tool_needed") {
+			return "no_tool_needed"
+		}
+		return "parsed_no_valid_calls"
+	}
+	text := strings.TrimSpace(result.Text)
+	if text == "" {
+		return "empty"
+	}
+	start, end := strings.Index(text, "{"), strings.LastIndex(text, "}")
+	if start < 0 || end <= start {
+		return "no_json_envelope"
+	}
+	if !json.Valid([]byte(text[start : end+1])) {
+		return "json_syntax"
+	}
+	if _, ok, ambiguous := parseExactModelToolEnvelope(text[start : end+1]); ambiguous {
+		return "envelope_shape"
+	} else if !ok {
+		return "envelope_shape"
+	}
+	return "unusable_decision"
+}
+
+func logModelToolDecisionSelection(requestID, phase string, result chathub.Result, source string, parsed bool, dedup modelToolCallDedup) {
+	reason := modelToolDecisionParseReason(result, dedup.Calls, parsed)
+	if parsed && dedup.Before > 0 {
+		reason = "tool_calls"
+	}
+	log.Printf("[req-trace] id=%s stage=router_candidate phase=%s source=%s relation=%s parsed=%t parse_reason=%s calls_before_dedup=%d calls_after_dedup=%d known_call_suppressed=%t final_len=%d stream_len=%d canonical_len=%d", requestID, phase, source, result.TextRelation, parsed, reason, dedup.Before, dedup.After, dedup.KnownCallSuppressed, len(result.FinalText), len(result.StreamedText), len(result.Text))
+}
+
+func modelToolScratchRequest(text, tone string) chathub.Request {
+	return chathub.Request{Text: text, Tone: tone, Started: true}
+}
+
+func logModelToolPhaseBinding(requestID, phase, scope, source string, request chathub.Request) {
+	log.Printf("[req-trace] id=%s stage=tool_phase_binding phase=%s phase_scope=%s binding_source=%s session_rotated=%t", requestID, phase, scope, source, strings.TrimSpace(request.SessionID) == "")
 }
 
 func parseModelToolDirectAnswer(text string) (string, bool) {

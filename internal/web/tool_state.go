@@ -2,6 +2,31 @@ package web
 
 import "fmt"
 
+func priorToolStateExcludingTrustedReplay(priorCallIDs, priorSeenCallDigests, trustedReplayCallDigests []string) ([]string, []string) {
+	replayed := make(map[string]struct{}, len(trustedReplayCallDigests))
+	for _, digest := range trustedReplayCallDigests {
+		if validCheckpointDigest(digest) {
+			replayed[digest] = struct{}{}
+		}
+	}
+	if len(replayed) == 0 {
+		return priorCallIDs, priorSeenCallDigests
+	}
+	filteredIDs := make([]string, 0, len(priorCallIDs))
+	for _, id := range priorCallIDs {
+		if _, ok := replayed[toolCallIDDigest(id)]; !ok {
+			filteredIDs = append(filteredIDs, id)
+		}
+	}
+	filteredDigests := make([]string, 0, len(priorSeenCallDigests))
+	for _, digest := range priorSeenCallDigests {
+		if _, ok := replayed[digest]; !ok {
+			filteredDigests = append(filteredDigests, digest)
+		}
+	}
+	return filteredIDs, filteredDigests
+}
+
 func validateToolConversationWithPriorDigests(messages []oaiMsg, priorCallIDs, priorSeenCallDigests []string) error {
 	pending := map[string]bool{}
 	seen := map[string]bool{}

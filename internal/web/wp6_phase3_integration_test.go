@@ -764,7 +764,7 @@ func TestWP6ResponsesToolResultUsesCheckpointedCallIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "checkpoints.json")
 	chat := &checkpointIntegrationChat{results: []chathub.Result{
 		{Text: `{"calls":[{"name":"lookup","arguments":{"query":"phase3"}}]}`, ConversationID: "conversation-tool", SessionID: "session-1"},
-		{Text: "TOOL-FINAL", ConversationID: "conversation-tool", SessionID: "session-2"},
+		{Text: "TOOL-FINAL", ConversationID: "public-conversation-tool", SessionID: "public-session-2"},
 	}}
 	server := phase3Server(t, chat, path)
 	firstBody := `{"model":"gpt-5.6-sol","input":"USE-LOOKUP","tools":[{"type":"function","name":"lookup","description":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}`
@@ -797,8 +797,11 @@ func TestWP6ResponsesToolResultUsesCheckpointedCallIdentity(t *testing.T) {
 		t.Fatalf("requests=%d", len(chat.requests))
 	}
 	request := chat.requests[1]
-	if request.ConversationID != "conversation-tool" || request.SessionID != "session-1" || !strings.Contains(request.Text, "TOOL-RESULT-MARKER") || strings.Contains(request.Text, "USE-LOOKUP") {
+	if request.ConversationID != "" || request.SessionID != "" || !strings.Contains(request.Text, "TOOL-RESULT-MARKER") || !strings.Contains(request.Text, "USE-LOOKUP") {
 		t.Fatalf("tool continuation request=%#v", request)
+	}
+	if !strings.Contains(request.Text, callID) || !strings.Contains(request.Text, `"role":"assistant"`) {
+		t.Fatalf("tool continuation did not replay caller-visible tool identity: %#v", request)
 	}
 }
 
@@ -835,8 +838,8 @@ func TestWP6HermesReloadedToolResultNameKeepsExactConversation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "checkpoints.json")
 	chat := &checkpointIntegrationChat{results: []chathub.Result{
 		{Text: `{"calls":[{"name":"lookup","arguments":{"query":"delta"}}]}`, ConversationID: "conversation-tool-chat", SessionID: "session-1"},
-		{Text: "TOOL-ANSWER", ConversationID: "conversation-tool-chat", SessionID: "session-2"},
-		{Text: "AFTER-TOOL-ANSWER", ConversationID: "conversation-tool-chat", SessionID: "session-3"},
+		{Text: "TOOL-ANSWER", ConversationID: "public-conversation-tool-chat", SessionID: "public-session-2"},
+		{Text: "AFTER-TOOL-ANSWER", ConversationID: "public-conversation-tool-chat", SessionID: "public-session-3"},
 	}}
 	server := phase3Server(t, chat, path)
 	tool := chathub.Tool{Type: "function", Function: json.RawMessage(`{"name":"lookup","description":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}`)}
@@ -870,7 +873,7 @@ func TestWP6HermesReloadedToolResultNameKeepsExactConversation(t *testing.T) {
 		t.Fatalf("requests=%d", len(chat.requests))
 	}
 	request := chat.requests[1]
-	if request.ConversationID != "conversation-tool-chat" || request.SessionID != "session-1" || !strings.Contains(request.Text, "TOOL-RESULT-DELTA") || strings.Contains(request.Text, "CALL-LOOKUP") {
+	if request.ConversationID != "" || request.SessionID != "" || !strings.Contains(request.Text, "TOOL-RESULT-DELTA") || !strings.Contains(request.Text, "CALL-LOOKUP") || !strings.Contains(request.Text, callID) {
 		t.Fatalf("tool result continuation=%#v", request)
 	}
 	secondResponse := wp1DecodeJSON(t, recorder.Body.String())
@@ -892,7 +895,7 @@ func TestWP6HermesReloadedToolResultNameKeepsExactConversation(t *testing.T) {
 		t.Fatalf("third status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	thirdRequest := chat.requests[2]
-	if thirdRequest.ConversationID != "conversation-tool-chat" || thirdRequest.SessionID != "session-2" || !strings.Contains(thirdRequest.Text, "AFTER-TOOL-USER") {
+	if thirdRequest.ConversationID != "public-conversation-tool-chat" || thirdRequest.SessionID != "public-session-2" || !strings.Contains(thirdRequest.Text, "AFTER-TOOL-USER") {
 		t.Fatalf("third continuation=%#v", thirdRequest)
 	}
 	for _, historical := range []string{"CALL-LOOKUP", "TOOL-RESULT-DELTA", "TOOL-ANSWER"} {

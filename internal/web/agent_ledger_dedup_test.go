@@ -27,6 +27,21 @@ func TestFilterKnownCallsKeepsNewArguments(t *testing.T) {
 	}
 }
 
+func TestDeduplicateModelToolCallsReportsPartialKnownCallSuppression(t *testing.T) {
+	ledger := agentLedger{Completed: []toolEvidence{{
+		Name:            "workspace_write_file",
+		ArgumentsSHA256: toolArgumentsSHA256(`{"path":"main.go","content":"old"}`),
+	}}}
+	calls := []detectedToolCall{
+		{Name: "workspace_write_file", Arguments: []byte(`{"path":"main.go","content":"old"}`)},
+		{Name: "workspace_write_file", Arguments: []byte(`{"path":"main.go","content":"new"}`)},
+	}
+	got := deduplicateModelToolCalls(calls, ledger, true)
+	if got.Before != 2 || got.After != 1 || !got.KnownCallSuppressed || len(got.Calls) != 1 {
+		t.Fatalf("unexpected dedup metadata: %#v", got)
+	}
+}
+
 func TestFilterKnownCallsSuppressesPendingEquivalentJSON(t *testing.T) {
 	ledger := agentLedger{Pending: []toolEvidence{{
 		Name:            "terminal",

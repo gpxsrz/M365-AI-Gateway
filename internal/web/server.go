@@ -930,12 +930,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	execution := checkpointExecutionFrom(r.Context())
 	var priorToolCallIDs []string
 	var priorSeenToolCallDigests []string
+	var trustedReplayCallDigests []string
 	if execution != nil && execution.turn != nil && execution.turn.turn != nil {
 		priorToolCallIDs = execution.turn.turn.AllowedPriorToolCallIDs
 		priorSeenToolCallDigests = execution.turn.turn.KnownPriorToolCallDigests
+		trustedReplayCallDigests = execution.turn.turn.TrustedReplayCallDigests
 		body.ConversationID = execution.turn.binding.ConversationID
 		body.SessionID = execution.turn.binding.SessionID
 	}
+	priorToolCallIDs, priorSeenToolCallDigests = priorToolStateExcludingTrustedReplay(priorToolCallIDs, priorSeenToolCallDigests, trustedReplayCallDigests)
 	if err := validateToolConversationWithPriorDigests(body.Messages, priorToolCallIDs, priorSeenToolCallDigests); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
@@ -1137,7 +1140,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// completed assistant turn with the actual call lost.
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
-		routeRes, routeErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments}))
+		routeReq := modelToolScratchRequest(routePrompt, tone)
+		logModelToolPhaseBinding(requestID, "route", "scratch", "fresh", routeReq)
+		routeRes, routeErr := s.chat.Chat(ctx, account, routeReq)
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
 		if routeErr != nil {
 			if writeCanonicalTerminalError(w, routeErr) {
@@ -1149,20 +1154,23 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if _, ok := requireSafeNativeToolEmission(w, routeRes, body.Tools); !ok {
 			return
 		}
-		execution.Observe(routeRes)
 		mergeSearchEvidence(&routerSearchEvidence, routeRes)
 		routeRes, calls, parsed, parseSource := selectModelToolDecisionResult(routeRes, toolMaps, body.ToolChoice)
-		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, len(calls))
+		dedup := deduplicateModelToolCalls(calls, ledger, parsed)
+		calls = dedup.Calls
+		knownCallSuppressed := dedup.KnownCallSuppressed
+		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, dedup)
 		carrier := routeRes
 		carrierIsRouteResult := true
-		calls = filterKnownCalls(calls, ledger)
 		if !parsed {
 			repairPrompt := modelToolRouterRepairPrompt(routeRes.Text)
 			if repairUnits := utf16CodeUnits(repairPrompt); repairUnits > settings.TextInputLimitUTF16 {
 				writeToolRouterRepairInputTooLarge(w, repairUnits, settings.TextInputLimitUTF16)
 				return
 			}
-			repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments}))
+			repairReq := modelToolScratchRequest(repairPrompt, tone)
+			logModelToolPhaseBinding(requestID, "repair", "scratch", "fresh", repairReq)
+			repairRes, repairErr := s.chat.Chat(ctx, account, repairReq)
 			if repairErr != nil && writeCanonicalTerminalError(w, repairErr) {
 				return
 			}
@@ -1170,46 +1178,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				if _, ok := requireSafeNativeToolEmission(w, repairRes, body.Tools); !ok {
 					return
 				}
-				execution.Observe(repairRes)
 				mergeSearchEvidence(&routerSearchEvidence, repairRes)
 				repairRes, calls, parsed, parseSource = selectModelToolDecisionResult(repairRes, toolMaps, body.ToolChoice)
-				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, len(calls))
+				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				calls = dedup.Calls
+				knownCallSuppressed = dedup.KnownCallSuppressed
+				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, dedup)
 				carrier = repairRes
 				carrierIsRouteResult = false
-				calls = filterKnownCalls(calls, ledger)
-			}
-		}
-		if parsed {
-			if answer, ok := parseModelToolDirectAnswer(carrier.Text); ok {
-				if !carrierIsRouteResult {
-					mergeSearchEvidence(&carrier, routerSearchEvidence)
-				}
-				carrier.Text = answer
-				carrier.Images = validImageURLs(carrier.Images)
-				if _, err := s.materializeArtifacts(ctx, r, &carrier); err != nil {
-					writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "artifact_materialization_failed", err.Error())
-					return
-				}
-				if !requireUsableChatResult(w, carrier, body.Tools) {
-					return
-				}
-				if responseFormat != nil {
-					formatted, formatErr := validateResponseFormatText(carrier.Text, responseFormat)
-					if formatErr != nil {
-						writeChatStreamError(w, "response_format_validation_failed", formatErr.Error())
-						return
-					}
-					carrier.Text = formatted
-				}
-				if err := completeCheckpointExecution(execution, ownsCheckpoint, carrier, assistantTextCheckpointMessage(carrier.Text, carrier.Images)); err != nil {
-					writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
-					return
-				}
-				response := routerDirectAnswerCompletion("chatcmpl-"+uuid.NewString(), carrier, resolution, nativePolicy, responseFormat)
-				if err := writeBufferedChatCompletionStream(w, response, resolution, body.Tools, body.ToolChoice, nativePolicy); err != nil {
-					writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
-				}
-				return
 			}
 		}
 		if parsed && len(calls) > 0 {
@@ -1225,7 +1201,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				mergeSearchEvidence(&carrier, routerSearchEvidence)
 			}
 			carrier.Text = ""
-			if err := completeCheckpointExecution(execution, ownsCheckpoint, carrier, assistantToolCheckpointMessage(calls, carrier, true)); err != nil {
+			if err := completeCheckpointScratchExecution(execution, ownsCheckpoint, assistantToolCheckpointMessage(calls, carrier, true)); err != nil {
 				writeChatStreamError(w, "checkpoint_error", err.Error())
 				return
 			}
@@ -1233,16 +1209,18 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		mode := normalizedToolChoiceMode(body.ToolChoice)
-		if strings.HasPrefix(mode, "named:") {
+		if !knownCallSuppressed && strings.HasPrefix(mode, "named:") {
 			http.Error(w, "model did not select the requested tool", http.StatusBadGateway)
 			return
 		}
-		if mode == "required" {
+		if !knownCallSuppressed && mode == "required" {
 			defs, _ := json.Marshal(toolMaps)
 			retryText := `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
 APPLICATION_REQUEST_AND_EVIDENCE:
 ` + prompt + "\n" + ledger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
-			retryRes, retryErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments}))
+			retryReq := modelToolScratchRequest(retryText, tone)
+			logModelToolPhaseBinding(requestID, "required_retry", "scratch", "fresh", retryReq)
+			retryRes, retryErr := s.chat.Chat(ctx, account, retryReq)
 			if retryErr != nil && writeCanonicalTerminalError(w, retryErr) {
 				return
 			}
@@ -1250,10 +1228,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				if _, ok := requireSafeNativeToolEmission(w, retryRes, body.Tools); !ok {
 					return
 				}
-				execution.Observe(retryRes)
 				retryRes, calls, parsed, parseSource = selectModelToolDecisionResult(retryRes, toolMaps, body.ToolChoice)
-				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, len(calls))
-				calls = filterKnownCalls(calls, ledger)
+				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				calls = dedup.Calls
+				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, dedup)
 				if parsed && len(calls) > 0 {
 					scope := fmt.Sprintf("%d:%v:stream-required-retry", len(body.Messages), completedCallIDs(ledger))
 					for i := range calls {
@@ -1265,7 +1243,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					}
 					mergeSearchEvidence(&retryRes, routerSearchEvidence)
 					retryRes.Text = ""
-					if err := completeCheckpointExecution(execution, ownsCheckpoint, retryRes, assistantToolCheckpointMessage(calls, retryRes, true)); err != nil {
+					if err := completeCheckpointScratchExecution(execution, ownsCheckpoint, assistantToolCheckpointMessage(calls, retryRes, true)); err != nil {
 						writeChatStreamError(w, "checkpoint_error", err.Error())
 						return
 					}
@@ -1285,6 +1263,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		answerPrompt := prompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Answer the user directly. If a tool is explicitly required, emit its structured call; otherwise return ordinary text."
 		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d", requestID, len(answerPrompt))
 		answerReq := execution.Request(chathub.Request{Text: answerPrompt, Tone: tone, Attachments: body.Attachments, Tools: answerTools, ToolChoice: answerToolChoice, ToolCallLimit: configuredRequestToolCallLimit(body, s.settings)})
+		bindingSource := "public_checkpoint"
+		if strings.TrimSpace(answerReq.ConversationID) == "" {
+			bindingSource = "new_public"
+		}
+		logModelToolPhaseBinding(requestID, "final_answer", "public", bindingSource, answerReq)
 		id := "chatcmpl-" + uuid.NewString()
 		model := resolution.ResponseModel
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1533,7 +1516,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
-		routeRes, routeErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments}))
+		routeReq := modelToolScratchRequest(routePrompt, tone)
+		logModelToolPhaseBinding(requestID, "route", "scratch", "fresh", routeReq)
+		routeRes, routeErr := s.chat.Chat(ctx, account, routeReq)
 		if routeErr != nil {
 			if writeCanonicalTerminalError(w, routeErr) {
 				return
@@ -1544,20 +1529,23 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if _, ok := requireSafeNativeToolEmission(w, routeRes, body.Tools); !ok {
 			return
 		}
-		execution.Observe(routeRes)
 		mergeSearchEvidence(&routerSearchEvidence, routeRes)
 		routeRes, calls, parsed, parseSource := selectModelToolDecisionResult(routeRes, toolMaps, body.ToolChoice)
-		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, len(calls))
+		dedup := deduplicateModelToolCalls(calls, ledger, parsed)
+		calls = dedup.Calls
+		knownCallSuppressed := dedup.KnownCallSuppressed
+		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, dedup)
 		carrier := routeRes
 		carrierIsRouteResult := true
-		calls = filterKnownCalls(calls, ledger)
 		if !parsed {
 			repairPrompt := modelToolRouterRepairPrompt(routeRes.Text)
 			if repairUnits := utf16CodeUnits(repairPrompt); repairUnits > settings.TextInputLimitUTF16 {
 				writeToolRouterRepairInputTooLarge(w, repairUnits, settings.TextInputLimitUTF16)
 				return
 			}
-			repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments}))
+			repairReq := modelToolScratchRequest(repairPrompt, tone)
+			logModelToolPhaseBinding(requestID, "repair", "scratch", "fresh", repairReq)
+			repairRes, repairErr := s.chat.Chat(ctx, account, repairReq)
 			if repairErr != nil && writeCanonicalTerminalError(w, repairErr) {
 				return
 			}
@@ -1565,13 +1553,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				if _, ok := requireSafeNativeToolEmission(w, repairRes, body.Tools); !ok {
 					return
 				}
-				execution.Observe(repairRes)
 				mergeSearchEvidence(&routerSearchEvidence, repairRes)
 				repairRes, calls, parsed, parseSource = selectModelToolDecisionResult(repairRes, toolMaps, body.ToolChoice)
-				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, len(calls))
+				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				calls = dedup.Calls
+				knownCallSuppressed = dedup.KnownCallSuppressed
+				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, dedup)
 				carrier = repairRes
 				carrierIsRouteResult = false
-				calls = filterKnownCalls(calls, ledger)
 			}
 			if !parsed {
 				mode := normalizedToolChoiceMode(body.ToolChoice)
@@ -1579,36 +1568,6 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					http.Error(w, "model returned an invalid tool routing decision", http.StatusBadGateway)
 					return
 				}
-			}
-		}
-		if parsed {
-			if answer, ok := parseModelToolDirectAnswer(carrier.Text); ok {
-				if !carrierIsRouteResult {
-					mergeSearchEvidence(&carrier, routerSearchEvidence)
-				}
-				carrier.Text = answer
-				carrier.Images = validImageURLs(carrier.Images)
-				if _, err := s.materializeArtifacts(ctx, r, &carrier); err != nil {
-					writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "artifact_materialization_failed", err.Error())
-					return
-				}
-				if !requireUsableChatResult(w, carrier, body.Tools) {
-					return
-				}
-				if responseFormat != nil {
-					formatted, formatErr := validateResponseFormatText(carrier.Text, responseFormat)
-					if formatErr != nil {
-						writeOpenAIErrorCode(w, http.StatusBadGateway, "upstream_error", "response_format_validation_failed", formatErr.Error())
-						return
-					}
-					carrier.Text = formatted
-				}
-				if err := completeCheckpointExecution(execution, ownsCheckpoint, carrier, assistantTextCheckpointMessage(carrier.Text, carrier.Images)); err != nil {
-					writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
-					return
-				}
-				jsonOut(w, routerDirectAnswerCompletion("chatcmpl-"+uuid.NewString(), carrier, resolution, nativePolicy, responseFormat))
-				return
 			}
 		}
 		if len(calls) > 0 {
@@ -1624,23 +1583,25 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				mergeSearchEvidence(&carrier, routerSearchEvidence)
 			}
 			carrier.Text = ""
-			if err := completeCheckpointExecution(execution, ownsCheckpoint, carrier, assistantToolCheckpointMessage(calls, carrier, body.Stream)); err != nil {
+			if err := completeCheckpointScratchExecution(execution, ownsCheckpoint, assistantToolCheckpointMessage(calls, carrier, body.Stream)); err != nil {
 				writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 				return
 			}
 			_ = writeToolResponseWithPolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, body.Stream, calls, carrier, resolution, nativePolicy, streamPrimed)
 			return
 		}
-		if strings.HasPrefix(normalizedToolChoiceMode(body.ToolChoice), "named:") {
+		if !knownCallSuppressed && strings.HasPrefix(normalizedToolChoiceMode(body.ToolChoice), "named:") {
 			http.Error(w, "model did not select the requested tool", http.StatusBadGateway)
 			return
 		}
-		if fmt.Sprint(body.ToolChoice) == "required" {
+		if !knownCallSuppressed && fmt.Sprint(body.ToolChoice) == "required" {
 			defs, _ := json.Marshal(toolMaps)
 			retryText := `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
 APPLICATION_REQUEST_AND_EVIDENCE:
 ` + prompt + "\n" + ledger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
-			retryRes, retryErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments}))
+			retryReq := modelToolScratchRequest(retryText, tone)
+			logModelToolPhaseBinding(requestID, "required_retry", "scratch", "fresh", retryReq)
+			retryRes, retryErr := s.chat.Chat(ctx, account, retryReq)
 			if retryErr != nil && writeCanonicalTerminalError(w, retryErr) {
 				return
 			}
@@ -1648,10 +1609,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				if _, ok := requireSafeNativeToolEmission(w, retryRes, body.Tools); !ok {
 					return
 				}
-				execution.Observe(retryRes)
 				retryRes, calls, parsed, parseSource = selectModelToolDecisionResult(retryRes, toolMaps, body.ToolChoice)
-				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, len(calls))
-				calls = filterKnownCalls(calls, ledger)
+				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				calls = dedup.Calls
+				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, dedup)
 				if parsed && len(calls) > 0 {
 					scope := fmt.Sprintf("%d:%v:required-retry", len(body.Messages), completedCallIDs(ledger))
 					for i := range calls {
@@ -1663,7 +1624,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					}
 					mergeSearchEvidence(&retryRes, routerSearchEvidence)
 					retryRes.Text = ""
-					if err := completeCheckpointExecution(execution, ownsCheckpoint, retryRes, assistantToolCheckpointMessage(calls, retryRes, body.Stream)); err != nil {
+					if err := completeCheckpointScratchExecution(execution, ownsCheckpoint, assistantToolCheckpointMessage(calls, retryRes, body.Stream)); err != nil {
 						writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 						return
 					}
@@ -1677,6 +1638,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	answerPrompt := prompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
 	answerReq := execution.Request(chathub.Request{Text: answerPrompt, Tone: tone, Attachments: body.Attachments, Tools: answerTools, ToolChoice: answerToolChoice, ToolCallLimit: configuredRequestToolCallLimit(body, s.settings)})
+	bindingSource := "public_checkpoint"
+	if strings.TrimSpace(answerReq.ConversationID) == "" {
+		bindingSource = "new_public"
+	}
+	logModelToolPhaseBinding(requestID, "final_answer", "public", bindingSource, answerReq)
 	res, err := s.chat.Chat(ctx, account, answerReq)
 	if err != nil {
 		if writeCanonicalTerminalError(w, err) {
@@ -1889,30 +1855,6 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}},
 		"m365": withNativePolicy(compatM365Metadata(res, resolution), nativePolicy),
 	})
-}
-
-func routerDirectAnswerCompletion(id string, result chathub.Result, resolution routeResolution, policy nativePolicySnapshot, _ *responseFormat) map[string]any {
-	text := result.Text
-	content := any(text)
-	if len(result.Images) > 0 {
-		parts := []any{map[string]any{"type": "text", "text": text}}
-		for _, url := range result.Images {
-			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
-		}
-		content = parts
-	}
-	message := map[string]any{"role": "assistant", "content": content}
-	if reasoning := chathub.ReasoningContent(result.Events); reasoning != "" {
-		message["reasoning_content"] = reasoning
-	}
-	return map[string]any{
-		"id":      id,
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   resolution.ResponseModel,
-		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": "stop"}},
-		"m365":    withNativePolicy(compatM365Metadata(result, resolution), policy),
-	}
 }
 
 func firstNonEmpty(vals ...string) string {

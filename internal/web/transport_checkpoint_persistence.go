@@ -99,6 +99,12 @@ func (s *transportCheckpointStore) loadLegacyCheckpointSnapshot(raw []byte) erro
 		if record.InFlight {
 			continue
 		}
+		// Records written before phase isolation had no separate public-sync
+		// cursor because every accepted turn was also sent to ChatHub. Preserve
+		// that meaning during migration instead of replaying old history.
+		if record.ConversationID != "" && record.AcceptedCount > 0 && record.PublicAcceptedCount == 0 {
+			record.PublicAcceptedCount = record.AcceptedCount
+		}
 		if len(record.CompletedToolCallDigests) == 0 && len(record.CompletedToolEvidence) > 0 {
 			record.CompletedToolCallDigests = completedToolCallDigests(record.CompletedToolEvidence)
 		}
@@ -150,11 +156,15 @@ func (s *transportCheckpointStore) loadGenerationManifest(raw []byte) error {
 			continue
 		}
 		record := cloneTransportCheckpointRecord(&recordFile.Record)
+		dirty := false
+		if record.ConversationID != "" && record.AcceptedCount > 0 && record.PublicAcceptedCount == 0 {
+			record.PublicAcceptedCount = record.AcceptedCount
+			dirty = true
+		}
 		if checkpointRecordFilename(record.ID) != entry.Name() || record.InFlight || !validTransportCheckpointRecord(record) || transportCheckpointExpired(record, openedAt) {
 			_ = os.Remove(fullPath)
 			continue
 		}
-		dirty := false
 		if len(record.CompletedToolCallDigests) == 0 && len(record.CompletedToolEvidence) > 0 {
 			record.CompletedToolCallDigests = completedToolCallDigests(record.CompletedToolEvidence)
 			dirty = true

@@ -1,14 +1,111 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"m365-native/internal/chathub"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+type issue66PhaseChat struct {
+	requests   []chathub.Request
+	routeText  string
+	repairText string
+	finalText  string
+	withRepair bool
+}
+
+func (f *issue66PhaseChat) Chat(_ context.Context, _ chathub.Account, req chathub.Request) (chathub.Result, error) {
+	phase := len(f.requests)
+	f.requests = append(f.requests, req)
+
+	conversationID := req.ConversationID
+	sessionID := req.SessionID
+	if conversationID == "" {
+		conversationID = fmt.Sprintf("scratch-conversation-%d", phase)
+	}
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("scratch-session-%d", phase)
+	}
+
+	text := f.finalText
+	switch {
+	case phase == 0:
+		text = f.routeText
+	case f.withRepair && phase == 1:
+		text = f.repairText
+	default:
+		// Reproduce #66: if final-answer continues the same non-empty
+		// conversation used by the router, ChatHub behaves as if the router
+		// instruction still applies and emits another tool-router envelope.
+		if len(f.requests) > 1 && f.requests[0].ConversationID != "" && req.ConversationID == f.requests[0].ConversationID {
+			text = `{"calls":[{"name":"terminal","arguments":{"command":"status"}}],"answer":""}`
+		}
+	}
+
+	return chathub.Result{
+		Text:           text,
+		FinalText:      text,
+		StreamedText:   text,
+		TextRelation:   "equal",
+		TextSource:     "final",
+		ConversationID: conversationID,
+		SessionID:      sessionID,
+	}, nil
+}
+
+func (f *issue66PhaseChat) ChatWithDelta(ctx context.Context, account chathub.Account, req chathub.Request, emit func(string) error) (chathub.Result, error) {
+	result, err := f.Chat(ctx, account, req)
+	if err == nil && emit != nil && result.Text != "" {
+		if emitErr := emit(result.Text); emitErr != nil {
+			return chathub.Result{}, emitErr
+		}
+	}
+	return result, err
+}
+
+func (f *issue66PhaseChat) ChatWithEvents(ctx context.Context, account chathub.Account, req chathub.Request, emit chathub.StreamHandler) (chathub.Result, error) {
+	result, err := f.Chat(ctx, account, req)
+	if err == nil && emit != nil && result.Text != "" {
+		if emitErr := emit(chathub.StreamEvent{Kind: "text", Text: result.Text}); emitErr != nil {
+			return chathub.Result{}, emitErr
+		}
+	}
+	return result, err
+}
+
+func issue66CheckpointServer(t *testing.T, chat *issue66PhaseChat, owner string) *Server {
+	t.Helper()
+	server := newWP1CandidateServer(t, &wp1CandidateChat{})
+	server.chat = chat
+	var err error
+	server.checkpoints, err = openTransportCheckpointStore(filepath.Join(t.TempDir(), "issue66-checkpoints.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := beginFullForTest(t, server.checkpoints, "chat-completions", owner, "", []oaiMsg{{Role: "user", Content: "Earlier request."}})
+	acceptForTest(t, turn, "public-conversation", "public-session", []oaiMsg{{Role: "assistant", Content: "Earlier answer."}}, "")
+	return server
+}
+
+func issue66ContinuationBody(routeRequest string) string {
+	return `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[
+			{"role":"user","content":"Earlier request."},
+			{"role":"assistant","content":"Earlier answer."},
+			{"role":"user","content":` + mustJSON(routeRequest) + `}
+		],
+		"attachments":[{"type":"file","url":"data:text/plain;base64,QQ==","name":"evidence.txt","mimeType":"text/plain"}],
+		"tools":[` + routerFallbackTool + `],
+		"tool_choice":"auto"
+	}`
+}
 
 const routerFallbackTool = `{
 	"type":"function",
@@ -93,6 +190,97 @@ func TestAutoToolRouterLongValidStructuredArgumentsBypassRepair(t *testing.T) {
 	}
 }
 
+func TestIssue66RouterAndRepairAreIsolatedFromPublicFinalAnswer(t *testing.T) {
+	const owner = "issue66-router-repair"
+	chat := &issue66PhaseChat{
+		routeText:  "not a routing envelope",
+		repairText: "still not a routing envelope",
+		finalText:  "SAFE_PUBLIC_FINAL",
+		withRepair: true,
+	}
+	server := issue66CheckpointServer(t, chat, owner)
+	rr := httptest.NewRecorder()
+	request := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(issue66ContinuationBody("Check status."))), owner)
+	server.openaiChat(rr, request)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 3 {
+		t.Fatalf("upstream requests=%d, want route, repair, final", len(chat.requests))
+	}
+	for i := 0; i < 2; i++ {
+		if chat.requests[i].ConversationID != "" || chat.requests[i].SessionID != "" {
+			t.Fatalf("scratch phase %d reused public binding: conversation=%q session=%q", i, chat.requests[i].ConversationID, chat.requests[i].SessionID)
+		}
+		if len(chat.requests[i].Attachments) != 0 {
+			t.Fatalf("scratch phase %d carried caller attachments: %#v", i, chat.requests[i].Attachments)
+		}
+	}
+	finalRequest := chat.requests[2]
+	if finalRequest.ConversationID != "public-conversation" || finalRequest.SessionID != "public-session" {
+		t.Fatalf("final answer binding=%q/%q, want public checkpoint binding", finalRequest.ConversationID, finalRequest.SessionID)
+	}
+	if len(finalRequest.Attachments) != 1 || finalRequest.Attachments[0].Name != "evidence.txt" {
+		t.Fatalf("public final answer lost caller attachment: %#v", finalRequest.Attachments)
+	}
+	response := wp1DecodeJSON(t, rr.Body.String())
+	message := response["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if message["content"] != "SAFE_PUBLIC_FINAL" {
+		t.Fatalf("content=%#v body=%s", message["content"], rr.Body.String())
+	}
+	views := checkpointViewsForTest(t, server.checkpoints)
+	if len(views) != 1 || views[0].ConversationID != "public-conversation" || views[0].SessionID != "public-session" {
+		t.Fatalf("scratch phases mutated public checkpoint binding: %#v", views)
+	}
+}
+
+func TestIssue66KnownCallSuppressionDoesNotFallIntoContaminatedFinalAnswer(t *testing.T) {
+	const owner = "issue66-known-call"
+	chat := &issue66PhaseChat{
+		routeText: `{"calls":[{"name":"terminal","arguments":{"command":"status"}}],"answer":""}`,
+		finalText: "KNOWN_CALL_PUBLIC_FINAL",
+	}
+	server := issue66CheckpointServer(t, chat, owner)
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"messages":[
+			{"role":"user","content":"Earlier request."},
+			{"role":"assistant","content":"Earlier answer."},
+			{"role":"user","content":"Check status."},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_status","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"status\"}"}}]},
+			{"role":"tool","tool_call_id":"call_status","content":"ok"},
+			{"role":"user","content":"Continue without repeating the same call."}
+		],
+		"tools":[` + routerFallbackTool + `],
+		"tool_choice":"auto"
+	}`
+	rr := httptest.NewRecorder()
+	request := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)), owner)
+	server.openaiChat(rr, request)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("upstream requests=%d, want isolated route then public final answer", len(chat.requests))
+	}
+	if chat.requests[0].ConversationID != "" || chat.requests[0].SessionID != "" {
+		t.Fatalf("known-call route reused public binding: %#v", chat.requests[0])
+	}
+	if chat.requests[1].ConversationID != "public-conversation" || chat.requests[1].SessionID != "public-session" {
+		t.Fatalf("known-call final answer binding=%q/%q", chat.requests[1].ConversationID, chat.requests[1].SessionID)
+	}
+	response := wp1DecodeJSON(t, rr.Body.String())
+	message := response["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if _, ok := message["tool_calls"]; ok {
+		t.Fatalf("known call was reissued: %#v", message)
+	}
+	if message["content"] != "KNOWN_CALL_PUBLIC_FINAL" {
+		t.Fatalf("content=%#v body=%s", message["content"], rr.Body.String())
+	}
+}
+
 func TestAutoToolRouterUsesValidatedStreamWhenFinalSnapshotIsMalformed(t *testing.T) {
 	validOutput, sentinel := longExecuteCodeRoutingOutput(t, 80)
 	malformedFinal := validOutput[:len(validOutput)-900]
@@ -139,13 +327,16 @@ func TestAutoToolRouterUsesValidatedStreamWhenFinalSnapshotIsMalformed(t *testin
 func TestAutoToolRouterUsesValidatedStreamDirectAnswerWhenFinalSnapshotIsMalformed(t *testing.T) {
 	final := `{"calls":[]`
 	streamed := `{"calls":[],"answer":"STREAM_RECOVERED_DIRECT_ANSWER"}`
-	chat := &continuationChat{results: []chathub.Result{{
-		Text:         final,
-		FinalText:    final,
-		StreamedText: streamed,
-		TextRelation: "divergent",
-		TextSource:   "final",
-	}}}
+	chat := &continuationChat{results: []chathub.Result{
+		{
+			Text:         final,
+			FinalText:    final,
+			StreamedText: streamed,
+			TextRelation: "divergent",
+			TextSource:   "final",
+		},
+		{Text: "STREAM_RECOVERED_DIRECT_ANSWER"},
+	}}
 	s := newWP1CandidateServer(t, &wp1CandidateChat{})
 	s.chat = chat
 	body := `{
@@ -160,8 +351,8 @@ func TestAutoToolRouterUsesValidatedStreamDirectAnswerWhenFinalSnapshotIsMalform
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if len(chat.requests) != 1 {
-		t.Fatalf("upstream requests=%d, validated streamed direct answer must bypass repair", len(chat.requests))
+	if len(chat.requests) != 2 {
+		t.Fatalf("upstream requests=%d, validated streamed direct answer must bypass repair but still use an isolated public final-answer turn", len(chat.requests))
 	}
 	response := wp1DecodeJSON(t, rr.Body.String())
 	message := response["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)

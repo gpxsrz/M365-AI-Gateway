@@ -54,6 +54,127 @@ func TestTransportCheckpointExactPrefixSendsOnlyDeltaAndPolicy(t *testing.T) {
 	}
 }
 
+func TestTransportCheckpointScratchAcceptanceKeepsPublicHistoryCatchUp(t *testing.T) {
+	store, err := openTransportCheckpointStore(filepath.Join(t.TempDir(), "checkpoints.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolCall := oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{
+		"id":   "call_read",
+		"type": "function",
+		"function": map[string]any{
+			"name":      "read_file",
+			"arguments": `{"path":"a"}`,
+		},
+	}}}
+
+	firstActive := []oaiMsg{{Role: "user", Content: "inspect safely"}}
+	first := beginFullForTest(t, store, "chat", "owner", "key", firstActive)
+	if err := first.acceptWithVisibility(checkpointBinding{}, []oaiMsg{toolCall}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	record := cloneTransportCheckpointRecord(store.records[first.RecordID()])
+	store.mu.Unlock()
+	if record.ConversationID != "" || record.CurrentSessionID != "" || record.AcceptedCount != 2 || record.PublicAcceptedCount != 0 {
+		t.Fatalf("scratch acceptance leaked into public binding/sync: %#v", record)
+	}
+
+	secondActive := append(append([]oaiMsg{}, firstActive...), toolCall, oaiMsg{Role: "tool", ToolCallID: "call_read", Content: "file result"})
+	second := beginFullForTest(t, store, "chat", "owner", "key", secondActive)
+	if second.Binding.ConversationID != "" || second.Binding.SessionID != "" {
+		t.Fatalf("scratch binding became public: %#v", second.Binding)
+	}
+	if len(second.Outbound) != len(secondActive) || second.Outbound[0].Content != "inspect safely" || second.Outbound[2].Content != "file result" {
+		t.Fatalf("first public turn did not catch up full caller-visible history: %#v", second.Outbound)
+	}
+	if err := second.Accept(checkpointBinding{ConversationID: "public-conversation", SessionID: "public-session-1"}, []oaiMsg{{Role: "assistant", Content: "first answer"}}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	thirdActive := append(append([]oaiMsg{}, secondActive...),
+		oaiMsg{Role: "assistant", Content: "first answer"},
+		oaiMsg{Role: "user", Content: "inspect another file"},
+	)
+	third := beginFullForTest(t, store, "chat", "owner", "key", thirdActive)
+	if len(third.Outbound) != 1 || third.Outbound[0].Content != "inspect another file" {
+		t.Fatalf("synced public checkpoint did not return to delta mode: %#v", third.Outbound)
+	}
+	secondToolCall := oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{
+		"id": "call_read_2", "type": "function", "function": map[string]any{"name": "read_file", "arguments": `{"path":"b"}`},
+	}}}
+	if err := third.acceptWithVisibility(third.Binding, []oaiMsg{secondToolCall}, "", false); err != nil {
+		t.Fatal(err)
+	}
+
+	fourthActive := append(append([]oaiMsg{}, thirdActive...), secondToolCall, oaiMsg{Role: "tool", ToolCallID: "call_read_2", Content: "second result"})
+	fourth := beginFullForTest(t, store, "chat", "owner", "key", fourthActive)
+	if fourth.Binding.ConversationID != "public-conversation" || fourth.Binding.SessionID != "public-session-1" {
+		t.Fatalf("public binding was not preserved across scratch tool call: %#v", fourth.Binding)
+	}
+	if len(fourth.Outbound) != 3 || fourth.Outbound[0].Content != "inspect another file" || fourth.Outbound[2].Content != "second result" {
+		t.Fatalf("public catch-up after later scratch call = %#v", fourth.Outbound)
+	}
+	if err := fourth.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportCheckpointResponsesScratchReplayIsMemoryOnly(t *testing.T) {
+	toolCall := oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{
+		"id": "call_lookup", "type": "function",
+		"function": map[string]any{"name": "lookup", "arguments": `{"query":"phase3"}`},
+	}}}
+	initial := []oaiMsg{{Role: "user", Content: "PRIVATE-RESPONSES-REQUEST"}}
+	result := oaiMsg{Role: "tool", ToolCallID: "call_lookup", Content: "tool result"}
+
+	t.Run("same process replays unsynchronised caller history", func(t *testing.T) {
+		store, err := openTransportCheckpointStore(filepath.Join(t.TempDir(), "checkpoints.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := beginFullForTest(t, store, "responses", "owner", "", initial)
+		if err := first.acceptWithVisibility(checkpointBinding{}, []oaiMsg{toolCall}, "resp_tool", false); err != nil {
+			t.Fatal(err)
+		}
+		continuation, err := store.BeginResponse("owner", "resp_tool", []oaiMsg{result})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if continuation.Binding.ConversationID != "" || continuation.Binding.SessionID != "" {
+			t.Fatalf("scratch binding leaked into responses continuation: %#v", continuation.Binding)
+		}
+		if len(continuation.TrustedReplayCallDigests) != 1 || continuation.TrustedReplayCallDigests[0] != toolCallIDDigest("call_lookup") {
+			t.Fatalf("trusted replay tool identity=%#v", continuation.TrustedReplayCallDigests)
+		}
+		if len(continuation.Outbound) != 3 || continuation.Outbound[0].Content != "PRIVATE-RESPONSES-REQUEST" || len(continuation.Outbound[1].ToolCalls) != 1 || continuation.Outbound[2].Content != "tool result" {
+			t.Fatalf("responses public replay=%#v", continuation.Outbound)
+		}
+		if err := continuation.Accept(checkpointBinding{ConversationID: "public-conversation", SessionID: "public-session"}, []oaiMsg{{Role: "assistant", Content: "done"}}, "resp_done"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("restart fails closed instead of persisting private replay", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "checkpoints.json")
+		store, err := openTransportCheckpointStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := beginFullForTest(t, store, "responses", "owner", "", initial)
+		if err := first.acceptWithVisibility(checkpointBinding{}, []oaiMsg{toolCall}, "resp_tool", false); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := openTransportCheckpointStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reopened.BeginResponse("owner", "resp_tool", []oaiMsg{result}); !errors.Is(err, ErrCheckpointPublicSync) {
+			t.Fatalf("restart continuation error=%v, want public sync failure", err)
+		}
+	})
+}
+
 func TestTransportCheckpointClearIsRestartSafe(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "checkpoints", "transport.json")
 	store, err := openTransportCheckpointStore(path)

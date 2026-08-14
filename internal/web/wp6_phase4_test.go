@@ -421,7 +421,7 @@ func TestWP6ResponsesGroupsSameTurnCallsForReversedResults(t *testing.T) {
 func TestWP6ResponsesCheckpointRoundTripTwoCallsWithReversedResults(t *testing.T) {
 	chat := &continuationChat{results: []chathub.Result{
 		{Text: `{"calls":[{"name":"read_file","arguments":{"path":"a"}},{"name":"search_code","arguments":{"query":"b"}}]}`, ConversationID: "conversation-phase4", SessionID: "session-1"},
-		{Text: "Both results received.", ConversationID: "conversation-phase4", SessionID: "session-2"},
+		{Text: "Both results received.", ConversationID: "public-conversation-phase4", SessionID: "public-session-2"},
 	}}
 	server := newWP1CandidateServer(t, &wp1CandidateChat{})
 	server.chat = chat
@@ -471,6 +471,12 @@ func TestWP6ResponsesCheckpointRoundTripTwoCallsWithReversedResults(t *testing.T
 	}
 	if len(chat.requests) != 2 || !strings.Contains(chat.requests[1].Text, "RESULT-B") || !strings.Contains(chat.requests[1].Text, "RESULT-A") {
 		t.Fatalf("checkpoint continuation did not forward both reversed results: %#v", chat.requests)
+	}
+	if chat.requests[0].ConversationID != "" || chat.requests[0].SessionID != "" {
+		t.Fatalf("responses router reused caller-visible checkpoint binding: %#v", chat.requests[0])
+	}
+	if chat.requests[1].ConversationID != "" || chat.requests[1].SessionID != "" {
+		t.Fatalf("responses final answer reused scratch identity before a public binding existed: %#v", chat.requests[1])
 	}
 }
 

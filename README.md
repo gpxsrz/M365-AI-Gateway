@@ -112,6 +112,14 @@ Sidecar 只在 **WebSocket 尚未成功建立、SignalR handshake 尚未開始�
 
 完整 repair prompt 仍會在第二次 upstream call **之前**重新套用目前的 `textInputLimitUTF16`。若 repair input 本身超過上限，Sidecar 會 fail closed，不會為了塞進預算再截斷 arguments；回應為 HTTP `502` / `upstream_error`，並帶 `code=tool_router_repair_input_too_large`、`limit_type=repair_prompt_utf16`、`limit`、`received`、`terminal=true`、`retryable=false` 與 `recommended_action`。這是內部 repair 的安全預算，不是新的 caller 設定，也不是提高 `128000 UTF-16` 的理由；Production 建議仍維持 `textInputLimitUTF16=128000`，由 Hermes/Hindsight 在 consumer 端更早做 token-based pruning/reduction。
 
+### Model tool router 的 ChatHub phase isolation
+
+#66 之後，tool router 的 `route`、bounded `repair` 與 required-tool constrained retry 都是**獨立 scratch ChatHub conversation**：每個 phase 使用新的 `ConversationId` / `SessionId`，Private mode 仍重套 `disableMemory=1`，且預設不攜帶 caller attachment。Scratch phase 的 upstream conversation/session identity 不會寫回 caller-visible checkpoint；真正的 final-answer 才會回到上一個已接受的 public binding，或在尚未建立 public conversation 時建立新的 public binding。這避免「tool selection assistant / 只能回 calls envelope」等隱藏規則殘留在 final-answer 的 ChatHub 短期 context。
+
+Router 若選到 ledger 已知的 completed/pending 同一 tool identity，Sidecar 會保留 `calls_before_dedup`、`calls_after_dedup` 與 `known_call_suppressed` 語意，不會把「選了已知 call」誤當成真正的 `calls=[]`，也不會重做相同工具。真正新的 unauthorized final-answer tool call 仍由既有 `invalid_tool_call` guard fail closed；#63 的 final/stream evidence 規則、arguments 不截斷與 caller-tool safety contract 都不因 phase isolation 放寬。
+
+Checkpoint 另外區分「caller-visible logical history 已接受到哪」與「public ChatHub conversation 實際同步到哪」。因此 scratch tool-call 可以先回 caller，但下一個真正 public turn 會先補齊尚未送進 public ChatHub 的 caller-visible history，再恢復一般 delta continuation。這個 replay plaintext 只保留在 process memory，checkpoint 持久化仍是 digest-only；若 Responses `previous_response_id` 剛好在 scratch tool-call 後、第一次 public catch-up 前遇到服務重啟，Sidecar 會以 checkpoint public-sync error fail closed，而不是把缺少原始 caller intent 的不完整 context 送給 ChatHub。一般 Chat Completions / Hermes 因 caller 會重送完整 history，可由 full-history checkpoint 安全重新同步。
+
 ### ChatHub completion evidence 與協議投影
 
 ChatHub transport 會在單次 request 存活期間保留 ordered raw SignalR/ChatHub frames，以及 Microsoft completion 的兩條獨立文字 evidence：WebSocket 累積的 `streamedText` 與 type-2 `item.result.message` 的 `finalText`。`Result.Text` 只是由這些 evidence 產生的 canonical projection，不再是唯一保留的文字來源；未知/future frame 也會留在 raw `Events` / `UnknownEvents`，不能因目前 adapter 尚未使用就提前丟棄。
@@ -280,6 +288,14 @@ The retry currently covers HTTP `500`, `502`, `503`, and `504` upgrade failures 
 If the model tool router's first candidate is not even parseable as outer JSON and must enter its single bounded repair pass, the sidecar now places the **complete raw router output** into the repair prompt instead of compacting it to a fixed 6000 characters. This prevents large `execute_code`, SQL, or other structured arguments from being cut in the middle and turned into a different invalid tool call during repair.
 
 The complete repair prompt is still checked against the current `textInputLimitUTF16` **before** a second upstream call. If the repair input itself exceeds that budget, the sidecar fails closed instead of truncating arguments to make them fit. It returns HTTP `502` / `upstream_error` with `code=tool_router_repair_input_too_large`, `limit_type=repair_prompt_utf16`, `limit`, `received`, `terminal=true`, `retryable=false`, and `recommended_action`. This is an internal repair safety budget, not a new caller setting and not a reason to raise the `128000 UTF-16` policy. Production guidance remains `textInputLimitUTF16=128000`, with Hermes/Hindsight performing token-based pruning or reduction earlier on the consumer side.
+
+### ChatHub phase isolation for the model tool router
+
+After #66, tool-router `route`, bounded `repair`, and required-tool constrained-retry phases run in **independent scratch ChatHub conversations**. Each phase gets a fresh `ConversationId` / `SessionId`, Private mode still reapplies `disableMemory=1`, and caller attachments are omitted by default. Scratch upstream conversation/session identities never update the caller-visible checkpoint. Only the real final-answer phase resumes the last accepted public binding, or creates a new public binding when no public conversation exists yet. This keeps hidden instructions such as "act as a tool-selection assistant" and "return only a calls envelope" out of the final-answer ChatHub short-term context.
+
+If the router selects a completed or pending tool identity that already exists in the ledger, the sidecar preserves explicit `calls_before_dedup`, `calls_after_dedup`, and `known_call_suppressed` semantics. It does not reinterpret "selected a known call" as a genuine `calls=[]`, and it does not execute the same tool again. A genuinely new unauthorized tool call returned by the final-answer model still fails closed through the existing `invalid_tool_call` guard; #63 final/stream evidence rules, argument losslessness, and caller-tool safety boundaries are unchanged.
+
+Checkpoint state also distinguishes caller-visible logical acceptance from the portion actually synchronized into the public ChatHub conversation. A scratch tool-call may therefore be returned to the caller first; the next real public turn catches up any caller-visible history that has not yet reached public ChatHub, then normal delta continuation resumes. Replay plaintext is process-memory-only and checkpoint persistence remains digest-only. If a Responses `previous_response_id` continuation crosses a service restart after a scratch tool-call but before the first public catch-up, the sidecar fails closed with a checkpoint public-sync error rather than sending ChatHub incomplete context that lacks the original caller intent. Regular Chat Completions / Hermes can safely resynchronize from the full history the caller sends again.
 
 ### ChatHub completion evidence and protocol projection
 

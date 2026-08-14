@@ -227,7 +227,8 @@ func anyMessages(messages []map[string]any) []any {
 func TestHermesBeyondSixteenRoundsPreservesCheckpointToolIdentity(t *testing.T) {
 	first := chathub.Result{Text: `{"calls":[{"name":"inspect_step","arguments":{"step":17}}]}`, ConversationID: "conversation-long", SessionID: "session-17"}
 	second := chathub.Result{Text: `{"calls":[],"answer":"LONG_TASK_DONE"}`, ConversationID: "conversation-long", SessionID: "session-18"}
-	chat := &wp6Phase5SequenceChat{results: []chathub.Result{first, second}}
+	final := chathub.Result{Text: "LONG_TASK_DONE", ConversationID: "public-conversation-long", SessionID: "public-session-18"}
+	chat := &wp6Phase5SequenceChat{results: []chathub.Result{first, second, final}}
 	server := newWP1CandidateServer(t, &wp1CandidateChat{})
 	server.chat = chat
 	server.checkpoints, _ = openTransportCheckpointStore(filepath.Join(t.TempDir(), "checkpoints.json"))
@@ -283,14 +284,17 @@ func TestHermesBeyondSixteenRoundsPreservesCheckpointToolIdentity(t *testing.T) 
 	if secondMessage["content"] != "LONG_TASK_DONE" {
 		t.Fatalf("second response=%#v", secondMessage)
 	}
-	if len(chat.requests) != 2 {
-		t.Fatalf("ChatHub requests=%d want=2", len(chat.requests))
+	if len(chat.requests) != 3 {
+		t.Fatalf("ChatHub requests=%d want=3", len(chat.requests))
 	}
-	if chat.requests[1].ConversationID != "conversation-long" || chat.requests[1].SessionID != "session-17" {
-		t.Fatalf("checkpoint continuity=%#v", chat.requests)
+	if chat.requests[0].ConversationID != "" || chat.requests[0].SessionID != "" || chat.requests[1].ConversationID != "" || chat.requests[1].SessionID != "" {
+		t.Fatalf("router phases reused scratch conversation identity: %#v", chat.requests)
 	}
-	if !strings.Contains(chat.requests[1].Text, "step 17 complete") {
-		t.Fatalf("continuation payload lost tool result: %q", chat.requests[1].Text)
+	if chat.requests[2].ConversationID != "" || chat.requests[2].SessionID != "" {
+		t.Fatalf("first public answer reused scratch binding: %#v", chat.requests[2])
+	}
+	if !strings.Contains(chat.requests[1].Text, "step 17 complete") || !strings.Contains(chat.requests[2].Text, "step 17 complete") {
+		t.Fatalf("continuation payload lost tool result: router=%q public=%q", chat.requests[1].Text, chat.requests[2].Text)
 	}
 }
 

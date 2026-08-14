@@ -56,6 +56,7 @@ var (
 	ErrCheckpointConversationDrift = errors.New(
 		"transport checkpoint conversation identity changed",
 	)
+	ErrCheckpointPublicSync       = errors.New("transport checkpoint public conversation sync is invalid")
 	ErrCheckpointCanonicalization = errors.New("transport checkpoint message cannot be canonicalized")
 	ErrCheckpointPersistence      = errors.New("transport checkpoint persistence failed")
 )
@@ -89,6 +90,7 @@ type checkpointTurn struct {
 	Rebound                   bool
 	AllowedPriorToolCallIDs   []string
 	KnownPriorToolCallDigests []string
+	TrustedReplayCallDigests  []string
 	ToolLedger                agentLedger
 
 	store               *transportCheckpointStore
@@ -109,10 +111,14 @@ func (t *checkpointTurn) RecordID() string {
 }
 
 func (t *checkpointTurn) Accept(binding checkpointBinding, produced []oaiMsg, responseID string) error {
+	return t.acceptWithVisibility(binding, produced, responseID, true)
+}
+
+func (t *checkpointTurn) acceptWithVisibility(binding checkpointBinding, produced []oaiMsg, responseID string, publicObserved bool) error {
 	if t == nil || t.store == nil {
 		return ErrCheckpointAttemptStale
 	}
-	return t.store.accept(t, binding, produced, responseID)
+	return t.store.accept(t, binding, produced, responseID, publicObserved)
 }
 
 func (t *checkpointTurn) Abort() error {
@@ -152,6 +158,7 @@ type transportCheckpointRecord struct {
 	CurrentSessionID             string                      `json:"currentSessionId,omitempty"`
 	LastSessionID                string                      `json:"lastSessionId,omitempty"`
 	AcceptedCount                int                         `json:"acceptedCount"`
+	PublicAcceptedCount          int                         `json:"publicAcceptedCount,omitempty"`
 	MessageDigests               []string                    `json:"messageDigests"`
 	HashChain                    []string                    `json:"hashChain"`
 	ResponseCursors              []checkpointResponseCursor  `json:"responseCursorDigests,omitempty"`
@@ -159,10 +166,15 @@ type transportCheckpointRecord struct {
 	CompletedToolEvidence        []toolEvidence              `json:"completedToolEvidence,omitempty"`
 	CompletedToolCallDigests     []string                    `json:"completedToolCallDigests,omitempty"`
 	CompletedToolIdentityDigests []string                    `json:"completedToolIdentityDigests,omitempty"`
-	CreatedAt                    time.Time                   `json:"createdAt"`
-	UpdatedAt                    time.Time                   `json:"updatedAt"`
-	Revision                     uint64                      `json:"revision"`
-	InFlight                     bool                        `json:"inFlight,omitempty"`
+	// PublicReplay is the caller-visible suffix that has been logically
+	// accepted but has not yet been sent to the public ChatHub conversation.
+	// It is intentionally memory-only: checkpoint persistence remains digest-
+	// only and must never gain private prompt/tool plaintext.
+	PublicReplay []oaiMsg  `json:"-"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+	Revision     uint64    `json:"revision"`
+	InFlight     bool      `json:"inFlight,omitempty"`
 }
 
 type checkpointPendingToolCall struct {
@@ -401,7 +413,11 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 		if selected.InFlight {
 			return nil, ErrCheckpointBusy
 		}
-		outbound := checkpointDeltaOutbound(active, selected.AcceptedCount)
+		publicAcceptedCount := checkpointPublicAcceptedCount(selected)
+		if publicAcceptedCount < 0 || publicAcceptedCount > selected.AcceptedCount {
+			return nil, ErrCheckpointPublicSync
+		}
+		outbound := checkpointDeltaOutbound(active, publicAcceptedCount)
 		if validateOutbound != nil {
 			if err := validateOutbound(outbound); err != nil {
 				return nil, err
@@ -488,6 +504,23 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 		baseHashChain:       append([]string(nil), history.chains...),
 		resolvedToolCallIDs: checkpointToolResultIDs(active),
 	}, nil
+}
+
+func checkpointPublicAcceptedCount(record *transportCheckpointRecord) int {
+	if record == nil {
+		return 0
+	}
+	// Before phase isolation, every accepted logical checkpoint message had
+	// necessarily also been sent to the public ChatHub conversation. Those
+	// records predate PublicAcceptedCount and therefore decode as zero. A
+	// non-empty public conversation with accepted history and a zero cursor is
+	// unambiguously that legacy state: new scratch-only checkpoints have no
+	// public conversation, while scratch turns after a public turn retain its
+	// already-positive public cursor.
+	if record.PublicAcceptedCount == 0 && record.AcceptedCount > 0 && strings.TrimSpace(record.ConversationID) != "" {
+		return record.AcceptedCount
+	}
+	return record.PublicAcceptedCount
 }
 
 func (s *transportCheckpointStore) BeginDelta(namespace, owner, key string, delta []oaiMsg) (*checkpointTurn, error) {
@@ -578,6 +611,19 @@ func (s *transportCheckpointStore) beginAppendLocked(record *transportCheckpoint
 		s.recomputeNextPruneAtLocked()
 		return nil, ErrCheckpointHistoryLimit
 	}
+	modelOutbound := cloneOAIMessages(outbound)
+	var trustedReplayCallDigests []string
+	publicAcceptedCount := checkpointPublicAcceptedCount(record)
+	if publicAcceptedCount < record.AcceptedCount {
+		if len(record.PublicReplay) == 0 {
+			// The unsynchronised replay suffix is deliberately not persisted.
+			// After a restart we therefore fail closed instead of silently asking
+			// ChatHub to answer with incomplete previous_response context.
+			return nil, ErrCheckpointPublicSync
+		}
+		trustedReplayCallDigests = checkpointToolCallDigests(record.PublicReplay)
+		modelOutbound = append(cloneOAIMessages(record.PublicReplay), modelOutbound...)
+	}
 	snapshot := cloneTransportCheckpointRecords(s.records)
 	digests := append(append([]string(nil), record.MessageDigests...), delta.digests...)
 	chains, err := extendCheckpointHashChain(record.HashChain, delta.digests)
@@ -596,9 +642,10 @@ func (s *transportCheckpointStore) beginAppendLocked(record *transportCheckpoint
 			ConversationID: record.ConversationID,
 			SessionID:      record.CurrentSessionID,
 		},
-		Outbound:                  cloneOAIMessages(outbound),
+		Outbound:                  modelOutbound,
 		AllowedPriorToolCallIDs:   pendingToolCallIDs(record.PendingToolCalls),
 		KnownPriorToolCallDigests: append([]string(nil), record.CompletedToolCallDigests...),
+		TrustedReplayCallDigests:  trustedReplayCallDigests,
 		ToolLedger:                buildAgentLedger(outbound, checkpointAgentLedger(record)),
 		store:                     s,
 		recordID:                  record.ID,
@@ -609,7 +656,7 @@ func (s *transportCheckpointStore) beginAppendLocked(record *transportCheckpoint
 	}, nil
 }
 
-func (s *transportCheckpointStore) accept(turn *checkpointTurn, binding checkpointBinding, produced []oaiMsg, responseID string) error {
+func (s *transportCheckpointStore) accept(turn *checkpointTurn, binding checkpointBinding, produced []oaiMsg, responseID string, publicObserved bool) error {
 	producedHistory, err := canonicalCheckpointMessages(produced)
 	if err != nil {
 		if abortErr := s.abort(turn); abortErr != nil && !errors.Is(abortErr, ErrCheckpointTurnClosed) {
@@ -631,7 +678,7 @@ func (s *transportCheckpointStore) accept(turn *checkpointTurn, binding checkpoi
 		turn.closed = true
 		return ErrCheckpointAttemptStale
 	}
-	if !validCheckpointText(binding.ConversationID, transportCheckpointMaxIdentity) || (binding.SessionID != "" && !validCheckpointText(binding.SessionID, transportCheckpointMaxIdentity)) || (responseID != "" && !validCheckpointText(responseID, transportCheckpointMaxIdentity)) {
+	if (binding.ConversationID != "" && !validCheckpointText(binding.ConversationID, transportCheckpointMaxIdentity)) || (publicObserved && binding.ConversationID == "") || (binding.SessionID != "" && !validCheckpointText(binding.SessionID, transportCheckpointMaxIdentity)) || (responseID != "" && !validCheckpointText(responseID, transportCheckpointMaxIdentity)) {
 		return s.invalidateTurnLocked(turn, ErrCheckpointInvalidBinding)
 	}
 	if record.ConversationID != "" && record.ConversationID != binding.ConversationID {
@@ -655,6 +702,12 @@ func (s *transportCheckpointStore) accept(turn *checkpointTurn, binding checkpoi
 	record.MessageDigests = allDigests
 	record.HashChain = allChains
 	record.AcceptedCount = len(allDigests)
+	if publicObserved {
+		record.PublicAcceptedCount = len(allDigests)
+		record.PublicReplay = nil
+	} else {
+		record.PublicReplay = append(cloneOAIMessages(turn.Outbound), produced...)
+	}
 	pending, err := advancePendingToolCalls(record.PendingToolCalls, turn.resolvedToolCallIDs, produced, turn.ToolLedger.Completed)
 	if err != nil {
 		return s.invalidateTurnLocked(turn, err)
@@ -843,7 +896,10 @@ func decodeTransportCheckpointFile(b []byte) (transportCheckpointFile, error) {
 }
 
 func validTransportCheckpointRecord(record *transportCheckpointRecord) bool {
-	if record == nil || !validCheckpointText(record.ID, 64) || !validCheckpointText(record.Namespace, transportCheckpointMaxNamespace) || record.OwnerDigest == "" || !validCheckpointText(record.ConversationID, transportCheckpointMaxIdentity) || (record.CurrentSessionID != "" && !validCheckpointText(record.CurrentSessionID, transportCheckpointMaxIdentity)) || (record.LastSessionID != "" && !validCheckpointText(record.LastSessionID, transportCheckpointMaxIdentity)) || record.AcceptedCount < 0 || record.Revision == 0 || record.CreatedAt.IsZero() || record.UpdatedAt.Before(record.CreatedAt) {
+	if record == nil || !validCheckpointText(record.ID, 64) || !validCheckpointText(record.Namespace, transportCheckpointMaxNamespace) || record.OwnerDigest == "" || (record.ConversationID != "" && !validCheckpointText(record.ConversationID, transportCheckpointMaxIdentity)) || (record.CurrentSessionID != "" && !validCheckpointText(record.CurrentSessionID, transportCheckpointMaxIdentity)) || (record.LastSessionID != "" && !validCheckpointText(record.LastSessionID, transportCheckpointMaxIdentity)) || record.AcceptedCount < 0 || record.PublicAcceptedCount < 0 || record.PublicAcceptedCount > record.AcceptedCount || record.Revision == 0 || record.CreatedAt.IsZero() || record.UpdatedAt.Before(record.CreatedAt) {
+		return false
+	}
+	if record.ConversationID == "" && (record.CurrentSessionID != "" || record.LastSessionID != "" || record.PublicAcceptedCount != 0) {
 		return false
 	}
 	if !validCheckpointDigest(record.OwnerDigest) || (record.KeyDigest != "" && !validCheckpointDigest(record.KeyDigest)) {
@@ -1188,6 +1244,29 @@ func cloneOAIMessages(messages []oaiMsg) []oaiMsg {
 	return append([]oaiMsg(nil), messages...)
 }
 
+func checkpointToolCallDigests(messages []oaiMsg) []string {
+	digests := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, message := range messages {
+		if message.Role != "assistant" {
+			continue
+		}
+		for _, call := range message.ToolCalls {
+			id, _ := call["id"].(string)
+			if id == "" {
+				continue
+			}
+			digest := toolCallIDDigest(id)
+			if _, ok := seen[digest]; ok {
+				continue
+			}
+			seen[digest] = struct{}{}
+			digests = append(digests, digest)
+		}
+	}
+	return digests
+}
+
 func cloneTransportCheckpointRecord(record *transportCheckpointRecord) *transportCheckpointRecord {
 	if record == nil {
 		return nil
@@ -1200,6 +1279,7 @@ func cloneTransportCheckpointRecord(record *transportCheckpointRecord) *transpor
 	clone.CompletedToolEvidence = append([]toolEvidence(nil), record.CompletedToolEvidence...)
 	clone.CompletedToolCallDigests = append([]string(nil), record.CompletedToolCallDigests...)
 	clone.CompletedToolIdentityDigests = append([]string(nil), record.CompletedToolIdentityDigests...)
+	clone.PublicReplay = cloneOAIMessages(record.PublicReplay)
 	return &clone
 }
 

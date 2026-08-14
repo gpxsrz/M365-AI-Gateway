@@ -43,48 +43,17 @@ func TestWP6GenericCallerToolPromptsPreserveNativeBing(t *testing.T) {
 func TestWP6RouterNoCallerAnswerDoesNotReuseJSONOnlyConversation(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
-			chat := &wp1CandidateChat{result: chathub.Result{
-				Text:           `{"calls":[],"answer":"Grounded answer"}`,
-				ConversationID: "router-conversation",
-				SessionID:      "router-session",
-				Events:         wp6Phase5RawEvents(),
+			chat := &wp6Phase5SequenceChat{results: []chathub.Result{
+				{
+					Text:           `{"calls":[],"answer":"Grounded answer"}`,
+					ConversationID: "router-conversation",
+					SessionID:      "router-session",
+					Events:         wp6Phase5RawEvents(),
+				},
+				{Text: "Grounded answer", ConversationID: "public-conversation", SessionID: "public-session"},
 			}}
-			server := newWP1CandidateServer(t, chat)
-			body := map[string]any{
-				"model":    "gpt-5.6-sol",
-				"stream":   stream,
-				"messages": []any{map[string]any{"role": "user", "content": "search"}},
-				"tools": []any{map[string]any{"type": "function", "function": map[string]any{
-					"name": "read_file", "description": "Read file contents without changing state.", "parameters": map[string]any{"type": "object"},
-				}}},
-			}
-			recorder := httptest.NewRecorder()
-			server.openaiChat(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(mustJSON(body))))
-
-			if recorder.Code != http.StatusOK || len(chat.requests) != 1 {
-				t.Fatalf("status=%d requests=%d body=%s", recorder.Code, len(chat.requests), recorder.Body.String())
-			}
-			encoded := recorder.Body.String()
-			if !strings.Contains(encoded, "Grounded answer") || strings.Contains(encoded, `\"calls\":[]`) {
-				t.Fatalf("router envelope crossed public boundary: %s", encoded)
-			}
-			for _, marker := range []string{`"search_result_markers":1`, `"targetLink":"https://support.microsoft.com/topic"`} {
-				if !strings.Contains(encoded, marker) {
-					t.Fatalf("missing Bing evidence %s: %s", marker, encoded)
-				}
-			}
-		})
-	}
-}
-
-func TestWP6RouterRepairKeepsDirectAnswerOutOfJSONOnlyConversation(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
-			chat := &wp1CandidateChat{results: []chathub.Result{
-				{Text: "Grounded answer", ConversationID: "router-conversation", SessionID: "router-session", Events: wp6Phase5RawEvents()},
-				{Text: `{"calls":[],"answer":"Grounded answer"}`, ConversationID: "router-conversation", SessionID: "router-session"},
-			}}
-			server := newWP1CandidateServer(t, chat)
+			server := newWP1CandidateServer(t, &wp1CandidateChat{})
+			server.chat = chat
 			body := map[string]any{
 				"model":    "gpt-5.6-sol",
 				"stream":   stream,
@@ -99,11 +68,66 @@ func TestWP6RouterRepairKeepsDirectAnswerOutOfJSONOnlyConversation(t *testing.T)
 			if recorder.Code != http.StatusOK || len(chat.requests) != 2 {
 				t.Fatalf("status=%d requests=%d body=%s", recorder.Code, len(chat.requests), recorder.Body.String())
 			}
+			if chat.requests[1].ConversationID != "" || chat.requests[1].SessionID != "" {
+				t.Fatalf("public final answer reused JSON-only router binding: %#v", chat.requests[1])
+			}
+			encoded := recorder.Body.String()
+			visible := ""
+			if stream {
+				visible, _ = wp6ChatStreamText(t, encoded)
+			} else {
+				visible = encoded
+			}
+			if !strings.Contains(visible, "Grounded answer") || strings.Contains(encoded, `\"calls\":[]`) {
+				t.Fatalf("router envelope crossed public boundary: %s", encoded)
+			}
+			for _, marker := range []string{`"search_result_markers":1`, `"targetLink":"https://support.microsoft.com/topic"`} {
+				if !strings.Contains(encoded, marker) {
+					t.Fatalf("missing Bing evidence %s: %s", marker, encoded)
+				}
+			}
+		})
+	}
+}
+
+func TestWP6RouterRepairKeepsDirectAnswerOutOfJSONOnlyConversation(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			chat := &wp6Phase5SequenceChat{results: []chathub.Result{
+				{Text: "Grounded answer", ConversationID: "router-conversation", SessionID: "router-session", Events: wp6Phase5RawEvents()},
+				{Text: `{"calls":[],"answer":"Grounded answer"}`, ConversationID: "repair-conversation", SessionID: "repair-session"},
+				{Text: "Grounded answer", ConversationID: "public-conversation", SessionID: "public-session"},
+			}}
+			server := newWP1CandidateServer(t, &wp1CandidateChat{})
+			server.chat = chat
+			body := map[string]any{
+				"model":    "gpt-5.6-sol",
+				"stream":   stream,
+				"messages": []any{map[string]any{"role": "user", "content": "search"}},
+				"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+					"name": "read_file", "description": "Read file contents without changing state.", "parameters": map[string]any{"type": "object"},
+				}}},
+			}
+			recorder := httptest.NewRecorder()
+			server.openaiChat(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(mustJSON(body))))
+
+			if recorder.Code != http.StatusOK || len(chat.requests) != 3 {
+				t.Fatalf("status=%d requests=%d body=%s", recorder.Code, len(chat.requests), recorder.Body.String())
+			}
 			if repair := chat.requests[1].Text; !strings.Contains(repair, `"answer":"direct final answer"`) {
 				t.Fatalf("repair prompt uses stale router envelope: %s", repair)
 			}
+			if chat.requests[2].ConversationID != "" || chat.requests[2].SessionID != "" {
+				t.Fatalf("public final answer reused router/repair scratch binding: %#v", chat.requests[2])
+			}
 			encoded := recorder.Body.String()
-			if !strings.Contains(encoded, "Grounded answer") || strings.Contains(encoded, `\"calls\":[]`) {
+			visible := ""
+			if stream {
+				visible, _ = wp6ChatStreamText(t, encoded)
+			} else {
+				visible = encoded
+			}
+			if !strings.Contains(visible, "Grounded answer") || strings.Contains(encoded, `\"calls\":[]`) {
 				t.Fatalf("router repair envelope crossed public boundary: %s", encoded)
 			}
 			for _, marker := range []string{`"search_result_markers":1`, `"targetLink":"https://support.microsoft.com/topic"`} {
@@ -450,15 +474,19 @@ func TestWP6B4ToolContinuationThenBingOnlyReusesCheckpoint(t *testing.T) {
 	if _, hasCalls := secondMessage["tool_calls"]; hasCalls || secondMessage["content"] != "Grounded continuation" {
 		t.Fatalf("B4 response=%#v", secondMessage)
 	}
-	if len(chat.requests) != 3 || chat.requests[1].ConversationID != "conversation" || chat.requests[1].SessionID != "session-1" || chat.requests[2].ConversationID != "conversation" || chat.requests[2].SessionID != "session-2" {
+	if len(chat.requests) != 3 || chat.requests[0].ConversationID != "" || chat.requests[0].SessionID != "" || chat.requests[1].ConversationID != "" || chat.requests[1].SessionID != "" || chat.requests[2].ConversationID != "" || chat.requests[2].SessionID != "" {
 		t.Fatalf("B4 transport continuity=%#v", chat.requests)
+	}
+	if !strings.Contains(chat.requests[2].Text, "inspect then search") || !strings.Contains(chat.requests[2].Text, "file result") {
+		t.Fatalf("B4 public catch-up lost caller-visible history: %s", chat.requests[2].Text)
 	}
 }
 
 func TestWP6SerialToolSafetyContractPreservesHermesCheckpointContinuation(t *testing.T) {
 	first := chathub.Result{Text: `{"calls":[{"name":"read_file","arguments":{"path":"a"}}]}`, ConversationID: "conversation", SessionID: "session-1"}
-	second := chathub.Result{Text: `{"calls":[],"answer":"done"}`, ConversationID: "conversation", SessionID: "session-2"}
-	chat := &wp6Phase5SequenceChat{results: []chathub.Result{first, second}}
+	second := chathub.Result{Text: `{"calls":[],"answer":"done"}`, ConversationID: "router-second", SessionID: "router-session-2"}
+	final := chathub.Result{Text: "done", ConversationID: "conversation", SessionID: "session-public"}
+	chat := &wp6Phase5SequenceChat{results: []chathub.Result{first, second, final}}
 	server := newWP1CandidateServer(t, &wp1CandidateChat{})
 	server.chat = chat
 	server.checkpoints, _ = openTransportCheckpointStore(filepath.Join(t.TempDir(), "checkpoints.json"))
@@ -493,11 +521,14 @@ func TestWP6SerialToolSafetyContractPreservesHermesCheckpointContinuation(t *tes
 	if secondMessage["content"] != "done" {
 		t.Fatalf("continuation response=%#v", secondMessage)
 	}
-	if len(chat.requests) != 2 || !strings.Contains(chat.requests[0].Text, "Maximum calls this turn: 1") || !strings.Contains(chat.requests[1].Text, "Maximum calls this turn: 1") {
+	if len(chat.requests) != 3 || !strings.Contains(chat.requests[0].Text, "Maximum calls this turn: 1") || !strings.Contains(chat.requests[1].Text, "Maximum calls this turn: 1") {
 		t.Fatalf("serial contract was not stable across turns: %#v", chat.requests)
 	}
-	if chat.requests[1].ConversationID != "conversation" || chat.requests[1].SessionID != "session-1" {
-		t.Fatalf("checkpoint continuity diverged after the serialized tool call: %#v", chat.requests)
+	if chat.requests[2].ConversationID != "" || chat.requests[2].SessionID != "" {
+		t.Fatalf("public final answer reused scratch router binding: %#v", chat.requests)
+	}
+	if !strings.Contains(chat.requests[2].Text, "inspect safely") || !strings.Contains(chat.requests[2].Text, "file result") || strings.Contains(chat.requests[2].Text, "Maximum calls this turn: 1") {
+		t.Fatalf("checkpoint public catch-up diverged after the serialized tool call: %s", chat.requests[2].Text)
 	}
 }
 

@@ -92,8 +92,9 @@ func checkpointRequestFrom(rctx context.Context) checkpointRequestControl {
 }
 
 type checkpointOutcome struct {
-	binding  checkpointBinding
-	produced []oaiMsg
+	binding        checkpointBinding
+	produced       []oaiMsg
+	publicObserved bool
 }
 
 type checkpointExecution struct {
@@ -115,7 +116,19 @@ func (e *checkpointExecution) Capture(result chathub.Result, produced ...oaiMsg)
 		return
 	}
 	e.turn.Observe(result)
-	e.outcome = checkpointOutcome{binding: e.turn.binding, produced: append([]oaiMsg(nil), produced...)}
+	e.outcome = checkpointOutcome{binding: e.turn.binding, produced: append([]oaiMsg(nil), produced...), publicObserved: true}
+}
+
+// CaptureScratch records a caller-visible result selected by an isolated
+// planning phase without allowing that scratch ChatHub result to mutate the
+// caller-visible conversation/session binding. If no public ChatHub turn has
+// happened yet, the binding intentionally remains empty until the first real
+// caller-visible request establishes it.
+func (e *checkpointExecution) CaptureScratch(produced ...oaiMsg) {
+	if e == nil || e.turn == nil {
+		return
+	}
+	e.outcome = checkpointOutcome{binding: e.turn.binding, produced: append([]oaiMsg(nil), produced...), publicObserved: false}
 }
 
 func (e *checkpointExecution) Request(request chathub.Request) chathub.Request {
@@ -139,7 +152,7 @@ func (e *checkpointExecution) Accept() error {
 		return fmt.Errorf("checkpoint acceptance requires a caller-visible assistant result")
 	}
 	e.turn.binding = e.outcome.binding
-	return e.turn.Accept(e.outcome.produced...)
+	return e.turn.acceptWithVisibility(e.outcome.publicObserved, e.outcome.produced...)
 }
 
 func (e *checkpointExecution) Abort() {
@@ -159,9 +172,20 @@ func completeCheckpointExecution(execution *checkpointExecution, owns bool, resu
 	return nil
 }
 
+func completeCheckpointScratchExecution(execution *checkpointExecution, owns bool, produced ...oaiMsg) error {
+	if execution == nil {
+		return nil
+	}
+	execution.CaptureScratch(produced...)
+	if owns {
+		return execution.Accept()
+	}
+	return nil
+}
+
 // publicCheckpointTurn is the request-scoped owner of a single checkpoint
-// lease. Internal router/repair calls may rotate its upstream SessionID, but
-// only the assistant message actually returned to the caller is accepted.
+// lease. Only caller-visible ChatHub traffic may mutate its upstream binding;
+// isolated router/repair scratch phases must never be observed here.
 type publicCheckpointTurn struct {
 	turn       *checkpointTurn
 	binding    checkpointBinding
@@ -301,6 +325,10 @@ func (t *publicCheckpointTurn) Observe(result chathub.Result) {
 }
 
 func (t *publicCheckpointTurn) Accept(produced ...oaiMsg) error {
+	return t.acceptWithVisibility(true, produced...)
+}
+
+func (t *publicCheckpointTurn) acceptWithVisibility(publicObserved bool, produced ...oaiMsg) error {
 	if t == nil || t.turn == nil {
 		return nil
 	}
@@ -309,10 +337,10 @@ func (t *publicCheckpointTurn) Accept(produced ...oaiMsg) error {
 		_ = t.turn.Abort()
 		return t.observeErr
 	}
-	if strings.TrimSpace(t.binding.ConversationID) == "" {
+	if publicObserved && strings.TrimSpace(t.binding.ConversationID) == "" {
 		return fmt.Errorf("checkpoint acceptance requires an upstream conversation ID")
 	}
-	return t.turn.Accept(t.binding, produced, t.responseID)
+	return t.turn.acceptWithVisibility(t.binding, produced, t.responseID, publicObserved)
 }
 
 func (t *publicCheckpointTurn) Abort() {
