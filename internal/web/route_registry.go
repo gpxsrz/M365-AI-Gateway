@@ -23,8 +23,9 @@ const (
 	operationalEnabled  operationalStatus = "enabled"
 	operationalDisabled operationalStatus = "disabled"
 
-	mappingAPIToneAccepted mappingEvidence = "api_tone_accepted"
-	mappingUnverified      mappingEvidence = "unverified"
+	mappingAPIToneAccepted    mappingEvidence = "api_tone_accepted"
+	mappingWebPayloadVerified mappingEvidence = "web_payload_verified"
+	mappingUnverified         mappingEvidence = "unverified"
 
 	identityDynamicUnidentified identityStatus = "dynamic_unidentified"
 	identityAcceptedUnverified  identityStatus = "accepted_unverified"
@@ -51,6 +52,15 @@ type routeDefinition struct {
 	Owner                 string
 	DisplayName           string
 	DefaultReasoningLevel string
+	OptionalCapability    bool
+	RuntimeEvidence       *runtimeModelCapabilityEvidence
+}
+
+type runtimeModelCapabilityEvidence struct {
+	CapturedAt                 string
+	SelectorObservationSHA256  string
+	UsabilityObservationSHA256 string
+	WireObservationSHA256      string
 }
 
 type routeResolution struct {
@@ -215,8 +225,12 @@ func routeRegistry(mappings []modelMapping) []routeDefinition {
 }
 
 func registeredRoute(model string, mappings []modelMapping) (routeDefinition, bool) {
+	return registeredRouteFromRegistry(model, routeRegistry(mappings))
+}
+
+func registeredRouteFromRegistry(model string, routes []routeDefinition) (routeDefinition, bool) {
 	model = strings.ToLower(strings.TrimSpace(model))
-	for _, route := range routeRegistry(mappings) {
+	for _, route := range routes {
 		if strings.EqualFold(route.ID, model) {
 			return cloneRouteDefinition(route), true
 		}
@@ -252,13 +266,17 @@ func resolutionFromRoute(requested string, route routeDefinition) routeResolutio
 
 func routeLocksReasoningEffort(route routeDefinition) bool {
 	id := strings.ToLower(strings.TrimSpace(route.ID))
-	if strings.HasPrefix(id, "m365-") || route.ConfiguredMapping || route.Kind == routeKindPreset || route.Kind == routeKindWebMode {
+	if strings.HasPrefix(id, "m365-") || route.ConfiguredMapping || route.OptionalCapability || route.Kind == routeKindPreset || route.Kind == routeKindWebMode {
 		return true
 	}
 	return id == "gpt-5.6-reasoning"
 }
 
 func resolveRoute(model, effort string, mappings []modelMapping) (routeResolution, error) {
+	return resolveRouteFromRegistry(model, effort, routeRegistry(mappings))
+}
+
+func resolveRouteFromRegistry(model, effort string, routes []routeDefinition) (routeResolution, error) {
 	requested := strings.TrimSpace(model)
 	if requested == "" {
 		requested = "m365-copilot"
@@ -267,7 +285,7 @@ func resolveRoute(model, effort string, mappings []modelMapping) (routeResolutio
 	if err != nil {
 		return routeResolution{}, &routeResolveError{Status: http.StatusBadRequest, Code: "invalid_reasoning_effort", Message: err.Error()}
 	}
-	route, ok := registeredRoute(requested, mappings)
+	route, ok := registeredRouteFromRegistry(requested, routes)
 	if !ok {
 		return routeResolution{}, &routeResolveError{Status: http.StatusNotFound, Code: "model_not_found", Message: fmt.Sprintf("Unknown M365 route: %s", requested)}
 	}
@@ -284,12 +302,16 @@ func resolveRoute(model, effort string, mappings []modelMapping) (routeResolutio
 }
 
 func resolveChatRoute(model, tone, effort string, mappings []modelMapping) (routeResolution, error) {
+	return resolveChatRouteFromRegistry(model, tone, effort, routeRegistry(mappings))
+}
+
+func resolveChatRouteFromRegistry(model, tone, effort string, routes []routeDefinition) (routeResolution, error) {
 	if strings.TrimSpace(model) != "" || strings.TrimSpace(tone) == "" {
-		return resolveRoute(model, effort, mappings)
+		return resolveRouteFromRegistry(model, effort, routes)
 	}
 	tone = strings.TrimSpace(tone)
 	for _, visibility := range []catalogVisibility{catalogPublic, catalogCompatibility, catalogHidden} {
-		for _, route := range routeRegistry(mappings) {
+		for _, route := range routes {
 			if route.OperationalStatus == operationalEnabled && route.CatalogVisibility == visibility && route.Tone == tone {
 				return resolutionFromRoute(route.ID, route), nil
 			}

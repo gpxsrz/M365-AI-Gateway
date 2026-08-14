@@ -36,37 +36,39 @@ const (
 )
 
 type runtimeSettings struct {
-	ChatMode                          string         `json:"chatMode"`
-	HermesCompatibilityEnabled        bool           `json:"hermesCompatibilityEnabled"`
-	MemoryCompatibilityEnabled        bool           `json:"memoryCompatibilityEnabled"`
-	InteractiveMaxConcurrent          int            `json:"interactiveMaxConcurrent"`
-	InteractiveQueueTimeoutSeconds    int            `json:"interactiveQueueTimeoutSeconds"`
-	MemoryMaxConcurrent               int            `json:"memoryMaxConcurrent"`
-	MemoryQueueTimeoutSeconds         int            `json:"memoryQueueTimeoutSeconds"`
-	InteractivePriorityHoldoffSeconds int            `json:"interactivePriorityHoldoffSeconds"`
-	MemoryBackoffInitialSeconds       int            `json:"memoryBackoffInitialSeconds"`
-	MemoryBackoffMaxSeconds           int            `json:"memoryBackoffMaxSeconds"`
-	TextInputLimitUTF16               int            `json:"textInputLimitUTF16"`
-	MaxToolCallsPerTurn               int            `json:"maxToolCallsPerTurn"`
-	MaxToolRounds                     int            `json:"maxToolRounds"`
-	HermesMaxToolRounds               int            `json:"hermesMaxToolRounds"`
-	ContextWindow                     int            `json:"contextWindow"`
-	MaxOutputTokens                   int            `json:"maxOutputTokens"`
-	ChatTimeoutSeconds                int            `json:"chatTimeoutSeconds"`
-	ImageTimeoutSeconds               int            `json:"imageTimeoutSeconds"`
-	LogLevel                          string         `json:"logLevel"`
-	DebugLogPath                      string         `json:"debugLogPath"`
-	ListenAddress                     string         `json:"listenAddress"`
-	ConfigPath                        string         `json:"configPath"`
-	TokenCachePath                    string         `json:"tokenCachePath"`
-	SessionCachePath                  string         `json:"sessionCachePath"`
-	OutboundProxy                     string         `json:"outboundProxy"`
-	ClientID                          string         `json:"clientId"`
-	Authority                         string         `json:"authority"`
-	RedirectURI                       string         `json:"redirectUri"`
-	Scope                             string         `json:"scope"`
-	ModelMappings                     []modelMapping `json:"modelMappings"`
-	ToolPlanningMode                  string         `json:"toolPlanningMode"`
+	ChatMode                          string                       `json:"chatMode"`
+	HermesCompatibilityEnabled        bool                         `json:"hermesCompatibilityEnabled"`
+	MemoryCompatibilityEnabled        bool                         `json:"memoryCompatibilityEnabled"`
+	InteractiveMaxConcurrent          int                          `json:"interactiveMaxConcurrent"`
+	InteractiveQueueTimeoutSeconds    int                          `json:"interactiveQueueTimeoutSeconds"`
+	MemoryMaxConcurrent               int                          `json:"memoryMaxConcurrent"`
+	MemoryQueueTimeoutSeconds         int                          `json:"memoryQueueTimeoutSeconds"`
+	InteractivePriorityHoldoffSeconds int                          `json:"interactivePriorityHoldoffSeconds"`
+	MemoryBackoffInitialSeconds       int                          `json:"memoryBackoffInitialSeconds"`
+	MemoryBackoffMaxSeconds           int                          `json:"memoryBackoffMaxSeconds"`
+	TextInputLimitUTF16               int                          `json:"textInputLimitUTF16"`
+	MaxToolCallsPerTurn               int                          `json:"maxToolCallsPerTurn"`
+	MaxToolRounds                     int                          `json:"maxToolRounds"`
+	HermesMaxToolRounds               int                          `json:"hermesMaxToolRounds"`
+	ContextWindow                     int                          `json:"contextWindow"`
+	MaxOutputTokens                   int                          `json:"maxOutputTokens"`
+	ChatTimeoutSeconds                int                          `json:"chatTimeoutSeconds"`
+	ImageTimeoutSeconds               int                          `json:"imageTimeoutSeconds"`
+	LogLevel                          string                       `json:"logLevel"`
+	DebugLogPath                      string                       `json:"debugLogPath"`
+	ListenAddress                     string                       `json:"listenAddress"`
+	ConfigPath                        string                       `json:"configPath"`
+	TokenCachePath                    string                       `json:"tokenCachePath"`
+	SessionCachePath                  string                       `json:"sessionCachePath"`
+	OutboundProxy                     string                       `json:"outboundProxy"`
+	ClientID                          string                       `json:"clientId"`
+	Authority                         string                       `json:"authority"`
+	RedirectURI                       string                       `json:"redirectUri"`
+	Scope                             string                       `json:"scope"`
+	ModelMappings                     []modelMapping               `json:"modelMappings"`
+	OptionalModelCapabilities         []optionalModelCapability    `json:"optionalModelCapabilities,omitempty"`
+	WebRequestCapabilityEvidence      webRequestCapabilityEvidence `json:"webRequestCapabilityEvidence,omitempty"`
+	ToolPlanningMode                  string                       `json:"toolPlanningMode"`
 }
 
 type settingsStore struct {
@@ -289,6 +291,15 @@ func validateSettings(v runtimeSettings) error {
 	if err := outbound.ValidateProxyURL(v.OutboundProxy); err != nil {
 		return err
 	}
+	if err := validateOptionalModelCapabilities(v.OptionalModelCapabilities); err != nil {
+		return err
+	}
+	optionalModels := make(map[string]struct{}, len(v.OptionalModelCapabilities))
+	optionalTones := make(map[string]struct{}, len(v.OptionalModelCapabilities))
+	for _, capability := range v.OptionalModelCapabilities {
+		optionalModels[strings.ToLower(strings.TrimSpace(capability.PublicModel))] = struct{}{}
+		optionalTones[strings.ToLower(strings.TrimSpace(capability.UpstreamTone))] = struct{}{}
+	}
 	seen := make(map[string]struct{}, len(v.ModelMappings))
 	for _, mapping := range v.ModelMappings {
 		model := strings.TrimSpace(mapping.PublicModel)
@@ -296,11 +307,17 @@ func validateSettings(v runtimeSettings) error {
 			return fmt.Errorf("公開模型 ID 只能包含英文字母、數字、句點、底線或連字號，且長度必須為 1-128")
 		}
 		key := strings.ToLower(model)
+		if _, exists := optionalModels[key]; exists {
+			return fmt.Errorf("公開模型 ID %q 同時出現在 modelMappings 與 optionalModelCapabilities", model)
+		}
+		if _, exists := optionalTones[strings.ToLower(strings.TrimSpace(mapping.UpstreamTone))]; exists {
+			return fmt.Errorf("上游 tone %q 同時出現在 modelMappings 與 optionalModelCapabilities", mapping.UpstreamTone)
+		}
 		if _, exists := seen[key]; exists {
 			return fmt.Errorf("公開模型 ID %q 重複", model)
 		}
 		seen[key] = struct{}{}
-		if !validUpstreamTone(strings.TrimSpace(mapping.UpstreamTone)) {
+		if !validUpstreamToneForSettings(strings.TrimSpace(mapping.UpstreamTone), v) {
 			return fmt.Errorf("上游 tone %q 不支援", mapping.UpstreamTone)
 		}
 		if strings.TrimSpace(mapping.DisplayName) == "" {
@@ -309,6 +326,9 @@ func validateSettings(v runtimeSettings) error {
 		if _, err := normalizeReasoningEffort(mapping.DefaultReasoningLevel); err != nil || strings.TrimSpace(mapping.DefaultReasoningLevel) == "" {
 			return fmt.Errorf("公開模型 %q 的預設推理等級無效", model)
 		}
+	}
+	if err := validateWebRequestCapabilityEvidence(v.WebRequestCapabilityEvidence, v); err != nil {
+		return err
 	}
 	return nil
 }
@@ -424,6 +444,15 @@ func atomicWriteSettingsFile(path string, raw []byte) error {
 }
 func managementRouteIDs(mappings []modelMapping) []string {
 	routes := catalogRouteDefinitions(mappings)
+	ids := make([]string, 0, len(routes))
+	for _, route := range routes {
+		ids = append(ids, route.ID)
+	}
+	return ids
+}
+
+func managementRouteIDsForSettings(cfg runtimeSettings) []string {
+	routes := catalogRouteDefinitionsForSettings(cfg)
 	ids := make([]string, 0, len(routes))
 	for _, route := range routes {
 		ids = append(ids, route.ID)
@@ -572,11 +601,15 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 				"hermes":  hermesRounds,
 				"memory":  genericRounds,
 			},
-			"codexModels":           managementRouteIDs(cfg.ModelMappings),
-			"upstreamTones":         knownUpstreamTones(),
-			"restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "clientId", "authority", "redirectUri", "scope", "debugLogPath"},
+			"codexModels":                      managementRouteIDsForSettings(cfg),
+			"upstreamTones":                    knownUpstreamTonesForSettings(cfg),
+			"chatHubRequestCapabilityBaseline": currentRequestCapabilityBaseline(),
+			"webRequestCapabilityDrift":        requestCapabilityDrift(cfg, currentRequestCapabilityBaseline()),
+			"restartRequiredFields":            []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "clientId", "authority", "redirectUri", "scope", "debugLogPath"},
 		})
 	case http.MethodPut:
+		s.checkpointLifecycle.Lock()
+		defer s.checkpointLifecycle.Unlock()
 		current := s.settings.get()
 		v := current
 		if json.NewDecoder(r.Body).Decode(&v) != nil {
@@ -590,7 +623,6 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
 		}
-		s.checkpointLifecycle.Lock()
 		var e error
 		commit := func() error { return s.settings.save(v) }
 		if current.ChatMode != v.ChatMode && s.checkpoints != nil {
@@ -598,7 +630,6 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		} else {
 			e = commit()
 		}
-		s.checkpointLifecycle.Unlock()
 		if e != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return

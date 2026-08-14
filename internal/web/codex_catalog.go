@@ -26,6 +26,8 @@ type modelSpec struct {
 	CatalogVisibility                             catalogVisibility
 	AliasUsed, CompatibilityRequired              bool
 	ConfiguredMapping, Experimental, Deprecated   bool
+	OptionalCapability                            bool
+	RuntimeEvidence                               *runtimeModelCapabilityEvidence
 }
 
 type reasoningEffortPreset struct {
@@ -93,18 +95,15 @@ func modelSpecsFromRoutes(routes []routeDefinition) []modelSpec {
 			ConfiguredMapping:     route.ConfiguredMapping,
 			Experimental:          route.Experimental,
 			Deprecated:            route.Deprecated,
+			OptionalCapability:    route.OptionalCapability,
+			RuntimeEvidence:       route.RuntimeEvidence,
 		})
 	}
 	return models
 }
 
 func validUpstreamTone(tone string) bool {
-	for _, known := range knownUpstreamTones() {
-		if tone == known {
-			return true
-		}
-	}
-	return false
+	return validStaticUpstreamTone(tone)
 }
 
 func knownUpstreamTones() []string {
@@ -144,7 +143,7 @@ func normalizeReasoningEffort(e string) (string, error) {
 }
 func modelCatalogForSettingsAndEvidence(cfg runtimeSettings, projection *catalogEvidenceProjection) []map[string]any {
 	l := configuredModelLimitsForSettings(cfg)
-	models := configuredModelSpecs(cfg.ModelMappings)
+	models := modelSpecsFromRoutes(catalogRouteDefinitionsForSettings(cfg))
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
 		// Keep capability fields both at the top level and under capabilities:
@@ -200,6 +199,15 @@ func modelCatalogForSettingsAndEvidence(cfg runtimeSettings, projection *catalog
 			"function_calling":           true, "supports_function_calling": true, "supports_vision": true,
 			"vision": true, "modalities": modalities, "input_modalities": modalities,
 			"output_modalities": []string{"text"}, "supported_features": features,
+		}
+		if m.OptionalCapability && m.RuntimeEvidence != nil {
+			entry["x_m365_optional_capability"] = true
+			entry["x_m365_evidence_source"] = "operator_attested_web_observation"
+			entry["x_m365_mapping_source"] = "operator_attested_web_observation"
+			entry["x_m365_evidence_captured_at"] = m.RuntimeEvidence.CapturedAt
+			entry["x_m365_selector_observation_sha256"] = m.RuntimeEvidence.SelectorObservationSHA256
+			entry["x_m365_usability_observation_sha256"] = m.RuntimeEvidence.UsabilityObservationSHA256
+			entry["x_m365_wire_observation_sha256"] = m.RuntimeEvidence.WireObservationSHA256
 		}
 		projection.apply(entry, m)
 		out = append(out, entry)

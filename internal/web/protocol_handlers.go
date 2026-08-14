@@ -506,7 +506,7 @@ func (s *Server) responsesCore(w http.ResponseWriter, r *http.Request) {
 	if o.Reasoning != nil && strings.TrimSpace(o.Reasoning.Effort) != "" {
 		effort = o.Reasoning.Effort
 	}
-	if _, routeErr := resolveRoute(o.Model, effort, settings.ModelMappings); routeErr != nil {
+	if _, routeErr := resolveRouteForSettings(o.Model, effort, settings); routeErr != nil {
 		if typed, ok := routeErr.(*routeResolveError); ok {
 			writeResponsesErrorCode(w, typed.Status, "invalid_request_error", typed.Code, typed.Message)
 		} else {

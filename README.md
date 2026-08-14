@@ -138,6 +138,12 @@ Request-scope raw evidence **不直接等於 canonical model input**。M365 只�
 
 Checkpoint 只保存穩定 canonical identity，不會因 unknown request/message/content extension 改變 digest；Production debug summary 也只保存 sanitised counts/field-type names，raw/private scalar 仍只受既有 opt-in snapshot、redaction、TTL 與 size bound 管理。這對 Hindsight strict JSON Schema 與 Semantica MCP 特別重要：Hindsight 的 format/reasoning extension 不會污染 LLM prompt，Semantica 的 nested tool schema、arguments 與 `structuredContent` 型大型 tool result 仍完整，而 MCP/tool 的 opaque metadata 不會被誤投影成模型內容。
 
+### Web 模型 rollout 與 request capability drift
+
+Microsoft Web selector 新增 model/tone 時，不會自動變成 Sidecar 的 mandatory compatibility baseline。管理員可以用 `optionalModelCapabilities` 保存 privacy-safe selector / usability / wire evidence；未知 tone 只有在 evidence schema、timestamp、selector identity、wire tone 與三個 observation SHA-256 都通過 metadata 驗證後，才具備成為 optional route 的資格，且必須再設 `enabled=true` 才會進入 `/v1/models` 與可用 tone 清單。這些 digest 是 operator-attested observation provenance，Sidecar 不保存原始 WebSocket frame，也不宣稱能由 runtime settings 重算 Microsoft 原始 observation；catalog 會標示 `operator_attested_web_observation`。沒有 evidence 的任意 `Gpt_*` 字串仍 fail-closed，因此未來新 model 不需要只為擴充 Go 字串 allowlist 而重新發版，也不會因此變成 unrestricted pass-through。
+
+`webRequestCapabilityEvidence` 則只保存 Web request 的 `streamingMode`、`optionsSets`、`allowedMessageTypes` snapshot。`GET /api/admin/settings` 會回傳 build 真正使用的 `chatHubRequestCapabilityBaseline` 與 `webRequestCapabilityDrift` exact diff；projection policy 固定為 `observe_only`，不會看到 Microsoft Web 多一個 flag 就自動塞進 Production ChatHub request。詳細 schema、範例與 privacy boundary 見 [Microsoft Web 模型與 ChatHub request capability evidence](docs/MODEL_CAPABILITY_EVIDENCE.md)。
+
 ### Final-answer router envelope
 
 #57 修正了 final-answer model 再次回傳內部 `{"calls":[],"answer":"..."}` envelope 時的外漏問題。Sidecar 只會解開完整且明確的 direct-answer envelope；一般使用者 JSON 保持原樣，含 non-empty `calls`、重複 internal keys、額外欄位或錯誤型別的 router-like JSON 會 fail closed，malformed JSON 不做猜測式剝殼。Generic `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Memory `/memory/v1/chat/completions` 的 streaming 與 non-streaming 均已完成 Production live qualification，Memory JSON Schema 輸出也另外通過 live canary。
@@ -314,6 +320,12 @@ Request-scoped raw evidence is **not** the canonical model input. Only supported
 When a caller supplies a safely nameable extension that is preserved but not projected, M365 exposes `X-M365-Preserved-Extension-Counts` and `X-M365-Preserved-Extension-Names`. Categories include `top`, `message`, `item`, `content`, `tool`, `format`, and `reasoning`; field/type names must satisfy bounded safe-name rules before they are reflected, and **values are never placed in these headers**. Intentionally ignored OpenAI parameters continue to use `X-M365-Ignored-Parameters`, allowing callers to distinguish supported, ignored, preserved-not-projected, and rejected behavior.
 
 Checkpoint state stores stable canonical identity only, so unknown request/message/content evidence does not alter checkpoint digests. Production debug summaries persist only sanitized counts and field/type names; raw/private scalar data remains governed by the existing opt-in snapshot, redaction, TTL, and size limits. This boundary is especially important for Hindsight strict JSON Schema and Semantica MCP: Hindsight format/reasoning extensions do not contaminate the LLM prompt, while Semantica nested tool schemas, arguments, and large `structuredContent`-style tool results remain intact without projecting opaque MCP/tool metadata into model content.
+
+### Web model rollout and request-capability drift
+
+A model/tone newly exposed by the Microsoft Web selector does not automatically become a mandatory Sidecar compatibility baseline. `optionalModelCapabilities` can retain privacy-safe selector/usability/wire evidence; an unknown tone becomes eligible as an optional route only after its evidence schema, timestamp, selector identity, wire tone, and three observation SHA-256 values pass metadata validation, and only `enabled=true` makes it routable and visible in `/v1/models`. Those digests are operator-attested observation provenance: the Sidecar does not retain the original WebSocket frame or claim it can recompute the Microsoft observation from runtime settings, so catalog entries identify the source as `operator_attested_web_observation`. Arbitrary `Gpt_*` strings without evidence remain fail-closed, so a future model does not require a code release merely to extend a Go string allowlist and does not become unrestricted pass-through.
+
+`webRequestCapabilityEvidence` separately records a Web request snapshot of `streamingMode`, `optionsSets`, and `allowedMessageTypes`. `GET /api/admin/settings` returns the build's real `chatHubRequestCapabilityBaseline` plus an exact `webRequestCapabilityDrift`; the projection policy is always `observe_only`, so Web flight flags are never copied into Production ChatHub requests automatically. See [Microsoft Web model and ChatHub request capability evidence](docs/MODEL_CAPABILITY_EVIDENCE.md) for schemas, examples, and the privacy boundary.
 
 ### Final-answer router envelope
 

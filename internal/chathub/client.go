@@ -685,28 +685,7 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 		message["messageAnnotations"] = annotations
 		message["connectedFederatedConnections"] = []string{"dummyId"}
 	}
-	optionsSets := []any{
-		"search_result_progress_messages_with_search_queries",
-		"update_textdoc_response_after_streaming",
-		"deepleo_networking_timeout_10minutes_canmore",
-		"cwc_flux_image",
-		"cwc_code_interpreter",
-		"cwc_code_interpreter_amsfix",
-		"cwcfluxgptv",
-		"flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
-		"gptvnorm2048",
-		"cwc_code_interpreter_citation_fix",
-		"code_interpreter_interactive_charts_inline_image",
-		"code_interpreter_matplotlib_patching",
-		"code_interpreter_interactive_charts",
-		"cwc_fileupload_odb",
-		"update_memory_plugin",
-		"add_custom_instructions",
-		"cwc_flux_v3",
-		"flux_v3_progress_messages",
-		"enable_batch_token_processing",
-		"enable_gg_gpt",
-	}
+	optionsSets := defaultOptionsSetsAny()
 	searchDisabled := len(disableBuiltInSearch) > 0 && disableBuiltInSearch[0]
 	chat := map[string]any{
 		"arguments": []any{
@@ -716,23 +695,19 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 				"sessionId":           sessionID,
 				"optionsSets":         optionsSets,
 				"options":             map[string]any{},
-				"allowedMessageTypes": []string{
-					"Chat", "Suggestion", "Disengaged", "Progress", "EndOfRequest", "InternalLoaderMessage",
-					"GeneratedCode", "GenerateContentQuery", "ReferencesListComplete", "RenderCardRequest",
-					"SearchQuery", "InternalSearchQuery", "SemanticSerp", "AuthError",
-				},
-				"sliceIds":          []any{},
-				"threadLevelGptId":  map[string]any{},
-				"conversationId":    conversationID,
-				"traceId":           uuid.NewString(),
-				"isStartOfSession":  firstTurn,
-				"productThreadType": "Office",
+				"allowedMessageTypes": append([]string(nil), defaultAllowedMessageTypes...),
+				"sliceIds":            []any{},
+				"threadLevelGptId":    map[string]any{},
+				"conversationId":      conversationID,
+				"traceId":             uuid.NewString(),
+				"isStartOfSession":    firstTurn,
+				"productThreadType":   "Office",
 				"clientInfo": map[string]any{
 					"clientPlatform": "mcmcopilot-web",
 					"clientAppName":  "Office",
 				},
 				"tone":          tone,
-				"streamingMode": "ConciseWithPadding",
+				"streamingMode": defaultStreamingMode,
 				"message":       message,
 
 				"plugins":    clientPlugins(callerToolsForChoice(tools, toolChoice), callerMCPForChoice(mcpServerURL, toolChoice), searchDisabled),

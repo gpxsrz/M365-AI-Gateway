@@ -653,7 +653,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	if body.Reasoning != nil && strings.TrimSpace(body.Reasoning.Effort) != "" {
 		effort = body.Reasoning.Effort
 	}
-	resolution, routeErr := resolveChatRoute(body.Model, body.Tone, effort, settings.ModelMappings)
+	resolution, routeErr := resolveChatRouteForSettings(body.Model, body.Tone, effort, settings)
 	if routeErr != nil {
 		if typed, ok := routeErr.(*routeResolveError); ok {
 			writeOpenAIErrorCode(w, typed.Status, "invalid_request_error", typed.Code, typed.Message)
@@ -901,7 +901,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.Reasoning != nil && strings.TrimSpace(body.Reasoning.Effort) != "" {
 		effort = body.Reasoning.Effort
 	}
-	resolution, routeErr := resolveRoute(body.Model, effort, settings.ModelMappings)
+	resolution, routeErr := resolveRouteForSettings(body.Model, effort, settings)
 	if routeErr != nil {
 		if typed, ok := routeErr.(*routeResolveError); ok {
 			writeOpenAIErrorCode(w, typed.Status, "invalid_request_error", typed.Code, typed.Message)

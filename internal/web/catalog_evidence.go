@@ -13,7 +13,7 @@ type catalogEvidenceProjection struct {
 }
 
 func bindCatalogEvidence(cfg runtimeSettings, validated evidence.ValidatedCatalogProjection) (*catalogEvidenceProjection, error) {
-	routes := routeRegistry(cfg.ModelMappings)
+	routes := routeRegistryForSettings(cfg)
 	registry := make(map[string]routeDefinition, len(routes))
 	for _, route := range routes {
 		registry[strings.ToLower(route.ID)] = route
@@ -76,7 +76,7 @@ func matchCatalogEvidenceIdentity(route routeDefinition, accepted evidence.Catal
 
 	switch accepted.MappingEvidence {
 	case "web_payload_verified":
-		if route.MappingEvidence != mappingAPIToneAccepted {
+		if route.MappingEvidence != mappingAPIToneAccepted && route.MappingEvidence != mappingWebPayloadVerified {
 			return fmt.Errorf("catalog evidence identity %q cannot promote an unverified registry mapping to web mapping", accepted.RequestedIdentity)
 		}
 	default:
