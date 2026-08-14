@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,29 +78,80 @@ type debugSnapshot struct {
 }
 
 type debugRecord struct {
-	ID                string         `json:"id"`
-	RequestID         string         `json:"requestId,omitempty"`
-	At                time.Time      `json:"at"`
-	ExpiresAt         time.Time      `json:"expiresAt"`
-	Protocol          string         `json:"protocol"`
-	Route             string         `json:"route"`
-	Path              string         `json:"path"`
-	Method            string         `json:"method"`
-	Status            int            `json:"status"`
-	Level             string         `json:"level"`
-	DurationMS        int64          `json:"durationMs"`
-	Stream            bool           `json:"stream"`
-	MessageCount      int            `json:"messageCount"`
-	ToolCount         int            `json:"toolCount"`
-	AttachmentCount   int            `json:"attachmentCount"`
-	EventCount        int            `json:"eventCount"`
-	InputTokens       int            `json:"inputTokens"`
-	OutputTokens      int            `json:"outputTokens"`
-	TokenSource       string         `json:"tokenSource"`
-	ErrorCode         string         `json:"errorCode,omitempty"`
-	SnapshotAvailable bool           `json:"snapshotAvailable"`
-	SnapshotExpiresAt time.Time      `json:"snapshotExpiresAt,omitempty"`
-	Snapshot          *debugSnapshot `json:"snapshot,omitempty"`
+	ID                       string         `json:"id"`
+	RequestID                string         `json:"requestId,omitempty"`
+	At                       time.Time      `json:"at"`
+	ExpiresAt                time.Time      `json:"expiresAt"`
+	Protocol                 string         `json:"protocol"`
+	Route                    string         `json:"route"`
+	Path                     string         `json:"path"`
+	Method                   string         `json:"method"`
+	Status                   int            `json:"status"`
+	Level                    string         `json:"level"`
+	DurationMS               int64          `json:"durationMs"`
+	Stream                   bool           `json:"stream"`
+	MessageCount             int            `json:"messageCount"`
+	ToolCount                int            `json:"toolCount"`
+	AttachmentCount          int            `json:"attachmentCount"`
+	EventCount               int            `json:"eventCount"`
+	InputTokens              int            `json:"inputTokens"`
+	OutputTokens             int            `json:"outputTokens"`
+	TokenSource              string         `json:"tokenSource"`
+	ErrorCode                string         `json:"errorCode,omitempty"`
+	PreservedExtensionCounts string         `json:"preservedExtensionCounts,omitempty"`
+	PreservedExtensionNames  []string       `json:"preservedExtensionNames,omitempty"`
+	SnapshotAvailable        bool           `json:"snapshotAvailable"`
+	SnapshotExpiresAt        time.Time      `json:"snapshotExpiresAt,omitempty"`
+	Snapshot                 *debugSnapshot `json:"snapshot,omitempty"`
+}
+
+func safeDebugPreservedExtensionCounts(value string) string {
+	if value == "" {
+		return ""
+	}
+	want := []string{"top", "message", "item", "content", "tool", "format", "reasoning"}
+	parts := strings.Split(value, ",")
+	if len(parts) != len(want) {
+		return ""
+	}
+	canonical := make([]string, 0, len(want))
+	for i, part := range parts {
+		key, raw, ok := strings.Cut(part, "=")
+		if !ok || key != want[i] {
+			return ""
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > 100000 {
+			return ""
+		}
+		canonical = append(canonical, key+"="+strconv.Itoa(n))
+	}
+	return strings.Join(canonical, ",")
+}
+
+func safeDebugPreservedExtensionNames(value string) []string {
+	if value == "" {
+		return nil
+	}
+	allowedKinds := map[string]bool{
+		"top": true, "message": true, "item": true, "item-type": true,
+		"content": true, "tool": true, "tool-function": true, "format": true,
+		"reasoning": true,
+	}
+	out := make([]string, 0, 32)
+	seen := map[string]bool{}
+	for _, entry := range strings.Split(value, ",") {
+		kind, name, ok := strings.Cut(entry, ":")
+		if !ok || !allowedKinds[kind] || !safeIngressEvidenceName(name) || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		out = append(out, entry)
+		if len(out) == 32 {
+			break
+		}
+	}
+	return out
 }
 
 type debugCaptureSession struct {
@@ -1102,24 +1154,26 @@ func (server *Server) debugMiddleware(next http.Handler) http.Handler {
 			eventCount = 1
 		}
 		record := debugRecord{
-			RequestID:       requestIDFrom(r),
-			At:              start,
-			Protocol:        protocol,
-			Route:           requestSummary.Route,
-			Path:            safePath,
-			Method:          safeServiceLogMethod(r.Method),
-			Status:          writer.status,
-			Level:           debugLevel(writer.status),
-			DurationMS:      duration,
-			Stream:          requestSummary.Stream,
-			MessageCount:    requestSummary.MessageCount,
-			ToolCount:       requestSummary.ToolCount,
-			AttachmentCount: requestSummary.AttachmentCount,
-			EventCount:      eventCount,
-			InputTokens:     estimateDebugTokens(input.bytes),
-			OutputTokens:    estimateDebugTokens(writer.bytes),
-			TokenSource:     "byte_estimate",
-			ErrorCode:       debugErrorCode(writer.status),
+			RequestID:                requestIDFrom(r),
+			At:                       start,
+			Protocol:                 protocol,
+			Route:                    requestSummary.Route,
+			Path:                     safePath,
+			Method:                   safeServiceLogMethod(r.Method),
+			Status:                   writer.status,
+			Level:                    debugLevel(writer.status),
+			DurationMS:               duration,
+			Stream:                   requestSummary.Stream,
+			MessageCount:             requestSummary.MessageCount,
+			ToolCount:                requestSummary.ToolCount,
+			AttachmentCount:          requestSummary.AttachmentCount,
+			EventCount:               eventCount,
+			InputTokens:              estimateDebugTokens(input.bytes),
+			OutputTokens:             estimateDebugTokens(writer.bytes),
+			TokenSource:              "byte_estimate",
+			ErrorCode:                debugErrorCode(writer.status),
+			PreservedExtensionCounts: safeDebugPreservedExtensionCounts(writer.Header().Get("X-M365-Preserved-Extension-Counts")),
+			PreservedExtensionNames:  safeDebugPreservedExtensionNames(writer.Header().Get("X-M365-Preserved-Extension-Names")),
 		}
 		server.debug.add(record, debugCapturedPayloads{
 			Request:       requestCapture,

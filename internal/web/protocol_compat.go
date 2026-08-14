@@ -10,19 +10,24 @@ import (
 
 // responsesRequest is the OpenAI Responses API request subset supported by the gateway.
 type responsesRequest struct {
-	Model              string           `json:"model"`
-	Instructions       string           `json:"instructions,omitempty"`
-	Input              any              `json:"input"`
-	Tools              []map[string]any `json:"tools,omitempty"`
-	ToolChoice         any              `json:"tool_choice,omitempty"`
-	ParallelToolCalls  *bool            `json:"parallel_tool_calls,omitempty"`
-	Stream             bool             `json:"stream,omitempty"`
-	User               string           `json:"user,omitempty"`
-	Reasoning          *reasoningConfig `json:"reasoning,omitempty"`
-	Verbosity          string           `json:"verbosity,omitempty"`
-	PreviousResponseID string           `json:"previous_response_id,omitempty"`
-	Conversation       string           `json:"conversation,omitempty"`
-	NewConversation    bool             `json:"new_conversation,omitempty"`
+	Model              string                        `json:"model"`
+	Instructions       string                        `json:"instructions,omitempty"`
+	Input              any                           `json:"input"`
+	Tools              []map[string]any              `json:"tools,omitempty"`
+	ToolChoice         any                           `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool                         `json:"parallel_tool_calls,omitempty"`
+	Stream             bool                          `json:"stream,omitempty"`
+	User               string                        `json:"user,omitempty"`
+	Reasoning          *reasoningConfig              `json:"reasoning,omitempty"`
+	Verbosity          string                        `json:"verbosity,omitempty"`
+	PreviousResponseID string                        `json:"previous_response_id,omitempty"`
+	Conversation       string                        `json:"conversation,omitempty"`
+	NewConversation    bool                          `json:"new_conversation,omitempty"`
+	IngressRaw         json.RawMessage               `json:"-"`
+	IngressExtensions  map[string]json.RawMessage    `json:"-"`
+	InputRaw           json.RawMessage               `json:"-"`
+	InputEvidence      []protocolIngressItemEvidence `json:"-"`
+	ToolEvidence       []protocolIngressToolEvidence `json:"-"`
 }
 
 const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Use the caller-provided exec tool only for local filesystem and command execution. Do not use Microsoft 365 native execution or file-mutation tools for those operations. Microsoft 365 native Bing web search, citations, grounding, and read-only information retrieval remain allowed. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
@@ -94,6 +99,12 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				sameTurnCalls = append(sameTurnCalls, map[string]any{"id": id, "type": "custom", "function": map[string]any{"name": name, "arguments": mustJSON(map[string]any{"input": input})}})
 			default:
 				flushCalls()
+				if typ != "" && typ != "message" {
+					// Unknown/future Responses input items are retained in
+					// request-scoped ingress evidence but are not implicitly
+					// reinterpreted as user messages.
+					continue
+				}
 				role, _ := m["role"].(string)
 				if role == "" {
 					role = "user"
@@ -105,6 +116,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				if content == nil {
 					content = []any{m}
 				}
+				content = canonicalizeOpenAIContent(content)
 				o.Messages = append(o.Messages, oaiMsg{Role: role, Content: content})
 			}
 		}
@@ -150,29 +162,41 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 }
 
 type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role                string                     `json:"role"`
+	Content             any                        `json:"content"`
+	IngressRaw          json.RawMessage            `json:"-"`
+	IngressExtensions   map[string]json.RawMessage `json:"-"`
+	ContentRaw          json.RawMessage            `json:"-"`
+	UnknownContentParts []json.RawMessage          `json:"-"`
+	UnknownContentTypes []string                   `json:"-"`
 }
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	InputSchema map[string]any `json:"input_schema"`
-	Annotations map[string]any `json:"annotations,omitempty"`
+	Name              string                     `json:"name"`
+	Description       string                     `json:"description,omitempty"`
+	InputSchema       map[string]any             `json:"input_schema"`
+	Annotations       map[string]any             `json:"annotations,omitempty"`
+	IngressRaw        json.RawMessage            `json:"-"`
+	IngressExtensions map[string]json.RawMessage `json:"-"`
 }
 type anthropicRequest struct {
-	Model      string             `json:"model"`
-	System     any                `json:"system,omitempty"`
-	Messages   []anthropicMessage `json:"messages"`
-	Tools      []anthropicTool    `json:"tools,omitempty"`
-	ToolChoice any                `json:"tool_choice,omitempty"`
-	Stream     bool               `json:"stream,omitempty"`
-	MaxTokens  int                `json:"max_tokens,omitempty"`
+	Model                     string                     `json:"model"`
+	System                    any                        `json:"system,omitempty"`
+	Messages                  []anthropicMessage         `json:"messages"`
+	Tools                     []anthropicTool            `json:"tools,omitempty"`
+	ToolChoice                any                        `json:"tool_choice,omitempty"`
+	Stream                    bool                       `json:"stream,omitempty"`
+	MaxTokens                 int                        `json:"max_tokens,omitempty"`
+	IngressRaw                json.RawMessage            `json:"-"`
+	IngressExtensions         map[string]json.RawMessage `json:"-"`
+	SystemRaw                 json.RawMessage            `json:"-"`
+	SystemUnknownContentParts []json.RawMessage          `json:"-"`
+	SystemUnknownContentTypes []string                   `json:"-"`
 }
 
 func (r anthropicRequest) openAI() (oaiReq, error) {
 	o := oaiReq{Model: r.Model, Stream: r.Stream}
 	if r.System != nil {
-		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: r.System})
+		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: canonicalizeOpenAIContent(r.System)})
 	}
 	for _, m := range r.Messages {
 		if s, ok := m.Content.(string); ok {

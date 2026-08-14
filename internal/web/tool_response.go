@@ -99,7 +99,13 @@ func toolDefinitionMaps(tools []chathub.Tool) []map[string]any {
 		if err != nil {
 			continue
 		}
-		out = append(out, map[string]any{"type": tool.Type, "function": function})
+		canonicalFunction := map[string]any{}
+		for _, name := range []string{"name", "description", "parameters", "annotations"} {
+			if value, ok := function[name]; ok {
+				canonicalFunction[name] = value
+			}
+		}
+		out = append(out, map[string]any{"type": tool.Type, "function": canonicalFunction})
 	}
 	return out
 }

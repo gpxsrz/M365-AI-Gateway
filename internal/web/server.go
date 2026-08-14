@@ -608,8 +608,10 @@ type chatBody struct {
 }
 
 type responseFormat struct {
-	Type       string         `json:"type"`
-	JSONSchema map[string]any `json:"json_schema,omitempty"`
+	Type              string                     `json:"type"`
+	JSONSchema        map[string]any             `json:"json_schema,omitempty"`
+	IngressRaw        json.RawMessage            `json:"-"`
+	IngressExtensions map[string]json.RawMessage `json:"-"`
 }
 
 func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
@@ -764,6 +766,15 @@ type oaiMsg struct {
 	ToolCalls         []map[string]any `json:"tool_calls,omitempty"`
 	ToolResultIsError bool             `json:"-"`
 	SidecarGenerated  bool             `json:"-"`
+	// Ingress evidence is request-scoped only. It lets compatibility layers
+	// observe caller extensions without forwarding or persisting them by
+	// accident. Canonical protocol projection continues to use the fields
+	// above.
+	IngressRaw          json.RawMessage            `json:"-"`
+	IngressExtensions   map[string]json.RawMessage `json:"-"`
+	ContentRaw          json.RawMessage            `json:"-"`
+	UnknownContentParts []json.RawMessage          `json:"-"`
+	UnknownContentTypes []string                   `json:"-"`
 }
 
 type oaiReq struct {
@@ -778,21 +789,23 @@ type oaiReq struct {
 	Attachments    []chathub.Attachment `json:"attachments,omitempty"`
 	Tools          []chathub.Tool       `json:"tools,omitempty"`
 	// Legacy OpenAI-compatible clients still send functions/function_call.
-	Functions           []json.RawMessage `json:"functions,omitempty"`
-	ToolChoice          any               `json:"tool_choice,omitempty"`
-	ParallelToolCalls   *bool             `json:"parallel_tool_calls,omitempty"`
-	FunctionCall        any               `json:"function_call,omitempty"`
-	Reasoning           *reasoningConfig  `json:"reasoning,omitempty"`
-	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
-	Verbosity           string            `json:"verbosity,omitempty"`
-	Temperature         json.RawMessage   `json:"temperature,omitempty"`
-	TopP                json.RawMessage   `json:"top_p,omitempty"`
-	MaxTokens           json.RawMessage   `json:"max_tokens,omitempty"`
-	MaxCompletionTokens json.RawMessage   `json:"max_completion_tokens,omitempty"`
-	Stop                json.RawMessage   `json:"stop,omitempty"`
-	Seed                json.RawMessage   `json:"seed,omitempty"`
-	FrequencyPenalty    json.RawMessage   `json:"frequency_penalty,omitempty"`
-	PresencePenalty     json.RawMessage   `json:"presence_penalty,omitempty"`
+	Functions           []json.RawMessage          `json:"functions,omitempty"`
+	ToolChoice          any                        `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool                      `json:"parallel_tool_calls,omitempty"`
+	FunctionCall        any                        `json:"function_call,omitempty"`
+	Reasoning           *reasoningConfig           `json:"reasoning,omitempty"`
+	ReasoningEffort     string                     `json:"reasoning_effort,omitempty"`
+	Verbosity           string                     `json:"verbosity,omitempty"`
+	Temperature         json.RawMessage            `json:"temperature,omitempty"`
+	TopP                json.RawMessage            `json:"top_p,omitempty"`
+	MaxTokens           json.RawMessage            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens json.RawMessage            `json:"max_completion_tokens,omitempty"`
+	Stop                json.RawMessage            `json:"stop,omitempty"`
+	Seed                json.RawMessage            `json:"seed,omitempty"`
+	FrequencyPenalty    json.RawMessage            `json:"frequency_penalty,omitempty"`
+	PresencePenalty     json.RawMessage            `json:"presence_penalty,omitempty"`
+	IngressRaw          json.RawMessage            `json:"-"`
+	IngressExtensions   map[string]json.RawMessage `json:"-"`
 }
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
@@ -874,6 +887,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		w = wrapSSEDeadlineWriter(w)
 	}
 	setIgnoredParameters(w, ignoredOpenAICompatibilityParameters(body))
+	ingressEvidence := setCallerIngressEvidenceHeaders(w, body)
+	if ingressEvidence.total() > 0 {
+		log.Printf("[req-trace] id=%s stage=ingress_evidence preserved=true top=%d message=%d item=%d content=%d tool=%d format=%d reasoning=%d", requestID, ingressEvidence.TopLevel, ingressEvidence.Message, ingressEvidence.Item, ingressEvidence.Content, ingressEvidence.Tool, ingressEvidence.Format, ingressEvidence.Reasoning)
+	}
 	needsTextValidation := !callerTextAlreadyValidated(r)
 	responseFormat := body.ResponseFormat
 	if err := validateResponseFormatDefinition(responseFormat); err != nil {

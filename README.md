@@ -120,6 +120,16 @@ ChatHub transport 會在單次 request 存活期間保留 ordered raw SignalR/Ch
 
 這裡的 lossless 指 **request-scoped processing evidence**，不等於把 Microsoft raw frames 原封不動回傳 Hermes，也不等於永久記錄私人內容、token 或 protected metadata。對外仍由 OpenAI/Hermes/Memory/Responses/Anthropic adapter 做安全 projection；Production debug storage 仍受 redaction、TTL 與 bounded-size 規則約束。
 
+### Caller ingress evidence 與 forward-compatible projection
+
+Hermes/OpenAI-compatible caller 進入 M365 時也遵守同一個「先保留 evidence、再投影」原則。`/v1/chat/completions`、`/hermes/v1/chat/completions`、`/memory/v1/chat/completions` 會在單次 request 存活期間保留 raw request、raw message/content、未知 content part，以及 tool / function extension；`/v1/responses` 與 `/v1/messages` 也會保留各自 raw input/message/tool evidence。`response_format` 與 `reasoning` 的未知 outer control 同樣可被辨識，而不是被固定 Go struct 無聲丟掉。
+
+Request-scope raw evidence **不直接等於 canonical model input**。M365 只會把目前支援的 message/content/tool 欄位送進 checkpoint、ledger 與 ChatHub projection；future/unknown content item、message metadata、tool-call metadata、tool/function outer extension 不會因為「已保留」就自動變成可執行或可投影資料。Tool `parameters` 本身仍是完整 JSON Schema canonical field，因此 nested schema keywords/extensions 與精確 JSON number 不會被裁掉。Responses 未知 future input-item type 會保留 evidence，但不會再被 default 分支誤當 user message。
+
+若 caller 送入目前未投影的安全 extension，回應會提供 `X-M365-Preserved-Extension-Counts` 與 `X-M365-Preserved-Extension-Names`。分類包含 `top`、`message`、`item`、`content`、`tool`、`format`、`reasoning`；field/type name 必須通過 bounded safe-name 規則才會反映，**value 永遠不會放進 header**。既有 intentionally ignored OpenAI 參數仍使用 `X-M365-Ignored-Parameters`，因此 caller 可以區分 supported、ignored、preserved-not-projected 與 rejected 行為。
+
+Checkpoint 只保存穩定 canonical identity，不會因 unknown request/message/content extension 改變 digest；Production debug summary 也只保存 sanitised counts/field-type names，raw/private scalar 仍只受既有 opt-in snapshot、redaction、TTL 與 size bound 管理。這對 Hindsight strict JSON Schema 與 Semantica MCP 特別重要：Hindsight 的 format/reasoning extension 不會污染 LLM prompt，Semantica 的 nested tool schema、arguments 與 `structuredContent` 型大型 tool result 仍完整，而 MCP/tool 的 opaque metadata 不會被誤投影成模型內容。
+
 ### Final-answer router envelope
 
 #57 修正了 final-answer model 再次回傳內部 `{"calls":[],"answer":"..."}` envelope 時的外漏問題。Sidecar 只會解開完整且明確的 direct-answer envelope；一般使用者 JSON 保持原樣，含 non-empty `calls`、重複 internal keys、額外欄位或錯誤型別的 router-like JSON 會 fail closed，malformed JSON 不做猜測式剝殼。Generic `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Memory `/memory/v1/chat/completions` 的 streaming 與 non-streaming 均已完成 Production live qualification，Memory JSON Schema 輸出也另外通過 live canary。
@@ -278,6 +288,16 @@ For the lifetime of one request, the ChatHub transport retains ordered raw Signa
 Equal final/stream text is used directly. A provable prefix relationship may select the more complete candidate, while genuinely divergent text is never resolved by a generic longest-wins rule. The tool router validates the canonical/final decision first and tries alternate evidence only after failure; any selected alternate still has to satisfy JSON parsing, tool-name/schema validation, `tool_choice`, and call limits. Memory `/memory/v1` `response_format/json_schema` likewise validates final/stream evidence, including a single safely extractable wrapped JSON candidate, before falling back to the existing bounded repair / fail-closed path.
 
 "Lossless" here means **request-scoped processing evidence**. It does not mean raw Microsoft frames are passed through to Hermes, nor does it mean private content, tokens, or protected metadata are permanently logged. Public OpenAI/Hermes/Memory/Responses/Anthropic adapters still perform safe protocol projection, while Production debug storage remains redacted, TTL-bound, and size-bounded.
+
+### Caller ingress evidence and forward-compatible projection
+
+Hermes/OpenAI-compatible ingress follows the same preserve-first rule. During one request, `/v1/chat/completions`, `/hermes/v1/chat/completions`, and `/memory/v1/chat/completions` retain the raw request, raw message/content evidence, unknown content parts, and tool/function extensions. `/v1/responses` and `/v1/messages` retain their own raw input/message/tool evidence as well. Unknown outer controls inside `response_format` and `reasoning` remain observable instead of silently disappearing when a fixed Go struct does not yet model them.
+
+Request-scoped raw evidence is **not** the canonical model input. Only supported message/content/tool fields enter checkpointing, the evidence ledger, and ChatHub projection. Future/unknown content items, message metadata, nested tool-call metadata, and tool/function outer extensions do not become executable or projectable merely because they were preserved. Tool `parameters` remains a complete canonical JSON Schema field, so nested schema keywords/extensions and exact JSON numbers are retained. Unknown future Responses input-item types are preserved as evidence but are no longer reinterpreted by the default branch as user messages.
+
+When a caller supplies a safely nameable extension that is preserved but not projected, M365 exposes `X-M365-Preserved-Extension-Counts` and `X-M365-Preserved-Extension-Names`. Categories include `top`, `message`, `item`, `content`, `tool`, `format`, and `reasoning`; field/type names must satisfy bounded safe-name rules before they are reflected, and **values are never placed in these headers**. Intentionally ignored OpenAI parameters continue to use `X-M365-Ignored-Parameters`, allowing callers to distinguish supported, ignored, preserved-not-projected, and rejected behavior.
+
+Checkpoint state stores stable canonical identity only, so unknown request/message/content evidence does not alter checkpoint digests. Production debug summaries persist only sanitized counts and field/type names; raw/private scalar data remains governed by the existing opt-in snapshot, redaction, TTL, and size limits. This boundary is especially important for Hindsight strict JSON Schema and Semantica MCP: Hindsight format/reasoning extensions do not contaminate the LLM prompt, while Semantica nested tool schemas, arguments, and large `structuredContent`-style tool results remain intact without projecting opaque MCP/tool metadata into model content.
 
 ### Final-answer router envelope
 

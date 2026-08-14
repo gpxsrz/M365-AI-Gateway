@@ -134,6 +134,41 @@ func TestDebugDefaultPersistsOnlySummaryWithoutSnapshot(t *testing.T) {
 	assertNoDebugSentinels(t, raw)
 }
 
+func TestDebugSummaryPersistsOnlySafeIngressExtensionMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "debug-summary.json")
+	store := openDebugStoreWithPolicy(path, testDebugPolicy())
+	server := &Server{debug: store, settings: &settingsStore{v: defaultRuntimeSettings()}}
+	handler := server.debugMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("X-M365-Preserved-Extension-Counts", "top=1,message=1,item=0,content=1,tool=1,format=0,reasoning=0")
+		w.Header().Set("X-M365-Preserved-Extension-Names", "top:future_top,message:future_message,content:future_block,tool:future_tool,bad kind:PRIVATE_VALUE")
+		jsonOut(w, map[string]any{"ok": true})
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m365-auto","messages":[{"role":"user","content":"PRIVATE_VALUE"}]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d", recorder.Code)
+	}
+	records := store.list()
+	if len(records) != 1 {
+		t.Fatalf("records=%d", len(records))
+	}
+	record := records[0]
+	if record.PreservedExtensionCounts != "top=1,message=1,item=0,content=1,tool=1,format=0,reasoning=0" {
+		t.Fatalf("counts=%q", record.PreservedExtensionCounts)
+	}
+	if got := strings.Join(record.PreservedExtensionNames, ","); got != "top:future_top,message:future_message,content:future_block,tool:future_tool" {
+		t.Fatalf("names=%q", got)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("PRIVATE_VALUE")) {
+		t.Fatalf("private caller scalar leaked into debug summary: %s", raw)
+	}
+}
+
 func TestDebugPersistenceIsSummaryFirstAndDeeplyRedacted(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "debug-summary.json")
 	store := openDebugStoreWithPolicy(path, testDebugPolicy())

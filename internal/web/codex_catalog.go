@@ -3,14 +3,17 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
 
 type modelLimits struct{ ContextWindow, MaxInputTokens, MaxOutputTokens int }
 type reasoningConfig struct {
-	Effort  string `json:"effort,omitempty"`
-	Summary string `json:"summary,omitempty"`
+	Effort            string                     `json:"effort,omitempty"`
+	Summary           string                     `json:"summary,omitempty"`
+	IngressRaw        json.RawMessage            `json:"-"`
+	IngressExtensions map[string]json.RawMessage `json:"-"`
 }
 
 type modelSpec struct {

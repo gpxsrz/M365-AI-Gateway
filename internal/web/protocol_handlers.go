@@ -468,6 +468,7 @@ func (s *Server) responsesCore(w http.ResponseWriter, r *http.Request) {
 		writeResponsesError(w, 400, "invalid_request_error", "bad json")
 		return
 	}
+	setIngressEvidenceSummaryHeaders(w, summarizeResponsesIngressEvidence(body))
 	for _, tool := range body.Tools {
 		name, _ := tool["name"].(string)
 		if err := validateReservedNativeToolName(name); err != nil {
@@ -630,6 +631,7 @@ func (s *Server) anthropicMessagesCore(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 400, "invalid_request_error", "bad json")
 		return
 	}
+	setIngressEvidenceSummaryHeaders(w, summarizeAnthropicIngressEvidence(body))
 	if body.Stream {
 		setStreamingSemantics(w, "posthoc-adapter")
 	}
