@@ -149,31 +149,3 @@ func (s *Server) oauthStoreForProfile(profileID string) (auth.OAuthProfileManife
 	}
 	return manifest, store, nil
 }
-
-type oauthAccountContext struct {
-	Manifest auth.OAuthProfileManifest
-	Store    *auth.Store
-}
-
-func (s *Server) oauthAccountContext(profileID string) (oauthAccountContext, error) {
-	manifest, store, err := s.oauthStoreForProfile(profileID)
-	if err != nil {
-		return oauthAccountContext{}, err
-	}
-	if store == nil {
-		return oauthAccountContext{}, errors.New("OAuth token store is unavailable")
-	}
-	return oauthAccountContext{Manifest: manifest, Store: store}, nil
-}
-
-func managementAccountInContext(context oauthAccountContext, account auth.AccountToken) (managementAccountView, error) {
-	return managementAccountView{
-		Status:    account.Status,
-		ExpiresAt: account.ExpiresAt,
-		UpdatedAt: account.UpdatedAt,
-	}, nil
-}
-
-func managementAccountForStore(_ *auth.Store, account auth.AccountToken) (managementAccountView, error) {
-	return managementAccountInContext(oauthAccountContext{}, account)
-}

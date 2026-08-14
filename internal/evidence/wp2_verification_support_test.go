@@ -449,7 +449,7 @@ func validateWP2WebChoices(mappings []WP2VerifiedWebChoiceV1) error {
 func validateWP2VerificationCatalog(catalog ValidatedCatalogProjection) ([]string, int, error) {
 	for _, claim := range catalog.Manifest.GlobalClaims {
 		for _, capability := range claim.Capabilities {
-			if !IsWP2VerifiableCapability(capability.CapabilityID) {
+			if !isWP2VerifiableCapabilityForTest(capability.CapabilityID) {
 				return nil, 0, validationError("verification_scope_forbidden", "wp2_verified_capability", "/catalog_manifest/global_claims/capabilities")
 			}
 		}
@@ -531,7 +531,7 @@ func validateWP2ProvisionalInventory(inventory ValidatedProvisionalClaimInventor
 			if entry.AcceptedCapabilityID != entry.ClaimID || len(entry.AcceptedSupportSHA256) == 0 {
 				return validationError("identity_mismatch", "evidence_backed_claim_support", "/provisional_inventory/entries")
 			}
-			if !IsWP2VerifiableCapability(entry.AcceptedCapabilityID) {
+			if !isWP2VerifiableCapabilityForTest(entry.AcceptedCapabilityID) {
 				return validationError("verification_scope_forbidden", "wp2_verified_capability", "/provisional_inventory/entries")
 			}
 			verified = append(verified, entry.AcceptedCapabilityID)
@@ -553,6 +553,15 @@ func validateWP2ProvisionalInventory(inventory ValidatedProvisionalClaimInventor
 		return validationError("identity_mismatch", "provisional_claim_disposition_counts", "/provisional_inventory")
 	}
 	return nil
+}
+
+func isWP2VerifiableCapabilityForTest(capabilityID string) bool {
+	for _, allowed := range WP2VerifiableCapabilityIDs() {
+		if capabilityID == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func validateWP2TestInventory(inventory WP2VerificationInventoryV1) error {

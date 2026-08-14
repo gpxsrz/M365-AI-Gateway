@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"path"
 	"sort"
 	"strings"
@@ -135,10 +134,6 @@ func acceptedWP2CatalogPackageSpecs() []wp2CommittedPackageSpec {
 			PayloadSchema: evidence.AccountPoolEvidenceSetSchemaV1,
 		},
 	}
-}
-
-func BuildAcceptedWP2CatalogProjection(repoRoot string) ([]byte, evidence.CatalogProjectionExpected, error) {
-	return BuildAcceptedWP2CatalogProjectionFromFS(os.DirFS(repoRoot), "docs/wp2/evidence")
 }
 
 func BuildAcceptedWP2CatalogProjectionFromFS(artifactFS fs.FS, basePath string) ([]byte, evidence.CatalogProjectionExpected, error) {

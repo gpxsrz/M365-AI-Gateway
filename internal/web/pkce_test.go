@@ -94,10 +94,7 @@ func TestStartPKCEUsesActiveProfileOAuthConfig(t *testing.T) {
 		AuthorizeEndpoint: "https://candidate.example.test/common/oauth2/v2.0/authorize",
 		TokenEndpoint:     "https://candidate.example.test/common/oauth2/v2.0/token",
 	}
-	store, err := auth.OpenStoreWithConfig(filepath.Join(t.TempDir(), "accounts.json"), config)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testOpenAuthStore(t, filepath.Join(t.TempDir(), "accounts.json"), config)
 	s := &Server{tokens: store, pkce: map[string]pendingPKCE{}}
 	rr := httptest.NewRecorder()
 	s.startPKCE(rr, httptest.NewRequest(http.MethodPost, "/api/auth/start", nil))

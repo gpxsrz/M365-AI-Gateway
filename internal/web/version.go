@@ -8,11 +8,10 @@ import (
 )
 
 var (
-	Version     = "dev"
-	Commit      = "unknown"
-	BuildTime   = "unknown"
-	startedAt   = time.Now()
-	updateCheck uint32
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+	startedAt = time.Now()
 )
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {

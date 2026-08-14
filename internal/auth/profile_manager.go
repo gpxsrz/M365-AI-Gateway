@@ -8,9 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"m365-native/internal/privatefile"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -417,71 +417,6 @@ func (manager *OAuthProfileManager) RecordValidation(profileID string, step OAut
 	return manifest, err
 }
 
-func (manager *OAuthProfileManager) Promote(profileID string) (OAuthActiveProfilePointer, error) {
-	var result OAuthActiveProfilePointer
-	err := manager.withLock(func() error {
-		pointer, err := manager.readPointerLocked()
-		if err != nil {
-			return err
-		}
-		if pointer.ActiveProfileID == profileID {
-			result = pointer
-			return nil
-		}
-		manifest, err := manager.readManifestLocked(profileID)
-		if err != nil {
-			return err
-		}
-		if manifest.Kind != oauthProfileKindStaged {
-			return errors.New("only staged OAuth profiles can be promoted")
-		}
-		if !manifest.Validation.Complete() {
-			return ErrOAuthProfileValidationIncomplete
-		}
-		if _, err := manager.openStoreLocked(manifest); err != nil {
-			return err
-		}
-		result = OAuthActiveProfilePointer{
-			Schema:            oauthActiveProfilePointerSchema,
-			ActiveProfileID:   profileID,
-			PreviousProfileID: pointer.ActiveProfileID,
-			Generation:        pointer.Generation + 1,
-			UpdatedAt:         manager.now().UTC(),
-		}
-		return manager.writePointerLocked(result)
-	})
-	return result, err
-}
-
-func (manager *OAuthProfileManager) Rollback() (OAuthActiveProfilePointer, error) {
-	var result OAuthActiveProfilePointer
-	err := manager.withLock(func() error {
-		pointer, err := manager.readPointerLocked()
-		if err != nil {
-			return err
-		}
-		if pointer.PreviousProfileID == "" {
-			return ErrOAuthProfileNoRollback
-		}
-		manifest, err := manager.readManifestLocked(pointer.PreviousProfileID)
-		if err != nil {
-			return err
-		}
-		if _, err := manager.openStoreLocked(manifest); err != nil {
-			return err
-		}
-		result = OAuthActiveProfilePointer{
-			Schema:            oauthActiveProfilePointerSchema,
-			ActiveProfileID:   pointer.PreviousProfileID,
-			PreviousProfileID: pointer.ActiveProfileID,
-			Generation:        pointer.Generation + 1,
-			UpdatedAt:         manager.now().UTC(),
-		}
-		return manager.writePointerLocked(result)
-	})
-	return result, err
-}
-
 func (manager *OAuthProfileManager) Discard(profileID string) error {
 	return manager.withLock(func() error {
 		if !validStagedOAuthProfileID(profileID) {
@@ -505,47 +440,6 @@ func (manager *OAuthProfileManager) Discard(profileID string) error {
 		}
 		return nil
 	})
-}
-
-func (manager *OAuthProfileManager) Status() (OAuthProfileStatus, error) {
-	var status OAuthProfileStatus
-	err := manager.withLock(func() error {
-		pointer, err := manager.readPointerLocked()
-		if err != nil {
-			return err
-		}
-		entries, err := os.ReadDir(manager.root)
-		if err != nil {
-			return err
-		}
-		profiles := make([]OAuthProfileSummary, 0, len(entries))
-		for _, entry := range entries {
-			if !entry.IsDir() || !validOAuthProfileID(entry.Name()) {
-				continue
-			}
-			manifest, err := manager.readManifestLocked(entry.Name())
-			if err != nil {
-				return err
-			}
-			profiles = append(profiles, OAuthProfileSummary{
-				ProfileID:  manifest.ProfileID,
-				Kind:       manifest.Kind,
-				Validation: manifest.Validation,
-				Active:     manifest.ProfileID == pointer.ActiveProfileID,
-				Previous:   manifest.ProfileID == pointer.PreviousProfileID,
-			})
-		}
-		sort.Slice(profiles, func(i, j int) bool { return profiles[i].ProfileID < profiles[j].ProfileID })
-		status = OAuthProfileStatus{
-			Schema:            oauthProfileStatusSchema,
-			ActiveProfileID:   pointer.ActiveProfileID,
-			PreviousProfileID: pointer.PreviousProfileID,
-			Generation:        pointer.Generation,
-			Profiles:          profiles,
-		}
-		return nil
-	})
-	return status, err
 }
 
 func (manager *OAuthProfileManager) newProfileIDLocked() (string, error) {
@@ -574,16 +468,6 @@ func validStagedOAuthProfileID(profileID string) bool {
 	}
 	_, err := hex.DecodeString(strings.TrimPrefix(profileID, oauthProfileIDPrefix))
 	return err == nil
-}
-
-func (manager *OAuthProfileManager) readPointer() (OAuthActiveProfilePointer, error) {
-	var pointer OAuthActiveProfilePointer
-	err := manager.withLock(func() error {
-		var err error
-		pointer, err = manager.readPointerLocked()
-		return err
-	})
-	return pointer, err
 }
 
 func (manager *OAuthProfileManager) readPointerLocked() (OAuthActiveProfilePointer, error) {
@@ -715,5 +599,5 @@ func writePrivateJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	return atomicWritePrivateFile(path, raw)
+	return privatefile.WriteAtomic(path, "OAuth profile file", ".m365-private-*", raw)
 }

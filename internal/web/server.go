@@ -211,7 +211,6 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/mcp/sse", s.mcpLegacySSE)
 	m.HandleFunc("/v1/mcp/message", s.mcpLegacyMessage)
 	m.HandleFunc(artifactRoutePrefix, s.artifactContent)
-	m.HandleFunc("/assets/compat-settings.js", s.compatibilitySettingsScript)
 	m.HandleFunc("/", s.rootPage)
 	return requestID(httpTrace(securityHeaders(s.adminRequestSecurity(s.adminMiddleware(s.debugMiddleware(m))))))
 }

@@ -1,10 +1,12 @@
-package evidence
+package evidence_test
 
 import (
 	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	. "m365-native/internal/evidence/offline"
 )
 
 func routeProtocolTestBinding() CaptureBinding {

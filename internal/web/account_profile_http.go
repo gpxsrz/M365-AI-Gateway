@@ -33,10 +33,6 @@ func (s *Server) managementAccount(account auth.AccountToken) (managementAccount
 	}, nil
 }
 
-func (s *Server) activeAccount() (auth.AccountToken, error) {
-	return s.activeAccountContext(context.Background())
-}
-
 func (s *Server) activeAccountContext(ctx context.Context) (auth.AccountToken, error) {
 	store := s.activeTokenStore()
 	if store == nil {

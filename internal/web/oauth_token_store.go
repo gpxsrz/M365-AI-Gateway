@@ -55,16 +55,18 @@ func (s *Server) storeOAuthTokenSetInStore(manifest auth.OAuthProfileManifest, t
 		// private path. Keep the running server on the object just updated.
 		s.setActiveTokenStore(tokenStore)
 	}
-	var accountView managementAccountView
+	accountView := managementAccountView{
+		Status:    account.Status,
+		ExpiresAt: account.ExpiresAt,
+		UpdatedAt: account.UpdatedAt,
+	}
 	if active {
 		accountView, err = s.managementAccount(account)
-	} else {
-		accountView, err = managementAccountForStore(tokenStore, account)
-	}
-	if err != nil {
-		return storedOAuthAccount{}, &oauthCallbackFailure{
-			Code:    "oauth_account_profile_failed",
-			Message: "帳號已授權，但帳號設定檔參照無法建立",
+		if err != nil {
+			return storedOAuthAccount{}, &oauthCallbackFailure{
+				Code:    "oauth_account_profile_failed",
+				Message: "帳號已授權，但帳號設定檔參照無法建立",
+			}
 		}
 	}
 	return storedOAuthAccount{Manifest: manifest, Account: accountView}, nil

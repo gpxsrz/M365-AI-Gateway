@@ -297,16 +297,6 @@ func (d *debugStore) startAutoExpiry() {
 	d.scheduleExpiryLocked()
 }
 
-func (d *debugStore) stopAutoExpiry() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.autoExpire = false
-	if d.expiryTimer != nil {
-		d.expiryTimer.Stop()
-		d.expiryTimer = nil
-	}
-}
-
 func (d *debugStore) scheduleExpiryLocked() {
 	if !d.autoExpire {
 		return

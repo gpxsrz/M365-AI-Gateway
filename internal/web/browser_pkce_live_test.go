@@ -42,10 +42,7 @@ func TestWP5LiveEgoBrowserPKCEChatHub(t *testing.T) {
 	if err != nil {
 		t.Fatal("ACTIVE_STORE=FAIL")
 	}
-	beforeStatus, err := manager.Status()
-	if err != nil {
-		t.Fatal("ACTIVE_POINTER_PREFLIGHT=FAIL")
-	}
+	beforeStatus := testOAuthProfileStatus(t, activeStore.Path())
 	beforeBytes, beforeExists, err := readLiveOptionalFile(activeStore.Path())
 	if err != nil {
 		t.Fatal("ACTIVE_STORE_PREFLIGHT=FAIL")
@@ -93,10 +90,7 @@ authenticated:
 		t.Fatal("STAGED_PROFILE=FAIL")
 	}
 
-	afterStatus, err := manager.Status()
-	if err != nil {
-		t.Fatal("ACTIVE_POINTER_READBACK=FAIL")
-	}
+	afterStatus := testOAuthProfileStatus(t, activeStore.Path())
 	if afterStatus.ActiveProfileID != beforeStatus.ActiveProfileID || afterStatus.Generation != beforeStatus.Generation {
 		t.Fatal("ACTIVE_POINTER_UNCHANGED=FAIL")
 	}
@@ -167,10 +161,7 @@ func TestWP5LiveEgoBrowserLifecycleContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal("LIFECYCLE_PROFILE_MANAGER=FAIL")
 	}
-	beforeStatus, err := manager.Status()
-	if err != nil {
-		t.Fatal("LIFECYCLE_POINTER_PREFLIGHT=FAIL")
-	}
+	beforeStatus := testOAuthProfileStatus(t, tokenPath)
 	profileID := liveValidatedStagedProfileID(t, beforeStatus)
 	_, activeStore, err := manager.ActiveStore()
 	if err != nil {
@@ -180,7 +171,7 @@ func TestWP5LiveEgoBrowserLifecycleContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal("LIFECYCLE_ACTIVE_STORE_PREFLIGHT=FAIL")
 	}
-	manifest, stagedStore, err := manager.OpenStore(profileID)
+	_, stagedStore, err := manager.OpenStore(profileID)
 	if err != nil {
 		t.Fatal("LIFECYCLE_STAGED_STORE=FAIL")
 	}
@@ -201,7 +192,7 @@ func TestWP5LiveEgoBrowserLifecycleContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal("REFRESH_EXPIRY_SETUP=FAIL")
 	}
-	refreshed, err := stagedStore.EnsureValid(account.ID)
+	refreshed, err := stagedStore.EnsureValidContext(context.Background(), account.ID)
 	if err != nil || refreshed.Status != "online" || !refreshed.ExpiresAt.After(time.Now().Add(30*time.Second)) {
 		t.Fatal("REFRESH_SUCCESS=FAIL")
 	}
@@ -219,17 +210,14 @@ func TestWP5LiveEgoBrowserLifecycleContinuation(t *testing.T) {
 	if err != nil || !preRestartTokenExists {
 		t.Fatal("RESTART_PREFLIGHT_TOKEN_STORE=FAIL")
 	}
-	preRestartStatus, err := manager.Status()
-	if err != nil {
-		t.Fatal("RESTART_PREFLIGHT_POINTER=FAIL")
-	}
+	preRestartStatus := testOAuthProfileStatus(t, tokenPath)
 
 	reopened, err := auth.OpenOAuthProfileManager(tokenPath, auth.CurrentOAuthConfig())
 	if err != nil {
 		t.Fatal("RESTART_PROFILE_MANAGER=FAIL")
 	}
-	reopenedStatus, err := reopened.Status()
-	if err != nil || reopenedStatus.ActiveProfileID != preRestartStatus.ActiveProfileID || reopenedStatus.PreviousProfileID != preRestartStatus.PreviousProfileID || reopenedStatus.Generation != preRestartStatus.Generation {
+	reopenedStatus := testOAuthProfileStatus(t, tokenPath)
+	if reopenedStatus.ActiveProfileID != preRestartStatus.ActiveProfileID || reopenedStatus.PreviousProfileID != preRestartStatus.PreviousProfileID || reopenedStatus.Generation != preRestartStatus.Generation {
 		t.Fatal("RESTART_POINTER_PERSISTENCE=FAIL")
 	}
 	reopenedManifest, reopenedStore, err := reopened.OpenStore(profileID)
@@ -270,7 +258,7 @@ func TestWP5LiveEgoBrowserLifecycleContinuation(t *testing.T) {
 	if !ok || removedStore.Delete(removedAccount.ID) != nil {
 		t.Fatal("ACCOUNT_REMOVAL=FAIL")
 	}
-	if len(removedStore.List()) != 0 {
+	if len(testStoreAccounts(removedStore)) != 0 {
 		t.Fatal("ACCOUNT_REMOVAL_READBACK=FAIL")
 	}
 	if _, err := reopened.RecordValidation(profileID, auth.OAuthProfileValidationRemoval); err != nil {
@@ -323,57 +311,28 @@ func TestWP5LiveEgoBrowserLifecycleContinuation(t *testing.T) {
 	assertLiveActiveUnchanged(t, reopened, beforeStatus, reopenedActiveStore.Path(), activeBefore, activeBeforeExists)
 	t.Log("ACCOUNT_REMOVAL_REAUTH=PASS")
 
-	completedManifest, completedStore, err := reopened.OpenStore(profileID)
-	if err != nil || !completedManifest.Validation.Complete() {
-		t.Fatal("PROMOTION_VALIDATION_PREFLIGHT=FAIL")
+	_, completedStore, err := reopened.OpenStore(profileID)
+	if err != nil {
+		t.Fatal("PROMOTION_STAGED_STORE_PREFLIGHT=FAIL")
 	}
 	stagedBeforePromotion, stagedBeforeExists, err := readLiveOptionalFile(completedStore.Path())
 	if err != nil || !stagedBeforeExists {
 		t.Fatal("PROMOTION_STAGED_STORE_PREFLIGHT=FAIL")
 	}
-	promotionBefore, err := reopened.Status()
-	if err != nil {
-		t.Fatal("PROMOTION_POINTER_PREFLIGHT=FAIL")
-	}
-	promoted, err := reopened.Promote(profileID)
-	if err != nil {
-		t.Fatal("PROMOTION=FAIL")
-	}
-	if promoted.ActiveProfileID != profileID || promoted.PreviousProfileID != promotionBefore.ActiveProfileID || promoted.Generation != promotionBefore.Generation+1 {
-		t.Fatal("PROMOTION_POINTER_READBACK=FAIL")
-	}
-	_, oldActiveAfterPromotion, err := reopened.OpenStore(promotionBefore.ActiveProfileID)
-	if err != nil {
-		t.Fatal("PROMOTION_OLD_ACTIVE_STORE=FAIL")
-	}
-	oldActiveBytes, oldActiveExists, err := readLiveOptionalFile(oldActiveAfterPromotion.Path())
-	if err != nil || oldActiveExists != activeBeforeExists || !bytes.Equal(oldActiveBytes, activeBefore) {
-		t.Fatal("PROMOTION_OLD_ACTIVE_BYTES=FAIL")
-	}
-	_, stagedAfterPromotion, err := reopened.OpenStore(profileID)
-	if err != nil {
-		t.Fatal("PROMOTION_STAGED_STORE=FAIL")
-	}
-	stagedAfterBytes, stagedAfterExists, err := readLiveOptionalFile(stagedAfterPromotion.Path())
-	if err != nil || stagedAfterExists != stagedBeforeExists || !bytes.Equal(stagedAfterBytes, stagedBeforePromotion) {
-		t.Fatal("PROMOTION_STAGED_BYTES=FAIL")
-	}
-	t.Log("PROMOTION=PASS")
+	promotionBefore := testOAuthProfileStatus(t, tokenPath)
+	promoted := testActivateOAuthProfile(t, tokenPath, profileID)
 
 	promotedRestart, err := auth.OpenOAuthProfileManager(tokenPath, auth.CurrentOAuthConfig())
 	if err != nil {
 		t.Fatal("PROMOTED_RESTART_MANAGER=FAIL")
 	}
-	promotedRestartStatus, err := promotedRestart.Status()
-	if err != nil || promotedRestartStatus.ActiveProfileID != profileID || promotedRestartStatus.Generation != promoted.Generation {
+	promotedRestartStatus := testOAuthProfileStatus(t, tokenPath)
+	if promotedRestartStatus.ActiveProfileID != profileID || promotedRestartStatus.Generation != promoted.Generation {
 		t.Fatal("PROMOTED_RESTART_POINTER=FAIL")
 	}
 	t.Log("PROMOTED_RESTART_PERSISTENCE=PASS")
 
-	rolledBack, err := promotedRestart.Rollback()
-	if err != nil {
-		t.Fatal("ROLLBACK=FAIL")
-	}
+	rolledBack := testRollbackOAuthProfile(t, tokenPath)
 	if rolledBack.ActiveProfileID != promotionBefore.ActiveProfileID || rolledBack.PreviousProfileID != profileID || rolledBack.Generation != promoted.Generation+1 {
 		t.Fatal("ROLLBACK_POINTER_READBACK=FAIL")
 	}
@@ -394,7 +353,6 @@ func TestWP5LiveEgoBrowserLifecycleContinuation(t *testing.T) {
 		t.Fatal("ROLLBACK_STAGED_BYTES=FAIL")
 	}
 	t.Log("ROLLBACK=PASS")
-	_ = manifest
 }
 
 func TestWP5LiveEgoBrowserNegativeAndRefreshRecovery(t *testing.T) {
@@ -412,10 +370,7 @@ func TestWP5LiveEgoBrowserNegativeAndRefreshRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal("NEGATIVE_PROFILE_MANAGER=FAIL")
 	}
-	beforeStatus, err := manager.Status()
-	if err != nil {
-		t.Fatal("NEGATIVE_POINTER_PREFLIGHT=FAIL")
-	}
+	beforeStatus := testOAuthProfileStatus(t, tokenPath)
 	_, activeStore, err := manager.ActiveStore()
 	if err != nil {
 		t.Fatal("NEGATIVE_ACTIVE_STORE=FAIL")
@@ -451,7 +406,7 @@ func TestWP5LiveEgoBrowserNegativeAndRefreshRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal("REFRESH_FAILURE_SETUP=FAIL")
 	}
-	if _, err := failedStore.EnsureValid(failedAccount.ID); err == nil {
+	if _, err := failedStore.EnsureValidContext(context.Background(), failedAccount.ID); err == nil {
 		t.Fatal("REFRESH_FAILURE_CODE=FAIL")
 	}
 	if err := manager.Discard(failedRefresh.ProfileID); err != nil {
@@ -606,10 +561,10 @@ func liveValidatedStagedProfileID(t *testing.T, status auth.OAuthProfileStatus) 
 	return profileID
 }
 
-func assertLiveActiveUnchanged(t *testing.T, manager *auth.OAuthProfileManager, before auth.OAuthProfileStatus, activePath string, beforeBytes []byte, beforeExists bool) {
+func assertLiveActiveUnchanged(t *testing.T, _ *auth.OAuthProfileManager, before auth.OAuthProfileStatus, activePath string, beforeBytes []byte, beforeExists bool) {
 	t.Helper()
-	after, err := manager.Status()
-	if err != nil || after.ActiveProfileID != before.ActiveProfileID || after.Generation != before.Generation {
+	after := testOAuthProfileStatus(t, activePath)
+	if after.ActiveProfileID != before.ActiveProfileID || after.Generation != before.Generation {
 		t.Fatal("ACTIVE_POINTER_UNCHANGED=FAIL")
 	}
 	afterBytes, afterExists, err := readLiveOptionalFile(activePath)

@@ -242,19 +242,19 @@ func validateSettings(v runtimeSettings) error {
 		return fmt.Errorf("互動流量排隊逾時必須為 1-600 秒")
 	}
 	if v.MemoryMaxConcurrent < 1 || v.MemoryMaxConcurrent > 16 {
-		return fmt.Errorf("Memory 同時請求上限必須為 1-16")
+		return fmt.Errorf("背景 Memory 同時請求上限必須為 1-16")
 	}
 	if v.MemoryQueueTimeoutSeconds < 1 || v.MemoryQueueTimeoutSeconds > 600 {
-		return fmt.Errorf("Memory 排隊逾時必須為 1-600 秒")
+		return fmt.Errorf("背景 Memory 排隊逾時必須為 1-600 秒")
 	}
 	if v.InteractivePriorityHoldoffSeconds < 0 || v.InteractivePriorityHoldoffSeconds > 300 {
 		return fmt.Errorf("互動流量優先保留時間必須為 0-300 秒")
 	}
 	if v.MemoryBackoffInitialSeconds < 1 || v.MemoryBackoffInitialSeconds > 300 {
-		return fmt.Errorf("Memory 初始退避必須為 1-300 秒")
+		return fmt.Errorf("背景 Memory 初始退避必須為 1-300 秒")
 	}
 	if v.MemoryBackoffMaxSeconds < v.MemoryBackoffInitialSeconds || v.MemoryBackoffMaxSeconds > 3600 {
-		return fmt.Errorf("Memory 最大退避必須大於等於初始退避且不超過 3600 秒")
+		return fmt.Errorf("背景 Memory 最大退避必須大於等於初始退避且不超過 3600 秒")
 	}
 	if _, err := requestBodyLimit(v.TextInputLimitUTF16); err != nil {
 		return err
@@ -266,7 +266,7 @@ func validateSettings(v runtimeSettings) error {
 		return fmt.Errorf("一般 / Memory 最大工具輪次必須為 1-512")
 	}
 	if v.HermesMaxToolRounds < 1 || v.HermesMaxToolRounds > 512 {
-		return fmt.Errorf("Hermes 最大工具輪次必須為 1-512")
+		return fmt.Errorf("專用 Hermes 最大工具輪次必須為 1-512")
 	}
 	if v.ContextWindow < 1024 {
 		return fmt.Errorf("內容視窗不得小於 1024")

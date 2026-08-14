@@ -61,9 +61,7 @@ func TestServerRestartOpensPromotedOAuthProfileWithPinnedClientConfig(t *testing
 			t.Fatal(err)
 		}
 	}
-	if _, err := manager.Promote(candidate.ProfileID); err != nil {
-		t.Fatal(err)
-	}
+	testActivateOAuthProfile(t, tokenPath, candidate.ProfileID)
 
 	passwordPath := filepath.Join(dir, "admin-password")
 	if err := os.WriteFile(passwordPath, []byte("administrator-password\n"), 0o600); err != nil {
@@ -95,7 +93,7 @@ func TestServerRestartOpensPromotedOAuthProfileWithPinnedClientConfig(t *testing
 	if got := server.tokens.Path(); got != candidateStore.Path() {
 		t.Fatalf("active token path = %q, want %q", got, candidateStore.Path())
 	}
-	accounts := server.tokens.List()
+	accounts := testStoreAccounts(server.tokens)
 	if len(accounts) != 1 || accounts[0].AccessToken != "candidate-access-secret" {
 		t.Fatalf("active accounts = %#v", accounts)
 	}

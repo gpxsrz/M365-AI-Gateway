@@ -59,10 +59,7 @@ func (f *wp1CandidateChat) ChatWithEvents(_ context.Context, _ chathub.Account, 
 
 func newWP1CandidateServer(t *testing.T, chat *wp1CandidateChat) *Server {
 	t.Helper()
-	store, err := auth.OpenStore(filepath.Join(t.TempDir(), "accounts.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testOpenAuthStore(t, filepath.Join(t.TempDir(), "accounts.json"), auth.CurrentOAuthConfig())
 	if _, err := store.Upsert(auth.TokenSet{
 		AccessToken: "test-token",
 		ExpiresAt:   time.Now().Add(time.Hour),

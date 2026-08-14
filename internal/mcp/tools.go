@@ -1,14 +1,12 @@
 package mcp
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+
+	"m365-native/internal/jsonschemautil"
 )
 
 type Tool struct {
@@ -28,29 +26,8 @@ type CallResult struct {
 	Meta           map[string]any   `json:"_meta,omitempty"`
 }
 
-type rejectingSchemaLoader struct{}
-
-func (rejectingSchemaLoader) Load(rawURL string) (any, error) {
-	return nil, fmt.Errorf("external JSON Schema reference is not allowed: %s", rawURL)
-}
-
 func compileToolSchema(schema map[string]any) (*jsonschema.Schema, error) {
-	encoded, err := json.Marshal(schema)
-	if err != nil {
-		return nil, err
-	}
-	document, err := jsonschema.UnmarshalJSON(bytes.NewReader(encoded))
-	if err != nil {
-		return nil, err
-	}
-	compiler := jsonschema.NewCompiler()
-	compiler.DefaultDraft(jsonschema.Draft2020)
-	compiler.UseLoader(rejectingSchemaLoader{})
-	const location = "urn:m365-copilot2api:mcp-tool-schema"
-	if err := compiler.AddResource(location, document); err != nil {
-		return nil, err
-	}
-	return compiler.Compile(location)
+	return jsonschemautil.Compile(schema, "urn:m365-copilot2api:mcp-tool-schema")
 }
 
 func validateToolValue(schema map[string]any, value any) error {
@@ -62,15 +39,7 @@ func validateToolValue(schema map[string]any, value any) error {
 }
 
 func decodeExactJSON(raw []byte, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("one JSON value required")
-	}
-	return nil
+	return jsonschemautil.DecodeExact(raw, target)
 }
 
 func normalizeCallResult(tool Tool, result CallResult) (CallResult, error) {

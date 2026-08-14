@@ -108,30 +108,8 @@ func knownUpstreamTones() []string {
 	return []string{"Gpt_5_2_Chat", "Gpt_5_2_Reasoning", "Gpt_5_3_Chat", "Gpt_5_4_Chat", "Gpt_5_4_Reasoning", "Gpt_5_5_Chat", "Gpt_5_5_Reasoning", "Gpt_5_6_Reasoning", "Gpt_Quick", "Gpt_Reasoning", "Claude_Sonnet", "Claude_Sonnet_Reasoning"}
 }
 
-func configuredModelMapping(model string, mappings []modelMapping) (modelMapping, bool) {
-	model = strings.ToLower(strings.TrimSpace(model))
-	for _, mapping := range mappings {
-		if strings.EqualFold(strings.TrimSpace(mapping.PublicModel), model) {
-			return mapping, true
-		}
-	}
-	return modelMapping{}, false
-}
-
-func configuredModelTone(model string, mappings []modelMapping) (string, bool) {
-	mapping, ok := configuredModelMapping(model, mappings)
-	if !ok {
-		return "", false
-	}
-	return mapping.UpstreamTone, true
-}
-
 func configuredModelSpecs(mappings []modelMapping) []modelSpec {
 	return modelSpecsFromRoutes(catalogRouteDefinitions(mappings))
-}
-
-func configuredModelLimits() modelLimits {
-	return configuredModelLimitsForSettings(currentSettings())
 }
 
 func configuredModelLimitsForSettings(cfg runtimeSettings) modelLimits {
@@ -161,21 +139,6 @@ func normalizeReasoningEffort(e string) (string, error) {
 	}
 	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, xhigh, max, or ultra", e)
 }
-func reasoningTone(model, effort string) (string, error) {
-	resolution, err := resolveRoute(model, effort, currentSettings().ModelMappings)
-	if err != nil {
-		return "", err
-	}
-	return resolution.ResolvedTone, nil
-}
-func modelCatalog() []map[string]any {
-	return modelCatalogForSettings(currentSettings())
-}
-
-func modelCatalogForSettings(cfg runtimeSettings) []map[string]any {
-	return modelCatalogForSettingsAndEvidence(cfg, nil)
-}
-
 func modelCatalogForSettingsAndEvidence(cfg runtimeSettings, projection *catalogEvidenceProjection) []map[string]any {
 	l := configuredModelLimitsForSettings(cfg)
 	models := configuredModelSpecs(cfg.ModelMappings)

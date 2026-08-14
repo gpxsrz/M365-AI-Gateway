@@ -269,33 +269,6 @@ var allowedHistoricalInventoryFields = map[string]struct{}{
 	"entries":                  {},
 }
 
-func BuildHistoricalBaselineSource(sourceFS fs.FS, basePath string, binary HistoricalBinaryIdentityV1) (ValidatedHistoricalBaselineSource, error) {
-	return buildHistoricalBaselineSource(sourceFS, basePath, binary, historicalArtifactIdentitiesV1)
-}
-
-func ValidateCommittedHistoricalBaselineSource(source HistoricalBaselineSourceV1, expectedSHA256 string) (ValidatedHistoricalBaselineSource, error) {
-	if err := requireSHA256(expectedSHA256, "/historical_source_sha256"); err != nil {
-		return ValidatedHistoricalBaselineSource{}, err
-	}
-	canonical, checksum, err := marshalHistoricalValue(source)
-	if err != nil {
-		return ValidatedHistoricalBaselineSource{}, err
-	}
-	if checksum != expectedSHA256 {
-		return ValidatedHistoricalBaselineSource{}, validationError("identity_mismatch", "historical_source_checksum", "/historical_source_sha256")
-	}
-	validated := ValidatedHistoricalBaselineSource{
-		Source:            source,
-		CanonicalJSON:     canonical,
-		ChecksumSHA256:    checksum,
-		expectedArtifacts: append([]HistoricalArtifactIdentityV1(nil), historicalArtifactIdentitiesV1...),
-	}
-	if err := validateHistoricalSource(validated); err != nil {
-		return ValidatedHistoricalBaselineSource{}, err
-	}
-	return validated, nil
-}
-
 func buildHistoricalBaselineSource(sourceFS fs.FS, basePath string, binary HistoricalBinaryIdentityV1, expectedArtifacts []HistoricalArtifactIdentityV1) (ValidatedHistoricalBaselineSource, error) {
 	if err := validateHistoricalBinaryIdentity(binary); err != nil {
 		return ValidatedHistoricalBaselineSource{}, err

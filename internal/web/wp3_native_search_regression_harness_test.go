@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"m365-native/internal/chathub"
-	"m365-native/internal/evidence"
+	evidence "m365-native/internal/evidence/offline"
 )
 
 const wp3NativeSearchSettingsSchemaV1 = "m365-wp3-native-search-regression-settings/v1"

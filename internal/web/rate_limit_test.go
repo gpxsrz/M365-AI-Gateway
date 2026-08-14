@@ -65,7 +65,7 @@ func TestMemorySchemaRepair429TriggersCooldown(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	snap := server.compatTraffic.snapshot()
-	if snap.Memory429Count != 1 || time.Until(snap.MemoryCooldownUntil) < 30*time.Second {
+	if snap.Memory429Count != 1 || time.Until(snap.SharedCooldownUntil) < 30*time.Second {
 		t.Fatalf("cooldown did not honor upstream Retry-After: %#v", snap)
 	}
 }
@@ -98,7 +98,7 @@ func TestInteractive429BlocksNewMemoryAdmission(t *testing.T) {
 		t.Fatalf("interactive Retry-After=%q want=37", got)
 	}
 	snap := server.compatTraffic.snapshot()
-	if snap.Shared429Count != 1 || snap.Last429Source != "interactive" || time.Until(snap.MemoryCooldownUntil) < 30*time.Second {
+	if snap.Shared429Count != 1 || snap.Last429Source != "interactive" || time.Until(snap.SharedCooldownUntil) < 30*time.Second {
 		t.Fatalf("shared cooldown did not honor upstream Retry-After: %#v", snap)
 	}
 	cfg := trafficTestSettings()

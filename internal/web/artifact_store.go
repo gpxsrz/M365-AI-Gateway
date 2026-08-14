@@ -135,10 +135,6 @@ func openArtifactStore(root string, options artifactStoreOptions) (*artifactStor
 	return s, nil
 }
 
-func (s *artifactStore) Put(filename string, raw []byte) (artifactRecord, error) {
-	return s.PutReader(filename, bytes.NewReader(raw), int64(len(raw)))
-}
-
 func (s *artifactStore) PutReader(filename string, reader io.Reader, maxBytes int64) (artifactRecord, error) {
 	if reader == nil {
 		return artifactRecord{}, errors.New("artifact reader is required")
@@ -310,17 +306,6 @@ func (s *artifactStore) Delete(token string) error {
 		return err
 	}
 	return nil
-}
-
-func (s *artifactStore) Cleanup() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return errors.New("artifact store is closed")
-	}
-	err := s.cleanupLocked(s.now())
-	s.scheduleLocked()
-	return err
 }
 
 func (s *artifactStore) Close() error {

@@ -290,10 +290,7 @@ func TestRefreshSingleAccountPropagatesRequestCancellation(t *testing.T) {
 		AuthorizeEndpoint: tokenEndpoint.URL + "/authorize",
 		TokenEndpoint:     tokenEndpoint.URL,
 	}
-	store, err := auth.OpenStoreWithConfig(filepath.Join(t.TempDir(), "accounts.json"), config)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testOpenAuthStore(t, filepath.Join(t.TempDir(), "accounts.json"), config)
 	account, err := store.Upsert(auth.TokenSet{
 		AccessToken:  "expired-access",
 		RefreshToken: "refresh-original",
@@ -365,10 +362,7 @@ func TestChatModePersistenceFailureRestoresTransportCheckpoints(t *testing.T) {
 }
 
 func TestOAuthTokenStoreCheckpointInvalidationFailureDoesNotCommitReplacement(t *testing.T) {
-	store, err := auth.OpenStore(filepath.Join(t.TempDir(), "accounts.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testOpenAuthStore(t, filepath.Join(t.TempDir(), "accounts.json"), auth.CurrentOAuthConfig())
 	original, err := store.Upsert(testTokenSet("original"))
 	if err != nil {
 		t.Fatal(err)
@@ -402,10 +396,7 @@ func TestOAuthTokenStorePersistenceFailureRestoresTransportCheckpoints(t *testin
 		t.Fatal(err)
 	}
 	path := filepath.Join(tokenDir, "accounts.json")
-	store, err := auth.OpenStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testOpenAuthStore(t, path, auth.CurrentOAuthConfig())
 	original, err := store.Upsert(testTokenSet("original"))
 	if err != nil {
 		t.Fatal(err)
@@ -495,12 +486,9 @@ func TestOAuthTokenStoreRechecksActiveProfileInsideCheckpointLifecycle(t *testin
 		done <- failure
 	}()
 	// The callback resolves the staged store before waiting on the lifecycle
-	// lock. Promote it while holding that same lock to reproduce the race that
-	// requires an active-store recheck after serialization.
-	if _, err := manager.Promote(staged.ProfileID); err != nil {
-		server.checkpointLifecycle.Unlock()
-		t.Fatal(err)
-	}
+	// lock. Change only the test fixture's active pointer while holding that
+	// same lock to reproduce the active-store recheck race.
+	testActivateOAuthProfile(t, activeStore.Path(), staged.ProfileID)
 	_, promotedStore, err := manager.ActiveStore()
 	if err != nil {
 		server.checkpointLifecycle.Unlock()

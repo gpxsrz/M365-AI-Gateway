@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"m365-native/internal/privatefile"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -63,14 +64,6 @@ func CachePath() string {
 	return filepath.Join(h, ".config", "m365-native", "accounts.json")
 }
 
-func OpenStore(path string) (*Store, error) {
-	return openStore(path, CurrentOAuthConfig(), true)
-}
-
-func OpenStoreWithConfig(path string, config OAuthConfig) (*Store, error) {
-	return openStore(path, config, true)
-}
-
 func openStore(path string, config OAuthConfig, allowLegacySchema bool) (*Store, error) {
 	if path == "" {
 		path = CachePath()
@@ -80,7 +73,7 @@ func openStore(path string, config OAuthConfig, allowLegacySchema bool) (*Store,
 		return nil, err
 	}
 	s := &Store{path: path, config: config, data: Cache{Schema: TokenCacheSchema, Accounts: []AccountToken{}}}
-	file, err := openPrivateTokenFile(path)
+	file, err := privatefile.OpenRegular(path, "token cache")
 	if os.IsNotExist(err) {
 		return s, nil
 	}
@@ -132,39 +125,6 @@ func openStore(path string, config OAuthConfig, allowLegacySchema bool) (*Store,
 	return s, nil
 }
 
-func openPrivateTokenFile(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("token cache must not be a symbolic link")
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("token cache must be a regular file")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	opened, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		file.Close()
-		return nil, fmt.Errorf("token cache identity changed while opening")
-	}
-	if opened.Mode().Perm() != 0o600 {
-		if err := file.Chmod(0o600); err != nil {
-			file.Close()
-			return nil, fmt.Errorf("secure token cache permissions: %w", err)
-		}
-	}
-	return file, nil
-}
-
 func (s *Store) Path() string {
 	return s.path
 }
@@ -179,71 +139,13 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return atomicWritePrivateFile(s.path, b)
+	return privatefile.WriteAtomic(s.path, "token cache", ".m365-private-*", b)
 }
 
 func (s *Store) initialize() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.saveLocked()
-}
-
-func atomicWritePrivateFile(path string, raw []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("token cache must not be a symbolic link")
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("token cache must be a regular file")
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	temporary, err := os.CreateTemp(dir, ".m365-private-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	removeTemporary := true
-	defer func() {
-		_ = temporary.Close()
-		if removeTemporary {
-			_ = os.Remove(temporaryPath)
-		}
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := temporary.Write(raw); err != nil {
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	removeTemporary = false
-	if directory, err := os.Open(dir); err == nil {
-		_ = directory.Sync()
-		_ = directory.Close()
-	}
-	return nil
-}
-
-func (s *Store) List() []AccountToken {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]AccountToken, len(s.data.Accounts))
-	copy(out, s.data.Accounts)
-	return out
 }
 
 func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
@@ -328,10 +230,6 @@ func (s *Store) First() (AccountToken, bool) {
 		return AccountToken{}, false
 	}
 	return s.data.Accounts[0], true
-}
-
-func (s *Store) EnsureValid(id string) (AccountToken, error) {
-	return s.EnsureValidContext(context.Background(), id)
 }
 
 func (s *Store) EnsureValidContext(ctx context.Context, id string) (AccountToken, error) {

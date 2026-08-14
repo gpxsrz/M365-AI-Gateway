@@ -10,6 +10,7 @@ import (
 
 	"m365-native/internal/chathub"
 	"m365-native/internal/evidence"
+	offlineevidence "m365-native/internal/evidence/offline"
 )
 
 type WP2AliasProjectionHarnessOptions struct {
@@ -406,7 +407,7 @@ func runWP2AliasCatalogObservation(route routeDefinition, binding evidence.Captu
 	if err != nil {
 		return evidence.AliasProjectionRecordV1{}, err
 	}
-	return evidence.CaptureAliasProjection(raw, descriptor, binding)
+	return offlineevidence.CaptureAliasProjection(raw, descriptor, binding)
 }
 
 func runWP2AliasSuccessObservation(route routeDefinition, resolution routeResolution, adapter wp2AliasProjectionProtocolAdapter, effort string, descriptor evidence.AliasProjectionDescriptor, binding evidence.CaptureBinding) (evidence.AliasProjectionRecordV1, error) {
@@ -466,7 +467,7 @@ func runWP2AliasSuccessObservation(route routeDefinition, resolution routeResolu
 	if err != nil {
 		return evidence.AliasProjectionRecordV1{}, err
 	}
-	return evidence.CaptureAliasProjection(raw, descriptor, binding)
+	return offlineevidence.CaptureAliasProjection(raw, descriptor, binding)
 }
 
 func runWP2AliasFailureObservation(model string, caseID evidence.AliasProjectionCase, adapter wp2AliasProjectionProtocolAdapter, descriptor evidence.AliasProjectionDescriptor, binding evidence.CaptureBinding) (evidence.AliasProjectionRecordV1, error) {
@@ -498,7 +499,7 @@ func runWP2AliasFailureObservation(model string, caseID evidence.AliasProjection
 	if err != nil {
 		return evidence.AliasProjectionRecordV1{}, err
 	}
-	return evidence.CaptureAliasProjection(raw, descriptor, binding)
+	return offlineevidence.CaptureAliasProjection(raw, descriptor, binding)
 }
 
 func decodeWP2AliasChatCompletion(body []byte) (map[string]any, string, error) {

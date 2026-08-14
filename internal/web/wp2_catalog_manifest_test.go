@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	committedevidence "m365-native/docs/wp2/evidence"
+	"m365-native/internal/evidence"
 )
 
 func TestBuildAcceptedWP2CatalogProjectionFromCommittedArtifacts(t *testing.T) {
@@ -33,10 +34,10 @@ func TestBuildAcceptedWP2CatalogProjectionFromCommittedArtifacts(t *testing.T) {
 	if len(validated.validated.Manifest.GlobalClaims) != 12 {
 		t.Fatalf("global claim count=%d", len(validated.validated.Manifest.GlobalClaims))
 	}
-	if _, ok := validated.validated.IdentityEvidence("existing-microsoft-route"); ok {
+	if testCatalogHasIdentity(validated.validated, "existing-microsoft-route") {
 		t.Fatal("synthetic configured mapping became runtime catalog evidence")
 	}
-	if _, ok := validated.validated.IdentityEvidence("existing-claude-route"); ok {
+	if testCatalogHasIdentity(validated.validated, "existing-claude-route") {
 		t.Fatal("synthetic configured mapping became runtime catalog evidence")
 	}
 
@@ -53,6 +54,15 @@ func TestBuildAcceptedWP2CatalogProjectionFromCommittedArtifacts(t *testing.T) {
 	if dependent != 1 {
 		t.Fatalf("account-dependent claims=%d", dependent)
 	}
+}
+
+func testCatalogHasIdentity(validated evidence.ValidatedCatalogProjection, requested string) bool {
+	for _, identity := range validated.Manifest.Identities {
+		if identity.RequestedIdentity == requested {
+			return true
+		}
+	}
+	return false
 }
 
 func TestEmbeddedAcceptedWP2CatalogArtifactsMatchRepositoryArtifacts(t *testing.T) {

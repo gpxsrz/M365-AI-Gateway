@@ -9,6 +9,7 @@ import (
 
 	"m365-native/internal/chathub"
 	"m365-native/internal/evidence"
+	offlineevidence "m365-native/internal/evidence/offline"
 )
 
 type WP2ConfiguredMapping struct {
@@ -194,7 +195,7 @@ func validateWP2ConfiguredMappings(mappings []WP2ConfiguredMapping) error {
 func wp2ModelMappings(mappings []WP2ConfiguredMapping) []modelMapping {
 	out := make([]modelMapping, 0, len(mappings))
 	for _, mapping := range mappings {
-		out = append(out, modelMapping{PublicModel: mapping.PublicModel, UpstreamTone: mapping.UpstreamTone, DisplayName: mapping.DisplayName, DefaultReasoningLevel: mapping.DefaultReasoningLevel})
+		out = append(out, modelMapping(mapping))
 	}
 	return out
 }
@@ -264,7 +265,7 @@ func runWP2LegacyConfiguredCatalogObservation(route routeDefinition, settings ru
 	if err != nil {
 		return evidence.LegacyConfiguredRecordV1{}, err
 	}
-	return evidence.CaptureLegacyConfigured(raw, descriptor, binding)
+	return offlineevidence.CaptureLegacyConfigured(raw, descriptor, binding)
 }
 
 func runWP2LegacyConfiguredSuccessObservation(route routeDefinition, resolution routeResolution, settings runtimeSettings, adapter wp2AliasProjectionProtocolAdapter, effort string, descriptor evidence.LegacyConfiguredDescriptor, binding evidence.CaptureBinding) (evidence.LegacyConfiguredRecordV1, error) {
@@ -303,7 +304,7 @@ func runWP2LegacyConfiguredSuccessObservation(route routeDefinition, resolution 
 	if err != nil {
 		return evidence.LegacyConfiguredRecordV1{}, err
 	}
-	return evidence.CaptureLegacyConfigured(raw, descriptor, binding)
+	return offlineevidence.CaptureLegacyConfigured(raw, descriptor, binding)
 }
 
 func runWP2LegacyConfiguredFailureObservation(model string, caseID evidence.LegacyConfiguredCase, settings runtimeSettings, adapter wp2AliasProjectionProtocolAdapter, descriptor evidence.LegacyConfiguredDescriptor, binding evidence.CaptureBinding) (evidence.LegacyConfiguredRecordV1, error) {
@@ -328,5 +329,5 @@ func runWP2LegacyConfiguredFailureObservation(model string, caseID evidence.Lega
 	if err != nil {
 		return evidence.LegacyConfiguredRecordV1{}, err
 	}
-	return evidence.CaptureLegacyConfigured(raw, descriptor, binding)
+	return offlineevidence.CaptureLegacyConfigured(raw, descriptor, binding)
 }

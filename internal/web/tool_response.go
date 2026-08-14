@@ -9,14 +9,6 @@ import (
 	"time"
 )
 
-func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, preambleSent ...bool) error {
-	return writeToolResponseWithRoute(w, id, model, stream, calls, res, routeResolution{}, preambleSent...)
-}
-
-func writeToolResponseWithRoute(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, route routeResolution, preambleSent ...bool) error {
-	return writeToolResponseWithPolicy(w, id, model, stream, calls, res, route, nativePolicySnapshot{}, preambleSent...)
-}
-
 func writeToolResponseWithPolicy(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, route routeResolution, policy nativePolicySnapshot, preambleSent ...bool) error {
 	return writeToolResponseWithMetadata(w, id, model, stream, calls, res, route, policy, nil, "", preambleSent...)
 }

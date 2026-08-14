@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"m365-native/internal/privatefile"
 	"time"
 )
 
@@ -45,7 +47,7 @@ func TestAtomicWritePrivateFileRejectsSymlinkTarget(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlink fixture unavailable: %v", err)
 	}
-	if err := atomicWritePrivateFile(link, []byte("replacement")); err == nil {
+	if err := privatefile.WriteAtomic(link, "token cache", ".m365-private-*", []byte("replacement")); err == nil {
 		t.Fatal("atomic private write replaced a symlink path")
 	}
 	raw, err := os.ReadFile(target)

@@ -212,17 +212,14 @@ func TestDefaultBrowserOAuthConfigPinsMicrosoftFirstPartyEndpoints(t *testing.T)
 
 func TestBrowserPKCECapturesTransientNativeclientCallbackIntoStagedDefaultClient(t *testing.T) {
 	endpoint := newLifecycleTokenEndpoint(t)
-	server, manager, activeStore := newOAuthLifecycleServer(t, endpoint)
+	server, _, activeStore := newOAuthLifecycleServer(t, endpoint)
 	testConfig := lifecycleOAuthConfig(endpoint.server.URL)
 	server.browserPKCEConfig = func() auth.OAuthConfig { return testConfig }
 	activeBefore, err := os.ReadFile(activeStore.Path())
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
-	statusBefore, err := manager.Status()
-	if err != nil {
-		t.Fatal(err)
-	}
+	statusBefore := testOAuthProfileStatus(t, activeStore.Path())
 
 	captured := make(chan browserPKCECaptureRequest, 1)
 	release := make(chan struct{})
@@ -295,10 +292,7 @@ func TestBrowserPKCECapturesTransientNativeclientCallbackIntoStagedDefaultClient
 		t.Fatalf("invalid single-account result: %#v", status["account"])
 	}
 
-	statusAfter, err := manager.Status()
-	if err != nil {
-		t.Fatal(err)
-	}
+	statusAfter := testOAuthProfileStatus(t, activeStore.Path())
 	if statusAfter.ActiveProfileID != statusBefore.ActiveProfileID || statusAfter.Generation != statusBefore.Generation {
 		t.Fatalf("active profile changed: before=%#v after=%#v", statusBefore, statusAfter)
 	}

@@ -51,10 +51,6 @@ func (e *TokenEndpointError) Error() string {
 	return fmt.Sprintf("token endpoint HTTP %d: %s", e.Status, code)
 }
 
-func (t TokenSet) Valid() bool {
-	return t.AccessToken != "" && time.Now().Before(t.ExpiresAt.Add(-30*time.Second))
-}
-
 func ExchangeCodeWithConfig(config OAuthConfig, code, verifier, redirect string) (TokenSet, error) {
 	config, err := normalizeOAuthConfig(config)
 	if err != nil {
@@ -68,14 +64,6 @@ func ExchangeCodeWithConfig(config OAuthConfig, code, verifier, redirect string)
 	form.Set("code_verifier", verifier)
 	form.Set("scope", config.Scope)
 	return requestToken(config.TokenEndpoint, form)
-}
-
-func Refresh(refreshToken string) (TokenSet, error) {
-	return RefreshWithConfig(CurrentOAuthConfig(), refreshToken)
-}
-
-func RefreshWithConfig(config OAuthConfig, refreshToken string) (TokenSet, error) {
-	return refreshWithConfigContext(context.Background(), config, refreshToken)
 }
 
 func requestToken(endpoint string, form url.Values) (TokenSet, error) {

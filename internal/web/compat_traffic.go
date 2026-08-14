@@ -23,7 +23,6 @@ type compatibilityTrafficSnapshot struct {
 	Shared429Count          uint64    `json:"shared429Count"`
 	Last429Source           string    `json:"last429Source,omitempty"`
 	SharedCooldownUntil     time.Time `json:"sharedCooldownUntil,omitzero"`
-	MemoryCooldownUntil     time.Time `json:"memoryCooldownUntil,omitzero"`
 	InteractiveHoldoffUntil time.Time `json:"interactiveHoldoffUntil,omitzero"`
 }
 
@@ -64,19 +63,8 @@ func (c *compatibilityTrafficController) snapshot() compatibilityTrafficSnapshot
 		Shared429Count:          c.shared429Count,
 		Last429Source:           c.last429Source,
 		SharedCooldownUntil:     c.sharedCooldownUntil,
-		MemoryCooldownUntil:     c.sharedCooldownUntil,
 		InteractiveHoldoffUntil: c.interactiveHoldoffUntil,
 	}
-}
-
-func (c *compatibilityTrafficController) beginInteractive() func(time.Duration) {
-	if c == nil {
-		return func(time.Duration) {}
-	}
-	c.mu.Lock()
-	c.interactiveInFlight++
-	c.mu.Unlock()
-	return c.releaseInteractive
 }
 
 func (c *compatibilityTrafficController) releaseInteractive(holdoff time.Duration) {

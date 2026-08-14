@@ -1,11 +1,10 @@
-package evidence
+package offline
 
 import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"io"
 	"sort"
 )
 
@@ -279,15 +278,7 @@ func validateNativeSearchRegressionIdentityInput(identity NativeSearchRegression
 }
 
 func validateNativeSearchRegressionExpected(identity NativeSearchRegressionIdentityV1, expected NativeSearchRegressionExpected) error {
-	if err := validateNativeSearchRegressionIdentityInput(NativeSearchRegressionIdentityInput{
-		NormativeADRSHA256:      expected.NormativeADRSHA256,
-		NormativeADRBytes:       expected.NormativeADRBytes,
-		SourceHead:              expected.SourceHead,
-		SourceTree:              expected.SourceTree,
-		HarnessSHA256:           expected.HarnessSHA256,
-		HarnessBytes:            expected.HarnessBytes,
-		EffectiveSettingsSHA256: expected.EffectiveSettingsSHA256,
-	}); err != nil {
+	if err := validateNativeSearchRegressionIdentityInput(NativeSearchRegressionIdentityInput(expected)); err != nil {
 		return err
 	}
 	if identity.NormativeADRPath != NativeSearchNormativeADRPath || identity.NormativeADRSHA256 != expected.NormativeADRSHA256 || identity.NormativeADRBytes != expected.NormativeADRBytes || identity.SourceHead != expected.SourceHead || identity.SourceTree != expected.SourceTree || identity.HarnessSHA256 != expected.HarnessSHA256 || identity.HarnessBytes != expected.HarnessBytes || identity.EffectiveSettingsSHA256 != expected.EffectiveSettingsSHA256 {
@@ -334,7 +325,7 @@ func validateNativeSearchRegressionObservation(observation NativeSearchRegressio
 	if _, ok := nativeSearchRegressionProtocolRank[observation.Protocol]; !ok {
 		return validationError("invalid_enum", "native_search_protocol", "/observations/protocol")
 	}
-	if observation.EndpointPath != nativeSearchRegressionEndpoint(observation.Protocol) {
+	if observation.EndpointPath != NativeSearchRegressionEndpoint(observation.Protocol) {
 		return validationError("invalid_binding", "protocol_endpoint", "/observations/endpoint_path")
 	}
 	if observation.HTTPStatus != 200 || observation.Terminal != nativeSearchRegressionTerminal(observation.Protocol) {
@@ -391,7 +382,7 @@ func nativeSearchRegressionCaseContract(caseID NativeSearchRegressionCase) (int,
 	}
 }
 
-func nativeSearchRegressionEndpoint(protocol NativeSearchRegressionProtocol) string {
+func NativeSearchRegressionEndpoint(protocol NativeSearchRegressionProtocol) string {
 	switch protocol {
 	case NativeSearchProtocolChatNonStream, NativeSearchProtocolChatStream:
 		return "/v1/chat/completions"
@@ -413,12 +404,4 @@ func nativeSearchRegressionTerminal(protocol NativeSearchRegressionProtocol) Nat
 	default:
 		return ""
 	}
-}
-
-func ensureJSONEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return validationError("invalid_json", "single_json_object", "/")
-	}
-	return nil
 }

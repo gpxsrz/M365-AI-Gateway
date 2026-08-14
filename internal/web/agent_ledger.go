@@ -99,11 +99,6 @@ func suppressedKnownCallResponse(l agentLedger) string {
 	return completedToolCallSuppressedResponse
 }
 
-func compactToolResult(s string, limit int) string {
-	s = strings.TrimSpace(s)
-	return boundedUTF8Preview(s, limit)
-}
-
 func boundedUTF8Preview(s string, limit int) string {
 	if limit < 200 {
 		limit = 200

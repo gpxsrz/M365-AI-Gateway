@@ -167,16 +167,6 @@ var builtInRouteRegistry = []routeDefinition{
 
 func cloneRouteDefinition(route routeDefinition) routeDefinition { return route }
 
-func builtInRoute(model string) (routeDefinition, bool) {
-	model = strings.ToLower(strings.TrimSpace(model))
-	for _, route := range builtInRouteRegistry {
-		if strings.EqualFold(route.ID, model) {
-			return cloneRouteDefinition(route), true
-		}
-	}
-	return routeDefinition{}, false
-}
-
 func configuredRouteDefinition(mapping modelMapping) routeDefinition {
 	id := strings.TrimSpace(mapping.PublicModel)
 	owner := "microsoft-365"

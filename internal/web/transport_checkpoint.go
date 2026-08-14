@@ -995,10 +995,6 @@ type canonicalCheckpointToolCall struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
-func canonicalCheckpointMessage(message oaiMsg) ([]byte, error) {
-	return canonicalCheckpointMessageWithToolName(message, "")
-}
-
 func canonicalCheckpointMessageWithToolName(message oaiMsg, toolName string) ([]byte, error) {
 	content, err := canonicalCheckpointValue(message.Content)
 	if err != nil {

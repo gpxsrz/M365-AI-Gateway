@@ -1,4 +1,4 @@
-package evidence
+package evidence_test
 
 import (
 	"crypto/sha256"
@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	. "m365-native/internal/evidence/offline"
 )
 
 func webChoiceBinding() CaptureBinding {

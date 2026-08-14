@@ -20,14 +20,33 @@ func TestValidateCatalogProjectionManifestAcceptsExactEvidence(t *testing.T) {
 	if validated.ChecksumSHA256 != catalogProjectionDigest(raw) {
 		t.Fatalf("checksum=%s", validated.ChecksumSHA256)
 	}
-	identity, ok := validated.IdentityEvidence("m365-auto")
+	identity, ok := findCatalogProjectionIdentityForTest(validated, "m365-auto")
 	if !ok || identity.CanonicalRoute != "m365-auto" || identity.PackageIssue != 4 {
 		t.Fatalf("identity=%#v ok=%t", identity, ok)
 	}
-	claims := validated.GlobalClaims("m365-auto", "magic")
+	claims := catalogProjectionTestClaims(validated, "m365-auto", "magic")
 	if len(claims) != 1 || claims[0].Protocol != "openai_chat_completions_nonstream" || claims[0].RouteEligibility != ClassificationVerified || claims[0].AccountDependent {
 		t.Fatalf("claims=%#v", claims)
 	}
+}
+
+func findCatalogProjectionIdentityForTest(validated ValidatedCatalogProjection, requested string) (CatalogProjectionIdentityEvidenceV1, bool) {
+	for _, identity := range validated.Manifest.Identities {
+		if identity.RequestedIdentity == requested {
+			return identity, true
+		}
+	}
+	return CatalogProjectionIdentityEvidenceV1{}, false
+}
+
+func catalogProjectionTestClaims(validated ValidatedCatalogProjection, route, tone string) []AccountPoolGlobalClaimV1 {
+	claims := make([]AccountPoolGlobalClaimV1, 0)
+	for _, claim := range validated.Manifest.GlobalClaims {
+		if claim.CanonicalRoute == route && claim.ResolvedTone == tone {
+			claims = append(claims, claim)
+		}
+	}
+	return claims
 }
 
 func TestValidateCatalogProjectionManifestRejectsStaleIdentity(t *testing.T) {

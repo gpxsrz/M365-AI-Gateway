@@ -47,6 +47,7 @@ type mcpHTTPObservation struct {
 	path            string
 	hasAuth         bool
 	hasSession      bool
+	sessionID       string
 	protocolVersion string
 	rpcMethod       string
 }
@@ -114,6 +115,7 @@ func TestWP6HermesV020MCPInterop(t *testing.T) {
 			path:            r.URL.Path,
 			hasAuth:         strings.HasPrefix(r.Header.Get("Authorization"), "Bearer "),
 			hasSession:      r.Header.Get(mcp.SessionHeader) != "",
+			sessionID:       r.Header.Get(mcp.SessionHeader),
 			protocolVersion: r.Header.Get(mcp.ProtocolHeader),
 		}
 		if r.Body != nil {
@@ -186,12 +188,20 @@ finally:
 		t.Fatalf("pinned Hermes legacy SSE result mismatch: %s", hermesFailureOutput(output, apiKey))
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for server.mcp.SessionCount() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	observationMu.Lock()
+	terminatedSessionID := ""
+	for _, observation := range observations {
+		if observation.path == "/v1/mcp" && observation.sessionID != "" {
+			terminatedSessionID = observation.sessionID
+		}
 	}
-	if server.mcp.SessionCount() != 0 {
-		t.Fatalf("Hermes shutdown leaked %d MCP session(s)", server.mcp.SessionCount())
+	observationMu.Unlock()
+	if terminatedSessionID == "" {
+		t.Fatal("Hermes MCP session ID was not observed")
+	}
+	afterShutdown := wp6MCPRequest(t, routes, http.MethodPost, "/v1/mcp", apiKey, terminatedSessionID, mcp.LatestProtocolVersion, "", wp6MCPBody(99, "tools/list", nil))
+	if afterShutdown.Code != http.StatusNotFound {
+		t.Fatalf("Hermes MCP session survived shutdown: status=%d body=%s", afterShutdown.Code, afterShutdown.Body.String())
 	}
 	observationMu.Lock()
 	defer observationMu.Unlock()

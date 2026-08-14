@@ -2,25 +2,6 @@ package web
 
 import "fmt"
 
-// validateToolConversation enforces the OpenAI tool protocol without making
-// assumptions about what a tool does. A later user turn may explicitly abandon
-// an interrupted client-side batch, but call IDs remain unique and a trailing
-// batch still requires exactly one matching result per call.
-func validateToolConversation(messages []oaiMsg) error {
-	return validateToolConversationWithPrior(messages, nil)
-}
-
-func validateToolConversationWithPrior(messages []oaiMsg, priorCallIDs []string, priorSeenCallIDs ...[]string) error {
-	var seenDigests []string
-	if len(priorSeenCallIDs) > 0 {
-		seenDigests = make([]string, 0, len(priorSeenCallIDs[0]))
-		for _, id := range priorSeenCallIDs[0] {
-			seenDigests = append(seenDigests, toolCallIDDigest(id))
-		}
-	}
-	return validateToolConversationWithPriorDigests(messages, priorCallIDs, seenDigests)
-}
-
 func validateToolConversationWithPriorDigests(messages []oaiMsg, priorCallIDs, priorSeenCallDigests []string) error {
 	pending := map[string]bool{}
 	seen := map[string]bool{}

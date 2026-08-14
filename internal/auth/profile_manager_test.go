@@ -6,8 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -48,7 +46,7 @@ func TestOAuthProfileManagerPreservesLegacyStoreAndPinsPrivateMetadata(t *testin
 		t.Fatalf("legacy token bytes changed: err=%v\n got=%s\nwant=%s", err, got, legacyRaw)
 	}
 
-	pointer, err := manager.readPointer()
+	pointer, err := readPointerForTest(manager)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +59,7 @@ func TestOAuthProfileManagerPreservesLegacyStoreAndPinsPrivateMetadata(t *testin
 	assertMode(t, manager.manifestPath(legacyOAuthProfileID), 0o600)
 	assertMode(t, basePath, 0o600)
 
-	status, err := manager.Status()
+	status, err := profileStatusForTest(manager)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +89,7 @@ func TestOAuthProfileManagerStagesCanonicalCopyFromActiveWithoutMutation(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	pointerBefore, err := manager.readPointer()
+	pointerBefore, err := readPointerForTest(manager)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +109,7 @@ func TestOAuthProfileManagerStagesCanonicalCopyFromActiveWithoutMutation(t *test
 	if got := mustReadFile(t, basePath); !bytes.Equal(got, activeBefore) {
 		t.Fatal("StageFromActive changed active token-store bytes")
 	}
-	pointerAfter, err := manager.readPointer()
+	pointerAfter, err := readPointerForTest(manager)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +121,7 @@ func TestOAuthProfileManagerStagesCanonicalCopyFromActiveWithoutMutation(t *test
 	assertMode(t, stagedStore.Path(), 0o600)
 }
 
-func TestOAuthProfilePromotionRequiresCompleteValidationAndRollbackOnlyChangesPointer(t *testing.T) {
+func TestOAuthProfileValidationDoesNotChangeActivePointerOrCredentialBytes(t *testing.T) {
 	dir := t.TempDir()
 	basePath := filepath.Join(dir, "accounts.json")
 	legacyRaw := []byte(`{"schema":"` + TokenCacheSchema + `","accounts":[{"id":"legacy","email":"legacy@example.test","status":"online","accessToken":"accepted-access-secret","refreshToken":"accepted-refresh-secret","expiresAt":"2030-01-02T03:04:05Z","updatedAt":"2026-08-06T12:00:00Z","oid":"legacy","tid":"tenant","clientId":"accepted-client"}]}`)
@@ -175,19 +173,12 @@ func TestOAuthProfilePromotionRequiresCompleteValidationAndRollbackOnlyChangesPo
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Promote(staged.ProfileID); !errors.Is(err, ErrOAuthProfileValidationIncomplete) {
-		t.Fatalf("promote before validation error = %v", err)
-	}
-
 	staged, err = manager.RecordValidation(staged.ProfileID, OAuthProfileValidationChatHub)
 	if err != nil {
 		t.Fatalf("record ChatHub validation: %v", err)
 	}
 	if staged.Validation.Complete() {
 		t.Fatalf("ChatHub-only validation unexpectedly completed lifecycle: %#v", staged.Validation)
-	}
-	if _, err := manager.Promote(staged.ProfileID); !errors.Is(err, ErrOAuthProfileValidationIncomplete) {
-		t.Fatalf("promote after ChatHub-only validation error = %v", err)
 	}
 	for _, step := range []OAuthProfileValidationStep{
 		OAuthProfileValidationRefresh,
@@ -200,28 +191,28 @@ func TestOAuthProfilePromotionRequiresCompleteValidationAndRollbackOnlyChangesPo
 		}
 	}
 	if !staged.Validation.Complete() {
-		t.Fatalf("complete lifecycle did not open promotion gate: %#v", staged.Validation)
+		t.Fatalf("complete lifecycle validation was not recorded: %#v", staged.Validation)
 	}
 
 	legacyBefore := mustReadFile(t, basePath)
 	stagedTokenPath := manager.tokenPath(staged.ProfileID)
 	stagedBefore := mustReadFile(t, stagedTokenPath)
 	manifestBefore := mustReadFile(t, manager.manifestPath(staged.ProfileID))
-	pointer, err := manager.Promote(staged.ProfileID)
+	pointer, err := readPointerForTest(manager)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pointer.ActiveProfileID != staged.ProfileID || pointer.PreviousProfileID != legacyOAuthProfileID || pointer.Generation != 2 {
-		t.Fatalf("promoted pointer = %#v", pointer)
+	if pointer.ActiveProfileID != legacyOAuthProfileID || pointer.PreviousProfileID != "" || pointer.Generation != 1 {
+		t.Fatalf("validation changed active pointer = %#v", pointer)
 	}
 	if got := mustReadFile(t, basePath); !bytes.Equal(got, legacyBefore) {
-		t.Fatal("promotion changed accepted legacy token bytes")
+		t.Fatal("validation changed accepted legacy token bytes")
 	}
 	if got := mustReadFile(t, stagedTokenPath); !bytes.Equal(got, stagedBefore) {
-		t.Fatal("promotion changed staged token bytes")
+		t.Fatal("validation changed staged token bytes")
 	}
 	if got := mustReadFile(t, manager.manifestPath(staged.ProfileID)); !bytes.Equal(got, manifestBefore) {
-		t.Fatal("promotion changed staged manifest")
+		t.Fatal("validation unexpectedly rewrote staged manifest after snapshot")
 	}
 
 	reopened, err := openOAuthProfileManager(basePath, testOAuthConfig("ignored-new-process-config"), func() time.Time { return times[len(times)-1] }, bytes.NewReader(bytes.Repeat([]byte{0x33}, 64)))
@@ -232,47 +223,34 @@ func TestOAuthProfilePromotionRequiresCompleteValidationAndRollbackOnlyChangesPo
 	if err != nil {
 		t.Fatal(err)
 	}
-	if activeManifest.ProfileID != staged.ProfileID || activeStore.Config() != stagedConfig {
-		t.Fatalf("reopened active = %#v config=%#v", activeManifest, activeStore.Config())
+	if activeManifest.ProfileID != legacyOAuthProfileID || activeStore.Config().ClientID != "accepted-client" {
+		t.Fatalf("reopened active profile = %#v config=%#v", activeManifest, activeStore.Config())
 	}
-	if list := activeStore.List(); len(list) != 1 || list[0].AccessToken != "candidate-access-secret" {
-		t.Fatalf("reopened candidate accounts = %#v", list)
+	if list := activeStore.List(); len(list) != 1 || list[0].AccessToken != "accepted-access-secret" {
+		t.Fatalf("reopened active accounts = %#v", list)
 	}
-
-	legacyBeforeRollback := mustReadFile(t, basePath)
-	stagedBeforeRollback := mustReadFile(t, stagedTokenPath)
-	manifestBeforeRollback := mustReadFile(t, manager.manifestPath(staged.ProfileID))
-	rolledBack, err := reopened.Rollback()
+	stagedManifest, reopenedStagedStore, err := reopened.OpenStore(staged.ProfileID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rolledBack.ActiveProfileID != legacyOAuthProfileID || rolledBack.PreviousProfileID != staged.ProfileID || rolledBack.Generation != 3 {
-		t.Fatalf("rolled back pointer = %#v", rolledBack)
+	if stagedManifest.ProfileID != staged.ProfileID || reopenedStagedStore.Config() != stagedConfig {
+		t.Fatalf("reopened staged profile = %#v config=%#v", stagedManifest, reopenedStagedStore.Config())
 	}
-	if got := mustReadFile(t, basePath); !bytes.Equal(got, legacyBeforeRollback) {
-		t.Fatal("rollback changed legacy token bytes")
+	if list := reopenedStagedStore.List(); len(list) != 1 || list[0].AccessToken != "candidate-access-secret" {
+		t.Fatalf("reopened staged accounts = %#v", list)
 	}
-	if got := mustReadFile(t, stagedTokenPath); !bytes.Equal(got, stagedBeforeRollback) {
-		t.Fatal("rollback changed staged token bytes")
-	}
-	if got := mustReadFile(t, manager.manifestPath(staged.ProfileID)); !bytes.Equal(got, manifestBeforeRollback) {
-		t.Fatal("rollback changed staged manifest")
-	}
-	legacyManifest, legacyStore, err := reopened.ActiveStore()
+	reopenedPointer, err := readPointerForTest(reopened)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if legacyManifest.ProfileID != legacyOAuthProfileID || legacyStore.Config().ClientID != "accepted-client" {
-		t.Fatalf("rollback active profile = %#v config=%#v", legacyManifest, legacyStore.Config())
-	}
-	if list := legacyStore.List(); len(list) != 1 || list[0].AccessToken != "accepted-access-secret" {
-		t.Fatalf("rollback legacy accounts = %#v", list)
+	if reopenedPointer != pointer {
+		t.Fatalf("restart changed active pointer: before=%#v after=%#v", pointer, reopenedPointer)
 	}
 
 	assertMode(t, manager.profileDir(staged.ProfileID), 0o700)
 	assertMode(t, manager.manifestPath(staged.ProfileID), 0o600)
 	assertMode(t, stagedTokenPath, 0o600)
-	metadata := string(manifestBeforeRollback)
+	metadata := string(manifestBefore)
 	for _, forbidden := range []string{"candidate-access-secret", "candidate-refresh-secret", "candidate@example.test", "candidate-oid", "candidate-tid"} {
 		if strings.Contains(metadata, forbidden) {
 			t.Fatalf("profile manifest leaked %q: %s", forbidden, metadata)
@@ -295,7 +273,7 @@ func TestOAuthProfileManagerDiscardsFailedStagingButProtectsPointerTargets(t *te
 	if _, err := os.Stat(manager.profileDir(failed.ProfileID)); !os.IsNotExist(err) {
 		t.Fatalf("discarded profile still exists: %v", err)
 	}
-	pointer, err := manager.readPointer()
+	pointer, err := readPointerForTest(manager)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,86 +282,6 @@ func TestOAuthProfileManagerDiscardsFailedStagingButProtectsPointerTargets(t *te
 	}
 	if err := manager.Discard(legacyOAuthProfileID); !errors.Is(err, ErrOAuthProfileInUse) {
 		t.Fatalf("discard active legacy error = %v", err)
-	}
-}
-
-func TestOAuthProfileManagerSerializesConcurrentPromotionsAcrossManagers(t *testing.T) {
-	basePath := filepath.Join(t.TempDir(), "accounts.json")
-	fixedNow := func() time.Time { return time.Date(2026, 8, 6, 15, 0, 0, 0, time.UTC) }
-	randomBytes := append(bytes.Repeat([]byte{0x55}, 16), bytes.Repeat([]byte{0x66}, 16)...)
-	first, err := openOAuthProfileManager(basePath, testOAuthConfig("legacy"), fixedNow, bytes.NewReader(randomBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	profileA, _, err := first.Stage(testOAuthConfig("candidate-a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	profileB, _, err := first.Stage(testOAuthConfig("candidate-b"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, profileID := range []string{profileA.ProfileID, profileB.ProfileID} {
-		for _, step := range []OAuthProfileValidationStep{OAuthProfileValidationChatHub, OAuthProfileValidationRefresh, OAuthProfileValidationRestart, OAuthProfileValidationRemoval} {
-			if _, err := first.RecordValidation(profileID, step); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	second, err := openOAuthProfileManager(basePath, testOAuthConfig("ignored"), fixedNow, bytes.NewReader(bytes.Repeat([]byte{0x77}, 32)))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	start := make(chan struct{})
-	errs := make(chan error, 2)
-	var wg sync.WaitGroup
-	for manager, profileID := range map[*OAuthProfileManager]string{first: profileA.ProfileID, second: profileB.ProfileID} {
-		wg.Add(1)
-		go func(manager *OAuthProfileManager, profileID string) {
-			defer wg.Done()
-			<-start
-			_, err := manager.Promote(profileID)
-			errs <- err
-		}(manager, profileID)
-	}
-	close(start)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("concurrent promote: %v", err)
-		}
-	}
-
-	pointer, err := first.readPointer()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pointer.Generation != 3 {
-		t.Fatalf("concurrent generation = %d, want 3: %#v", pointer.Generation, pointer)
-	}
-	gotPair := []string{pointer.ActiveProfileID, pointer.PreviousProfileID}
-	wantPair := []string{profileA.ProfileID, profileB.ProfileID}
-	sort.Strings(gotPair)
-	sort.Strings(wantPair)
-	if !reflect.DeepEqual(gotPair, wantPair) {
-		t.Fatalf("active/previous = %v, want %v", gotPair, wantPair)
-	}
-
-	status, err := second.Status()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.Generation != 3 || status.ActiveProfileID != pointer.ActiveProfileID || status.PreviousProfileID != pointer.PreviousProfileID {
-		t.Fatalf("status/pointer mismatch: status=%#v pointer=%#v", status, pointer)
-	}
-	ids := make([]string, 0, len(status.Profiles))
-	for _, profile := range status.Profiles {
-		ids = append(ids, profile.ProfileID)
-	}
-	if !sort.StringsAreSorted(ids) {
-		t.Fatalf("status profiles not deterministic: %v", ids)
 	}
 }
 

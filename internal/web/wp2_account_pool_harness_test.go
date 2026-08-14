@@ -12,6 +12,7 @@ import (
 	"m365-native/internal/auth"
 	"m365-native/internal/chathub"
 	"m365-native/internal/evidence"
+	offlineevidence "m365-native/internal/evidence/offline"
 )
 
 type WP2AccountPoolHarnessOptions struct {
@@ -201,7 +202,7 @@ func runWP2AccountPoolObservation(scenario wp2AccountPoolProfileScenario, route 
 	if err != nil {
 		return evidence.RouteProtocolRecordV1{}, err
 	}
-	return evidence.CaptureRouteProtocol(raw, descriptor, profileBinding)
+	return offlineevidence.CaptureRouteProtocol(raw, descriptor, profileBinding)
 }
 
 func wp2AccountPoolRequest(request *http.Request, accountID string) (*http.Request, error) {

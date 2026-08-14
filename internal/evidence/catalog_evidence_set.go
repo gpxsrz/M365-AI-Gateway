@@ -84,26 +84,3 @@ type CatalogStaleManifestRejection struct {
 	ErrorRule string `json:"error_rule"`
 	ErrorPath string `json:"error_path,omitempty"`
 }
-
-func ValidateCatalogEvidenceBinding(binding CaptureBinding) error {
-	for path, value := range map[string]string{
-		"/normative_adr_sha256":      binding.NormativeADRSHA256,
-		"/binary_sha256":             binding.BinarySHA256,
-		"/harness_sha256":            binding.HarnessSHA256,
-		"/effective_settings_sha256": binding.EffectiveSettingsSHA256,
-	} {
-		if !sha256Pattern.MatchString(value) {
-			return validationError("invalid_identity", "sha256", path)
-		}
-	}
-	if !gitCommitPattern.MatchString(binding.SourceHead) {
-		return validationError("invalid_identity", "git_commit_sha", "/source_head")
-	}
-	if binding.DirtyContentSHA256 != "" && !sha256Pattern.MatchString(binding.DirtyContentSHA256) {
-		return validationError("invalid_identity", "dirty_content_sha256", "/dirty_content_sha256")
-	}
-	if binding.AccountProfileRef != "" {
-		return validationError("privacy_forbidden", "catalog_evidence_has_no_account_profile", "/account_profile_ref")
-	}
-	return nil
-}

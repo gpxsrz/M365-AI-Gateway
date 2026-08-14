@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"m365-native/internal/privatefile"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +46,7 @@ func apiKeyStorePath() string {
 func openAPIKeys() (*apiKeyStore, error) {
 	path := apiKeyStorePath()
 	store := &apiKeyStore{Path: path}
-	file, err := openPrivateRegularFile(path)
+	file, err := privatefile.OpenRegular(path, "credential file")
 	if os.IsNotExist(err) {
 		return store, nil
 	}
@@ -67,39 +68,6 @@ func openAPIKeys() (*apiKeyStore, error) {
 	return store, nil
 }
 
-func openPrivateRegularFile(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("credential file must not be a symbolic link")
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("credential file must be a regular file")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	opened, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		file.Close()
-		return nil, fmt.Errorf("credential file identity changed while opening")
-	}
-	if opened.Mode().Perm() != 0o600 {
-		if err := file.Chmod(0o600); err != nil {
-			file.Close()
-			return nil, fmt.Errorf("secure credential file permissions: %w", err)
-		}
-	}
-	return file, nil
-}
-
 func (s *apiKeyStore) save() error {
 	raw, err := json.MarshalIndent(struct {
 		Keys []apiKeyRecord `json:"keys"`
@@ -110,57 +78,7 @@ func (s *apiKeyStore) save() error {
 	if s.persist != nil {
 		return s.persist(s.Path, raw)
 	}
-	return atomicWriteAPIKeyFile(s.Path, raw)
-}
-
-func atomicWriteAPIKeyFile(path string, raw []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("credential file must not be a symbolic link")
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("credential file must be a regular file")
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	temporary, err := os.CreateTemp(dir, ".api-keys-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	removeTemporary := true
-	defer func() {
-		_ = temporary.Close()
-		if removeTemporary {
-			_ = os.Remove(temporaryPath)
-		}
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := temporary.Write(raw); err != nil {
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	removeTemporary = false
-	if directory, err := os.Open(dir); err == nil {
-		_ = directory.Sync()
-		_ = directory.Close()
-	}
-	return nil
+	return privatefile.WriteAtomic(s.Path, "credential file", ".api-keys-*", raw)
 }
 
 func keyHash(key string) string {
@@ -229,9 +147,4 @@ func (s *apiKeyStore) authenticate(raw string) (string, bool) {
 		return s.Keys[i].ID, true
 	}
 	return "", false
-}
-
-func (s *apiKeyStore) valid(raw string) bool {
-	_, ok := s.authenticate(raw)
-	return ok
 }

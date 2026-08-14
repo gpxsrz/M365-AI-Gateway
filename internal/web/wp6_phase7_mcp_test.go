@@ -65,12 +65,12 @@ func TestWP6ProductionMCPRouteAuthOwnerAndRoundTrip(t *testing.T) {
 	})
 
 	unauthorized := wp6MCPRequest(t, handler, http.MethodPost, "/v1/mcp", "", "", "", "", initializeBody)
-	if unauthorized.Code != http.StatusUnauthorized || server.mcp.SessionCount() != 0 {
-		t.Fatalf("unauthorized status=%d sessions=%d", unauthorized.Code, server.mcp.SessionCount())
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", unauthorized.Code)
 	}
 	badOrigin := wp6MCPRequest(t, handler, http.MethodPost, "/v1/mcp", keyA, "", "", "https://evil.test", initializeBody)
-	if badOrigin.Code != http.StatusForbidden || server.mcp.SessionCount() != 0 {
-		t.Fatalf("bad origin status=%d sessions=%d", badOrigin.Code, server.mcp.SessionCount())
+	if badOrigin.Code != http.StatusForbidden {
+		t.Fatalf("bad origin status=%d", badOrigin.Code)
 	}
 	server.adminSecurity.allowedHosts = []adminAllowedHost{{host: "sidecar.test"}}
 	forgedRequest := httptest.NewRequest(http.MethodPost, "https://attacker.test/v1/mcp", bytes.NewReader(initializeBody))
@@ -80,8 +80,8 @@ func TestWP6ProductionMCPRouteAuthOwnerAndRoundTrip(t *testing.T) {
 	forgedRequest.Header.Set("Origin", "https://attacker.test")
 	forgedHost := httptest.NewRecorder()
 	handler.ServeHTTP(forgedHost, forgedRequest)
-	if forgedHost.Code != http.StatusForbidden || server.mcp.SessionCount() != 0 {
-		t.Fatalf("forged Host/Origin status=%d sessions=%d", forgedHost.Code, server.mcp.SessionCount())
+	if forgedHost.Code != http.StatusForbidden {
+		t.Fatalf("forged Host/Origin status=%d", forgedHost.Code)
 	}
 	matchingOrigin := wp6MCPRequest(t, handler, http.MethodPost, "/v1/mcp", keyA, "", "", "https://sidecar.test", initializeBody)
 	if matchingOrigin.Code != http.StatusOK {

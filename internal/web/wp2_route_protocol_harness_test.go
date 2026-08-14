@@ -15,6 +15,7 @@ import (
 	"m365-native/internal/auth"
 	"m365-native/internal/chathub"
 	"m365-native/internal/evidence"
+	offlineevidence "m365-native/internal/evidence/offline"
 )
 
 type WP2RouteProtocolHarnessOptions struct {
@@ -413,7 +414,7 @@ func runWP2RouteProtocolObservation(route routeDefinition, adapter wp2RouteProto
 	if err != nil {
 		return evidence.RouteProtocolRecordV1{}, err
 	}
-	return evidence.CaptureRouteProtocol(raw, descriptor, binding)
+	return offlineevidence.CaptureRouteProtocol(raw, descriptor, binding)
 }
 
 func runWP2RouteProtocolRouteFailure(model string, caseID evidence.RouteProtocolCase, adapter wp2RouteProtocolAdapter, descriptor evidence.RouteProtocolDescriptor, binding evidence.CaptureBinding) (evidence.RouteProtocolRecordV1, error) {
@@ -448,7 +449,7 @@ func runWP2RouteProtocolRouteFailure(model string, caseID evidence.RouteProtocol
 	if err != nil {
 		return evidence.RouteProtocolRecordV1{}, err
 	}
-	return evidence.CaptureRouteProtocol(raw, descriptor, binding)
+	return offlineevidence.CaptureRouteProtocol(raw, descriptor, binding)
 }
 
 func newWP2RouteProtocolHarnessServer(chat chatService) (wp2RouteProtocolHarness, func(), error) {
@@ -461,7 +462,7 @@ func newWP2RouteProtocolHarnessServerWithSettings(chat chatService, settings run
 		return wp2RouteProtocolHarness{}, nil, err
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	store, err := auth.OpenStore(filepath.Join(dir, "accounts.json"))
+	store, err := openAuthStoreForTest(filepath.Join(dir, "accounts.json"), auth.CurrentOAuthConfig())
 	if err != nil {
 		cleanup()
 		return wp2RouteProtocolHarness{}, nil, err

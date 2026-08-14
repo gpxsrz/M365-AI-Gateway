@@ -23,12 +23,21 @@ func trafficTestSettings() runtimeSettings {
 	return v
 }
 
+func acquireInteractiveForTest(t *testing.T, controller *compatibilityTrafficController, cfg runtimeSettings) func(time.Duration) {
+	t.Helper()
+	release, err := controller.acquireInteractive(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return release
+}
+
 func TestCompatibilityTrafficSnapshotOmitsInactiveDeadlines(t *testing.T) {
 	raw, err := json.Marshal(newCompatibilityTrafficController().snapshot())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"sharedCooldownUntil", "memoryCooldownUntil", "interactiveHoldoffUntil"} {
+	for _, field := range []string{"sharedCooldownUntil", "interactiveHoldoffUntil"} {
 		if strings.Contains(string(raw), field) {
 			t.Fatalf("inactive deadline %q leaked into snapshot: %s", field, raw)
 		}
@@ -335,7 +344,7 @@ func TestLegacyV1ChatCountsAsInteractivePriority(t *testing.T) {
 
 func TestCompatibilityTrafficSnapshotUsesInteractiveMetricNames(t *testing.T) {
 	controller := newCompatibilityTrafficController()
-	release := controller.beginInteractive()
+	release := acquireInteractiveForTest(t, controller, trafficTestSettings())
 	defer release(0)
 	raw, err := json.Marshal(controller.snapshot())
 	if err != nil {
@@ -349,7 +358,7 @@ func TestCompatibilityTrafficSnapshotUsesInteractiveMetricNames(t *testing.T) {
 func TestCompatibilityTrafficInteractivePriority(t *testing.T) {
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
-	endInteractive := c.beginInteractive()
+	endInteractive := acquireInteractiveForTest(t, c, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	if _, err := c.acquireMemory(ctx, cfg); err == nil {
@@ -372,7 +381,7 @@ func TestCompatibilityTraffic429Backoff(t *testing.T) {
 	}
 	release(http.StatusTooManyRequests)
 	snap := c.snapshot()
-	if snap.Memory429Count != 1 || !snap.MemoryCooldownUntil.After(time.Now()) {
+	if snap.Memory429Count != 1 || !snap.SharedCooldownUntil.After(time.Now()) {
 		t.Fatalf("unexpected 429 snapshot: %#v", snap)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
@@ -420,7 +429,7 @@ func TestCompatibilityTrafficMemoryQueueIsBounded(t *testing.T) {
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
 	cfg.MemoryQueueTimeoutSeconds = 10
-	endInteractive := c.beginInteractive()
+	endInteractive := acquireInteractiveForTest(t, c, cfg)
 	defer endInteractive(0)
 	for i := 0; i < memoryQueueMaxWaiting; i++ {
 		c.memoryQueue = append(c.memoryQueue, uint64(i))
@@ -441,7 +450,7 @@ func TestCompatibilityTrafficAdmissionRetryAfterIsNotFixedOneSecond(t *testing.T
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
 	cfg.MemoryQueueTimeoutSeconds = 10
-	endInteractive := c.beginInteractive()
+	endInteractive := acquireInteractiveForTest(t, c, cfg)
 	defer endInteractive(0)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()

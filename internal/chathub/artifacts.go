@@ -264,26 +264,6 @@ func IsProtectedArtifactField(key string, child any) bool {
 	return ok && ContainsProtectedArtifactReference(text)
 }
 
-func directArtifactBearingMap(value map[string]any) bool {
-	if generatedCodeInterpreterMessage(value) {
-		return true
-	}
-	for key, child := range value {
-		if IsProtectedArtifactField(key, child) {
-			return true
-		}
-	}
-	return false
-}
-
-// ContainsDirectProtectedArtifactJSON identifies one artifact-bearing subtree
-// without treating an ordinary parent envelope as protected merely because a
-// different descendant contains Code Interpreter metadata.
-func ContainsDirectProtectedArtifactJSON(raw json.RawMessage) bool {
-	var value map[string]any
-	return len(raw) == 0 || json.Unmarshal(raw, &value) != nil || directArtifactBearingMap(value)
-}
-
 // ContainsProtectedArtifactJSON applies the same bounded structural guard to
 // caller-visible tool arguments. Invalid or overly deep input fails closed.
 func ContainsProtectedArtifactJSON(raw json.RawMessage) bool {

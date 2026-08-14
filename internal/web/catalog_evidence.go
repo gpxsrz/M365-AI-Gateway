@@ -12,23 +12,6 @@ type catalogEvidenceProjection struct {
 	identities map[string]evidence.CatalogProjectionIdentityEvidenceV1
 }
 
-func configureCatalogEvidence(server *Server, raw []byte, expected evidence.CatalogProjectionExpected) error {
-	projection, err := validateAndBindAcceptedWP2CatalogProjection(serverRuntimeSettings(server), raw, expected)
-	if err != nil {
-		return err
-	}
-	server.catalogEvidence = projection
-	return nil
-}
-
-func validateAndBindAcceptedWP2CatalogProjection(cfg runtimeSettings, raw []byte, expected evidence.CatalogProjectionExpected) (*catalogEvidenceProjection, error) {
-	validated, err := evidence.ValidateCatalogProjectionManifest(raw, expected)
-	if err != nil {
-		return nil, err
-	}
-	return bindCatalogEvidence(cfg, validated)
-}
-
 func bindCatalogEvidence(cfg runtimeSettings, validated evidence.ValidatedCatalogProjection) (*catalogEvidenceProjection, error) {
 	routes := routeRegistry(cfg.ModelMappings)
 	registry := make(map[string]routeDefinition, len(routes))

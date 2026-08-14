@@ -376,22 +376,3 @@ func validateCatalogProjectionExpected(expected CatalogProjectionExpected) error
 	}
 	return nil
 }
-
-func (validated ValidatedCatalogProjection) IdentityEvidence(requestedIdentity string) (CatalogProjectionIdentityEvidenceV1, bool) {
-	for _, identity := range validated.Manifest.Identities {
-		if strings.EqualFold(identity.RequestedIdentity, requestedIdentity) {
-			return identity, true
-		}
-	}
-	return CatalogProjectionIdentityEvidenceV1{}, false
-}
-
-func (validated ValidatedCatalogProjection) GlobalClaims(canonicalRoute, resolvedTone string) []AccountPoolGlobalClaimV1 {
-	claims := make([]AccountPoolGlobalClaimV1, 0)
-	for _, claim := range validated.Manifest.GlobalClaims {
-		if claim.CanonicalRoute == canonicalRoute && claim.ResolvedTone == resolvedTone {
-			claims = append(claims, claim)
-		}
-	}
-	return claims
-}

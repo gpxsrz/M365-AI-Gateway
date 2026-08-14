@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"m365-native/internal/auth"
@@ -186,7 +187,7 @@ type oauthLifecycleObservation struct {
 
 func TestOAuthLifecycleFirstLoginAndStagedReauthorization(t *testing.T) {
 	endpoint := newLifecycleTokenEndpoint(t)
-	server, manager, activeStore := newOAuthLifecycleServer(t, endpoint)
+	server, _, activeStore := newOAuthLifecycleServer(t, endpoint)
 
 	firstStart := lifecycleAdminRequest(t, server, http.MethodPost, "http://127.0.0.1/api/auth/start", "{}")
 	if firstStart.Code != http.StatusOK {
@@ -198,7 +199,7 @@ func TestOAuthLifecycleFirstLoginAndStagedReauthorization(t *testing.T) {
 	}
 	firstState, _ := first["state"].(string)
 	callbackLifecycleState(t, server, firstState, "first-login-code")
-	activeAccounts := activeStore.List()
+	activeAccounts := testStoreAccounts(activeStore)
 	if len(activeAccounts) != 1 || !strings.Contains(activeAccounts[0].AccessToken, "first-login-code") {
 		t.Fatalf("first login active accounts=%#v", activeAccounts)
 	}
@@ -216,11 +217,11 @@ func TestOAuthLifecycleFirstLoginAndStagedReauthorization(t *testing.T) {
 	if !strings.HasPrefix(stagedID, "oauthp_") || reauth["staged"] != true {
 		t.Fatalf("reauth target=%#v", reauth)
 	}
-	_, stagedBeforeCallback, err := manager.OpenStore(stagedID)
+	_, stagedBeforeCallback, err := server.oauthProfiles.OpenStore(stagedID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if accounts := stagedBeforeCallback.List(); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "first-login-code") {
+	if accounts := testStoreAccounts(stagedBeforeCallback); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "first-login-code") {
 		t.Fatalf("staged active copy=%#v", accounts)
 	}
 	reauthState, _ := reauth["state"].(string)
@@ -231,11 +232,11 @@ func TestOAuthLifecycleFirstLoginAndStagedReauthorization(t *testing.T) {
 	if got, err := os.ReadFile(activeStore.Path()); err != nil || string(got) != string(acceptedBefore) {
 		t.Fatalf("reauth changed accepted active store: err=%v", err)
 	}
-	_, stagedAfterCallback, err := manager.OpenStore(stagedID)
+	_, stagedAfterCallback, err := server.oauthProfiles.OpenStore(stagedID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	stagedAccounts := stagedAfterCallback.List()
+	stagedAccounts := testStoreAccounts(stagedAfterCallback)
 	if len(stagedAccounts) != 1 || !strings.Contains(stagedAccounts[0].AccessToken, "reauth-code") {
 		t.Fatalf("reauth staged accounts=%#v", stagedAccounts)
 	}
@@ -243,7 +244,7 @@ func TestOAuthLifecycleFirstLoginAndStagedReauthorization(t *testing.T) {
 
 func TestOAuthLifecycleOrdinaryReloginUpdatesOnlyActiveCredential(t *testing.T) {
 	endpoint := newLifecycleTokenEndpoint(t)
-	server, manager, activeStore := newOAuthLifecycleServer(t, endpoint)
+	server, _, activeStore := newOAuthLifecycleServer(t, endpoint)
 
 	first := startOAuthLifecycle(t, server, "{}")
 	firstState, _ := first["state"].(string)
@@ -256,20 +257,17 @@ func TestOAuthLifecycleOrdinaryReloginUpdatesOnlyActiveCredential(t *testing.T) 
 	reloginState, _ := relogin["state"].(string)
 	callbackLifecycleState(t, server, reloginState, "ordinary-relogin-code")
 
-	accounts := activeStore.List()
+	accounts := testStoreAccounts(activeStore)
 	if len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "ordinary-relogin-code") {
 		t.Fatalf("ordinary re-login active accounts=%#v", accounts)
 	}
-	status, err := manager.Status()
-	if err != nil {
-		t.Fatal(err)
-	}
+	status := testOAuthProfileStatus(t, activeStore.Path())
 	if status.ActiveProfileID != "legacy" || status.PreviousProfileID != "" || len(status.Profiles) != 1 {
 		t.Fatalf("ordinary re-login created or promoted a staged profile: %#v", status)
 	}
 }
 
-func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
+func TestOAuthLifecycleRefreshRestartAndRemoval(t *testing.T) {
 	endpoint := newLifecycleTokenEndpoint(t)
 	server, manager, activeStore := newOAuthLifecycleServer(t, endpoint)
 	observations := []oauthLifecycleObservation{}
@@ -300,10 +298,10 @@ func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
 	if !ok {
 		t.Fatal("staged account missing")
 	}
-	if _, err := stagedStore.EnsureValid(stagedAccount.ID); err != nil {
+	if _, err := stagedStore.EnsureValidContext(context.Background(), stagedAccount.ID); err != nil {
 		t.Fatal(err)
 	}
-	refreshedAccounts := stagedStore.List()
+	refreshedAccounts := testStoreAccounts(stagedStore)
 	if len(refreshedAccounts) != 1 || !strings.Contains(refreshedAccounts[0].AccessToken, "refresh-success") || refreshedAccounts[0].RefreshToken != "refresh-success-next" {
 		t.Fatalf("refreshed staged accounts=%#v", refreshedAccounts)
 	}
@@ -320,7 +318,7 @@ func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if accounts := restartedStore.List(); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "refresh-success") {
+	if accounts := testStoreAccounts(restartedStore); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "refresh-success") {
 		t.Fatalf("restart lost staged profile state=%#v", accounts)
 	}
 	observations = append(observations, oauthLifecycleObservation{State: "restart_persistence", Outcome: "success"})
@@ -333,11 +331,11 @@ func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
 	if !ok || removedStore.Delete(removedAccount.ID) != nil {
 		t.Fatal("staged account removal failed")
 	}
-	if len(removedStore.List()) != 0 {
-		t.Fatalf("staged account removal did not persist: %#v", removedStore.List())
+	if accounts := testStoreAccounts(removedStore); len(accounts) != 0 {
+		t.Fatalf("staged account removal did not persist: %#v", accounts)
 	}
-	if len(activeStore.List()) != 1 {
-		t.Fatalf("staged account removal changed active store: %#v", activeStore.List())
+	if accounts := testStoreAccounts(activeStore); len(accounts) != 1 {
+		t.Fatalf("staged account removal changed active store: %#v", accounts)
 	}
 	observations = append(observations, oauthLifecycleObservation{State: "account_removal", Outcome: "success"})
 
@@ -351,59 +349,10 @@ func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if accounts := restoredStore.List(); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "post-removal-reauth") {
+	if accounts := testStoreAccounts(restoredStore); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "post-removal-reauth") {
 		t.Fatalf("post-removal reauth accounts=%#v", accounts)
 	}
 	observations = append(observations, oauthLifecycleObservation{State: "account_removal_reauth", Outcome: "success"})
-
-	for _, step := range []auth.OAuthProfileValidationStep{
-		auth.OAuthProfileValidationChatHub,
-		auth.OAuthProfileValidationRefresh,
-		auth.OAuthProfileValidationRestart,
-		auth.OAuthProfileValidationRemoval,
-	} {
-		if _, err := reopened.RecordValidation(stagedID, step); err != nil {
-			t.Fatal(err)
-		}
-	}
-	promoted, err := reopened.Promote(stagedID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if promoted.ActiveProfileID != stagedID || promoted.PreviousProfileID != "legacy" {
-		t.Fatalf("promoted pointer=%#v", promoted)
-	}
-	promotedRestart, err := auth.OpenOAuthProfileManager(activeStore.Path(), lifecycleOAuthConfig(endpoint.server.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	activeManifest, promotedStore, err := promotedRestart.ActiveStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if activeManifest.ProfileID != stagedID || len(promotedStore.List()) != 1 {
-		t.Fatalf("promoted restart state manifest=%#v accounts=%#v", activeManifest, promotedStore.List())
-	}
-
-	rolledBack, err := promotedRestart.Rollback()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rolledBack.ActiveProfileID != "legacy" || rolledBack.PreviousProfileID != stagedID {
-		t.Fatalf("rollback pointer=%#v", rolledBack)
-	}
-	rollbackRestart, err := auth.OpenOAuthProfileManager(activeStore.Path(), lifecycleOAuthConfig(endpoint.server.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rollbackManifest, rollbackStore, err := rollbackRestart.ActiveStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rollbackManifest.ProfileID != "legacy" || len(rollbackStore.List()) != 1 || !strings.Contains(rollbackStore.List()[0].AccessToken, "accepted-login") {
-		t.Fatalf("rollback restart state manifest=%#v accounts=%#v", rollbackManifest, rollbackStore.List())
-	}
-	observations = append(observations, oauthLifecycleObservation{State: "rollback", Outcome: "success"})
 
 	failedReauth := startOAuthLifecycle(t, server, `{"stageActive":true}`)
 	failedID, _ := failedReauth["oauthProfileId"].(string)
@@ -417,7 +366,7 @@ func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
 	if !ok {
 		t.Fatal("failed staged account missing")
 	}
-	if _, err := failedStore.EnsureValid(failedAccount.ID); err == nil {
+	if _, err := failedStore.EnsureValidContext(context.Background(), failedAccount.ID); err == nil {
 		t.Fatal("refresh failure unexpectedly succeeded")
 	}
 	if err := manager.Discard(failedID); err != nil {
@@ -442,7 +391,7 @@ func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if accounts := recoveryStore.List(); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "refresh-recovery-code") {
+	if accounts := testStoreAccounts(recoveryStore); len(accounts) != 1 || !strings.Contains(accounts[0].AccessToken, "refresh-recovery-code") {
 		t.Fatalf("refresh recovery staged accounts=%#v", accounts)
 	}
 	if got, err := os.ReadFile(activeStore.Path()); err != nil || string(got) != string(acceptedBefore) {
@@ -459,7 +408,7 @@ func TestOAuthLifecycleRefreshRestartRemovalAndRollback(t *testing.T) {
 			t.Fatalf("lifecycle report leaked %q: %s", forbidden, report)
 		}
 	}
-	const expectedReport = `[{"state":"first_login","outcome":"success"},{"state":"reauth","outcome":"success"},{"state":"refresh_success","outcome":"success"},{"state":"restart_persistence","outcome":"success"},{"state":"account_removal","outcome":"success"},{"state":"account_removal_reauth","outcome":"success"},{"state":"rollback","outcome":"success"},{"state":"refresh_failure","outcome":"failed","code":"token_refresh_error"},{"state":"refresh_recovery","outcome":"success"}]`
+	const expectedReport = `[{"state":"first_login","outcome":"success"},{"state":"reauth","outcome":"success"},{"state":"refresh_success","outcome":"success"},{"state":"restart_persistence","outcome":"success"},{"state":"account_removal","outcome":"success"},{"state":"account_removal_reauth","outcome":"success"},{"state":"refresh_failure","outcome":"failed","code":"token_refresh_error"},{"state":"refresh_recovery","outcome":"success"}]`
 	if string(report) != expectedReport {
 		t.Fatalf("lifecycle report=%s want=%s", report, expectedReport)
 	}

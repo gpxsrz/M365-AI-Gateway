@@ -224,7 +224,7 @@ func TestRootPageServesLocalizedTemplates(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedRootInjectsCompatibilitySettingsAsset(t *testing.T) {
+func TestAuthenticatedRootContainsCompatibilitySettings(t *testing.T) {
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -245,17 +245,19 @@ func TestAuthenticatedRootInjectsCompatibilitySettingsAsset(t *testing.T) {
 	request.AddCookie(&http.Cookie{Name: "m365_admin_session", Value: "localized-admin"})
 	recorder := httptest.NewRecorder()
 	s.rootPage(recorder, request)
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `<script src="/assets/compat-settings.js"></script>`) {
-		t.Fatalf("compatibility settings asset was not injected: status=%d body=%s", recorder.Code, recorder.Body.String())
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("authenticated management page status=%d body=%s", recorder.Code, body)
 	}
-
-	asset := httptest.NewRecorder()
-	s.compatibilitySettingsScript(asset, httptest.NewRequest(http.MethodGet, "/assets/compat-settings.js", nil))
-	if asset.Code != http.StatusOK || !strings.HasPrefix(asset.Header().Get("Content-Type"), "text/javascript") || !strings.Contains(asset.Body.String(), "interactiveMaxConcurrent") || !strings.Contains(asset.Body.String(), "interactiveQueueTimeoutSeconds") {
-		t.Fatalf("compatibility settings asset is unavailable: status=%d type=%q body=%s", asset.Code, asset.Header().Get("Content-Type"), asset.Body.String())
+	for _, required := range []string{"interactiveMaxConcurrent", "interactiveQueueTimeoutSeconds", "checkpointPersistence", "sharedCooldownUntil", `id="sidebarVersion"`, `$('sidebarVersion').textContent=version`} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("authenticated management page missing %q", required)
+		}
+	}
+	if strings.Contains(body, "/assets/compat-settings.js") {
+		t.Fatal("authenticated management page still depends on compatibility overlay asset")
 	}
 }
-
 func TestCanonicalManagementIdentifiersRemainEnglish(t *testing.T) {
 	expected := map[string][]string{
 		"web/index.html": {"expiresAt", "updatedAt", "durationMs"},
@@ -301,17 +303,6 @@ func TestLocalizedAdministrationInlineJavaScriptIsValid(t *testing.T) {
 		if output, err := exec.Command(node, "--check", jsPath).CombinedOutput(); err != nil {
 			t.Fatalf("%s localized JavaScript is invalid: %v\n%s", path, err, output)
 		}
-	}
-	raw, err := os.ReadFile(filepath.Join("assets", "compat-settings.js"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	jsPath := filepath.Join(t.TempDir(), "compat-settings.js")
-	if err := os.WriteFile(jsPath, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if output, err := exec.Command(node, "--check", jsPath).CombinedOutput(); err != nil {
-		t.Fatalf("embedded compatibility settings JavaScript is invalid: %v\n%s", err, output)
 	}
 }
 

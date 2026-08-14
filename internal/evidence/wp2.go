@@ -173,11 +173,6 @@ func WP2VerifiableCapabilityIDs() []string {
 	return append([]string(nil), wp2VerifiableCapabilityOrder...)
 }
 
-func IsWP2VerifiableCapability(capabilityID string) bool {
-	_, ok := wp2VerifiableCapabilities[capabilityID]
-	return ok
-}
-
 var forbiddenPrivacyFields = map[string]string{
 	"token":               "token",
 	"accesstoken":         "token",

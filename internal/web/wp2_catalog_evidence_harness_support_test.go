@@ -14,6 +14,7 @@ import (
 
 	committedevidence "m365-native/docs/wp2/evidence"
 	"m365-native/internal/evidence"
+	offlineevidence "m365-native/internal/evidence/offline"
 )
 
 type WP2CatalogEvidenceHarnessOptions struct {
@@ -67,7 +68,7 @@ func WP2CatalogHarnessEffectiveSettingsSHA256() string {
 }
 
 func BuildWP2CatalogEvidenceSet(options WP2CatalogEvidenceHarnessOptions) (evidence.CatalogEvidenceSetV1, error) {
-	if err := evidence.ValidateCatalogEvidenceBinding(options.Binding); err != nil {
+	if err := offlineevidence.ValidateCatalogEvidenceBinding(options.Binding); err != nil {
 		return evidence.CatalogEvidenceSetV1{}, err
 	}
 	if options.Binding.DirtyContentSHA256 != "" {

@@ -102,10 +102,6 @@ type ProvisionalClaimBuildInput struct {
 	HistoricalInventorySHA256 string
 }
 
-type ProvisionalClaimInventoryExpected struct {
-	Input ProvisionalClaimBuildInput
-}
-
 type provisionalClaimInventoryExpected struct {
 	Input       ProvisionalClaimBuildInput
 	Policies    []provisionalClaimPolicyV1
@@ -161,66 +157,6 @@ var provisionalClaimNonCapabilityFieldsV1 = map[string]struct{}{
 	"priority":               {},
 	"capabilities":           {},
 	"account_dependent":      {},
-}
-
-var provisionalClaimPoliciesV1 = []provisionalClaimPolicyV1{
-	{ClaimID: "api_availability", PublicSurface: "catalog_compatibility", FieldPaths: []string{"supported_in_api"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "broad_catalog_default_not_scoped_evidence", HistoricalCapabilityIDs: []string{"model_catalog"}, DeferredOwner: "catalog_capability_matrix"},
-	{ClaimID: "apply_patch", PublicSurface: "catalog_compatibility", FieldPaths: []string{"apply_patch_tool_type"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "advanced_tool_deferred", HistoricalCapabilityIDs: []string{"apply_patch_freeform_tool"}, DeferredOwner: "advanced_tool_capability"},
-	{ClaimID: "availability_metadata", PublicSurface: "catalog_compatibility", FieldPaths: []string{"availability_nux", "upgrade"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "compatibility_metadata_not_wp2_evidence", HistoricalCapabilityIDs: []string{"model_catalog"}, DeferredOwner: "catalog_capability_matrix"},
-	{ClaimID: "basic_text_delivery", PublicSurface: "accepted_catalog_projection", Disposition: ProvisionalClaimEvidenceBacked, RationaleCode: "accepted_wp2_scoped_evidence", AcceptedCapabilityID: "basic_text_delivery"},
-	{ClaimID: "chat_completions_compatibility", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.chat_completions"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "broad_boolean_exceeds_scoped_evidence", HistoricalCapabilityIDs: []string{"nonstream_text"}, DeferredOwner: "protocol_capability_matrix"},
-	{ClaimID: "context_window", PublicSurface: "catalog_compatibility", FieldPaths: []string{"context_window", "effective_context_window_percent", "max_context_window", "truncation_policy.limit", "truncation_policy.mode"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "configured_limit_not_upstream_capability", HistoricalCapabilityIDs: []string{"context_boundary", "context_overflow_rejection"}, DeferredOwner: "resource_contract"},
-	{ClaimID: "experimental_tools", PublicSurface: "catalog_compatibility", FieldPaths: []string{"experimental_supported_tools"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "empty_compatibility_default_not_verification", HistoricalCapabilityIDs: []string{"model_catalog"}, DeferredOwner: "advanced_tool_capability"},
-	{ClaimID: "feature_advertisement_bundle", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.supported_features", "supported_features"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "aggregate_compatibility_default_not_verification", HistoricalCapabilityIDs: []string{"model_catalog"}, DeferredOwner: "advanced_capability_matrix"},
-	{ClaimID: "file_attachment", PublicSurface: "protocol_behavior", Disposition: ProvisionalClaimUnverified, RationaleCode: "attachment_failure_not_account_isolated", HistoricalCapabilityIDs: []string{"file_attachment"}, DeferredOwner: "files_capability"},
-	{ClaimID: "file_read_api", PublicSurface: "http_endpoint", Disposition: ProvisionalClaimUnsupported, RationaleCode: "accepted_sidecar_endpoint_absent", HistoricalCapabilityIDs: []string{"file_read_api"}, DeferredOwner: "files_capability"},
-	{ClaimID: "file_upload_api", PublicSurface: "http_endpoint", Disposition: ProvisionalClaimUnsupported, RationaleCode: "accepted_sidecar_endpoint_absent", HistoricalCapabilityIDs: []string{"file_upload_api"}, DeferredOwner: "files_capability"},
-	{ClaimID: "function_calling", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.function_calling", "capabilities.supports_function_calling", "function_calling", "supports_function_calling"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "implemented_outside_wp2_acceptance", HistoricalCapabilityIDs: []string{"function_calling", "responses_function_calling"}, DeferredOwner: "advanced_tool_capability"},
-	{ClaimID: "image_detail_original", PublicSurface: "catalog_compatibility", FieldPaths: []string{"supports_image_detail_original"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "accepted_defect_does_not_verify_semantics", HistoricalCapabilityIDs: []string{"image_detail_original"}, DeferredOwner: "vision_capability"},
-	{ClaimID: "image_generation", PublicSurface: "protocol_behavior", Disposition: ProvisionalClaimUnverified, RationaleCode: "failure_not_sidecar_or_account_isolated", HistoricalCapabilityIDs: []string{"image_generation"}, DeferredOwner: "image_generation_capability"},
-	{ClaimID: "input_limit", PublicSurface: "catalog_compatibility", FieldPaths: []string{"max_input_tokens"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "configured_limit_not_upstream_capability", HistoricalCapabilityIDs: []string{"context_overflow_rejection"}, DeferredOwner: "resource_contract"},
-	{ClaimID: "modalities", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.input_modalities", "capabilities.modalities", "capabilities.output_modalities", "input_modalities", "modalities", "output_modalities"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "aggregate_modalities_not_scoped_evidence", HistoricalCapabilityIDs: []string{"vision_image_input"}, DeferredOwner: "multimodal_capability"},
-	{ClaimID: "multi_agent", PublicSurface: "catalog_compatibility", FieldPaths: []string{"multi_agent_version"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "consumer_mode_not_wp2_evidence", DeferredOwner: "multi_agent_capability"},
-	{ClaimID: "native_search_grounding", PublicSurface: "protocol_behavior", Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "observed_implementation_outside_wp2_acceptance", HistoricalCapabilityIDs: []string{"bing_web_search", "custom_exec_native_search_preservation"}, DeferredOwner: "native_search_capability"},
-	{ClaimID: "output_limit", PublicSurface: "catalog_compatibility", FieldPaths: []string{"max_output_tokens"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "configured_limit_enforcement_not_accepted", HistoricalCapabilityIDs: []string{"max_tokens_enforcement", "output_boundary"}, DeferredOwner: "resource_contract"},
-	{ClaimID: "parallel_tool_calls", PublicSurface: "catalog_compatibility", FieldPaths: []string{"supports_parallel_tool_calls"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "single_call_does_not_prove_parallel_support", HistoricalCapabilityIDs: []string{"parallel_tool_calls"}, DeferredOwner: "advanced_tool_capability"},
-	{ClaimID: "protocol_transport", PublicSurface: "accepted_catalog_projection", Disposition: ProvisionalClaimEvidenceBacked, RationaleCode: "accepted_wp2_scoped_evidence", AcceptedCapabilityID: "protocol_transport"},
-	{ClaimID: "reasoning_enhancement", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.reasoning", "capabilities.reasoning_efforts", "capabilities.supported_reasoning_levels", "supported_reasoning_levels"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "accepted_values_do_not_prove_semantic_effect", HistoricalCapabilityIDs: []string{"reasoning_levels"}, DeferredOwner: "reasoning_capability"},
-	{ClaimID: "reasoning_summaries", PublicSurface: "catalog_compatibility", FieldPaths: []string{"default_reasoning_summary", "supports_reasoning_summaries"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "advanced_parameter_deferred", HistoricalCapabilityIDs: []string{"reasoning_summary"}, DeferredOwner: "reasoning_capability"},
-	{ClaimID: "reasoning_tone_routing", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.reasoning_mode", "default_reasoning_level"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "implemented_mapping_not_semantic_verification", HistoricalCapabilityIDs: []string{"auto_route_reasoning_invariance", "invalid_reasoning_rejection", "reasoning_levels"}, DeferredOwner: "reasoning_capability"},
-	{ClaimID: "responses_compatibility", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.responses", "use_responses_lite"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "broad_boolean_exceeds_scoped_evidence", HistoricalCapabilityIDs: []string{"responses_nonstream"}, DeferredOwner: "protocol_capability_matrix"},
-	{ClaimID: "route_identity", PublicSurface: "accepted_catalog_projection", Disposition: ProvisionalClaimEvidenceBacked, RationaleCode: "accepted_wp2_scoped_evidence", AcceptedCapabilityID: "route_identity"},
-	{ClaimID: "route_mapping", PublicSurface: "accepted_catalog_projection", Disposition: ProvisionalClaimEvidenceBacked, RationaleCode: "accepted_wp2_scoped_evidence", AcceptedCapabilityID: "route_mapping"},
-	{ClaimID: "search_tool_compatibility", PublicSurface: "catalog_compatibility", FieldPaths: []string{"supports_search_tool", "web_search_tool_type"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "native_search_is_not_openai_tool_semantics", HistoricalCapabilityIDs: []string{"openai_web_search_tool"}, DeferredOwner: "native_search_capability"},
-	{ClaimID: "service_tiers", PublicSurface: "catalog_compatibility", FieldPaths: []string{"additional_speed_tiers", "service_tiers"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "empty_compatibility_default_not_verification", HistoricalCapabilityIDs: []string{"model_catalog"}, DeferredOwner: "catalog_capability_matrix"},
-	{ClaimID: "shell_tool", PublicSurface: "catalog_compatibility", FieldPaths: []string{"shell_type", "tool_mode"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "implemented_outside_wp2_acceptance", HistoricalCapabilityIDs: []string{"responses_custom_exec_tool"}, DeferredOwner: "advanced_tool_capability"},
-	{ClaimID: "skills_usage_instructions", PublicSurface: "catalog_compatibility", FieldPaths: []string{"include_skills_usage_instructions"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "consumer_mode_not_wp2_evidence", DeferredOwner: "catalog_capability_matrix"},
-	{ClaimID: "streaming_compatibility", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.streaming"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "streaming_tests_not_wp2_acceptance", HistoricalCapabilityIDs: []string{"anthropic_streaming", "chat_streaming", "responses_streaming"}, DeferredOwner: "protocol_capability_matrix"},
-	{ClaimID: "tool_calling", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.supports_tools", "capabilities.tool_calls", "capabilities.tools", "supports_tools", "tool_calls"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "implemented_outside_wp2_acceptance", HistoricalCapabilityIDs: []string{"anthropic_tool_calling", "function_calling", "responses_custom_exec_tool", "responses_function_calling"}, DeferredOwner: "advanced_tool_capability"},
-	{ClaimID: "tool_result_continuation", PublicSurface: "protocol_behavior", Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "accepted_by_other_workflow_not_wp2", HistoricalCapabilityIDs: []string{"anthropic_tool_result_continuation", "responses_tool_result_continuation", "tool_result_continuation"}, DeferredOwner: "tool_result_continuation_workflow"},
-	{ClaimID: "verbosity", PublicSurface: "catalog_compatibility", FieldPaths: []string{"default_verbosity", "support_verbosity"}, Disposition: ProvisionalClaimUnverified, RationaleCode: "advanced_parameter_deferred", HistoricalCapabilityIDs: []string{"verbosity_control"}, DeferredOwner: "reasoning_capability"},
-	{ClaimID: "vision_image_input", PublicSurface: "catalog_compatibility", FieldPaths: []string{"capabilities.supports_vision", "capabilities.vision", "supports_vision", "vision"}, Disposition: ProvisionalClaimImplementedUnaccepted, RationaleCode: "historical_pass_not_wp2_acceptance", HistoricalCapabilityIDs: []string{"vision_image_input"}, DeferredOwner: "vision_capability"},
-}
-
-func AcceptedWP1ProvisionalClaimSourceIdentity() ProvisionalClaimSourceIdentityV1 {
-	return ProvisionalClaimSourceIdentityV1{
-		Commit: acceptedWP1ProvisionalClaimCommitV1,
-		Path:   acceptedWP1ProvisionalClaimPathV1,
-		Bytes:  acceptedWP1ProvisionalClaimBytesV1,
-		SHA256: acceptedWP1ProvisionalClaimSHA256V1,
-	}
-}
-
-func BuildProvisionalClaimInventory(input ProvisionalClaimBuildInput) (ValidatedProvisionalClaimInventory, error) {
-	return buildProvisionalClaimInventory(input, provisionalClaimPoliciesV1, AcceptedWP1ProvisionalClaimSourceIdentity())
-}
-
-func ValidateProvisionalClaimInventory(raw []byte, expected ProvisionalClaimInventoryExpected) (ValidatedProvisionalClaimInventory, error) {
-	return validateProvisionalClaimInventory(raw, provisionalClaimInventoryExpected{
-		Input:       expected.Input,
-		Policies:    provisionalClaimPoliciesV1,
-		ExpectedWP1: AcceptedWP1ProvisionalClaimSourceIdentity(),
-	})
 }
 
 func buildProvisionalClaimInventory(input ProvisionalClaimBuildInput, policies []provisionalClaimPolicyV1, expectedWP1 ProvisionalClaimSourceIdentityV1) (ValidatedProvisionalClaimInventory, error) {

@@ -1,10 +1,12 @@
-package evidence
+package evidence_test
 
 import (
 	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	. "m365-native/internal/evidence/offline"
 )
 
 func TestBuildNativeSearchRegressionPackageIsDeterministicClosedAndScoped(t *testing.T) {
@@ -157,7 +159,7 @@ func nativeSearchRegressionTestObservations() []NativeSearchRegressionObservatio
 				Schema:                    NativeSearchRegressionObservationSchemaV1,
 				CaseID:                    caseID,
 				Protocol:                  protocol,
-				EndpointPath:              nativeSearchRegressionEndpoint(protocol),
+				EndpointPath:              NativeSearchRegressionEndpoint(protocol),
 				HTTPStatus:                200,
 				Terminal:                  terminal,
 				ClientToolsCount:          tools,

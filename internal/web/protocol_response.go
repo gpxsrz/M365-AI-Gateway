@@ -111,15 +111,6 @@ func projectAnthropicResult(src map[string]any) (anthropicResultProjection, erro
 	return anthropicResultProjection{blocks: blocks, stop: stop}, nil
 }
 
-func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src map[string]any) error {
-	projection, err := projectAnthropicResult(src)
-	if err != nil {
-		return err
-	}
-	writeAnthropicProjection(w, model, stream, src, projection)
-	return nil
-}
-
 func writeAnthropicProjection(w http.ResponseWriter, model string, stream bool, src map[string]any, projection anthropicResultProjection) {
 	id := "msg_" + uuid.NewString()
 	metadata := anthropicM365Metadata(src)

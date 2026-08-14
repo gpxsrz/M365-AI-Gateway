@@ -63,10 +63,7 @@ func newPKCECallbackServer(t *testing.T, redirect string, now time.Time, tokenSt
 	t.Setenv("M365_REDIRECT_URI", redirect)
 	t.Setenv("M365_TOKEN_ENDPOINT", tokenStub.server.URL)
 	dir := t.TempDir()
-	store, err := auth.OpenStore(filepath.Join(dir, "accounts.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := testOpenAuthStore(t, filepath.Join(dir, "accounts.json"), auth.CurrentOAuthConfig())
 	return &Server{
 		tokens: store,
 		pkce: map[string]pendingPKCE{
