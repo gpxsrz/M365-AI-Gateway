@@ -231,6 +231,49 @@ func (s *transportCheckpointStore) persistRecordLocked(record *transportCheckpoi
 	return nil
 }
 
+func (s *transportCheckpointStore) persistRecordReplacingEvictedLocked(record, evicted *transportCheckpointRecord) error {
+	if record == nil || evicted == nil {
+		return ErrCheckpointPersistence
+	}
+	if err := s.ensureGenerationLocked(); err != nil {
+		return err
+	}
+	raw, err := encodeCheckpointRecordFile(record)
+	if err != nil {
+		return err
+	}
+	evictedSize := s.recordBytes[evicted.ID]
+	newTotal := s.persistedBytes - evictedSize + int64(len(raw))
+	if newTotal > transportCheckpointMaxFileBytes {
+		return ErrCheckpointCapacity
+	}
+
+	// Publish the in-flight replacement before removing the evicted record.
+	// If writing fails, the old record and all accounting stay untouched. If a
+	// crash lands between the write and delete, startup discards the in-flight
+	// replacement and keeps the old accepted record. A crash after the delete
+	// can only leave one fewer reusable checkpoint.
+	newPath := checkpointRecordPath(s.path, s.generation, record.ID)
+	if err := writeCheckpointFileAtomic(newPath, raw); err != nil {
+		return fmt.Errorf("%w: write replacement record: %v", ErrCheckpointPersistence, err)
+	}
+	evictedPath := checkpointRecordPath(s.path, s.generation, evicted.ID)
+	if err := os.Remove(evictedPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(newPath)
+		_ = syncCheckpointDirectory(checkpointGenerationPath(s.path, s.generation))
+		return fmt.Errorf("%w: delete evicted record: %v", ErrCheckpointPersistence, err)
+	}
+	if s.recordBytes == nil {
+		s.recordBytes = make(map[string]int64)
+	}
+	delete(s.recordBytes, evicted.ID)
+	s.recordBytes[record.ID] = int64(len(raw))
+	s.persistedBytes = newTotal
+	s.noteCheckpointExpiryLocked(record)
+	_ = syncCheckpointDirectory(checkpointGenerationPath(s.path, s.generation))
+	return nil
+}
+
 func (s *transportCheckpointStore) deleteRecordLocked(recordID string) error {
 	if s.generation == "" {
 		delete(s.recordBytes, recordID)

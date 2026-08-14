@@ -172,7 +172,7 @@ func TestTransportCheckpointExistingTurnPersistsOnlyTouchedRecordNearCapacity(t 
 	_ = turn.Abort()
 }
 
-func TestTransportCheckpointCapacityReusesUnchangedRecordFiles(t *testing.T) {
+func TestTransportCheckpointCapacityReplacesOnlyEvictedRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "checkpoints", "transport.json")
 	store, err := openTransportCheckpointStore(path)
 	if err != nil {
@@ -208,6 +208,7 @@ func TestTransportCheckpointCapacityReusesUnchangedRecordFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	snapshotBefore := store.persistenceSnapshot()
 
 	turn, err := store.BeginFull("hermes", "owner", "new-key", []oaiMsg{{Role: "user", Content: "new"}}, false)
 	if err != nil {
@@ -216,10 +217,10 @@ func TestTransportCheckpointCapacityReusesUnchangedRecordFiles(t *testing.T) {
 	store.mu.Lock()
 	newGeneration := store.generation
 	store.mu.Unlock()
-	if newGeneration == oldGeneration {
-		t.Fatal("capacity eviction did not atomically switch checkpoint generation")
+	if newGeneration != oldGeneration {
+		t.Fatalf("capacity eviction rotated checkpoint generation from %q to %q", oldGeneration, newGeneration)
 	}
-	stableAfter, err := os.Stat(checkpointRecordPath(path, newGeneration, stableID))
+	stableAfter, err := os.Stat(checkpointRecordPath(path, oldGeneration, stableID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +228,7 @@ func TestTransportCheckpointCapacityReusesUnchangedRecordFiles(t *testing.T) {
 		t.Fatal("capacity eviction rewrote an unchanged checkpoint record")
 	}
 	snapshot := store.persistenceSnapshot()
-	if snapshot.RecordCount != transportCheckpointMaxRecords || snapshot.LastGenerationRecordCount != transportCheckpointMaxRecords || snapshot.LastGenerationReusedRecordCount != transportCheckpointMaxRecords-1 || snapshot.LastGenerationWrittenRecordCount != 1 {
+	if snapshot.RecordCount != transportCheckpointMaxRecords || snapshot.GenerationSwitchCount != snapshotBefore.GenerationSwitchCount {
 		t.Fatalf("unexpected checkpoint persistence snapshot after capacity eviction: %#v", snapshot)
 	}
 	acceptForTest(t, turn, "conversation-new", "session-new", []oaiMsg{{Role: "assistant", Content: "answer"}}, "")

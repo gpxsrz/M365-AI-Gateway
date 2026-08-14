@@ -1769,29 +1769,34 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if responseFormat != nil {
 		formatted, formatErr := validateResponseFormatText(res.Text, responseFormat)
 		if formatErr != nil && memoryCompatibilityRequest(r.URL.Path) && responseFormat.Type == "json_schema" {
-			if _, candidateErr := decodeExactJSONValue([]byte(normalizeJSONText(res.Text))); candidateErr == nil {
-				repairPrompt := memorySchemaRepairPrompt(res.Text, responseFormat, formatErr)
-				if budgetErr := validateCallerString(repairPrompt, settings.TextInputLimitUTF16); budgetErr != nil {
-					writeOpenAITextPolicyError(w, r, budgetErr)
-					return
-				}
-				repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, ToolChoice: "none", DisableBuiltInSearch: true}))
-				if repairErr != nil {
-					if writeCanonicalTerminalError(w, repairErr) {
+			if candidate, ok := memoryStructuredJSONCandidate(res.Text); ok {
+				formatted, formatErr = validateResponseFormatText(candidate, responseFormat)
+				if formatErr == nil {
+					res.Text = candidate
+				} else {
+					repairPrompt := memorySchemaRepairPrompt(candidate, responseFormat, formatErr)
+					if budgetErr := validateCallerString(repairPrompt, settings.TextInputLimitUTF16); budgetErr != nil {
+						writeOpenAITextPolicyError(w, r, budgetErr)
 						return
 					}
-				} else {
-					execution.Observe(repairRes)
-					if repaired, repairedErr := validateResponseFormatText(repairRes.Text, responseFormat); repairedErr == nil {
-						if factErr := memoryRepairPreservesFacts(res.Text, repaired, responseFormat); factErr == nil {
-							res = repairRes
-							formatted = repaired
-							formatErr = nil
-						} else {
-							formatErr = factErr
+					repairRes, repairErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: repairPrompt, Tone: tone, ToolChoice: "none", DisableBuiltInSearch: true}))
+					if repairErr != nil {
+						if writeCanonicalTerminalError(w, repairErr) {
+							return
 						}
 					} else {
-						formatErr = repairedErr
+						execution.Observe(repairRes)
+						if repaired, repairedErr := validateResponseFormatText(repairRes.Text, responseFormat); repairedErr == nil {
+							if factErr := memoryRepairPreservesFacts(candidate, repaired, responseFormat); factErr == nil {
+								res = repairRes
+								formatted = repaired
+								formatErr = nil
+							} else {
+								formatErr = factErr
+							}
+						} else {
+							formatErr = repairedErr
+						}
 					}
 				}
 			}

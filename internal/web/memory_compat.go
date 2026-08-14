@@ -141,6 +141,64 @@ func memorySchemaInstruction(format *responseFormat) string {
 		"Do not wrap the JSON in Markdown and do not add prose.\nJSON_SCHEMA:\n" + string(encoded)
 }
 
+func memoryStructuredJSONCandidate(text string) (string, bool) {
+	normalized := normalizeJSONText(text)
+	if _, err := decodeExactJSONValue([]byte(normalized)); err == nil {
+		return normalized, true
+	}
+
+	raw := []byte(normalized)
+	matchStart := -1
+	matchEnd := -1
+	match := ""
+	for i := 0; i < len(raw); i++ {
+		if !memoryWrappedJSONValueStart(raw[i]) || !memoryJSONValueBoundary(raw, i-1) {
+			continue
+		}
+		decoder := json.NewDecoder(bytes.NewReader(raw[i:]))
+		decoder.UseNumber()
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			continue
+		}
+		end := i + int(decoder.InputOffset())
+		if end <= i || !memoryJSONValueBoundary(raw, end) {
+			continue
+		}
+		candidate := strings.TrimSpace(string(raw[i:end]))
+		if _, err := decodeExactJSONValue([]byte(candidate)); err != nil {
+			continue
+		}
+		if matchStart >= 0 {
+			return "", false
+		}
+		matchStart, matchEnd, match = i, end, candidate
+		i = end - 1
+	}
+	if matchStart < 0 {
+		return "", false
+	}
+	if strings.ContainsAny(string(raw[:matchStart]), "{}[]") || strings.ContainsAny(string(raw[matchEnd:]), "{}[]") {
+		return "", false
+	}
+	return match, true
+}
+
+func memoryWrappedJSONValueStart(b byte) bool {
+	// Outside an exact JSON response, only containers have an unambiguous
+	// structural boundary. Bare strings, numbers, booleans, and null can occur
+	// naturally in prose and must not be promoted into a structured response.
+	return b == '{' || b == '['
+}
+
+func memoryJSONValueBoundary(raw []byte, index int) bool {
+	if index < 0 || index >= len(raw) {
+		return true
+	}
+	b := raw[index]
+	return !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_')
+}
+
 func memorySchemaRepairPrompt(invalidText string, format *responseFormat, validationErr error) string {
 	schema, _ := format.JSONSchema["schema"].(map[string]any)
 	encoded, _ := json.Marshal(schema)

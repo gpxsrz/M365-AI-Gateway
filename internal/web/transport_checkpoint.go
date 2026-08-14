@@ -447,7 +447,6 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 		s.records = snapshot
 		return nil, err
 	}
-	structuralChange = structuralChange || evicted
 	now := s.now()
 	recordID, err := newCheckpointID()
 	if err != nil {
@@ -469,6 +468,8 @@ func (s *transportCheckpointStore) beginFull(namespace, owner, key string, activ
 	s.records[record.ID] = record
 	if structuralChange {
 		err = s.persistLocked()
+	} else if evicted != nil {
+		err = s.persistRecordReplacingEvictedLocked(record, evicted)
 	} else {
 		err = s.persistRecordLocked(record)
 	}
@@ -767,9 +768,9 @@ func (s *transportCheckpointStore) uniqueLongestPrefixLocked(namespace, ownerDig
 	return selected, false
 }
 
-func (s *transportCheckpointStore) makeRoomLocked(ownerDigest string) (bool, error) {
+func (s *transportCheckpointStore) makeRoomLocked(ownerDigest string) (*transportCheckpointRecord, error) {
 	if len(s.records) < transportCheckpointMaxRecords {
-		return false, nil
+		return nil, nil
 	}
 	var ownerOldest *transportCheckpointRecord
 	var globalOldest *transportCheckpointRecord
@@ -789,10 +790,10 @@ func (s *transportCheckpointStore) makeRoomLocked(ownerDigest string) (bool, err
 		oldest = globalOldest
 	}
 	if oldest == nil {
-		return false, ErrCheckpointCapacity
+		return nil, ErrCheckpointCapacity
 	}
 	delete(s.records, oldest.ID)
-	return true, nil
+	return oldest, nil
 }
 
 func (s *transportCheckpointStore) pruneExpiredLocked() error {

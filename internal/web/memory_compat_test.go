@@ -1,11 +1,15 @@
 package web
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"m365-native/internal/chathub"
 )
 
 func TestCompatibilityNamespacesAreIsolated(t *testing.T) {
@@ -128,6 +132,208 @@ func TestMemorySchemaInstructionPinsProtocolKeys(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("instruction missing %q: %s", want, got)
 		}
+	}
+}
+
+type memoryWrappedJSONChat struct {
+	calls int
+	text  string
+}
+
+func (c *memoryWrappedJSONChat) Chat(_ context.Context, _ chathub.Account, _ chathub.Request) (chathub.Result, error) {
+	c.calls++
+	text := c.text
+	if text == "" {
+		text = "Here is the requested object:\n{\"city\":\"台中\"}"
+	}
+	return chathub.Result{
+		Text:           text,
+		ConversationID: "memory-wrapped-json",
+		SessionID:      "memory-wrapped-json-session",
+	}, nil
+}
+
+func (c *memoryWrappedJSONChat) ChatWithDelta(ctx context.Context, account chathub.Account, req chathub.Request, _ func(string) error) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func (c *memoryWrappedJSONChat) ChatWithEvents(ctx context.Context, account chathub.Account, req chathub.Request, _ chathub.StreamHandler) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func TestMemorySchemaAcceptsSingleJSONValueWrappedInProse(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-wrapped-json")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryWrappedJSONChat{}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"我住台中"}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if chat.calls != 1 {
+		t.Fatalf("chat calls=%d, want 1 deterministic extraction without repair", chat.calls)
+	}
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Choices) != 1 || response.Choices[0].Message.Content != `{"city":"台中"}` {
+		t.Fatalf("response did not return the extracted JSON only: %s", rr.Body.String())
+	}
+}
+
+func TestMemorySchemaRejectsMultipleWrappedJSONValuesWithoutRepair(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-multiple-json")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryWrappedJSONChat{text: "First:\n{\"city\":\"台中\"}\nSecond:\n{\"city\":\"新竹\"}"}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"我住台中"}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusBadGateway || !strings.Contains(rr.Body.String(), "response_format_validation_failed") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if chat.calls != 1 {
+		t.Fatalf("chat calls=%d, want 1 fail-closed response without repair", chat.calls)
+	}
+}
+
+func TestMemorySchemaIgnoresIncidentalScalarsAroundWrappedObject(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-numbered-wrapper")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryWrappedJSONChat{text: "1. The requested object is:\n{\"city\":\"台中\"}\nThis is true."}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"我住台中"}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK || chat.calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rr.Code, chat.calls, rr.Body.String())
+	}
+}
+
+func TestMemorySchemaDoesNotPromoteScalarFromProse(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-prose-scalar")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryWrappedJSONChat{text: "The count is 7."}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"count"}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"integer"}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusBadGateway || !strings.Contains(rr.Body.String(), "response_format_validation_failed") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if chat.calls != 1 {
+		t.Fatalf("chat calls=%d, want 1 fail-closed response without repair", chat.calls)
+	}
+}
+
+type memoryWrappedRepairChat struct {
+	calls   int
+	prompts []string
+}
+
+func (c *memoryWrappedRepairChat) Chat(_ context.Context, _ chathub.Account, req chathub.Request) (chathub.Result, error) {
+	c.calls++
+	c.prompts = append(c.prompts, req.Text)
+	if c.calls == 1 {
+		return chathub.Result{
+			Text:           "Here is the requested object:\n```json\n{\"城市\":\"台中\"}\n```",
+			ConversationID: "memory-wrapped-repair",
+			SessionID:      "memory-wrapped-repair-session",
+		}, nil
+	}
+	return chathub.Result{
+		Text:           `{"city":"台中"}`,
+		ConversationID: "memory-wrapped-repair",
+		SessionID:      "memory-wrapped-repair-session",
+	}, nil
+}
+
+func (c *memoryWrappedRepairChat) ChatWithDelta(ctx context.Context, account chathub.Account, req chathub.Request, _ func(string) error) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func (c *memoryWrappedRepairChat) ChatWithEvents(ctx context.Context, account chathub.Account, req chathub.Request, _ chathub.StreamHandler) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func TestMemorySchemaRepairUsesOnlyExtractedJSONCandidate(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-wrapped-repair")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryWrappedRepairChat{}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"我住台中"}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if chat.calls != 2 || len(chat.prompts) != 2 {
+		t.Fatalf("chat calls=%d prompts=%d, want one candidate plus one bounded repair", chat.calls, len(chat.prompts))
+	}
+	if strings.Contains(chat.prompts[1], "Here is the requested object") || strings.Contains(chat.prompts[1], "```json") {
+		t.Fatalf("repair prompt retained wrapper text: %s", chat.prompts[1])
+	}
+	if !strings.Contains(chat.prompts[1], "PREVIOUS_CANDIDATE:\n{\"城市\":\"台中\"}") {
+		t.Fatalf("repair prompt did not use the extracted candidate: %s", chat.prompts[1])
 	}
 }
 
