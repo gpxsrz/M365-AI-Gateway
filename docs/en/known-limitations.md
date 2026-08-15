@@ -12,7 +12,6 @@ This page lists current limitations only and intentionally avoids replaying the 
 8. **Tool-round ceilings**: generic/Memory and Hermes use different ceilings; Hermes 128 is still a runaway guard, not unlimited execution.
 9. **WebSocket retry**: retry is limited to transient dial / upgrade failures before the payload is sent; already-sent ChatHub requests are not blindly replayed.
 10. **Hindsight bank mission**: until Hermes upstream #18774 is fixed, bank-mission values may not synchronize to the live bank and require Banks API readback.
-11. **Deployment mixed-source (#69)**: current NAS deployment automation does not bind the binary and three `web/*.html` files into one indivisible artifact; a correct binary identity does not prove the UI is from the same source.
-12. **Web model / request-capability drift**: Microsoft Web selector and request capabilities can change independently of a sidecar release; an evidence snapshot is not a permanent capability contract.
+11. **Web model / request-capability drift**: Microsoft Web selector and request capabilities can change independently of a sidecar release; an evidence snapshot is not a permanent capability contract.
 
 See [`compatibility.md`](compatibility.md) for verification status.

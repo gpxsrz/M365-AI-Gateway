@@ -12,7 +12,6 @@
 8. **Tool-round ceiling**：generic/Memory 與 Hermes 有不同 ceiling；Hermes 128 仍是 runaway safety guard，不是無限執行。
 9. **WebSocket retry**：只涵蓋 payload 尚未送出前的 transient dial / upgrade；不對已送出的 ChatHub request 做盲目 replay。
 10. **Hindsight bank mission**：Hermes upstream #18774 修復前，`bank_mission` / `bank_retain_mission` 可能不會同步到 live bank，需以 Banks API readback 確認。
-11. **Deployment mixed-source (#69)**：current NAS deployment automation 尚未把 binary 與三個 `web/*.html` 綁成同一不可拆 artifact；binary identity 正確不代表管理 UI 同版。
-12. **Web model / request capability drift**：Microsoft Web selector 與 request capability 會隨 rollout 改變；evidence snapshot 不是永久 capabilities contract。
+11. **Web model / request capability drift**：Microsoft Web selector 與 request capability 會隨 rollout 改變；evidence snapshot 不是永久 capabilities contract。
 
 驗證狀態請讀 [`compatibility.md`](compatibility.md)。

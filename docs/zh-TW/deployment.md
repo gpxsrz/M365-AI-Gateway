@@ -19,15 +19,11 @@ web/debug.html
 
 因此 binary 與 Web assets 必須來自同一 intended commit，在同一部署視窗切換、同一 rollback set 還原，並在部署後逐一做 identity readback。
 
-### Current known gap: #69
+### Release-unit automation
 
-目前 `scripts/deploy-nas-production.sh` 仍以 binary 為主要部署物，尚未機械式綁定三個 Web assets。這可能形成「binary 是新 commit、管理 UI 還是舊檔」的 mixed-source runtime。
+`scripts/deploy-nas-production.sh` 將 binary 與固定三個 Web assets 打包成 deterministic release archive；manifest 綁定 exact commit、tree 與四個檔案的 SHA-256。部署端會先驗 archive／manifest／payload identity，再把四個 runtime 檔案納入同一 snapshot、同一停機視窗切換、同一 rollback，最後逐一讀回 SHA。
 
-在 #69 完成以前：
-
-- 不得把 binary SHA 正確視為整個 Production source identity 正確。
-- 部署後必須額外比對三個 Web asset SHA 與 intended commit。
-- 若 binary / Web 不同源，應視為 deployment 未完整收斂，而不是 UI 小問題。
+腳本採 non-interactive `sudo -n` privilege path，不接受 password-fed `sudo -S`。缺任一 Web asset、來源是 symlink、archive/hash/manifest 不一致或部署後 identity 不符時都 fail closed。
 
 ## Snapshot / rollback 原則
 

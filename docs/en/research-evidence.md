@@ -46,7 +46,7 @@ After `stream_options.include_usage` became a first-class request field, the old
 
 ### Deployment #69
 
-The Production server reads `web/index.html`, `web/login.html`, and `web/debug.html` from the filesystem. Current deployment automation primarily pins binary identity, and a mixed-source runtime has been observed where the binary was current while all three Web assets remained from older source. This is the direct evidence basis for #69.
+The Production server reads `web/index.html`, `web/login.html`, and `web/debug.html` from the filesystem. A mixed-source runtime was observed where the binary was current while all three Web assets remained from older source; that observation is the direct evidence basis for #69. The deployment helper now binds the binary and those three Web assets into one deterministic release, rollback, and identity-readback unit; see [`deployment.md`](deployment.md).
 
 ## Historical archive
 

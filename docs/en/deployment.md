@@ -19,15 +19,11 @@ web/debug.html
 
 Binary and Web assets therefore need to come from the same intended commit, switch in one deployment window, roll back as one set, and receive independent post-deploy identity checks.
 
-### Current known gap: #69
+### Release-unit automation
 
-`scripts/deploy-nas-production.sh` still treats the binary as the primary deployed artifact and does not yet mechanically bind the three Web assets. That can produce a mixed-source runtime where the binary is new but the management UI is stale.
+`scripts/deploy-nas-production.sh` packages the binary and the fixed three Web assets into a deterministic release archive. Its manifest binds the exact commit, tree, and SHA-256 of all four files. The remote side verifies the archive, manifest, and payload identities before placing all four runtime files in one snapshot, switching them in one stopped deployment window, rolling them back as one set, and independently reading back each SHA.
 
-Until #69 is complete:
-
-- a correct binary SHA does not prove full Production source identity;
-- post-deploy qualification must separately compare all three Web asset hashes with the intended commit;
-- binary/Web source mismatch is an incomplete deployment, not merely a cosmetic UI issue.
+The script uses the non-interactive `sudo -n` privilege path and does not accept password-fed `sudo -S`. A missing Web asset, symlinked source, archive/hash/manifest mismatch, or post-deploy identity mismatch fails closed.
 
 ## Snapshot and rollback
 

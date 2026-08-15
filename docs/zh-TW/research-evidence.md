@@ -46,7 +46,7 @@
 
 ### Deployment #69
 
-Production server 從 filesystem 讀取 `web/index.html`、`web/login.html`、`web/debug.html`。目前部署自動化主要固定 binary identity，因此曾觀察到 binary 已更新、三個 Web asset 仍停在舊 source 的 mixed-source runtime。這是 #69 的直接 evidence basis。
+Production server 從 filesystem 讀取 `web/index.html`、`web/login.html`、`web/debug.html`。過去曾觀察到 binary 已更新、三個 Web asset 仍停在舊 source 的 mixed-source runtime；這是 #69 的直接 evidence basis。部署 helper 現在已把 binary 與三個 Web assets 綁成同一 deterministic release、rollback 與 identity-readback unit；詳見 [`deployment.md`](deployment.md)。
 
 ## 歷史 archive
 
