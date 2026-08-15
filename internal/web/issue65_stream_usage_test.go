@@ -129,6 +129,58 @@ func TestIssue65BufferedStreamIncludesUsageBeforeDone(t *testing.T) {
 	}
 }
 
+func TestIssue68HermesBufferedToolContinuationPreservesOuterStreamUsage(t *testing.T) {
+	chat := &wp1CandidateChat{result: chathub.Result{Text: "The lookup result is available."}}
+	server := newWP1CandidateServer(t, chat)
+	settings := server.settings.get()
+	settings.ToolPlanningMode = "native"
+	server.settings.v = settings
+	body := `{
+		"model":"gpt-5.6-reasoning",
+		"stream":true,
+		"stream_options":{"include_usage":true},
+		"messages":[
+			{"role":"user","content":"Look up x."},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}
+			]},
+			{"role":"tool","tool_call_id":"call_lookup","content":"{\"answer\":\"ok\"}"},
+			{"role":"user","content":"Summarize the result without repeating the lookup."}
+		],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"lookup",
+				"description":"Look up a value.",
+				"parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}
+			}
+		}],
+		"tool_choice":"auto"
+	}`
+	rr := httptest.NewRecorder()
+	server.hermesOpenAIChat(rr, httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	objects, done := issue65SSEObjects(t, rr.Body.String())
+	if done != 1 {
+		t.Fatalf("[DONE] count=%d body=%s", done, rr.Body.String())
+	}
+	usageChunk := issue65UsageChunk(t, objects)
+	usage, _ := usageChunk["usage"].(map[string]any)
+	if usage["prompt_tokens"].(float64) <= 0 || usage["completion_tokens"].(float64) <= 0 {
+		t.Fatalf("buffered continuation usage=%#v", usage)
+	}
+	for _, object := range objects {
+		choices, _ := object["choices"].([]any)
+		if len(choices) > 0 {
+			if value, ok := object["usage"]; !ok || value != nil {
+				t.Fatalf("buffered continuation ordinary chunk lacks usage:null: %#v", object)
+			}
+		}
+	}
+}
+
 func TestIssue65StreamOptionsRequireStreamingAtHTTPBoundary(t *testing.T) {
 	chat := &wp1CandidateChat{result: chathub.Result{Text: "should-not-run"}}
 	server := newWP1CandidateServer(t, chat)

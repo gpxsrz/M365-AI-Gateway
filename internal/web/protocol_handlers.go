@@ -430,6 +430,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 
 func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []byte, int, error) {
 	o.Stream = false
+	o.StreamOptions = nil
 	b, _ := json.Marshal(o)
 	r2 := r.Clone(r.Context())
 	r2.Method = http.MethodPost
