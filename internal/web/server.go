@@ -1071,7 +1071,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[req-trace] id=%s stage=prompt_flattened prompt_len=%d attachments=%d", requestID, len(prompt), len(body.Attachments))
 	log.Printf("[multimodal-entry] messages=%d attachments=%d prompt_len=%d", len(body.Messages), len(body.Attachments), len(prompt))
 	prompt = strings.TrimSpace(prompt)
+	memoryCallerEvidence := ""
 	if memoryCompatibilityRequest(r.URL.Path) {
+		memoryCallerEvidence = prompt
 		prompt += memorySchemaInstruction(responseFormat)
 	}
 	if prompt != "" {
@@ -1777,27 +1779,47 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		res, formatted, formatErr, formatSource = validateResponseFormatResultEvidence(res, responseFormat)
 		log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=%t final_len=%d stream_len=%d canonical_len=%d", requestID, formatSource, res.TextRelation, formatErr == nil, len(res.FinalText), len(res.StreamedText), len(res.Text))
 		if formatErr != nil && memoryCompatibilityRequest(r.URL.Path) && responseFormat.Type == "json_schema" {
-			var (
-				repairCandidate string
-				repairFormatErr error
-			)
-			for _, evidence := range resultTextEvidenceCandidates(res) {
-				candidate, ok := memoryStructuredJSONCandidate(evidence.text)
-				if !ok {
-					continue
+			analysis := analyzeMemoryStructuredResponse(res, responseFormat)
+			repairCandidate := analysis.RepairCandidate
+			repairFormatErr := analysis.RepairFormatErr
+			if analysis.Valid {
+				res = analysis.Result
+				formatted = analysis.Formatted
+				formatErr = nil
+				log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=true extraction=single_json final_len=%d stream_len=%d canonical_len=%d", requestID, analysis.Source, res.TextRelation, len(res.FinalText), len(res.StreamedText), len(res.Text))
+			}
+			if formatErr != nil && repairCandidate == "" && analysis.EntirelyNonJSONText && memorySchemaAllowsStructuredReask(responseFormat) {
+				reaskPrompt := memorySchemaReaskPrompt(memoryCallerEvidence, responseFormat)
+				if budgetErr := validateCallerString(reaskPrompt, settings.TextInputLimitUTF16); budgetErr != nil {
+					writeOpenAITextPolicyError(w, r, budgetErr)
+					return
 				}
-				candidateFormatted, candidateErr := validateResponseFormatText(candidate, responseFormat)
-				if candidateErr == nil {
-					res.Text = candidate
-					res.TextSource = evidence.source
-					formatted = candidateFormatted
-					formatErr = nil
-					log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=true extraction=single_json final_len=%d stream_len=%d canonical_len=%d", requestID, evidence.source, res.TextRelation, len(res.FinalText), len(res.StreamedText), len(res.Text))
-					break
-				}
-				if repairCandidate == "" {
-					repairCandidate = candidate
-					repairFormatErr = candidateErr
+				reaskRes, reaskErr := s.chat.Chat(ctx, account, execution.Request(chathub.Request{Text: reaskPrompt, Tone: tone, Attachments: body.Attachments, ToolChoice: "none", DisableBuiltInSearch: true}))
+				if reaskErr != nil {
+					if writeCanonicalTerminalError(w, reaskErr) {
+						return
+					}
+				} else {
+					execution.Observe(reaskRes)
+					reaskRes, reasked, reaskedErr, reaskSource := validateResponseFormatResultEvidence(reaskRes, responseFormat)
+					log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=%t phase=reask final_len=%d stream_len=%d canonical_len=%d", requestID, reaskSource, reaskRes.TextRelation, reaskedErr == nil, len(reaskRes.FinalText), len(reaskRes.StreamedText), len(reaskRes.Text))
+					if reaskedErr == nil {
+						res = reaskRes
+						formatted = reasked
+						formatErr = nil
+					} else {
+						formatErr = reaskedErr
+						reaskAnalysis := analyzeMemoryStructuredResponse(reaskRes, responseFormat)
+						if reaskAnalysis.Valid {
+							res = reaskAnalysis.Result
+							formatted = reaskAnalysis.Formatted
+							formatErr = nil
+							log.Printf("[req-trace] id=%s stage=response_format_candidate source=%s relation=%s valid=true phase=reask extraction=single_json final_len=%d stream_len=%d canonical_len=%d", requestID, reaskAnalysis.Source, res.TextRelation, len(res.FinalText), len(res.StreamedText), len(res.Text))
+						} else if reaskAnalysis.RepairCandidate != "" {
+							repairCandidate = reaskAnalysis.RepairCandidate
+							repairFormatErr = reaskAnalysis.RepairFormatErr
+						}
+					}
 				}
 			}
 			if formatErr != nil && repairCandidate != "" {

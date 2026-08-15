@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"m365-native/internal/chathub"
 	"net/http"
 	"strconv"
 	"strings"
@@ -182,6 +183,78 @@ func memoryStructuredJSONCandidate(text string) (string, bool) {
 		return "", false
 	}
 	return match, true
+}
+
+type memoryStructuredResponseAnalysis struct {
+	Result              chathub.Result
+	Formatted           string
+	RepairCandidate     string
+	RepairFormatErr     error
+	Source              string
+	Valid               bool
+	EntirelyNonJSONText bool
+}
+
+func analyzeMemoryStructuredResponse(result chathub.Result, format *responseFormat) memoryStructuredResponseAnalysis {
+	analysis := memoryStructuredResponseAnalysis{Result: result, EntirelyNonJSONText: true}
+	for _, evidence := range resultTextEvidenceCandidates(result) {
+		if !memoryEntirelyNonJSONText(evidence.text) {
+			analysis.EntirelyNonJSONText = false
+		}
+		candidate, ok := memoryStructuredJSONCandidate(evidence.text)
+		if !ok {
+			continue
+		}
+		if normalized, candidateErr := validateResponseFormatText(candidate, format); candidateErr == nil {
+			analysis.Result.Text = candidate
+			analysis.Result.TextSource = evidence.source
+			analysis.Result.TextRelation = "exact"
+			analysis.Result.FinalText = ""
+			analysis.Result.StreamedText = ""
+			analysis.Formatted = normalized
+			analysis.Source = evidence.source
+			analysis.Valid = true
+			return analysis
+		} else if analysis.RepairCandidate == "" {
+			analysis.RepairCandidate = candidate
+			analysis.RepairFormatErr = candidateErr
+		}
+	}
+	return analysis
+}
+
+func memoryEntirelyNonJSONText(text string) bool {
+	// A structured re-ask is only safe when there is no JSON-shaped evidence
+	// to preserve or disambiguate. Any container delimiter means the response
+	// may contain malformed or competing structured candidates and must keep
+	// the existing fail-closed behavior instead of being regenerated.
+	return !strings.ContainsAny(normalizeJSONText(text), "{}[]")
+}
+
+func memorySchemaAllowsStructuredReask(format *responseFormat) bool {
+	if format == nil || format.Type != "json_schema" {
+		return false
+	}
+	schema, _ := format.JSONSchema["schema"].(map[string]any)
+	typeName, _ := schema["type"].(string)
+	return typeName == "object" || typeName == "array"
+}
+
+func memorySchemaReaskPrompt(callerEvidence string, format *responseFormat) string {
+	schema, _ := format.JSONSchema["schema"].(map[string]any)
+	encoded, _ := json.Marshal(schema)
+	return fmt.Sprintf(`MEMORY_PROVIDER_SCHEMA_REASK
+The previous upstream response was entirely non-JSON and is not structured evidence. Do not copy facts from it.
+Re-answer using only the CALLER_EVIDENCE below and the caller's JSON Schema.
+Do not add, replace, normalize, infer, or invent scalar values merely to satisfy the schema.
+Property names are protocol identifiers: copy them exactly and never translate or rename them.
+Return exactly one JSON value matching JSON_SCHEMA, with no Markdown or prose.
+
+JSON_SCHEMA:
+%s
+
+CALLER_EVIDENCE:
+%s`, string(encoded), callerEvidence)
 }
 
 func memoryWrappedJSONValueStart(b byte) bool {

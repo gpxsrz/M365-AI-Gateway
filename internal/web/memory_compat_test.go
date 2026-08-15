@@ -393,6 +393,228 @@ type memoryWrappedRepairChat struct {
 	prompts []string
 }
 
+type memoryNonJSONReaskChat struct {
+	requests []chathub.Request
+	reask    string
+	repair   string
+}
+
+func (c *memoryNonJSONReaskChat) Chat(_ context.Context, _ chathub.Account, req chathub.Request) (chathub.Result, error) {
+	c.requests = append(c.requests, req)
+	if len(c.requests) == 1 {
+		return chathub.Result{
+			Text:           "I understood the memory request, but I did not return a JSON value.",
+			ConversationID: "memory-non-json-reask",
+			SessionID:      "memory-non-json-reask-session",
+		}, nil
+	}
+	text := c.reask
+	if text == "" {
+		text = `{"marker":"ISSUE70_SYNTHETIC"}`
+	}
+	if len(c.requests) >= 3 && c.repair != "" {
+		text = c.repair
+	}
+	return chathub.Result{
+		Text:           text,
+		ConversationID: "memory-non-json-reask",
+		SessionID:      "memory-non-json-reask-session",
+	}, nil
+}
+
+func (c *memoryNonJSONReaskChat) ChatWithDelta(ctx context.Context, account chathub.Account, req chathub.Request, _ func(string) error) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func (c *memoryNonJSONReaskChat) ChatWithEvents(ctx context.Context, account chathub.Account, req chathub.Request, _ chathub.StreamHandler) (chathub.Result, error) {
+	return c.Chat(ctx, account, req)
+}
+
+func TestMemorySchemaReasksOnceWhenInitialResponseIsEntirelyNonJSON(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-non-json-reask")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryNonJSONReaskChat{}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"Remember marker ISSUE70_SYNTHETIC."}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"marker":{"type":"string"}},"required":["marker"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("chat requests=%d, want initial request plus one bounded structured re-ask", len(chat.requests))
+	}
+	reask := chat.requests[1]
+	if reask.ToolChoice != "none" || !reask.DisableBuiltInSearch || len(reask.Tools) != 0 {
+		t.Fatalf("unsafe structured re-ask: choice=%#v search_disabled=%t tools=%d", reask.ToolChoice, reask.DisableBuiltInSearch, len(reask.Tools))
+	}
+	if !strings.Contains(reask.Text, "ISSUE70_SYNTHETIC") || !strings.Contains(reask.Text, `"marker"`) {
+		t.Fatalf("structured re-ask lost caller evidence or schema: %s", reask.Text)
+	}
+	if strings.Contains(reask.Text, "I understood the memory request") {
+		t.Fatalf("structured re-ask promoted the invalid prose to caller evidence: %s", reask.Text)
+	}
+	if !strings.Contains(rr.Body.String(), `\"marker\":\"ISSUE70_SYNTHETIC\"`) {
+		t.Fatalf("structured re-ask response missing validated JSON: %s", rr.Body.String())
+	}
+}
+
+func TestMemorySchemaReasksForTopLevelArraySchema(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-non-json-reask-array")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryNonJSONReaskChat{reask: `["ISSUE70_SYNTHETIC"]`}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"Remember marker ISSUE70_SYNTHETIC."}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"array","items":{"type":"string"}}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 2 || !strings.Contains(rr.Body.String(), `\"ISSUE70_SYNTHETIC\"`) {
+		t.Fatalf("array structured re-ask failed: requests=%d body=%s", len(chat.requests), rr.Body.String())
+	}
+}
+
+func TestMemorySchemaNonJSONReaskIsBoundedAndFailsClosed(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-non-json-reask-bounded")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryNonJSONReaskChat{reask: "Still prose, still not JSON."}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"Remember marker ISSUE70_SYNTHETIC."}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"marker":{"type":"string"}},"required":["marker"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusBadGateway || !strings.Contains(rr.Body.String(), "response_format_validation_failed") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("chat requests=%d, want exactly one bounded structured re-ask", len(chat.requests))
+	}
+}
+
+func TestMemorySchemaNonJSONReaskCandidateUsesFactSafeRepair(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-non-json-reask-repair")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryNonJSONReaskChat{
+		reask:  `{"wrong_marker":"ISSUE70_SYNTHETIC"}`,
+		repair: `{"marker":"ISSUE70_SYNTHETIC"}`,
+	}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"Remember marker ISSUE70_SYNTHETIC."}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"marker":{"type":"string"}},"required":["marker"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 3 {
+		t.Fatalf("chat requests=%d, want initial request, one re-ask, and one bounded repair", len(chat.requests))
+	}
+	repair := chat.requests[2]
+	if repair.ToolChoice != "none" || !repair.DisableBuiltInSearch || len(repair.Tools) != 0 {
+		t.Fatalf("unsafe post-reask repair: choice=%#v search_disabled=%t tools=%d", repair.ToolChoice, repair.DisableBuiltInSearch, len(repair.Tools))
+	}
+	if !strings.Contains(repair.Text, `{"wrong_marker":"ISSUE70_SYNTHETIC"}`) {
+		t.Fatalf("post-reask repair did not use the re-ask JSON candidate: %s", repair.Text)
+	}
+	if strings.Contains(repair.Text, "I understood the memory request") {
+		t.Fatalf("post-reask repair promoted initial prose to structured evidence: %s", repair.Text)
+	}
+}
+
+func TestMemorySchemaNonJSONReaskRepairRejectsInventedFact(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-non-json-reask-repair-facts")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryNonJSONReaskChat{
+		reask:  `{"wrong_marker":"ISSUE70_SYNTHETIC"}`,
+		repair: `{"marker":"INVENTED"}`,
+	}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"Remember marker ISSUE70_SYNTHETIC."}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"marker":{"type":"string"}},"required":["marker"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusBadGateway || !strings.Contains(rr.Body.String(), "response_format_validation_failed") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(chat.requests) != 3 {
+		t.Fatalf("chat requests=%d, want one re-ask and one bounded fact-checked repair", len(chat.requests))
+	}
+}
+
+func TestMemorySchemaMalformedContainerEvidenceDoesNotTriggerReask(t *testing.T) {
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.MemoryCompatibilityEnabled = true
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("memory-malformed-container")); err != nil {
+		t.Fatal(err)
+	}
+	chat := &memoryWrappedJSONChat{text: "I tried to return JSON but stopped here: {"}
+	server.chat = chat
+	body := `{"model":"m365-auto","messages":[{"role":"user","content":"Remember marker ISSUE70_SYNTHETIC."}],"response_format":{"type":"json_schema","json_schema":{"name":"memory","schema":{"type":"object","properties":{"marker":{"type":"string"}},"required":["marker"],"additionalProperties":false}}}}`
+	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "memory-owner")
+	rr := httptest.NewRecorder()
+
+	server.memoryOpenAIChat(rr, req)
+
+	if rr.Code != http.StatusBadGateway || !strings.Contains(rr.Body.String(), "response_format_validation_failed") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if chat.calls != 1 {
+		t.Fatalf("chat calls=%d, malformed structured evidence must fail closed without regeneration", chat.calls)
+	}
+}
+
 func (c *memoryWrappedRepairChat) Chat(_ context.Context, _ chathub.Account, req chathub.Request) (chathub.Result, error) {
 	c.calls++
 	c.prompts = append(c.prompts, req.Text)
