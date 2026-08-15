@@ -13,5 +13,6 @@ This page lists current limitations only and intentionally avoids replaying the 
 9. **WebSocket retry**: retry is limited to transient dial / upgrade failures before the payload is sent; already-sent ChatHub requests are not blindly replayed.
 10. **Hindsight bank mission**: until Hermes upstream #18774 is fixed, bank-mission values may not synchronize to the live bank and require Banks API readback.
 11. **Web model / request-capability drift**: Microsoft Web selector and request capabilities can change independently of a sidecar release; an evidence snapshot is not a permanent capability contract.
+12. **Milestone durable does not mean the same already-built request recalled it**: the Gateway can wait for Hindsight `retain.completed` before autonomous admission, but it cannot retroactively modify an HTTP body Hermes built before the wait; verify fresh memory through a subsequent normal recall/readback when required.
 
 See [`compatibility.md`](compatibility.md) for verification status.

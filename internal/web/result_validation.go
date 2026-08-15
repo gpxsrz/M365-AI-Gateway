@@ -114,7 +114,8 @@ func writeCanonicalTerminalFailure(w http.ResponseWriter, terminal chathub.Termi
 func writeCanonicalTerminalError(w http.ResponseWriter, err error) bool {
 	var rateLimit *chathub.RateLimitError
 	if errors.As(err, &rateLimit) {
-		w.Header().Set("Retry-After", canonicalRetryAfter(rateLimit.RetryAfter))
+		markSoftThrottleWriter(w, rateLimit.SoftThrottle)
+		w.Header().Set("Retry-After", canonicalRateLimitRetryAfter(rateLimit))
 		writeOpenAIErrorCode(w, http.StatusTooManyRequests, "rate_limit_error", "upstream_rate_limited", "Microsoft 365 Copilot is temporarily rate limited")
 		return true
 	}
@@ -128,7 +129,8 @@ func writeCanonicalTerminalError(w http.ResponseWriter, err error) bool {
 func writeCanonicalTerminalStreamError(w http.ResponseWriter, err error) bool {
 	var rateLimit *chathub.RateLimitError
 	if errors.As(err, &rateLimit) {
-		retryAfter := canonicalRetryAfter(rateLimit.RetryAfter)
+		markSoftThrottleWriter(w, rateLimit.SoftThrottle)
+		retryAfter := canonicalRateLimitRetryAfter(rateLimit)
 		w.Header().Set("Retry-After", retryAfter)
 		if tracker, ok := w.(interface{ setOutcomeStatus(int) }); ok {
 			tracker.setOutcomeStatus(http.StatusTooManyRequests)
@@ -148,6 +150,20 @@ func writeCanonicalTerminalStreamError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
+func markSoftThrottleWriter(w http.ResponseWriter, soft bool) {
+	for w != nil {
+		if tracker, ok := w.(interface{ setSoftThrottle(bool) }); ok {
+			tracker.setSoftThrottle(soft)
+			return
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		w = unwrapper.Unwrap()
+	}
+}
+
 func writeUpstreamEmptyResponse(w http.ResponseWriter) {
 	writeUpstreamEmptyResponseMessage(w, "ChatHub returned no text, tool call, or image result")
 }
@@ -165,6 +181,16 @@ func canonicalRetryAfter(value string) string {
 		return when.UTC().Format(http.TimeFormat)
 	}
 	return "1"
+}
+
+func canonicalRateLimitRetryAfter(rateLimit *chathub.RateLimitError) string {
+	if rateLimit != nil && rateLimit.SoftThrottle && strings.TrimSpace(rateLimit.RetryAfter) == "" {
+		return strconv.Itoa(sharedThrottleInitialCooldownSeconds)
+	}
+	if rateLimit == nil {
+		return "1"
+	}
+	return canonicalRetryAfter(rateLimit.RetryAfter)
 }
 
 func writeChatStreamRateLimitError(w http.ResponseWriter, retryAfter string) {

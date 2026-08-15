@@ -56,8 +56,10 @@ func safeServiceLogPath(path string) string {
 		return safePath
 	}
 	switch path {
+	case hindsightWebhookPath:
+		return hindsightWebhookPath
 	case "/api/admin/login", "/api/admin/logout", "/api/admin/session", "/api/admin/change-password",
-		"/api/admin/keys", "/api/admin/settings", "/api/admin/deployments",
+		"/api/admin/keys", "/api/admin/settings", "/api/admin/traffic/recovery", "/api/admin/deployments",
 		"/api/admin/deployment", "/api/admin/deployment/check", "/api/admin/debug/logs",
 		"/api/admin/debug/detail", "/api/admin/debug/session", "/api/admin/debug/export",
 		"/api/health", "/api/version", "/api/update", "/api/account", "/api/account/refresh", "/api/account/logout",
@@ -71,7 +73,7 @@ func safeServiceLogPath(path string) string {
 
 func httpTrace(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/v1/") && !hermesCompatibilityRequest(r.URL.Path) && !memoryCompatibilityRequest(r.URL.Path) {
+		if r.URL.Path != hindsightWebhookPath && !strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/v1/") && !hermesCompatibilityRequest(r.URL.Path) && !memoryCompatibilityRequest(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

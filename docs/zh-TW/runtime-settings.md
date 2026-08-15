@@ -19,8 +19,14 @@
 - `memoryMaxConcurrent`
 - `memoryQueueTimeoutSeconds`
 - `interactivePriorityHoldoffSeconds`
-- `memoryBackoffInitialSeconds`
-- `memoryBackoffMaxSeconds`
+- `memoryBackoffInitialSeconds`（legacy compatibility；不再控制 #71 shared breaker）
+- `memoryBackoffMaxSeconds`（legacy compatibility；不再控制 #71 shared breaker）
+
+#71 shared-account breaker 使用固定 cooldown 階梯 `1125 / 2250 / 4500 / 9000 / 18000` 秒，不是 runtime-tunable exponential backoff。`GET /api/admin/settings` 的 `compatibilityTraffic` 會回報完整 scheduler projection：`trafficMode`、interactive/external/autonomous in-flight/waiting、`effectiveHermesConcurrency`、Memory pending/oldest age、milestone yield state/deadline/outcome/duration、最近 retain/consolidation、hard/soft throttle、streak/cooldown remaining、suppressed reask，以及 `sharedCircuitState / sharedCooldownLevel / sharedCooldownUntil`。
+
+Hindsight durable-event callback 使用 `M365_HINDSIGHT_WEBHOOK_SECRET` 作為 HMAC 驗證用 runtime environment setting；它是敏感值，不屬於管理 UI 顯示或 handoff evidence。
+
+管理 UI 會把 `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 明確標成 legacy compatibility 欄位，並顯示 #71 scheduler 狀態。`RECOVERY` 期間會出現受控 completion 操作；它只應在 controlled live qualification 已通過後使用。
 
 ### Tools / model policy
 

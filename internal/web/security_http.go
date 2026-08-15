@@ -53,6 +53,22 @@ func serveStaticFile(w http.ResponseWriter, r *http.Request, name, contentType s
 	http.ServeContent(w, r, name, st.ModTime(), bytes.NewReader(raw))
 }
 
+func serveAugmentedAdminIndex(w http.ResponseWriter, r *http.Request) {
+	const name = "web/index.html"
+	raw, err := os.ReadFile(name)
+	if err != nil {
+		http.Error(w, "管理介面無法使用", http.StatusInternalServerError)
+		return
+	}
+	st, err := os.Stat(name)
+	if err != nil {
+		http.Error(w, "管理介面無法使用", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	http.ServeContent(w, r, name, st.ModTime(), bytes.NewReader(augmentIssue71AdminIndex(raw)))
+}
+
 func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -70,6 +86,10 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 		if !mustChange {
 			name = "web/index.html"
 		}
+	}
+	if name == "web/index.html" {
+		serveAugmentedAdminIndex(w, r)
+		return
 	}
 	serveWebFile(w, r, name)
 }

@@ -175,6 +175,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/change-password", s.adminChangePassword)
 	m.HandleFunc("/api/admin/keys", s.adminKeys)
 	m.HandleFunc("/api/admin/settings", s.adminSettings)
+	m.HandleFunc("/api/admin/traffic/recovery", s.adminTrafficRecovery)
 	m.HandleFunc("/api/admin/deployments", s.deployments)
 	m.HandleFunc("/api/admin/deployment", s.deploymentAction)
 	m.HandleFunc("/api/admin/deployment/check", s.deploymentCheck)
@@ -194,6 +195,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
 	m.HandleFunc("/api/auth/candidate/chat", s.validateOAuthCandidateChat)
 	m.HandleFunc("/api/auth/browser/default/start", s.startDefaultClientBrowserPKCE)
+	m.HandleFunc(hindsightWebhookPath, s.hindsightWebhook)
 	m.HandleFunc("/api/chat", s.chatOnce)
 	m.HandleFunc("/api/chat/stream", s.chatStream)
 	m.HandleFunc("/api/conversations", s.conversations)
@@ -217,7 +219,7 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/" {
+		if r.URL.Path == hindsightWebhookPath || r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -809,6 +811,33 @@ type oaiReq struct {
 	IngressExtensions   map[string]json.RawMessage `json:"-"`
 }
 
+type predecodedOpenAIRequestContextKey struct{}
+
+type predecodedOpenAIRequestState struct {
+	mu   sync.Mutex
+	body oaiReq
+	used bool
+}
+
+func withPredecodedOpenAIRequest(r *http.Request, body oaiReq) *http.Request {
+	state := &predecodedOpenAIRequestState{body: body}
+	return r.WithContext(context.WithValue(r.Context(), predecodedOpenAIRequestContextKey{}, state))
+}
+
+func predecodedOpenAIRequest(r *http.Request) (oaiReq, bool) {
+	state, ok := r.Context().Value(predecodedOpenAIRequestContextKey{}).(*predecodedOpenAIRequestState)
+	if !ok || state == nil {
+		return oaiReq{}, false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.used {
+		return oaiReq{}, false
+	}
+	state.used = true
+	return state.body, true
+}
+
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
 func contentToString(c any) string {
@@ -875,14 +904,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", err.Error())
 		return
 	}
-	var body oaiReq
-	if err := decodeBoundedJSON(w, r, bodyLimit, &body); err != nil {
-		if isRequestBodyTooLarge(err) {
-			writeRequestBodyTooLarge(w, r.URL.Path, bodyLimit)
+	body, predecoded := predecodedOpenAIRequest(r)
+	if !predecoded {
+		if err := decodeBoundedJSON(w, r, bodyLimit, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				writeRequestBodyTooLarge(w, r.URL.Path, bodyLimit)
+				return
+			}
+			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		http.Error(w, "bad json", http.StatusBadRequest)
-		return
 	}
 	streamOptions, err := parseChatStreamOptions(body.StreamOptions, body.Stream)
 	if err != nil {
@@ -899,6 +930,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	needsTextValidation := !callerTextAlreadyValidated(r)
 	responseFormat := body.ResponseFormat
+	if tracker, ok := w.(interface{ setRetryPotential(bool) }); ok {
+		tracker.setRetryPotential((memoryCompatibilityRequest(r.URL.Path) && responseFormat != nil) || len(body.Tools) > 0 || len(body.Functions) > 0)
+	}
 	if err := validateResponseFormatDefinition(responseFormat); err != nil {
 		writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "invalid_response_format", err.Error())
 		return

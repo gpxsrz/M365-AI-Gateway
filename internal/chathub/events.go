@@ -29,9 +29,10 @@ type TerminalState struct {
 }
 
 type RateLimitError struct {
-	StatusCode int
-	RetryAfter string
-	Err        error
+	StatusCode   int
+	RetryAfter   string
+	SoftThrottle bool
+	Err          error
 }
 
 func (e *RateLimitError) Error() string {

@@ -13,5 +13,6 @@
 9. **WebSocket retry**：只涵蓋 payload 尚未送出前的 transient dial / upgrade；不對已送出的 ChatHub request 做盲目 replay。
 10. **Hindsight bank mission**：Hermes upstream #18774 修復前，`bank_mission` / `bank_retain_mission` 可能不會同步到 live bank，需以 Banks API readback 確認。
 11. **Web model / request capability drift**：Microsoft Web selector 與 request capability 會隨 rollout 改變；evidence snapshot 不是永久 capabilities contract。
+12. **Milestone durable ≠ 同一筆已組好的 request 已 recall**：Gateway 可以等待 Hindsight `retain.completed` 再放 autonomous admission，但無法反向修改 Hermes 在等待前已組好的 HTTP body；需要 fresh memory 時要以後續正常 recall/readback 驗證。
 
 驗證狀態請讀 [`compatibility.md`](compatibility.md)。

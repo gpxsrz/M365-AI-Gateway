@@ -84,6 +84,26 @@ Forward-compatible ingress 若保存／忽略 caller extensions，可透過既�
 
 Interactive queue full / timeout 等可重試 admission failure 使用 HTTP `503` 並附 `Retry-After`。這和 Microsoft upstream 429 cooldown 是不同層級；caller 不應把任何 5xx 都當成可無條件 replay 已送出的 ChatHub request。
 
+Microsoft hard 429 與 ChatHub structured soft-throttle 都正規化為 canonical HTTP `429 rate_limit_error`。若 upstream 有有效的 `Retry-After` 就保留；若 soft-throttle 沒提供，第一階使用 shared breaker 的 `1125` 秒 cooldown，而不是快速 `1s` replay。Throttle 一旦成立，`response_format` repair/reask 與 required-tool/router retry 都必須停止，不得把 throttle prose 當 malformed model output 再送一次。
+
+Shared breaker 狀態為 `CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY`。`OPEN` 的時間到期只代表可接受一筆受控 external-user interactive probe；autonomous Hermes continuation 與 Memory backlog 都不會自動成為 probe。Probe 再 throttle 會從最新 throttle timestamp 升到下一階；成功只進 `RECOVERY`，不會自動釋放 Memory backlog。RECOVERY 的降階條件由 controlled live qualification 決定。
+
+`/memory/v1` admission 503 會區分原因：
+
+- `interactive_capacity_busy`：interactive / holdoff 尚未讓出容量；
+- `memory_capacity_deferred`：Gateway 已有 active 1 + waiting 1 的 Memory 工作，額外 request fail-fast；
+- `upstream_throttle`：shared breaker 非 `CLOSED`，立即 defer，且不會送 ChatHub round。
+
+### Hindsight durable-event callback
+
+`POST /internal/hindsight/webhook` 是 machine-auth callback，不使用 admin session 或 caller API key。Runtime 必須設定 `M365_HINDSIGHT_WEBHOOK_SECRET`；Hindsight 以 raw JSON body 計算 HMAC-SHA256，並送出 `X-Hindsight-Signature: sha256=<hex>`。可附 `X-Hindsight-Event`，若存在必須和 payload `event` 相符。
+
+Gateway 只接受 `retain.completed` 與 `consolidation.completed`，且要求 `operation_id` / `timestamp`。`retain.completed` 可通過 active milestone durability barrier；`consolidation.completed` 只記錄 observability。Webhook delivery 是 at-least-once，因此 Gateway 對 `event + operation_id` 做 bounded dedupe。Secret 不會回傳到管理 UI、log 或 error body。
+
+### Controlled recovery completion
+
+`POST /api/admin/traffic/recovery` body `{"action":"complete"}` 只允許在 shared breaker 已是 `RECOVERY` 時由管理者使用；其他 state 回 `409 recovery_not_ready`。這不是自動 recovery policy，也不能拿來跳過 qualification；用途是 controlled live qualification 完成後明確把 `RECOVERY` 關回 `CLOSED` 並重設 cooldown level。
+
 ChatHub WebSocket bounded retry 只涵蓋 payload 尚未送出前的 transient dial / HTTP-upgrade failure；目前涵蓋 HTTP `500` / `502` / `503` / `504` 與沒有 HTTP response 的 transient network dial error。Payload 已送出後不得套同一規則盲目 replay。
 
 Current verification status：[`compatibility.md`](compatibility.md)。

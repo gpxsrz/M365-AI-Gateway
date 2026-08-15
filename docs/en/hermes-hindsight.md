@@ -74,17 +74,47 @@ HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 
 ## Shared-account traffic policy
 
-Current correctness-first M365 Memory admission baseline:
+M365 admission baseline observed by live readback during the 2026-08-16 incident:
 
 ```text
 memoryMaxConcurrent=1
-memoryQueueTimeoutSeconds=60
-interactivePriorityHoldoffSeconds=300
+memoryQueueTimeoutSeconds=30
+interactivePriorityHoldoffSeconds=10
 memoryBackoffInitialSeconds=30
 memoryBackoffMaxSeconds=600
 ```
 
-Interactive traffic includes generic chat, Hermes, Responses, and Anthropic. Memory waits FIFO; already-running Memory work is not forcibly preempted. Live Microsoft accounts are not deliberately flooded to force 429; rate-limit behavior is primarily verified deterministically.
+`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` are retained as legacy settings/API compatibility fields; the #71 shared-account breaker no longer derives cooldown from them. Its fixed engineering policy is `1125 → 2250 → 4500 → 9000 → 18000` seconds, capped at L5. A hard 429 or structured ChatHub soft throttle enters `OPEN`; expiry only transitions to `HALF_OPEN_READY` and does not auto-retry. At most one controlled **external-user** interactive request may become the probe; autonomous Hermes continuations and Memory backlog cannot probe. Probe success enters `RECOVERY` without releasing Memory, and RECOVERY downgrade/release thresholds require controlled live qualification.
+
+Interactive traffic includes generic chat, Hermes, Responses, and Anthropic. In normal state Memory waits FIFO; already-running Memory work is not forcibly preempted. Live Microsoft accounts are not deliberately flooded to force 429; breaker behavior is primarily verified deterministically.
+
+### Issue #71 milestone / adaptive arbitration
+
+`/hermes/v1` deterministically classifies the latest Hermes framework turn without LLM semantic guessing:
+
+- `EXTERNAL_USER`: an ordinary latest user turn; it can move ahead of queued autonomous work and cancels an unfinished milestone yield.
+- `ASYNC_COMPLETION`: `[ASYNC DELEGATION BATCH COMPLETE — ...]` / `[ASYNC DELEGATION COMPLETE — ...]`; a successful completion arms a milestone Memory barrier.
+- `AUTONOMOUS_CONTINUATION`: fixed Hermes standing-goal, kanban, compression, output-length, tool-continuation, or verify-on-stop system markers.
+
+Autonomous/background Hermes is limited to one in flight. Normal account-wide interactive capacity may still use `interactiveMaxConcurrent=2`; under autonomous pressure, Memory pressure, milestone yield, cooldown, or recovery the management projection reports effective Hermes concurrency 1 (0 during cooldown). The Gateway does not semantically deduplicate tasks.
+
+A successful `ASYNC_COMPLETION` starts a Memory lease with a hard ceiling of **300 seconds**. The next `AUTONOMOUS_CONTINUATION` waits until one of these conditions occurs:
+
+1. an HMAC-verified official Hindsight `retain.completed` webhook proves the retain is server-side durable, immediately ending the barrier;
+2. 300 seconds expires, recording `timeout` and allowing Hermes to continue;
+3. a new `EXTERNAL_USER` arrives, recording `preempted_by_interactive` and prioritizing the user.
+
+`/memory/v1` HTTP 200 and Hindsight queued / claimed / processing states are **not** durability. `consolidation.completed` updates observability only and is **not** a barrier. Memory ingress is bounded to active 1 + waiting 1; additional requests are immediately deferred as `memory_capacity_deferred` instead of becoming Gateway waiters. While the shared breaker is not `CLOSED`, Memory fails fast as `upstream_throttle` without waiting for the queue timeout or touching Microsoft.
+
+The Hindsight webhook uses the official `X-Hindsight-Signature: sha256=<HMAC-SHA256>` over the raw payload. The Gateway accepts only `retain.completed` / `consolidation.completed` and uses bounded `event_type + operation_id` deduplication for at-least-once delivery. The secret stays on runtime secret/config surfaces and is never displayed in the management UI.
+
+### Context / memory handoff boundary
+
+The Gateway does not delete Hermes working context. The milestone barrier exposes a checkpoint that says a fresh retain is durable, so Hermes can subsequently compact low-value history while exact source/log/report artifacts remain authoritative.
+
+The Gateway cannot retroactively inject a recall that completes after Hermes has already built the HTTP request body. Therefore "retain durable" does not imply that the same already-built autonomous request contains the newest memory context; when fresh memory matters, verify it through the **next** normal Hindsight recall/readback. This limitation is not solved by carrying Hermes or Hindsight core patches.
+
+`compatibilityTraffic` projects `NORMAL / HERMES_BUSY / MEMORY_YIELD / UPSTREAM_COOLDOWN / RECOVERY`, external/autonomous in-flight counts, effective Hermes concurrency, Memory pending/oldest age, milestone state/deadline/outcome, latest retain/consolidation, hard/soft throttle timestamps, streak/cooldown remaining, and suppressed-reask count. `RECOVERY` never auto-closes; management may explicitly complete recovery only after controlled live qualification.
 
 ## Overflow recovery
 

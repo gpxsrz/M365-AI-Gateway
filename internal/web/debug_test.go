@@ -508,6 +508,11 @@ func TestCompatibilityRoutesEnterStructuredDiagnostics(t *testing.T) {
 	if !strings.Contains(logs.String(), "path=/hermes/v1/chat/completions") {
 		t.Fatalf("Hermes route was omitted from HTTP trace: %s", logs.String())
 	}
+	logs.Reset()
+	trace.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, hindsightWebhookPath, nil))
+	if !strings.Contains(logs.String(), "path="+hindsightWebhookPath) {
+		t.Fatalf("Hindsight durable webhook route was omitted from HTTP trace: %s", logs.String())
+	}
 }
 
 func TestDebugAuditEventsAreRedactedAndExposed(t *testing.T) {

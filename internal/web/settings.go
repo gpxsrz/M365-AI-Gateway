@@ -584,7 +584,7 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		cfg := s.settings.get()
-		traffic := s.compatibilityTrafficRuntime().snapshot()
+		traffic := s.compatibilityTrafficRuntime().snapshotForSettings(cfg)
 		checkpointPersistence := transportCheckpointPersistenceSnapshot{}
 		if s.checkpoints != nil {
 			checkpointPersistence = s.checkpoints.persistenceSnapshot()

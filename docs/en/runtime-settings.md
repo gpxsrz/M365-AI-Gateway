@@ -19,8 +19,14 @@ Management-setting surface: `GET /api/admin/settings` / `PUT /api/admin/settings
 - `memoryMaxConcurrent`
 - `memoryQueueTimeoutSeconds`
 - `interactivePriorityHoldoffSeconds`
-- `memoryBackoffInitialSeconds`
-- `memoryBackoffMaxSeconds`
+- `memoryBackoffInitialSeconds` (legacy compatibility; no longer controls the #71 shared breaker)
+- `memoryBackoffMaxSeconds` (legacy compatibility; no longer controls the #71 shared breaker)
+
+The #71 shared-account breaker uses the fixed cooldown ladder `1125 / 2250 / 4500 / 9000 / 18000` seconds rather than runtime-tunable exponential backoff. `GET /api/admin/settings` exposes the full scheduler projection under `compatibilityTraffic`: `trafficMode`, interactive/external/autonomous in-flight/waiting counts, `effectiveHermesConcurrency`, Memory pending/oldest age, milestone yield state/deadline/outcome/duration, latest retain/consolidation, hard/soft throttle timestamps, streak/cooldown remaining, suppressed reask count, and `sharedCircuitState / sharedCooldownLevel / sharedCooldownUntil`.
+
+The Hindsight durable-event callback uses `M365_HINDSIGHT_WEBHOOK_SECRET` as an HMAC verification runtime environment setting. Its value is sensitive and is not part of management-UI display or handoff evidence.
+
+The management UI explicitly labels `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` as legacy compatibility fields and shows the #71 scheduler state. While in `RECOVERY`, it exposes a controlled completion action that should be used only after controlled live qualification passes.
 
 ### Tools / model policy
 

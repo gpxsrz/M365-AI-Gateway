@@ -17,6 +17,48 @@ const (
 	hermesCompatibilityPrefix = "/hermes/v1/"
 )
 
+type hermesRequestClass string
+
+const (
+	hermesRequestExternalUser           hermesRequestClass = "EXTERNAL_USER"
+	hermesRequestAsyncCompletion        hermesRequestClass = "ASYNC_COMPLETION"
+	hermesRequestAutonomousContinuation hermesRequestClass = "AUTONOMOUS_CONTINUATION"
+)
+
+var hermesAutonomousContinuationPrefixes = [...]string{
+	"[Continuing toward your standing goal",
+	"[Continuing toward this kanban task",
+	"[The work looks complete, but the task is still open]",
+	"Continue from the compressed conversation context above.",
+	"[System: The previous response was cut off by a network error mid-stream.",
+	"[System: Your previous response was truncated by the output length limit.",
+	"[System: Your previous tool call ",
+	"[System: Continue now. Execute the required tool calls",
+	"Your previous turn indicated a tool call but none was included.",
+	"[System: You edited code in this turn, but the workspace does not have fresh passing verification evidence yet.",
+}
+
+func classifyHermesRequest(body oaiReq) hermesRequestClass {
+	for i := len(body.Messages) - 1; i >= 0; i-- {
+		message := body.Messages[i]
+		if message.Role != "user" {
+			continue
+		}
+		text := strings.TrimSpace(contentToString(message.Content))
+		if strings.HasPrefix(text, "[ASYNC DELEGATION BATCH COMPLETE — ") ||
+			strings.HasPrefix(text, "[ASYNC DELEGATION COMPLETE — ") {
+			return hermesRequestAsyncCompletion
+		}
+		for _, prefix := range hermesAutonomousContinuationPrefixes {
+			if strings.HasPrefix(text, prefix) {
+				return hermesRequestAutonomousContinuation
+			}
+		}
+		return hermesRequestExternalUser
+	}
+	return hermesRequestExternalUser
+}
+
 func memoryCompatibilityRequest(path string) bool {
 	return strings.HasPrefix(path, memoryCompatibilityPrefix)
 }
@@ -47,9 +89,13 @@ func (s *Server) serveInteractiveOpenAI(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) serveInteractiveRequest(w http.ResponseWriter, r *http.Request, reject func(http.ResponseWriter, int, string), handler http.HandlerFunc) {
+	s.serveInteractiveRequestClass(w, r, hermesRequestExternalUser, reject, handler)
+}
+
+func (s *Server) serveInteractiveRequestClass(w http.ResponseWriter, r *http.Request, class hermesRequestClass, reject func(http.ResponseWriter, int, string), handler http.HandlerFunc) {
 	cfg := serverRuntimeSettings(s)
 	traffic := s.compatibilityTrafficRuntime()
-	release, err := traffic.acquireInteractive(r.Context(), cfg)
+	release, err := traffic.acquireInteractiveClass(r.Context(), cfg, class)
 	if err != nil {
 		retryAfter := 1
 		if admission, ok := err.(*interactiveAdmissionError); ok && admission.retryAfter > 0 {
@@ -62,7 +108,15 @@ func (s *Server) serveInteractiveRequest(w http.ResponseWriter, r *http.Request,
 	defer release(time.Duration(cfg.InteractivePriorityHoldoffSeconds) * time.Second)
 	tracked := &statusTrackingResponseWriter{ResponseWriter: w}
 	defer func() {
-		traffic.observeInteractiveStatus(tracked.finalStatus(), cfg, tracked.Header().Get("Retry-After"))
+		status := tracked.finalStatus()
+		traffic.observeInteractiveStatus(status, tracked.Header().Get("Retry-After"))
+		if status == http.StatusTooManyRequests {
+			traffic.observeThrottleDetection(tracked.softThrottle)
+			if tracked.retryPotential {
+				traffic.observeReaskSuppressed(1)
+			}
+		}
+		traffic.observeHermesCompletion(class, status)
 	}()
 	handler(tracked, r)
 }
@@ -93,11 +147,21 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	release, err := traffic.acquireMemory(r.Context(), cfg)
 	if err != nil {
 		retryAfter := 1
+		code := "interactive_capacity_busy"
+		message := "Memory Provider request is waiting for interactive capacity"
 		if admission, ok := err.(*memoryAdmissionError); ok && admission.retryAfter > 0 {
 			retryAfter = admission.retryAfter
+			if admission.code != "" {
+				code = admission.code
+			}
+			if admission.code == "memory_capacity_deferred" {
+				message = "Memory Provider request deferred because the bounded Memory admission queue is full"
+			} else if admission.code == "upstream_throttle" {
+				message = "Memory Provider request deferred while the shared Microsoft account circuit breaker is active"
+			}
 		}
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-		writeOpenAIError(w, http.StatusServiceUnavailable, "rate_limit_error", "Memory Provider request is waiting for interactive capacity")
+		writeOpenAIErrorCode(w, http.StatusServiceUnavailable, "rate_limit_error", code, message)
 		return
 	}
 	tracked := &statusTrackingResponseWriter{ResponseWriter: w}
@@ -105,6 +169,10 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		status := tracked.finalStatus()
 		release(status)
 		if status == http.StatusTooManyRequests {
+			traffic.observeThrottleDetection(tracked.softThrottle)
+			if tracked.retryPotential {
+				traffic.observeReaskSuppressed(1)
+			}
 			traffic.honorRetryAfter(tracked.Header().Get("Retry-After"))
 		}
 	}()
@@ -119,9 +187,28 @@ func (s *Server) hermesOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", "Hermes compatibility profile is disabled")
 		return
 	}
+	bodyLimit, err := requestBodyLimit(cfg.TextInputLimitUTF16)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "configuration_error", err.Error())
+		return
+	}
+	var body oaiReq
+	if err := decodeBoundedJSON(w, r, bodyLimit, &body); err != nil {
+		if isRequestBodyTooLarge(err) {
+			writeRequestBodyTooLarge(w, r.URL.Path, bodyLimit)
+			return
+		}
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	class := classifyHermesRequest(body)
+	r = withPredecodedOpenAIRequest(r, body)
 	control, _ := compatibilityCheckpointControl(r.URL.Path)
 	control.Mode = checkpointFullHistory
-	s.serveInteractiveOpenAI(w, r.WithContext(withCheckpointRequest(r.Context(), control)), s.openaiChat)
+	r = r.WithContext(withCheckpointRequest(r.Context(), control))
+	s.serveInteractiveRequestClass(w, r, class, func(w http.ResponseWriter, status int, message string) {
+		writeOpenAIError(w, status, "rate_limit_error", message)
+	}, s.openaiChat)
 }
 
 func memorySchemaInstruction(format *responseFormat) string {

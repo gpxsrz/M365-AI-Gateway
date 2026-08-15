@@ -189,6 +189,34 @@ func webSocketDialFailure(status int, retryAfter string, err error) error {
 	return fmt.Errorf("ws dial: %w", err)
 }
 
+func knownSoftThrottleText(text string) bool {
+	text = strings.TrimSpace(text)
+	return (strings.Contains(text, "暫時無法回應") && strings.Contains(text, "請稍後再試")) ||
+		(strings.Contains(text, "暂时无法响应") && strings.Contains(text, "请稍后重试"))
+}
+
+func softThrottleBotMessage(container map[string]any) bool {
+	messages, _ := container["messages"].([]any)
+	for _, raw := range messages {
+		message, _ := raw.(map[string]any)
+		author, _ := message["author"].(string)
+		origin, _ := message["contentOrigin"].(string)
+		messageType, _ := message["messageType"].(string)
+		text, _ := message["text"].(string)
+		if author == "bot" && origin == "BotConnection" && messageType == "" && knownSoftThrottleText(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func softThrottleFailure(result Result, messageSignal bool) error {
+	if result.Throttling == nil && !messageSignal {
+		return nil
+	}
+	return &RateLimitError{StatusCode: http.StatusTooManyRequests, SoftThrottle: true, Err: errors.New("ChatHub soft throttle")}
+}
+
 func retryableWebSocketDialFailure(status int, err error) bool {
 	switch status {
 	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -397,6 +425,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 	var final string
 	var throttling any
+	var softThrottleMessageSeen bool
 	var rawResult string
 	var events []json.RawMessage
 	seenStreamTools := map[string]bool{}
@@ -478,6 +507,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if thr, ok := arg["throttling"]; ok {
 						throttling = thr
 					}
+					if softThrottleBotMessage(arg) {
+						softThrottleMessageSeen = true
+					}
 					if msgs, ok := arg["messages"].([]any); ok {
 						for _, mraw := range msgs {
 							m, ok := mraw.(map[string]any)
@@ -505,6 +537,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				if item != nil {
 					if thr, ok := item["throttling"]; ok {
 						throttling = thr
+					}
+					if softThrottleBotMessage(item) {
+						softThrottleMessageSeen = true
 					}
 					if res, ok := item["result"].(map[string]any); ok {
 						rawResult, _ = res["value"].(string)
@@ -547,6 +582,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					Terminal:       TerminalState{Kind: "complete"},
 				}
 				if err := CanonicalizeResult(&result); err != nil {
+					return result, err
+				}
+				if err := softThrottleFailure(result, softThrottleMessageSeen); err != nil {
 					return result, err
 				}
 				return result, nil

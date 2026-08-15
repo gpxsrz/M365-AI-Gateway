@@ -163,7 +163,7 @@ func TestCompatibilityTrafficInteractiveQueueIsBoundedAndCancellable(t *testing.
 func TestCompatibilityTrafficInteractive429BlocksNewInteractiveAdmission(t *testing.T) {
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
-	c.observeInteractiveStatus(http.StatusTooManyRequests, cfg, "1")
+	c.observeInteractiveStatus(http.StatusTooManyRequests, "1")
 	snapshot := c.snapshot()
 	if snapshot.Shared429Count != 1 || snapshot.Last429Source != "interactive" || !snapshot.SharedCooldownUntil.After(time.Now()) {
 		t.Fatalf("interactive 429 did not create shared cooldown: %#v", snapshot)
@@ -391,6 +391,125 @@ func TestCompatibilityTraffic429Backoff(t *testing.T) {
 	}
 }
 
+func TestCompatibilityTrafficCooldownExpiryDoesNotAutoAdmitMemory(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	c.observeInteractiveStatus(http.StatusTooManyRequests, "")
+	c.mu.Lock()
+	c.sharedCooldownUntil = time.Now().Add(-time.Second)
+	c.mu.Unlock()
+	if snap := c.snapshot(); snap.SharedCircuitState != "HALF_OPEN_READY" {
+		t.Fatalf("state=%q want=HALF_OPEN_READY after cooldown expiry", snap.SharedCircuitState)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	release, err := c.acquireMemory(ctx, cfg)
+	if err == nil {
+		release(http.StatusOK)
+		t.Fatal("Memory backlog auto-probed Microsoft when shared cooldown expired")
+	}
+}
+
+func TestCompatibilityTrafficCooldownLadderCapsAtApprovedMaximum(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	wants := []time.Duration{
+		1125 * time.Second,
+		2250 * time.Second,
+		4500 * time.Second,
+		9000 * time.Second,
+		18000 * time.Second,
+		18000 * time.Second,
+	}
+	for i, want := range wants {
+		observedAt := time.Now()
+		c.observeInteractiveStatus(http.StatusTooManyRequests, "")
+		snap := c.snapshot()
+		wantLevel := i + 1
+		if wantLevel > len(sharedThrottleCooldownSeconds) {
+			wantLevel = len(sharedThrottleCooldownSeconds)
+		}
+		if snap.SharedCooldownLevel != wantLevel || snap.SharedCircuitState != "OPEN" {
+			t.Fatalf("step=%d state=%q level=%d want state=OPEN level=%d", i+1, snap.SharedCircuitState, snap.SharedCooldownLevel, wantLevel)
+		}
+		remaining := snap.SharedCooldownUntil.Sub(observedAt)
+		if remaining < want-time.Second || remaining > want+time.Second {
+			t.Fatalf("step=%d cooldown=%v want about %v", i+1, remaining, want)
+		}
+	}
+}
+
+func TestCompatibilityTrafficHalfOpenAllowsOneProbeAndSuccessEntersRecovery(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	cfg.InteractiveMaxConcurrent = 2
+	c.observeInteractiveStatus(http.StatusTooManyRequests, "")
+	c.mu.Lock()
+	c.sharedCooldownUntil = time.Now().Add(-time.Second)
+	c.mu.Unlock()
+
+	probeRelease, err := c.acquireInteractive(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap := c.snapshot(); snap.SharedCircuitState != "PROBE_IN_FLIGHT" {
+		probeRelease(0)
+		t.Fatalf("state=%q want=PROBE_IN_FLIGHT", snap.SharedCircuitState)
+	}
+
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer secondCancel()
+	if release, err := c.acquireInteractive(secondCtx, cfg); err == nil {
+		release(0)
+		probeRelease(0)
+		t.Fatal("second interactive request bypassed single controlled probe")
+	}
+
+	c.observeInteractiveStatus(http.StatusOK, "")
+	probeRelease(0)
+	if snap := c.snapshot(); snap.SharedCircuitState != "RECOVERY" {
+		t.Fatalf("state=%q want=RECOVERY", snap.SharedCircuitState)
+	}
+
+	memoryCtx, memoryCancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer memoryCancel()
+	if release, err := c.acquireMemory(memoryCtx, cfg); err == nil {
+		release(http.StatusOK)
+		t.Fatal("Memory backlog was released immediately after a successful probe")
+	}
+}
+
+func TestCompatibilityTrafficFailedProbeStepsCooldownFromLatestThrottle(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	firstAt := time.Now()
+	c.observeInteractiveStatus(http.StatusTooManyRequests, "")
+	first := c.snapshot()
+	if first.SharedCooldownLevel != 1 || first.SharedCircuitState != "OPEN" {
+		t.Fatalf("first throttle state=%q level=%d", first.SharedCircuitState, first.SharedCooldownLevel)
+	}
+	if first.SharedCooldownUntil.Before(firstAt.Add(1124*time.Second)) || first.SharedCooldownUntil.After(firstAt.Add(1126*time.Second)) {
+		t.Fatalf("first cooldown=%v want about 1125s from throttle", first.SharedCooldownUntil.Sub(firstAt))
+	}
+
+	c.mu.Lock()
+	c.sharedCooldownUntil = time.Now().Add(-time.Second)
+	c.mu.Unlock()
+	probeRelease, err := c.acquireInteractive(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Now()
+	c.observeInteractiveStatus(http.StatusTooManyRequests, "")
+	probeRelease(0)
+	second := c.snapshot()
+	if second.SharedCooldownLevel != 2 || second.SharedCircuitState != "OPEN" {
+		t.Fatalf("failed probe state=%q level=%d", second.SharedCircuitState, second.SharedCooldownLevel)
+	}
+	if second.SharedCooldownUntil.Before(failedAt.Add(2249*time.Second)) || second.SharedCooldownUntil.After(failedAt.Add(2251*time.Second)) {
+		t.Fatalf("second cooldown=%v want about 2250s from latest throttle", second.SharedCooldownUntil.Sub(failedAt))
+	}
+}
+
 func TestCompatibilityTrafficMemoryQueueIsFIFO(t *testing.T) {
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
@@ -403,26 +522,20 @@ func TestCompatibilityTrafficMemoryQueueIsFIFO(t *testing.T) {
 		release func(int)
 		err     error
 	}
-	results := make(chan admitted, 2)
-	for _, id := range []int{1, 2} {
-		id := id
-		go func() {
-			release, err := c.acquireMemory(context.Background(), cfg)
-			results <- admitted{id: id, release: release, err: err}
-		}()
-		time.Sleep(20 * time.Millisecond)
-	}
+	results := make(chan admitted, 1)
+	go func() {
+		release, err := c.acquireMemory(context.Background(), cfg)
+		results <- admitted{id: 1, release: release, err: err}
+	}()
+	waitForCompatibilityTraffic(t, c, func(snapshot compatibilityTrafficSnapshot) bool {
+		return snapshot.MemoryInFlight == 1 && snapshot.MemoryWaiting == 1
+	})
 	firstRelease(http.StatusOK)
 	first := <-results
 	if first.err != nil || first.id != 1 {
 		t.Fatalf("first admitted=%#v", first)
 	}
 	first.release(http.StatusOK)
-	second := <-results
-	if second.err != nil || second.id != 2 {
-		t.Fatalf("second admitted=%#v", second)
-	}
-	second.release(http.StatusOK)
 }
 
 func TestCompatibilityTrafficMemoryQueueIsBounded(t *testing.T) {

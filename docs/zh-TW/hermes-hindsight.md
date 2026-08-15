@@ -74,17 +74,47 @@ HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 
 ## 同帳號流量政策
 
-Current correctness-first M365 Memory admission baseline：
+2026-08-16 事故期間 live readback 的 M365 admission baseline：
 
 ```text
 memoryMaxConcurrent=1
-memoryQueueTimeoutSeconds=60
-interactivePriorityHoldoffSeconds=300
+memoryQueueTimeoutSeconds=30
+interactivePriorityHoldoffSeconds=10
 memoryBackoffInitialSeconds=30
 memoryBackoffMaxSeconds=600
 ```
 
-Interactive traffic 包含 generic chat、Hermes、Responses、Anthropic。Memory 採 FIFO；已經開始的 Memory request 不會被強制 preempt。真實 Microsoft 帳號不以高併發刻意觸發 429，429/backoff 主要用 deterministic test 驗證。
+`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 為舊設定／API 相容欄位；#71 shared-account breaker 不再用它們決定 cooldown。Breaker 的固定工程政策為 `1125 → 2250 → 4500 → 9000 → 18000` 秒，L5 封頂。命中 hard 429 或 ChatHub structured soft-throttle 後進 `OPEN`；時間到只進 `HALF_OPEN_READY`，不會自動 retry。只有一筆受控 **external-user** interactive request 可成為 probe；autonomous Hermes continuation 與 Memory backlog 都不得搶 probe。Probe 成功後進 `RECOVERY`，但不直接放行 Memory；RECOVERY 的降階／解封門檻必須由 controlled live qualification 決定。
+
+Interactive traffic 包含 generic chat、Hermes、Responses、Anthropic。正常狀態 Memory 採 FIFO；已經開始的 Memory request 不會被強制 preempt。真實 Microsoft 帳號不以高併發刻意觸發 429，breaker 行為主要用 deterministic test 驗證。
+
+### Issue #71 milestone / adaptive arbitration
+
+`/hermes/v1` 會用 Hermes framework 的穩定 marker 分成三類，不使用 LLM 猜語意：
+
+- `EXTERNAL_USER`：一般最新 user turn；可以越過排隊中的 autonomous work，並取消尚未完成的 milestone yield。
+- `ASYNC_COMPLETION`：`[ASYNC DELEGATION BATCH COMPLETE — ...]` / `[ASYNC DELEGATION COMPLETE — ...]`；成功處理後建立 milestone Memory barrier。
+- `AUTONOMOUS_CONTINUATION`：standing-goal / kanban / compression / output-length / tool-continuation / verify-on-stop 等 Hermes 固定 system continuation marker。
+
+Autonomous/background Hermes 同時最多 1 筆；正常狀態的 account total interactive ceiling 仍可由 `interactiveMaxConcurrent` 保持 2。當有 autonomous work、Memory pressure、milestone yield、breaker cooldown 或 recovery 時，管理面會顯示有效 Hermes concurrency 已降到 1（cooldown 時為 0）。Gateway 不做「兩個任務語意是否相同」的 dedupe。
+
+成功的 `ASYNC_COMPLETION` 會建立最多 **300 秒**的 Memory lease。下一個 `AUTONOMOUS_CONTINUATION` 會等到以下任一條件成立：
+
+1. Hindsight 正式 `retain.completed` webhook 經 HMAC 驗證，代表 retain 已 server-side durable；立即結束 barrier；
+2. 300 秒到期；記錄 `timeout` 後讓 Hermes 繼續；
+3. 新的 `EXTERNAL_USER` 到達；記錄 `preempted_by_interactive`，優先服務使用者。
+
+`/memory/v1` HTTP 200、queued / claimed / processing 都**不是** durability。`consolidation.completed` 只更新 observability，也**不是 barrier**。Memory ingress 維持 active 1 + waiting 1；再多的 request 立即以 `memory_capacity_deferred` defer，不會把整個 Hindsight pending backlog 轉成 Gateway waiters。Shared breaker 非 `CLOSED` 時 Memory 立即回 `upstream_throttle`，不會等 queue timeout，也不會碰 Microsoft。
+
+Hindsight webhook 使用正式 `X-Hindsight-Signature: sha256=<HMAC-SHA256>` 驗證 raw payload；Gateway 只接受 `retain.completed` / `consolidation.completed`，並用 `event_type + operation_id` 做 bounded at-least-once dedupe。Secret 只存在 runtime secret/config surface，不在 UI 顯示。
+
+### Context / memory handoff 邊界
+
+Gateway 不主動刪 Hermes working context。Milestone barrier 提供「fresh retain 已 durable」的 observable checkpoint，讓 Hermes 後續可以安全 compact 低價值歷史；精確 source / logs / reports 仍是事實權威。
+
+一個已經在 Hermes 端組好的 HTTP request body，Gateway 無法在等待期間反向塞入後來才完成的 recall。因此「retain durable」不等於「同一筆已送到 Gateway 的 autonomous request 一定已帶最新 memory-context」；需要 fresh memory 時，以**下一次**正常 Hindsight recall/readback 驗證。這個限制不能靠修改 Hermes/Hindsight core 規避。
+
+管理設定的 `compatibilityTraffic` 會投影 `NORMAL / HERMES_BUSY / MEMORY_YIELD / UPSTREAM_COOLDOWN / RECOVERY`、external/autonomous in-flight、effective Hermes concurrency、Memory pending/oldest age、milestone state/deadline/outcome、最近 retain/consolidation、hard/soft throttle、streak/cooldown remaining 與 suppressed reask 計數。`RECOVERY` 不會自行回 `CLOSED`；完成 controlled live qualification 後才可由管理面顯式完成 recovery。
 
 ## Overflow recovery
 
