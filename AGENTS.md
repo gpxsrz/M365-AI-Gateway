@@ -1,57 +1,39 @@
-# M365-Copilot2API 專案規則
+# M365-Copilot2API — Agent Core Rules
 
-## 儲存庫權威
+這份檔案是 **always-loaded core**。保持短小；不要把操作手冊、歷史 Issue、Production 拓撲或完整驗證紀錄塞回來。
 
-- 公開 `gpxsrz/M365-Copilot2API` 的 `main` 是唯一開發主線。
-- `HEXUXIU/M365-Copilot2API` 只供唯讀比較。不得向其推送、建立 Issue，或未經審查自動同步。
-- 功能修正、測試、文件與 Issue 都應在公開 fork 完成。
-- 不要把主機名稱、私人路徑、憑證、部署拓撲或內部操作紀錄寫入公開儲存庫。
+## 不可變規則
 
-## 工程方式
+- 公開 `gpxsrz/M365-Copilot2API` 的 `main` 是唯一開發權威。
+- `HEXUXIU/M365-Copilot2API` 只供唯讀比較，不得向其推送或建立 Issue。
+- 一個 Sidecar 執行個體對應一個 Microsoft 365 帳號。
+- Hermes / Hindsight 核心程式碼不因本專案相容性問題修改；可透過設定配合，協定與 transport 相容性由本專案修正。
+- Private / Temporary Chat、檔案暫存、圖片、Code Interpreter artifact 是不同資料邊界，不得混為一談。
+- 不得提交或輸出 token、cookie、密碼、API key、帳號／租戶識別、HAR、可重放封包、token cache、私有檔案網址或產出檔案內容。
 
-- 先追查實際執行路徑，再做最小且完整的根因修正。
-- 優先刪除無用途的程式碼，並沿用既有模組、標準函式庫與原生平台能力。
-- 不加入未經需求證明的抽象層、相容層、設定或依賴。
-- 共用缺陷應在共用邊界修正；不要只補單一呼叫端。
-- 非單純文字變更必須留下最小可執行的回歸測試。
+## 工程規則
 
-## 穩定產品邊界
+- 先追實際執行路徑，再做最小且完整的根因修正；共用缺陷修在共用邊界。
+- 不新增沒有需求證據的抽象層、相容層、設定或依賴。
+- 非單純文字變更必須留下最小可執行 regression test。
+- 任何 adapter 若改變模式或協定形狀（例如 stream → non-stream），必須同步處理只屬於原模式的欄位，並測完整 continuation path，不能只測入口 validation。
+- 能由測試、hash、commit identity 或 readback 機械驗證的規則，不得只依賴文件或人工記憶。
+- 不得直接丟棄 dirty worktree／未追蹤原始碼；**backup 不等於 review**，必須先判斷是否有未被 `main` 吸收的價值。
 
-- 維持一個 Sidecar 執行個體對應一個 Microsoft 365 帳號。
-- 呼叫端負責長期對話歷史、記憶與內容壓縮；Sidecar 只維護必要的短期傳輸續接狀態。
-- 工具回應只保留真實上游內容與結構化工具呼叫，不得合成「將執行」「目的」「預期」等說明文字。
-- Checkpoint identity 必須嚴格保留角色、內容、工具呼叫 ID 與參數；`role=tool` 的可省略 `name` 不得造成無意義的重新綁定。
-- 管理介面的可見中文與公開中文文件一律使用台灣繁中。測試 fixture、協定欄位及正式產品名稱可保留必要原文。
+## Progressive loading
 
-## 安全與公開證據
+不要一次讀完整文件樹。
 
-- 不得提交 token、cookie、密碼、API 金鑰、帳號或租戶識別資料、HAR、可重放封包、token cache、私有檔案網址或產出檔案內容。
-- 測試使用不可登入、不可重放的假值；錯誤訊息不得帶出認證內容。
-- Private Chat、文件暫存、圖片上傳及 Code Interpreter 產出檔案是不同資料邊界，必須分別驗證。
-- 不要把部分相容性測試寫成完整官方等價保證。
+1. 先讀本檔。
+2. 依任務只讀 [`docs/README.md`](docs/README.md) 的路由表。
+3. 只載入目前任務需要的語言版本與主題文件；台灣繁中優先使用 `docs/zh-TW/`。
+4. 只有在追 regression、歷史決策或舊 evidence 時才讀 `docs/history/`。
+5. Production、GitHub、NAS、VM、OAuth、DevSpace cleanup 等私人操作，使用本機 `m365-ops` skill，並只讀該階段對應 reference。
+6. 若本機 `m365-ops` 提供 current handoff ledger，接手時先讀該短狀態，不要無條件重掃所有外部 surface；停止動作前更新 handoff，再回報使用者。
+7. 完成一個階段後，只保留短狀態摘要（source identity、已完成 gate、下一 gate、未解風險），再載入下一階段。
 
-## 工作流程與驗證
+## 驗證與收尾
 
-1. 從最新公開 `main` 建立主題分支。
-2. 以失敗測試或可重現檢查固定問題。
-3. 實作最小修正並清理同一路徑的死碼。
-4. 從最終整合狀態執行相關測試與完整檢查。
-5. 只發布已驗證的乾淨 commit，並以公開 GitHub ref 與 CI 讀回為準。
+Go 變更至少執行 `gofmt`、`go mod verify`、`go test ./...`、`go vet ./...`、`go build ./...`、`git diff --check`；併發、串流、checkpoint、生命週期變更另跑 `go test -race ./...`。
 
-Go 變更至少執行：
-
-```bash
-gofmt -w <changed-go-files>
-go mod verify
-go test ./...
-go vet ./...
-go build ./...
-git diff --check
-```
-
-涉及併發、串流、checkpoint 或生命週期時另執行 `go test -race ./...`。管理介面變更還要實際檢查登入頁、主頁與診斷頁的文字、互動及瀏覽器主控台。
-
-## 文件邊界
-
-- `README.md` 說明使用方式，`CONTRIBUTING.md` 說明貢獻流程，`SECURITY.md` 說明安全回報。
-- 公開文件只描述可重現的產品行為；環境專用部署與備份程序由私人操作文件管理。
+宣稱「完成／收尾」以前，必須重新讀回適用表面的 current identity；若有 DevSpace worktree、agent、stale process、未審 WIP、未完成 Issue gate 或 Production mixed-source，就不得說「沒有尾巴」。
