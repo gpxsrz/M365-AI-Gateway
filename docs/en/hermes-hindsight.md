@@ -60,17 +60,19 @@ recall_max_input_chars=800
 prefetch_waits_for_retain=true
 prefetch_retain_drain_timeout=600
 
-HINDSIGHT_API_WORKER_MAX_SLOTS=2
-HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=1
+HINDSIGHT_API_WORKER_MAX_SLOTS=1
+HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=0
 HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
 HINDSIGHT_API_WORKER_MAX_RETRIES=12
-HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=120
+HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=60
 HINDSIGHT_API_LLM_TIMEOUT=120
 HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 ```
 
 `observation` is the consolidated high-density knowledge layer and is appropriate for automatic injection. `recall_types` also affects the `hindsight_recall` tool; use `hindsight_reflect` for broader synthesis over the bank. `HINDSIGHT_API_LLM_TIMEOUT=120` is deliberately bounded because M365 admission control can block new Memory work but cannot preempt a request that already started.
+
+The live 2026-08-16 recovery baseline intentionally runs only one Hindsight worker slot with no separately reserved consolidation slot. Shared-account safety is enforced by the Gateway scheduler and breaker; consolidation remains background work and is not the milestone durability barrier. `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` remains fixed at `1`.
 
 ## Shared-account traffic policy
 

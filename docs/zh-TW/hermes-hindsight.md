@@ -60,17 +60,19 @@ recall_max_input_chars=800
 prefetch_waits_for_retain=true
 prefetch_retain_drain_timeout=600
 
-HINDSIGHT_API_WORKER_MAX_SLOTS=2
-HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=1
+HINDSIGHT_API_WORKER_MAX_SLOTS=1
+HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=0
 HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
 HINDSIGHT_API_WORKER_MAX_RETRIES=12
-HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=120
+HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=60
 HINDSIGHT_API_LLM_TIMEOUT=120
 HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 ```
 
 `observation` 是 consolidation 後的高密度知識層，適合自動注入；`recall_types` 也會影響 `hindsight_recall` tool，要做跨完整 bank 的深度綜合時優先使用 `hindsight_reflect`。`HINDSIGHT_API_LLM_TIMEOUT=120` 刻意保持有限，因為 M365 admission control 能阻止新的 Memory request，卻不能搶占已經開始的工作。
+
+2026-08-16 live recovery baseline 刻意只保留一個 Hindsight worker slot，且不另外保留 consolidation slot。shared-account safety 由 Gateway scheduler / breaker 負責；consolidation 仍是背景工作，不是 milestone durability barrier。`HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` 維持固定 `1`。
 
 ## 同帳號流量政策
 
