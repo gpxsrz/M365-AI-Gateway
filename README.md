@@ -1,6 +1,10 @@
-# M365-Copilot2API
+# M365 AI Gateway
 
-M365-Copilot2API 是社群維護的自架 Sidecar，將 Microsoft 365 Copilot ChatHub 轉接成常見的 OpenAI / Anthropic 相容 API。Hermes Agent 與 Hindsight Memory Provider 是正式相容目標；專案同時支援 caller tools、多模態輸入、Bing、Code Interpreter、artifact 與 MCP。
+M365 AI Gateway 是社群維護的自架 Microsoft 365 AI interoperability gateway。它以 Microsoft 365 Copilot ChatHub 為上游，對外提供 OpenAI / Anthropic 相容介面，並把 Hermes Agent、Hindsight Memory Provider、caller tools、多模態輸入、Bing、Code Interpreter、artifact、MCP 與共享帳號流量仲裁放在同一個可維運邊界內。
+
+> 本專案為非官方社群專案，與 Microsoft 無隸屬或背書關係。`m365-native` binary / Go module / config directory 是既有 runtime compatibility identity，與 public product name 分開維護。
+
+> 專案原名為 `M365-Copilot2API`。更名只改 public brand / repository identity；既有 runtime identity 與歷史 evidence 不會為了品牌重寫。
 
 > 深度文件已改成 **progressive-loading** 架構。請從 [`docs/README.md`](docs/README.md) 選擇主題，不要一次讀完整 `docs/`。
 
@@ -71,7 +75,11 @@ git diff --check
 
 # English
 
-M365-Copilot2API is a community-maintained self-hosted sidecar that exposes Microsoft 365 Copilot ChatHub through familiar OpenAI- and Anthropic-compatible APIs. Hermes Agent and Hindsight Memory Provider are first-class compatibility targets; caller tools, multimodal input, Bing, Code Interpreter, artifacts, and MCP are also supported.
+M365 AI Gateway is a community-maintained, self-hosted Microsoft 365 AI interoperability gateway. It uses Microsoft 365 Copilot ChatHub as its upstream while exposing OpenAI- and Anthropic-compatible surfaces and bringing Hermes Agent, Hindsight Memory Provider, caller tools, multimodal input, Bing, Code Interpreter, artifacts, MCP, and shared-account traffic arbitration under one operable boundary.
+
+> This is an independent community project and is not affiliated with or endorsed by Microsoft. The existing `m365-native` binary, Go module, and configuration directory remain runtime compatibility identities and are intentionally separate from the public product name.
+
+> The project was formerly named `M365-Copilot2API`. The rebrand changes the public product / repository identity without rewriting established runtime identities or historical evidence.
 
 > Deep documentation now uses a **progressive-loading** layout. Start from [`docs/README.md`](docs/README.md) and load only the topic you need instead of reading the entire `docs/` tree.
 

@@ -1,13 +1,18 @@
 # 架構與產品邊界
 
-這份文件只回答「M365-Copilot2API 現在是什麼、請求怎麼走、資料邊界在哪」。Consumer-specific 設定、部署與歷史 evidence 請讀其他主題文件。
+這份文件只回答「M365 AI Gateway 現在是什麼、請求怎麼走、資料邊界在哪」。Consumer-specific 設定、部署與歷史 evidence 請讀其他主題文件。
 
 ## 核心模型
 
 - 一個 Sidecar 執行個體對應一個 Microsoft 365 帳號。
-- Sidecar 負責把 OpenAI / Anthropic / MCP 相容請求投影到 Microsoft 365 Copilot ChatHub。
+- Gateway 負責把 OpenAI / Anthropic / MCP 相容請求投影到 Microsoft 365 Copilot ChatHub，並為 Hermes / Hindsight 等不同工作負載提供 profile、checkpoint 與共享帳號 admission control。
 - 長期對話歷史與長期記憶由 caller / Hermes / Hindsight 管理；Sidecar 只保留必要的短期 transport continuation state。
-- 公開 `gpxsrz/M365-Copilot2API` `main` 是本專案唯一開發主線。
+- 公開 `gpxsrz/M365-AI-Gateway` `main` 是本專案唯一開發主線。
+- 本專案是獨立社群專案，不是 Microsoft 官方產品；`m365-native` 保留作 runtime compatibility identity。
+
+### 相容識別符
+
+Public brand 更名不要求破壞既有 runtime / protocol identity。`m365-native` binary、Go module、設定目錄，以及已部署的 `m365-copilot2api` Compose project / path、MCP server name / URN、artifact upstream client-version 等識別符可維持原值，除非另有獨立相容性遷移與實測證據。這些 legacy identifiers 不代表目前產品名稱。
 
 ## 主要介面
 

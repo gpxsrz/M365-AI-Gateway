@@ -39,7 +39,7 @@ Never put real bootstrap secrets or API keys in the repository, Issues, handoff 
 ## Container image
 
 ```bash
-docker build -t m365-copilot2api .
+docker build -t m365-ai-gateway .
 ```
 
 The `Dockerfile` is a build base, not a universal Production Compose recipe. Administrator bootstrap trusts true loopback only; ordinary bridge/NAT requests do not automatically count as loopback. Before exposing the service beyond localhost, design TLS, trusted reverse-proxy controls, network boundaries, and persistent administrator-password handling.

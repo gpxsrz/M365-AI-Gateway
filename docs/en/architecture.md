@@ -1,13 +1,18 @@
 # Architecture and product boundaries
 
-This document answers only what M365-Copilot2API is, how requests flow, and where the data boundaries are. Use the other topic documents for consumer settings, deployment, or historical evidence.
+This document answers only what M365 AI Gateway is, how requests flow, and where the data boundaries are. Use the other topic documents for consumer settings, deployment, or historical evidence.
 
 ## Core model
 
 - One sidecar instance maps to one Microsoft 365 account.
-- The sidecar projects OpenAI / Anthropic / MCP-compatible requests onto Microsoft 365 Copilot ChatHub.
+- The gateway projects OpenAI / Anthropic / MCP-compatible requests onto Microsoft 365 Copilot ChatHub and provides workload profiles, checkpoints, and shared-account admission control for consumers such as Hermes and Hindsight.
 - Long-term conversation history and durable memory belong to the caller / Hermes / Hindsight. The sidecar keeps only short-lived transport continuation state.
-- Public `gpxsrz/M365-Copilot2API` `main` is the single development line.
+- Public `gpxsrz/M365-AI-Gateway` `main` is the single development line.
+- This is an independent community project, not an official Microsoft product; `m365-native` remains a runtime compatibility identity.
+
+### Compatibility identifiers
+
+The public rebrand does not require breaking established runtime or protocol identities. The `m365-native` binary, Go module and configuration directory, plus deployed `m365-copilot2api` Compose project / paths, MCP server names / URNs, and artifact upstream client-version identifiers may remain unchanged unless a separate compatibility migration is backed by live evidence. These legacy identifiers are not the current product name.
 
 ## Main surfaces
 

@@ -1,6 +1,6 @@
 # Microsoft Web model and request-capability evidence
 
-The Microsoft 365 Copilot Web model selector and ChatHub request surface can change with rollout. M365-Copilot2API treats these observations as **external capability evidence**, not as permanent string whitelists in Go source.
+The Microsoft 365 Copilot Web model selector and ChatHub request surface can change with rollout. M365 AI Gateway treats these observations as **external capability evidence**, not as permanent string whitelists in Go source.
 
 ## Optional model capability
 

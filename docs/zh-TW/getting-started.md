@@ -39,7 +39,7 @@ curl -sS http://127.0.0.1:4141/v1/models \
 ## Container image
 
 ```bash
-docker build -t m365-copilot2api .
+docker build -t m365-ai-gateway .
 ```
 
 `Dockerfile` 是建置基礎，不代表通用 Production Compose。管理 bootstrap 只信任真正 loopback；一般 bridge/NAT request 不會自動被當成 loopback。要把服務暴露到 localhost 以外，必須先設計 TLS、可信 reverse proxy、網路邊界與持久管理員密碼流程。

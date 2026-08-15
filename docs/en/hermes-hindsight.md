@@ -96,7 +96,7 @@ Interactive traffic includes generic chat, Hermes, Responses, and Anthropic. Mem
 
 As documented for upstream #18774 on 2026-08-13, the Hermes plugin may read `bank_mission` / `bank_retain_mission` without synchronizing them into live Hindsight `reflect_mission` / `retain_mission` overrides.
 
-Until fixed upstream, apply the desired values through the Hindsight Banks Config API and require a GET readback. This is not an M365-Copilot2API core defect and should not be carried as a Hermes-core patch here.
+Until fixed upstream, apply the desired values through the Hindsight Banks Config API and require a GET readback. This is not an M365 AI Gateway core defect and should not be carried as a Hermes-core patch here.
 
 Current workaround surface:
 

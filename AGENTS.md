@@ -1,10 +1,10 @@
-# M365-Copilot2API — Agent Core Rules
+# M365 AI Gateway — Agent Core Rules
 
 這份檔案是 **always-loaded core**。保持短小；不要把操作手冊、歷史 Issue、Production 拓撲或完整驗證紀錄塞回來。
 
 ## 不可變規則
 
-- 公開 `gpxsrz/M365-Copilot2API` 的 `main` 是唯一開發權威。
+- 公開 `gpxsrz/M365-AI-Gateway` 的 `main` 是唯一開發權威。
 - `HEXUXIU/M365-Copilot2API` 只供唯讀比較，不得向其推送或建立 Issue。
 - 一個 Sidecar 執行個體對應一個 Microsoft 365 帳號。
 - Hermes / Hindsight 核心程式碼不因本專案相容性問題修改；可透過設定配合，協定與 transport 相容性由本專案修正。

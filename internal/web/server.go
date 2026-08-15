@@ -584,7 +584,7 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 
 func writeOAuthCompletionPage(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<!doctype html><html lang="zh-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M365 Copilot2API 授權完成</title><style>body{font:16px system-ui;text-align:center;padding:15vh 20px;color:#242424}main{max-width:520px;margin:auto}h1{font-size:26px}</style></head><body><main><h1>授權完成</h1><p>Microsoft 帳號已登入，可以關閉此頁面。</p><script>if(window.opener){window.opener.postMessage({type:"m365-auth-complete"},window.location.origin);setTimeout(()=>window.close(),300)}</script></main></body></html>`)
+	fmt.Fprint(w, `<!doctype html><html lang="zh-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M365 AI Gateway 授權完成</title><style>body{font:16px system-ui;text-align:center;padding:15vh 20px;color:#242424}main{max-width:520px;margin:auto}h1{font-size:26px}</style></head><body><main><h1>授權完成</h1><p>Microsoft 帳號已登入，可以關閉此頁面。</p><script>if(window.opener){window.opener.postMessage({type:"m365-auth-complete"},window.location.origin);setTimeout(()=>window.close(),300)}</script></main></body></html>`)
 }
 
 type chatBody struct {

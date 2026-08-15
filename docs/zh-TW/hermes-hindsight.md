@@ -96,7 +96,7 @@ Interactive traffic 包含 generic chat、Hermes、Responses、Anthropic。Memor
 
 截至 2026-08-13 的已知 upstream #18774：Hermes plugin 可能讀到 `bank_mission` / `bank_retain_mission`，但沒有同步成 live Hindsight bank 的 `reflect_mission` / `retain_mission` override。
 
-修復前，desired value 應直接透過 Hindsight Banks Config API 設定，並以 GET readback 驗證。這不是 M365-Copilot2API core 應修的問題，也不應維護 Hermes core patch。
+修復前，desired value 應直接透過 Hindsight Banks Config API 設定，並以 GET readback 驗證。這不是 M365 AI Gateway core 應修的問題，也不應維護 Hermes core patch。
 
 Current workaround surface：
 

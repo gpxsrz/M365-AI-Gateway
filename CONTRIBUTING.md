@@ -1,6 +1,6 @@
 # 貢獻指南
 
-公開 `gpxsrz/M365-Copilot2API` 的 `main` 是唯一開發權威；`HEXUXIU/M365-Copilot2API` 只供唯讀比較。
+公開 `gpxsrz/M365-AI-Gateway` 的 `main` 是唯一開發權威；`HEXUXIU/M365-Copilot2API` 只供唯讀比較。
 
 ## 工作流程
 
@@ -43,7 +43,7 @@ git diff --check
 
 # Contributing Guide
 
-Public `gpxsrz/M365-Copilot2API` `main` is the single development source of truth; `HEXUXIU/M365-Copilot2API` is read-only reference material.
+Public `gpxsrz/M365-AI-Gateway` `main` is the single development source of truth; `HEXUXIU/M365-Copilot2API` is read-only reference material.
 
 ## Workflow
 
