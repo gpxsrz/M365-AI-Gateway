@@ -27,6 +27,6 @@
 | Hermes | `/hermes/v1` | Production verified | checkpoint, overflow, tool continuation, #68 |
 | Hindsight | `/memory/v1` | Core Production verified | retain/recall/reflect, overflow, 40K/retry1 |
 | Traffic | Interactive / Memory admission | Deterministically verified | bounded concurrency, FIFO, shared cooldown |
-| Deployment identity | binary + Web from one commit | **Needs work / #69** | current script does not mechanically prevent mixed-source runtime |
+| Deployment identity | binary + Web from one commit | **Production verified** | #69 binds binary + three runtime Web assets into one deterministic release/rollback unit with identity readback |
 
 For evidence rationale, read [`research-evidence.md`](research-evidence.md). For current gaps, read [`known-limitations.md`](known-limitations.md).

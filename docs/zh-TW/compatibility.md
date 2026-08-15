@@ -27,6 +27,6 @@
 | Hermes | `/hermes/v1` | Production 已驗證 | checkpoint、overflow、tool continuation、#68 |
 | Hindsight | `/memory/v1` | 核心 Production 已驗證 | retain/recall/reflect、overflow、40K/retry1 |
 | Traffic | Interactive / Memory admission | deterministic 已驗證 | bounded concurrency、FIFO、shared cooldown |
-| Deployment identity | binary + Web 同 commit | **待補強 / #69** | current script 尚未機械式防 mixed-source |
+| Deployment identity | binary + Web 同 commit | **Production 已驗證** | #69 已把 binary + 三個 runtime Web assets 綁成同一 deterministic release/rollback unit，並做 identity readback |
 
 更詳細的「為什麼」請讀 [`research-evidence.md`](research-evidence.md)；目前缺口請讀 [`known-limitations.md`](known-limitations.md)。
