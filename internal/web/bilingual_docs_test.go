@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -99,6 +100,49 @@ func TestDocumentationProgressiveLoadingLayout(t *testing.T) {
 		if lines := strings.Count(string(raw), "\n") + 1; lines > maxLines {
 			t.Errorf("%s has %d lines, max %d; move deep content behind the topic router", path, lines, maxLines)
 		}
+	}
+}
+
+func TestPublicMarkdownHasSingleTrailingNewline(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	check := func(path string) error {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		trimmed := bytes.TrimRight(raw, "\r\n")
+		if !bytes.Equal(raw[len(trimmed):], []byte("\n")) {
+			rel, relErr := filepath.Rel(repoRoot, path)
+			if relErr != nil {
+				rel = path
+			}
+			t.Errorf("%s must end with exactly one LF newline and no blank EOF line", rel)
+		}
+		return nil
+	}
+	entries, err := os.ReadDir(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		if err := check(filepath.Join(repoRoot, entry.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = filepath.WalkDir(filepath.Join(repoRoot, "docs"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".md" {
+			return nil
+		}
+		return check(path)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
