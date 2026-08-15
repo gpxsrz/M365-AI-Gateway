@@ -27,6 +27,15 @@ func ignoredOpenAICompatibilityParameters(body oaiReq) []string {
 	return names
 }
 
+func ignoredOpenAICompatibilityParametersWithStreamOptions(body oaiReq, options chatStreamOptions) []string {
+	names := ignoredOpenAICompatibilityParameters(body)
+	if options.IncludeObfuscationSet {
+		names = append(names, "stream_options.include_obfuscation")
+		sort.Strings(names)
+	}
+	return names
+}
+
 func setIgnoredParameters(w http.ResponseWriter, names []string) {
 	if len(names) == 0 {
 		return

@@ -10,10 +10,18 @@ import (
 )
 
 func writeToolResponseWithPolicy(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, route routeResolution, policy nativePolicySnapshot, preambleSent ...bool) error {
-	return writeToolResponseWithMetadata(w, id, model, stream, calls, res, route, policy, nil, "", preambleSent...)
+	return writeToolResponseWithUsagePolicy(w, id, model, stream, calls, res, route, policy, chatCompletionStreamUsage{}, preambleSent...)
+}
+
+func writeToolResponseWithUsagePolicy(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, route routeResolution, policy nativePolicySnapshot, usage chatCompletionStreamUsage, preambleSent ...bool) error {
+	return writeToolResponseWithUsageMetadata(w, id, model, stream, calls, res, route, policy, nil, "", usage, preambleSent...)
 }
 
 func writeToolResponseWithMetadata(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, route routeResolution, policy nativePolicySnapshot, metadata map[string]any, reasoning string, preambleSent ...bool) error {
+	return writeToolResponseWithUsageMetadata(w, id, model, stream, calls, res, route, policy, metadata, reasoning, chatCompletionStreamUsage{}, preambleSent...)
+}
+
+func writeToolResponseWithUsageMetadata(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, route routeResolution, policy nativePolicySnapshot, metadata map[string]any, reasoning string, usage chatCompletionStreamUsage, preambleSent ...bool) error {
 	toolCalls := toolCallMaps(calls)
 	var textContent any
 	if !stream && strings.TrimSpace(res.Text) != "" {
@@ -60,6 +68,7 @@ func writeToolResponseWithMetadata(w http.ResponseWriter, id, model string, stre
 		}
 		base := func(delta map[string]any, finish any) map[string]any {
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
+			addChatCompletionUsageNull(chunk, usage)
 			if len(metadata) > 0 {
 				chunk["m365"] = metadata
 			}
@@ -83,6 +92,7 @@ func writeToolResponseWithMetadata(w http.ResponseWriter, id, model string, stre
 			emit(base(map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": tc.ID, "type": typ, "function": map[string]any{"name": tc.Name, "arguments": string(tc.Arguments)}}}}, nil))
 		}
 		emit(base(map[string]any{}, "tool_calls"))
+		writeChatCompletionUsageChunk(w, id, model, time.Now().Unix(), usage, chatCompletionVisibleOutput(res.Text, reasoning), calls, metadata)
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		return nil
 	}
@@ -111,6 +121,10 @@ func toolDefinitionMaps(tools []chathub.Tool) []map[string]any {
 }
 
 func writeBufferedChatCompletionStream(w http.ResponseWriter, response map[string]any, route routeResolution, tools []chathub.Tool, choice any, policies ...nativePolicySnapshot) error {
+	return writeBufferedChatCompletionStreamWithUsage(w, response, route, tools, choice, chatCompletionStreamUsage{}, policies...)
+}
+
+func writeBufferedChatCompletionStreamWithUsage(w http.ResponseWriter, response map[string]any, route routeResolution, tools []chathub.Tool, choice any, usage chatCompletionStreamUsage, policies ...nativePolicySnapshot) error {
 	id, _ := response["id"].(string)
 	model, _ := response["model"].(string)
 	message, finish := openAIChoice(response)
@@ -160,7 +174,7 @@ func writeBufferedChatCompletionStream(w http.ResponseWriter, response map[strin
 				policy = policies[0]
 			}
 			metadata, _ := response["m365"].(map[string]any)
-			return writeToolResponseWithMetadata(w, id, model, true, allowedCalls, chathub.Result{Text: text, Images: images}, route, policy, metadata, reasoning)
+			return writeToolResponseWithUsageMetadata(w, id, model, true, allowedCalls, chathub.Result{Text: text, Images: images}, route, policy, metadata, reasoning, usage)
 		}
 		if rejected {
 			return fmt.Errorf("%w", errUnavailableToolCall)
@@ -184,6 +198,7 @@ func writeBufferedChatCompletionStream(w http.ResponseWriter, response map[strin
 			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": terminal}},
 		}
+		addChatCompletionUsageNull(chunk, usage)
 		if metadata != nil {
 			chunk["m365"] = metadata
 		}
@@ -216,6 +231,8 @@ func writeBufferedChatCompletionStream(w http.ResponseWriter, response map[strin
 		finish = "stop"
 	}
 	emit(map[string]any{}, finish)
+	metadataMap, _ := metadata.(map[string]any)
+	writeChatCompletionUsageChunk(w, id, model, created, usage, chatCompletionVisibleOutput(text, reasoning), nil, metadataMap)
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
@@ -224,6 +241,10 @@ func writeBufferedChatCompletionStream(w http.ResponseWriter, response map[strin
 }
 
 func writeTextStreamEndWithPolicy(w http.ResponseWriter, id, model string, route routeResolution, policy nativePolicySnapshot, results ...chathub.Result) {
+	writeTextStreamEndWithUsagePolicy(w, id, model, route, policy, chatCompletionStreamUsage{}, "", results...)
+}
+
+func writeTextStreamEndWithUsagePolicy(w http.ResponseWriter, id, model string, route routeResolution, policy nativePolicySnapshot, usage chatCompletionStreamUsage, completionText string, results ...chathub.Result) {
 	chunk := map[string]any{
 		"id":      id,
 		"object":  "chat.completion.chunk",
@@ -235,6 +256,7 @@ func writeTextStreamEndWithPolicy(w http.ResponseWriter, id, model string, route
 			"finish_reason": "stop",
 		}},
 	}
+	addChatCompletionUsageNull(chunk, usage)
 	metadata := map[string]any{}
 	if len(results) > 0 {
 		metadata = compatM365Metadata(results[0], route)
@@ -248,6 +270,7 @@ func writeTextStreamEndWithPolicy(w http.ResponseWriter, id, model string, route
 		chunk["m365"] = metadata
 	}
 	fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
+	writeChatCompletionUsageChunk(w, id, model, time.Now().Unix(), usage, completionText, nil, metadata)
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()

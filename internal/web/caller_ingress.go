@@ -13,6 +13,7 @@ import (
 
 var openAIRequestKnownFields = map[string]struct{}{
 	"model": {}, "response_format": {}, "messages": {}, "stream": {}, "user": {},
+	"stream_options":  {},
 	"conversation_id": {}, "session_id": {}, "session_key": {}, "attachments": {},
 	"tools": {}, "functions": {}, "tool_choice": {}, "parallel_tool_calls": {},
 	"function_call": {}, "reasoning": {}, "reasoning_effort": {}, "verbosity": {},

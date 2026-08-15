@@ -782,6 +782,7 @@ type oaiReq struct {
 	ResponseFormat *responseFormat      `json:"response_format,omitempty"`
 	Messages       []oaiMsg             `json:"messages"`
 	Stream         bool                 `json:"stream"`
+	StreamOptions  json.RawMessage      `json:"stream_options,omitempty"`
 	User           string               `json:"user"`
 	ConversationID string               `json:"conversation_id"`
 	SessionID      string               `json:"session_id"`
@@ -883,10 +884,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	streamOptions, err := parseChatStreamOptions(body.StreamOptions, body.Stream)
+	if err != nil {
+		writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "invalid_stream_options", err.Error())
+		return
+	}
 	if body.Stream {
 		w = wrapSSEDeadlineWriter(w)
 	}
-	setIgnoredParameters(w, ignoredOpenAICompatibilityParameters(body))
+	setIgnoredParameters(w, ignoredOpenAICompatibilityParametersWithStreamOptions(body, streamOptions))
 	ingressEvidence := setCallerIngressEvidenceHeaders(w, body)
 	if ingressEvidence.total() > 0 {
 		log.Printf("[req-trace] id=%s stage=ingress_evidence preserved=true top=%d message=%d item=%d content=%d tool=%d format=%d reasoning=%d", requestID, ingressEvidence.TopLevel, ingressEvidence.Message, ingressEvidence.Item, ingressEvidence.Content, ingressEvidence.Tool, ingressEvidence.Format, ingressEvidence.Reasoning)
@@ -912,6 +918,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	tone := resolution.ResolvedTone
 	normalizeLegacyTools(&body)
+	streamUsage := newChatCompletionStreamUsage(streamOptions, resolution.ResponseModel, body)
 	if _, err := strictToolChoiceMode(body.ToolChoice); err != nil {
 		writeOpenAIErrorCode(w, http.StatusBadRequest, "invalid_request_error", "invalid_tool_choice", err.Error())
 		return
@@ -1020,7 +1027,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		selected := httptest.NewRecorder()
-		writeErr := writeBufferedChatCompletionStream(selected, buffered, resolution, body.Tools, body.ToolChoice, nativePolicy)
+		writeErr := writeBufferedChatCompletionStreamWithUsage(selected, buffered, resolution, body.Tools, body.ToolChoice, streamUsage, nativePolicy)
 		if errors.Is(writeErr, errUnavailableToolCall) && normalizedToolChoiceMode(body.ToolChoice) == "auto" {
 			fallbackBody := textOnlyFallbackRequest(body)
 			fallback, fallbackRaw, fallbackStatus, fallbackErr := s.runOpenAIAdapter(r, fallbackBody)
@@ -1035,7 +1042,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			selected = httptest.NewRecorder()
-			writeErr = writeBufferedChatCompletionStream(selected, fallback, resolution, nil, "none", nativePolicy)
+			writeErr = writeBufferedChatCompletionStreamWithUsage(selected, fallback, resolution, nil, "none", streamUsage, nativePolicy)
 		}
 		if writeErr != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", writeErr.Error())
@@ -1205,7 +1212,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				writeChatStreamError(w, "checkpoint_error", err.Error())
 				return
 			}
-			_ = writeToolResponseWithPolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, true, calls, carrier, resolution, nativePolicy)
+			_ = writeToolResponseWithUsagePolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, true, calls, carrier, resolution, nativePolicy, streamUsage)
 			return
 		}
 		mode := normalizedToolChoiceMode(body.ToolChoice)
@@ -1247,7 +1254,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						writeChatStreamError(w, "checkpoint_error", err.Error())
 						return
 					}
-					_ = writeToolResponseWithPolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, true, calls, retryRes, resolution, nativePolicy)
+					_ = writeToolResponseWithUsagePolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, true, calls, retryRes, resolution, nativePolicy, streamUsage)
 					return
 				}
 			}
@@ -1302,6 +1309,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				first = false
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}, "m365": withNativePolicy(resolution.metadata(), nativePolicy)}
+			addChatCompletionUsageNull(chunk, streamUsage)
 			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 			flusher.Flush()
 		}
@@ -1316,6 +1324,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				first = false
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}, "m365": withNativePolicy(resolution.metadata(), nativePolicy)}
+			addChatCompletionUsageNull(chunk, streamUsage)
 			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 			flusher.Flush()
 		}
@@ -1329,6 +1338,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				first = false
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}, "m365": withNativePolicy(resolution.metadata(), nativePolicy)}
+			addChatCompletionUsageNull(chunk, streamUsage)
 			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 			flusher.Flush()
 		}
@@ -1463,7 +1473,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				return
 			}
 			res.Text = text.String()
-			_ = writeToolResponseWithPolicy(w, id, model, true, calls, res, resolution, nativePolicy, true)
+			_ = writeToolResponseWithUsagePolicy(w, id, model, true, calls, res, resolution, nativePolicy, streamUsage, true)
 			return
 		}
 		if suppressedKnownCalls {
@@ -1492,7 +1502,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				writeChatStreamError(w, "checkpoint_error", err.Error())
 				return
 			}
-			writeTextStreamEndWithPolicy(w, id, model, resolution, nativePolicy, res)
+			writeTextStreamEndWithUsagePolicy(w, id, model, resolution, nativePolicy, streamUsage, chatCompletionVisibleOutput(visible.String(), chathub.ReasoningContent(res.Events)), res)
 			return
 		}
 		if strings.TrimSpace(text.String()) == "" && len(res.Images) == 0 && strings.TrimSpace(chathub.ReasoningContent(res.Events)) == "" {
@@ -1509,9 +1519,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			writeChatStreamError(w, "checkpoint_error", err.Error())
 			return
 		}
-		writeTextStreamEndWithPolicy(w, id, model, resolution, nativePolicy, res)
+		writeTextStreamEndWithUsagePolicy(w, id, model, resolution, nativePolicy, streamUsage, chatCompletionVisibleOutput(visible.String(), chathub.ReasoningContent(res.Events)), res)
 		return
 	}
+	// Every path below is non-streaming. Keep the literal false at response
+	// writers so future streaming compatibility work cannot mistake these call
+	// sites for an uncovered SSE branch.
 	// Ask the upstream model to select and validate the next tool. The gateway
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
@@ -1587,7 +1600,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 				return
 			}
-			_ = writeToolResponseWithPolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, body.Stream, calls, carrier, resolution, nativePolicy, streamPrimed)
+			_ = writeToolResponseWithPolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, false, calls, carrier, resolution, nativePolicy, streamPrimed)
 			return
 		}
 		if !knownCallSuppressed && strings.HasPrefix(normalizedToolChoiceMode(body.ToolChoice), "named:") {
@@ -1628,7 +1641,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 						return
 					}
-					_ = writeToolResponseWithPolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, body.Stream, calls, retryRes, resolution, nativePolicy, streamPrimed)
+					_ = writeToolResponseWithPolicy(w, "chatcmpl-"+uuid.NewString(), resolution.ResponseModel, false, calls, retryRes, resolution, nativePolicy, streamPrimed)
 					return
 				}
 			}
@@ -1698,7 +1711,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 				return
 			}
-			_ = writeToolResponseWithPolicy(w, id, model, body.Stream, calls, toolResult, resolution, nativePolicy)
+			_ = writeToolResponseWithPolicy(w, id, model, false, calls, toolResult, resolution, nativePolicy)
 			return
 		}
 		if len(calls) > 0 && !allowAnswerToolCalls {
@@ -1730,7 +1743,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				writeOpenAIError(w, http.StatusInternalServerError, "checkpoint_error", err.Error())
 				return
 			}
-			_ = writeToolResponseWithPolicy(w, id, model, body.Stream, calls, res, resolution, nativePolicy)
+			_ = writeToolResponseWithPolicy(w, id, model, false, calls, res, resolution, nativePolicy)
 			return
 		}
 		if len(calls) > 0 && !allowAnswerToolCalls {
