@@ -61,6 +61,7 @@ prefetch_waits_for_retain=true
 prefetch_retain_drain_timeout=600
 
 HINDSIGHT_API_WORKER_MAX_SLOTS=1
+HINDSIGHT_API_SKIP_LLM_VERIFICATION=true
 HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=0
 HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
 HINDSIGHT_API_WORKER_MAX_RETRIES=12
@@ -72,7 +73,7 @@ HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 
 `observation` 是 consolidation 後的高密度知識層，適合自動注入；`recall_types` 也會影響 `hindsight_recall` tool，要做跨完整 bank 的深度綜合時優先使用 `hindsight_reflect`。`HINDSIGHT_API_LLM_TIMEOUT=120` 刻意保持有限，因為 M365 admission control 能阻止新的 Memory request，卻不能搶占已經開始的工作。
 
-2026-08-16 live recovery baseline 刻意只保留一個 Hindsight worker slot，且不另外保留 consolidation slot。shared-account safety 由 Gateway scheduler / breaker 負責；consolidation 仍是背景工作，不是 milestone durability barrier。`HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` 維持固定 `1`。
+2026-08-16 live recovery baseline 刻意只保留一個 Hindsight worker slot，且不另外保留 consolidation slot；同時跳過 Hindsight 只在啟動時執行的 LLM connection verification，避免 API/worker restart 額外消耗一筆 shared-account probe，真正的 retain/recall/reflect 仍會在自己的 request path 回報 provider failure。shared-account safety 由 Gateway scheduler / breaker 負責；consolidation 仍是背景工作，不是 milestone durability barrier。`HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` 維持固定 `1`。
 
 ## 同帳號流量政策
 
@@ -86,7 +87,7 @@ memoryBackoffInitialSeconds=30
 memoryBackoffMaxSeconds=600
 ```
 
-`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 為舊設定／API 相容欄位；#71 shared-account breaker 不再用它們決定 cooldown。Breaker 的固定工程政策為 `1125 → 2250 → 4500 → 9000 → 18000` 秒，L5 封頂。命中 hard 429 或 ChatHub structured soft-throttle 後進 `OPEN`；時間到只進 `HALF_OPEN_READY`，不會自動 retry。只有一筆受控 **external-user** interactive request 可成為 probe；autonomous Hermes continuation 與 Memory backlog 都不得搶 probe。Probe 成功後進 `RECOVERY`，但不直接放行 Memory；RECOVERY 的降階／解封門檻必須由 controlled live qualification 決定。
+`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 為舊設定／API 相容欄位；#71 shared-account breaker 不再用它們決定 cooldown。Breaker 的固定工程政策為 `1125 → 2250 → 4500 → 9000 → 18000` 秒，L5 封頂。命中 hard 429 或已驗證的 ChatHub soft-throttle notice 才進 `OPEN`；正常 `item.throttling` quota / metering metadata 不算限流。時間到只進 `HALF_OPEN_READY`，不會自動 retry。只有一筆受控 **external-user** interactive request 可成為 probe；autonomous Hermes continuation 與 Memory backlog 都不得搶 probe。Probe 成功後進 `RECOVERY`，但不直接放行 Memory。`RECOVERY` 期間 `/memory/v1` 仍會 fail-fast；因此這一階段的 controlled qualification 是確認 external-user probe 成功、讀回 `RECOVERY`，並確認沒有競爭中的 in-flight/waiting work。只有 operator 明確完成 recovery 回到 `CLOSED` 後，才允許受限的 Hindsight/Memory live work 恢復。
 
 Interactive traffic 包含 generic chat、Hermes、Responses、Anthropic。正常狀態 Memory 採 FIFO；已經開始的 Memory request 不會被強制 preempt。真實 Microsoft 帳號不以高併發刻意觸發 429，breaker 行為主要用 deterministic test 驗證。
 
@@ -116,7 +117,7 @@ Gateway 不主動刪 Hermes working context。Milestone barrier 提供「fresh r
 
 一個已經在 Hermes 端組好的 HTTP request body，Gateway 無法在等待期間反向塞入後來才完成的 recall。因此「retain durable」不等於「同一筆已送到 Gateway 的 autonomous request 一定已帶最新 memory-context」；需要 fresh memory 時，以**下一次**正常 Hindsight recall/readback 驗證。這個限制不能靠修改 Hermes/Hindsight core 規避。
 
-管理設定的 `compatibilityTraffic` 會投影 `NORMAL / HERMES_BUSY / MEMORY_YIELD / UPSTREAM_COOLDOWN / RECOVERY`、external/autonomous in-flight、effective Hermes concurrency、Memory pending/oldest age、milestone state/deadline/outcome、最近 retain/consolidation、hard/soft throttle、streak/cooldown remaining 與 suppressed reask 計數。`RECOVERY` 不會自行回 `CLOSED`；完成 controlled live qualification 後才可由管理面顯式完成 recovery。
+管理設定的 `compatibilityTraffic` 會投影 `NORMAL / HERMES_BUSY / MEMORY_YIELD / UPSTREAM_COOLDOWN / RECOVERY`、external/autonomous in-flight、effective Hermes concurrency、Memory pending/oldest age、milestone state/deadline/outcome、最近 retain/consolidation、hard/soft throttle、streak/cooldown remaining 與 suppressed reask 計數。`RECOVERY` 不會自行回 `CLOSED`；完成 controlled live qualification 後才可由管理面顯式完成 recovery。因此 recovery 後的 Hindsight canary 是 **CLOSED 狀態下的受限恢復檢查**，不是 RECOVERY 狀態的 Memory probe。
 
 ## Overflow recovery
 

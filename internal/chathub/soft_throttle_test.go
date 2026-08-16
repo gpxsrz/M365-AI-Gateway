@@ -59,31 +59,43 @@ func chatHubSoftThrottleFixture(t *testing.T, item map[string]any) (Result, erro
 	return client.Chat(ctx, Account{AccessToken: "token", OID: "oid", TID: "tid"}, Request{Text: "fixture", ConversationID: "conversation", SessionID: "session"})
 }
 
-func TestChatHubStructuredSoftThrottleReturnsRateLimitError(t *testing.T) {
-	const throttleText = "STRUCTURED_SIGNAL_ONLY"
+func TestChatHubThrottlingMetadataWithoutKnownNoticeDoesNotRateLimit(t *testing.T) {
+	const reply = "STRUCTURED_METADATA_ONLY"
 	result, err := chatHubSoftThrottleFixture(t, map[string]any{
 		"messages": []any{map[string]any{
 			"author":        "bot",
 			"contentOrigin": "BotConnection",
 			"messageType":   "",
 			"offense":       "None",
-			"text":          throttleText,
+			"text":          reply,
 		}},
 		"throttling": map[string]any{"signal": "fixture"},
-		"result":     map[string]any{"message": throttleText, "value": ""},
+		"result":     map[string]any{"message": reply, "value": ""},
 	})
-	var rateLimit *RateLimitError
-	if !errors.As(err, &rateLimit) {
-		t.Fatalf("error=%T %v, want RateLimitError", err, err)
+	if err != nil {
+		t.Fatalf("quota metadata was misclassified as throttle: %T %v", err, err)
 	}
-	if rateLimit.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d, want 429", rateLimit.StatusCode)
+	if result.Throttling == nil || result.Text != reply {
+		t.Fatalf("quota metadata/result was not preserved: %#v", result)
 	}
-	if !rateLimit.SoftThrottle || rateLimit.RetryAfter != "" {
-		t.Fatalf("soft-throttle classification=%t retry-after=%q", rateLimit.SoftThrottle, rateLimit.RetryAfter)
+}
+
+func TestChatHubNormalMeteringThrottlingMetadataDoesNotRateLimit(t *testing.T) {
+	const reply = "NORMAL_META_OK"
+	result, err := chatHubSoftThrottleFixture(t, map[string]any{
+		"throttling": map[string]any{
+			"maxNumUserMessagesInConversation":            30,
+			"numLongDocSummaryUserMessagesInConversation": 0,
+			"numUserMessagesInConversation":               1,
+			"metering":                                    map[string]any{"enabled": true},
+		},
+		"result": map[string]any{"message": reply, "value": ""},
+	})
+	if err != nil {
+		t.Fatalf("normal metering metadata was misclassified as throttle: %T %v", err, err)
 	}
-	if result.Throttling == nil || result.Text != throttleText {
-		t.Fatalf("soft-throttle evidence was not preserved: %#v", result)
+	if result.Text != reply {
+		t.Fatalf("text=%q want=%q", result.Text, reply)
 	}
 }
 

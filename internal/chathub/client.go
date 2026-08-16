@@ -211,7 +211,12 @@ func softThrottleBotMessage(container map[string]any) bool {
 }
 
 func softThrottleFailure(result Result, messageSignal bool) error {
-	if result.Throttling == nil && !messageSignal {
+	// ChatHub includes a non-empty `throttling` object on ordinary successful
+	// turns as per-conversation quota/metering metadata. Its presence alone is
+	// therefore not evidence that the current turn was throttled. Only a
+	// recognized throttle notice (or an actual HTTP 429 handled at dial time)
+	// should become a RateLimitError.
+	if !messageSignal {
 		return nil
 	}
 	return &RateLimitError{StatusCode: http.StatusTooManyRequests, SoftThrottle: true, Err: errors.New("ChatHub soft throttle")}

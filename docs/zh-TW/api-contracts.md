@@ -84,7 +84,7 @@ Forward-compatible ingress 若保存／忽略 caller extensions，可透過既�
 
 Interactive queue full / timeout 等可重試 admission failure 使用 HTTP `503` 並附 `Retry-After`。這和 Microsoft upstream 429 cooldown 是不同層級；caller 不應把任何 5xx 都當成可無條件 replay 已送出的 ChatHub request。
 
-Microsoft hard 429 與 ChatHub structured soft-throttle 都正規化為 canonical HTTP `429 rate_limit_error`。若 upstream 有有效的 `Retry-After` 就保留；若 soft-throttle 沒提供，第一階使用 shared breaker 的 `1125` 秒 cooldown，而不是快速 `1s` replay。Throttle 一旦成立，`response_format` repair/reask 與 required-tool/router retry 都必須停止，不得把 throttle prose 當 malformed model output 再送一次。
+Microsoft hard 429 與已驗證的 ChatHub soft-throttle notice 都正規化為 canonical HTTP `429 rate_limit_error`。**非空的 `item.throttling` object 本身不足以證明正在限流**：正常成功 turn 也會攜帶每個 conversation 的 quota / metering metadata，例如訊息計數與 metering 欄位。Gateway 仍保存這些 metadata供觀測，但只有真正 hard 429 或已驗證的 soft-throttle notice/message shape 才能開 breaker。若 upstream 有有效的 `Retry-After` 就保留；若 soft-throttle 沒提供，第一階使用 shared breaker 的 `1125` 秒 cooldown，而不是快速 `1s` replay。Throttle 一旦成立，`response_format` repair/reask 與 required-tool/router retry 都必須停止，不得把 throttle prose 當 malformed model output 再送一次。
 
 Shared breaker 狀態為 `CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY`。`OPEN` 的時間到期只代表可接受一筆受控 external-user interactive probe；autonomous Hermes continuation 與 Memory backlog 都不會自動成為 probe。Probe 再 throttle 會從最新 throttle timestamp 升到下一階；成功只進 `RECOVERY`，不會自動釋放 Memory backlog。RECOVERY 的降階條件由 controlled live qualification 決定。
 

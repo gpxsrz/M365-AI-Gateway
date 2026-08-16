@@ -61,6 +61,7 @@ prefetch_waits_for_retain=true
 prefetch_retain_drain_timeout=600
 
 HINDSIGHT_API_WORKER_MAX_SLOTS=1
+HINDSIGHT_API_SKIP_LLM_VERIFICATION=true
 HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=0
 HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
 HINDSIGHT_API_WORKER_MAX_RETRIES=12
@@ -72,7 +73,7 @@ HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 
 `observation` is the consolidated high-density knowledge layer and is appropriate for automatic injection. `recall_types` also affects the `hindsight_recall` tool; use `hindsight_reflect` for broader synthesis over the bank. `HINDSIGHT_API_LLM_TIMEOUT=120` is deliberately bounded because M365 admission control can block new Memory work but cannot preempt a request that already started.
 
-The live 2026-08-16 recovery baseline intentionally runs only one Hindsight worker slot with no separately reserved consolidation slot. Shared-account safety is enforced by the Gateway scheduler and breaker; consolidation remains background work and is not the milestone durability barrier. `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` remains fixed at `1`.
+The live 2026-08-16 recovery baseline intentionally runs only one Hindsight worker slot with no separately reserved consolidation slot. It also skips Hindsight's startup-only LLM connection verification so restarting the API/worker does not consume an unplanned shared-account probe; real retain/recall/reflect calls still surface their own provider failures. Shared-account safety is enforced by the Gateway scheduler and breaker; consolidation remains background work and is not the milestone durability barrier. `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` remains fixed at `1`.
 
 ## Shared-account traffic policy
 
@@ -86,7 +87,7 @@ memoryBackoffInitialSeconds=30
 memoryBackoffMaxSeconds=600
 ```
 
-`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` are retained as legacy settings/API compatibility fields; the #71 shared-account breaker no longer derives cooldown from them. Its fixed engineering policy is `1125 → 2250 → 4500 → 9000 → 18000` seconds, capped at L5. A hard 429 or structured ChatHub soft throttle enters `OPEN`; expiry only transitions to `HALF_OPEN_READY` and does not auto-retry. At most one controlled **external-user** interactive request may become the probe; autonomous Hermes continuations and Memory backlog cannot probe. Probe success enters `RECOVERY` without releasing Memory, and RECOVERY downgrade/release thresholds require controlled live qualification.
+`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` are retained as legacy settings/API compatibility fields; the #71 shared-account breaker no longer derives cooldown from them. Its fixed engineering policy is `1125 → 2250 → 4500 → 9000 → 18000` seconds, capped at L5. A hard 429 or a verified ChatHub soft-throttle notice enters `OPEN`; normal quota/metering metadata in `item.throttling` does not. Expiry only transitions to `HALF_OPEN_READY` and does not auto-retry. At most one controlled **external-user** interactive request may become the probe; autonomous Hermes continuations and Memory backlog cannot probe. Probe success enters `RECOVERY` without releasing Memory. During `RECOVERY`, `/memory/v1` is still fail-fast blocked; controlled qualification at this state therefore verifies the successful external-user probe, `RECOVERY` readback, and zero competing in-flight/waiting work. Only after the operator explicitly completes recovery back to `CLOSED` may bounded Hindsight/Memory live work resume.
 
 Interactive traffic includes generic chat, Hermes, Responses, and Anthropic. In normal state Memory waits FIFO; already-running Memory work is not forcibly preempted. Live Microsoft accounts are not deliberately flooded to force 429; breaker behavior is primarily verified deterministically.
 
@@ -116,7 +117,7 @@ The Gateway does not delete Hermes working context. The milestone barrier expose
 
 The Gateway cannot retroactively inject a recall that completes after Hermes has already built the HTTP request body. Therefore "retain durable" does not imply that the same already-built autonomous request contains the newest memory context; when fresh memory matters, verify it through the **next** normal Hindsight recall/readback. This limitation is not solved by carrying Hermes or Hindsight core patches.
 
-`compatibilityTraffic` projects `NORMAL / HERMES_BUSY / MEMORY_YIELD / UPSTREAM_COOLDOWN / RECOVERY`, external/autonomous in-flight counts, effective Hermes concurrency, Memory pending/oldest age, milestone state/deadline/outcome, latest retain/consolidation, hard/soft throttle timestamps, streak/cooldown remaining, and suppressed-reask count. `RECOVERY` never auto-closes; management may explicitly complete recovery only after controlled live qualification.
+`compatibilityTraffic` projects `NORMAL / HERMES_BUSY / MEMORY_YIELD / UPSTREAM_COOLDOWN / RECOVERY`, external/autonomous in-flight counts, effective Hermes concurrency, Memory pending/oldest age, milestone state/deadline/outcome, latest retain/consolidation, hard/soft throttle timestamps, streak/cooldown remaining, and suppressed-reask count. `RECOVERY` never auto-closes; management may explicitly complete recovery only after controlled live qualification. A post-recovery Hindsight canary is therefore a **CLOSED-state** bounded-resumption check, not a RECOVERY-state Memory probe.
 
 ## Overflow recovery
 
