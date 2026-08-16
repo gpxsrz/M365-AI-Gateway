@@ -38,6 +38,8 @@ var hermesAutonomousContinuationPrefixes = [...]string{
 	"[System: You edited code in this turn, but the workspace does not have fresh passing verification evidence yet.",
 }
 
+const hermesDelegatedChildPromptPrefix = "You are a focused subagent working on a specific delegated task."
+
 func classifyHermesRequest(body oaiReq) hermesRequestClass {
 	for i := len(body.Messages) - 1; i >= 0; i-- {
 		message := body.Messages[i]
@@ -54,9 +56,65 @@ func classifyHermesRequest(body oaiReq) hermesRequestClass {
 				return hermesRequestAutonomousContinuation
 			}
 		}
-		return hermesRequestExternalUser
+		break
+	}
+	if hermesDelegatedChildRequest(body) {
+		return hermesRequestAutonomousContinuation
 	}
 	return hermesRequestExternalUser
+}
+
+func hermesDelegatedChildRequest(body oaiReq) bool {
+	for _, message := range body.Messages {
+		if message.Role != "system" && message.Role != "developer" {
+			break
+		}
+		text := strings.ReplaceAll(contentToString(message.Content), "\r\n", "\n")
+		paragraphs := strings.Split(text, "\n\n")
+		for i := 0; i+1 < len(paragraphs); i++ {
+			lines := strings.Split(strings.TrimSpace(paragraphs[i]), "\n")
+			platform, ok := hermesRuntimeIdentityPlatform(lines, body.Model)
+			if !ok || platform != "subagent" {
+				continue
+			}
+			if strings.HasPrefix(strings.TrimSpace(paragraphs[i+1]), hermesDelegatedChildPromptPrefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hermesRuntimeIdentityPlatform(lines []string, model string) (string, bool) {
+	if len(lines) != 4 && len(lines) != 5 {
+		return "", false
+	}
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	if !strings.HasPrefix(lines[0], "Conversation started: ") || strings.TrimSpace(strings.TrimPrefix(lines[0], "Conversation started: ")) == "" {
+		return "", false
+	}
+	index := 1
+	if len(lines) == 5 {
+		if !strings.HasPrefix(lines[index], "Session ID: ") || strings.TrimSpace(strings.TrimPrefix(lines[index], "Session ID: ")) == "" {
+			return "", false
+		}
+		index++
+	}
+	if strings.TrimSpace(model) == "" || lines[index] != "Model: "+strings.TrimSpace(model) {
+		return "", false
+	}
+	index++
+	if !strings.HasPrefix(lines[index], "Provider: ") || strings.TrimSpace(strings.TrimPrefix(lines[index], "Provider: ")) == "" {
+		return "", false
+	}
+	index++
+	if !strings.HasPrefix(lines[index], "Platform: ") {
+		return "", false
+	}
+	platform := strings.TrimSpace(strings.TrimPrefix(lines[index], "Platform: "))
+	return platform, platform != ""
 }
 
 func memoryCompatibilityRequest(path string) bool {
@@ -147,6 +205,7 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	release, err := traffic.acquireMemory(r.Context(), cfg)
 	if err != nil {
 		retryAfter := 1
+		status := http.StatusServiceUnavailable
 		code := "interactive_capacity_busy"
 		message := "Memory Provider request is waiting for interactive capacity"
 		if admission, ok := err.(*memoryAdmissionError); ok && admission.retryAfter > 0 {
@@ -157,11 +216,12 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			if admission.code == "memory_capacity_deferred" {
 				message = "Memory Provider request deferred because the bounded Memory admission queue is full"
 			} else if admission.code == "upstream_throttle" {
+				status = http.StatusTooManyRequests
 				message = "Memory Provider request deferred while the shared Microsoft account circuit breaker is active"
 			}
 		}
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-		writeOpenAIErrorCode(w, http.StatusServiceUnavailable, "rate_limit_error", code, message)
+		writeOpenAIErrorCode(w, status, "rate_limit_error", code, message)
 		return
 	}
 	tracked := &statusTrackingResponseWriter{ResponseWriter: w}

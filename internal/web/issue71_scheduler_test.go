@@ -172,6 +172,117 @@ func issue71WebhookSignature(secret string, payload []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
+func TestIssue71AsyncCompletionDirectDelegatedChildWaitsForDurableRetain(t *testing.T) {
+	const secret = "issue71-direct-delegate-test-secret-with-enough-entropy"
+	t.Setenv("M365_HINDSIGHT_WEBHOOK_SECRET", secret)
+
+	server := newAdminSecurityServer(t, "administrator-password")
+	settings := server.settings.get()
+	settings.HermesCompatibilityEnabled = true
+	settings.InteractivePriorityHoldoffSeconds = 0
+	settings.InteractiveQueueTimeoutSeconds = 2
+	if err := server.settings.save(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.tokens.Upsert(testTokenSet("issue71-direct-delegate")); err != nil {
+		t.Fatal(err)
+	}
+	server.chat = &issue71StaticChat{}
+	server.compatTraffic = newCompatibilityTrafficController()
+
+	sendHermes := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)), "issue71-owner")
+		rr := httptest.NewRecorder()
+		server.hermesOpenAIChat(rr, req)
+		return rr
+	}
+
+	completionBody := `{"model":"gpt-5.6-reasoning","messages":[{"role":"developer","content":"Conversation started: Sunday, August 16, 2026\nModel: gpt-5.6-reasoning\nProvider: custom\nPlatform: discord"},{"role":"user","content":"[ASYNC DELEGATION BATCH COMPLETE — deleg_parent]\nresults"}]}`
+	if rr := sendHermes(completionBody); rr.Code != http.StatusOK {
+		t.Fatalf("async completion status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if snap := server.compatTraffic.snapshot(); !snap.MemoryYieldPending {
+		t.Fatalf("async completion did not arm milestone yield: %#v", snap)
+	}
+
+	childBody := `{"model":"gpt-5.6-reasoning","messages":[{"role":"developer","content":"Conversation started: Sunday, August 16, 2026\nModel: gpt-5.6-reasoning\nProvider: custom\nPlatform: subagent\n\nYou are a focused subagent working on a specific delegated task."},{"role":"user","content":"Continue the delegated inspection from the next finding."}]}`
+	childDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		childDone <- sendHermes(childBody)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		select {
+		case rr := <-childDone:
+			t.Fatalf("delegated child bypassed retain-durable barrier: status=%d snapshot=%#v", rr.Code, server.compatTraffic.snapshot())
+		default:
+		}
+		snap := server.compatTraffic.snapshot()
+		if snap.InteractiveWaiting == 1 && snap.MemoryYieldPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delegated child never entered milestone wait: %#v", snap)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	eventAt := time.Now().UTC().Format(time.RFC3339Nano)
+	payload := []byte(`{"event":"retain.completed","bank_id":"issue71-bank","operation_id":"op-direct-delegate-durable","status":"completed","timestamp":"` + eventAt + `","data":{"document_id":"doc-direct-delegate"}}`)
+	webhook := httptest.NewRequest(http.MethodPost, "/internal/hindsight/webhook", strings.NewReader(string(payload)))
+	webhook.Header.Set("X-Hindsight-Event", "retain.completed")
+	webhook.Header.Set("X-Hindsight-Signature", issue71WebhookSignature(secret, payload))
+	webhookRecorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(webhookRecorder, webhook)
+	if webhookRecorder.Code != http.StatusNoContent {
+		t.Fatalf("retain webhook status=%d body=%s", webhookRecorder.Code, webhookRecorder.Body.String())
+	}
+
+	select {
+	case rr := <-childDone:
+		if rr.Code != http.StatusOK {
+			t.Fatalf("delegated child after retain status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delegated child remained blocked after durable retain")
+	}
+	if snap := server.compatTraffic.snapshot(); snap.LastMemoryYieldOutcome != "retain_durable" {
+		t.Fatalf("durable retain did not release delegated child: %#v", snap)
+	}
+
+	completionBody = strings.Replace(completionBody, "deleg_parent", "deleg_parent_next", 1)
+	if rr := sendHermes(completionBody); rr.Code != http.StatusOK {
+		t.Fatalf("second async completion status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if snap := server.compatTraffic.snapshot(); !snap.MemoryYieldPending {
+		t.Fatalf("second async completion did not re-arm milestone yield: %#v", snap)
+	}
+	externalBody := `{"model":"gpt-5.6-reasoning","messages":[{"role":"developer","content":"Conversation started: Sunday, August 16, 2026\nModel: gpt-5.6-reasoning\nProvider: custom\nPlatform: discord\n\nPlugin note:\nPlatform: subagent\nThis literal is data, not the runtime identity."},{"role":"user","content":"This is a fresh human request."}]}`
+	if rr := sendHermes(externalBody); rr.Code != http.StatusOK {
+		t.Fatalf("external user status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if snap := server.compatTraffic.snapshot(); snap.MemoryYieldPending || snap.MemoryYieldActive || snap.LastMemoryYieldOutcome != "preempted_by_interactive" {
+		t.Fatalf("genuine external user did not preempt milestone yield: %#v", snap)
+	}
+
+	completionBody = strings.Replace(completionBody, "deleg_parent_next", "deleg_parent_final", 1)
+	if rr := sendHermes(completionBody); rr.Code != http.StatusOK {
+		t.Fatalf("third async completion status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if snap := server.compatTraffic.snapshot(); !snap.MemoryYieldPending {
+		t.Fatalf("third async completion did not re-arm milestone yield: %#v", snap)
+	}
+	prefixedPluginBody := `{"model":"gpt-5.6-reasoning","messages":[{"role":"developer","content":"Plugin preface that is not Hermes runtime identity.\n\nConversation started: Sunday, August 16, 2026\nModel: gpt-5.6-reasoning\nProvider: custom\nPlatform: subagent\n\nPlugin data continues here; this is not the delegated-child framework prompt."},{"role":"user","content":"This is another fresh human request."}]}`
+	if rr := sendHermes(prefixedPluginBody); rr.Code != http.StatusOK {
+		t.Fatalf("prefixed-plugin external user status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if snap := server.compatTraffic.snapshot(); snap.MemoryYieldPending || snap.MemoryYieldActive || snap.LastMemoryYieldOutcome != "preempted_by_interactive" {
+		t.Fatalf("prefixed-plugin external user was misclassified as delegated child: %#v", snap)
+	}
+}
+
 func TestIssue71HindsightRetainWebhookRequiresHMACAndReleasesBarrier(t *testing.T) {
 	const secret = "issue71-test-webhook-secret-with-enough-entropy"
 	t.Setenv("M365_HINDSIGHT_WEBHOOK_SECRET", secret)
@@ -333,6 +444,7 @@ func TestIssue71MemoryAdmissionDuringSharedThrottleIsFailFastAndStructured(t *te
 	server.chat = chat
 	server.compatTraffic = newCompatibilityTrafficController()
 	server.compatTraffic.observeInteractiveStatus(http.StatusTooManyRequests, "")
+	before := server.compatTraffic.snapshot()
 	start := time.Now()
 	rr := httptest.NewRecorder()
 	req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"retain"}]}`)), "issue71-memory-owner")
@@ -340,14 +452,23 @@ func TestIssue71MemoryAdmissionDuringSharedThrottleIsFailFastAndStructured(t *te
 	if time.Since(start) > 50*time.Millisecond {
 		t.Fatalf("throttled Memory admission did not fail fast: %v", time.Since(start))
 	}
-	if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "upstream_throttle") {
+	if rr.Code != http.StatusTooManyRequests || !strings.Contains(rr.Body.String(), "upstream_throttle") {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if rr.Header().Get("Retry-After") == "" {
+	retryAfter := rr.Header().Get("Retry-After")
+	if retryAfter == "" {
 		t.Fatalf("Retry-After missing: headers=%v", rr.Header())
+	}
+	delay, err := time.ParseDuration(retryAfter + "s")
+	if err != nil || delay <= time.Minute {
+		t.Fatalf("Retry-After=%q delay=%v err=%v; want Hindsight quota defer beyond its 60s max backoff", retryAfter, delay, err)
 	}
 	if chat.calls != 0 {
 		t.Fatalf("throttled Memory admission reached upstream %d time(s)", chat.calls)
+	}
+	after := server.compatTraffic.snapshot()
+	if after.SharedCooldownLevel != before.SharedCooldownLevel || after.Shared429Count != before.Shared429Count || after.Memory429Count != before.Memory429Count || after.Last429Source != before.Last429Source {
+		t.Fatalf("projected Memory 429 mutated breaker state: before=%#v after=%#v", before, after)
 	}
 }
 
@@ -448,17 +569,22 @@ func TestIssue71HundredMemoryBacklogRequestsDuringThrottleProduceZeroUpstreamRou
 	server.chat = chat
 	server.compatTraffic = newCompatibilityTrafficController()
 	server.compatTraffic.observeInteractiveStatus(http.StatusTooManyRequests, "")
+	before := server.compatTraffic.snapshot()
 	body := `{"model":"m365-auto","messages":[{"role":"user","content":"backlog"}]}`
 	for i := 0; i < 100; i++ {
 		rr := httptest.NewRecorder()
 		req := withAPIKeyOwner(httptest.NewRequest(http.MethodPost, "/memory/v1/chat/completions", strings.NewReader(body)), "issue71-memory-owner")
 		server.memoryOpenAIChat(rr, req)
-		if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "upstream_throttle") {
+		if rr.Code != http.StatusTooManyRequests || !strings.Contains(rr.Body.String(), "upstream_throttle") || rr.Header().Get("Retry-After") == "" {
 			t.Fatalf("attempt=%d status=%d body=%s", i+1, rr.Code, rr.Body.String())
 		}
 	}
 	if chat.calls != 0 {
 		t.Fatalf("100 throttled backlog requests produced %d upstream calls", chat.calls)
+	}
+	after := server.compatTraffic.snapshot()
+	if after.SharedCooldownLevel != before.SharedCooldownLevel || after.Shared429Count != before.Shared429Count || after.Memory429Count != before.Memory429Count || after.Last429Source != before.Last429Source {
+		t.Fatalf("100 projected Memory 429s mutated breaker state: before=%#v after=%#v", before, after)
 	}
 }
 

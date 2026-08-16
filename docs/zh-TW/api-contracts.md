@@ -88,11 +88,11 @@ Microsoft hard 429 與已驗證的 ChatHub soft-throttle notice 都正規化為 
 
 Shared breaker 狀態為 `CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY`。`OPEN` 的時間到期只代表可接受一筆受控 external-user interactive probe；autonomous Hermes continuation 與 Memory backlog 都不會自動成為 probe。Probe 再 throttle 會從最新 throttle timestamp 升到下一階；成功只進 `RECOVERY`，不會自動釋放 Memory backlog。RECOVERY 的降階條件由 controlled live qualification 決定。
 
-`/memory/v1` admission 503 會區分原因：
+`/memory/v1` admission failure 會區分「本地容量暫滿」與「shared breaker 已經開啟」：
 
-- `interactive_capacity_busy`：interactive / holdoff 尚未讓出容量；
-- `memory_capacity_deferred`：Gateway 已有 active 1 + waiting 1 的 Memory 工作，額外 request fail-fast；
-- `upstream_throttle`：shared breaker 非 `CLOSED`，立即 defer，且不會送 ChatHub round。
+- HTTP `503` + `interactive_capacity_busy`：interactive / holdoff 尚未讓出容量；
+- HTTP `503` + `memory_capacity_deferred`：Gateway 已有 active 1 + waiting 1 的 Memory 工作，額外 request fail-fast；
+- HTTP `429` + `upstream_throttle` + `Retry-After`：shared breaker 已經不是 `CLOSED`，因此立即 defer，且不會送 ChatHub round。這是把**既有 breaker 狀態投影給 caller**，不是又發生一筆新的 Microsoft throttle；不會增加 breaker/429 counter，也不會讓 cooldown level 再升級。Hindsight v0.9.x 可利用這個長 `Retry-After`，把 pending operation 延到 `next_retry_at`，而不是在 cooldown 期間一直用短 retry 空轉。
 
 ### Hindsight durable-event callback
 

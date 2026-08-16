@@ -152,8 +152,9 @@ func TestMemoryBacklogDoesNotBecomeProbeAfterSharedCooldownExpires(t *testing.T)
 	server.compatTraffic.mu.Lock()
 	server.compatTraffic.sharedCooldownUntil = time.Now().Add(-time.Second)
 	server.compatTraffic.mu.Unlock()
-	if snap := server.compatTraffic.snapshot(); snap.SharedCircuitState != "HALF_OPEN_READY" {
-		t.Fatalf("state=%q want=HALF_OPEN_READY", snap.SharedCircuitState)
+	before := server.compatTraffic.snapshot()
+	if before.SharedCircuitState != "HALF_OPEN_READY" {
+		t.Fatalf("state=%q want=HALF_OPEN_READY", before.SharedCircuitState)
 	}
 
 	for i := 0; i < 5; i++ {
@@ -162,15 +163,19 @@ func TestMemoryBacklogDoesNotBecomeProbeAfterSharedCooldownExpires(t *testing.T)
 		rr := httptest.NewRecorder()
 		server.memoryOpenAIChat(rr, req)
 		cancel()
-		if rr.Code != http.StatusServiceUnavailable {
+		if rr.Code != http.StatusTooManyRequests || !strings.Contains(rr.Body.String(), "upstream_throttle") || rr.Header().Get("Retry-After") == "" {
 			t.Fatalf("attempt=%d status=%d body=%s", i+1, rr.Code, rr.Body.String())
 		}
 	}
 	if chat.calls != 0 {
 		t.Fatalf("background upstream calls=%d want=0", chat.calls)
 	}
-	if snap := server.compatTraffic.snapshot(); snap.SharedCircuitState != "HALF_OPEN_READY" {
-		t.Fatalf("Memory backlog changed breaker state to %q", snap.SharedCircuitState)
+	after := server.compatTraffic.snapshot()
+	if after.SharedCircuitState != "HALF_OPEN_READY" {
+		t.Fatalf("Memory backlog changed breaker state to %q", after.SharedCircuitState)
+	}
+	if after.SharedCooldownLevel != before.SharedCooldownLevel || after.Shared429Count != before.Shared429Count || after.Memory429Count != before.Memory429Count || after.Last429Source != before.Last429Source {
+		t.Fatalf("projected Memory 429 changed half-open breaker evidence: before=%#v after=%#v", before, after)
 	}
 }
 

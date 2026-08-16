@@ -93,11 +93,13 @@ Interactive traffic 包含 generic chat、Hermes、Responses、Anthropic。正�
 
 ### Issue #71 milestone / adaptive arbitration
 
-`/hermes/v1` 會用 Hermes framework 的穩定 marker 分成三類，不使用 LLM 猜語意：
+`/hermes/v1` 會用 Hermes framework provenance 加上最新 framework turn 的穩定 marker 分成三類，不使用 LLM 猜語意：
 
-- `EXTERNAL_USER`：一般最新 user turn；可以越過排隊中的 autonomous work，並取消尚未完成的 milestone yield。
+- `EXTERNAL_USER`：沒有 delegated-child framework provenance 的一般最新 user turn；可以越過排隊中的 autonomous work，並取消尚未完成的 milestone yield。
 - `ASYNC_COMPLETION`：`[ASYNC DELEGATION BATCH COMPLETE — ...]` / `[ASYNC DELEGATION COMPLETE — ...]`；成功處理後建立 milestone Memory barrier。
-- `AUTONOMOUS_CONTINUATION`：standing-goal / kanban / compression / output-length / tool-continuation / verify-on-stop 等 Hermes 固定 system continuation marker。
+- `AUTONOMOUS_CONTINUATION`：standing-goal / kanban / compression / output-length / tool-continuation / verify-on-stop 等 Hermes 固定 continuation marker，以及 leading `role=system` / `role=developer` block 內具有 Hermes runtime identity paragraph、其中 `Model: ...` 與 request model 相符並帶 `Provider: ...`、`Platform: subagent`，而且下一個 paragraph 緊接 Hermes 固定 child prompt `You are a focused subagent working on a specific delegated task.` 的 delegated-child request。
+
+Async-completion user marker 的優先權仍高於 delegated-child provenance，因此巢狀 subagent 的 completion 仍可建立 barrier。`Platform: subagent` 只有在相符的 runtime identity paragraph **緊接固定 delegated-child framework prompt** 時才算；plugin/system 資料裡即使塞進看似完整的 identity paragraph，也不能冒充 child。GPT-5/Codex 的 chat-completions 可能把 leading Hermes block 投影成 `role=developer`，所以 `system` / `developer` 都會辨識。這樣 completion flow 直接 `delegate_task` 的 child 會等待 retain durable，而真正 user-facing Hermes turn 仍可 preempt。
 
 Autonomous/background Hermes 同時最多 1 筆；正常狀態的 account total interactive ceiling 仍可由 `interactiveMaxConcurrent` 保持 2。當有 autonomous work、Memory pressure、milestone yield、breaker cooldown 或 recovery 時，管理面會顯示有效 Hermes concurrency 已降到 1（cooldown 時為 0）。Gateway 不做「兩個任務語意是否相同」的 dedupe。
 
@@ -107,7 +109,7 @@ Autonomous/background Hermes 同時最多 1 筆；正常狀態的 account total 
 2. 300 秒到期；記錄 `timeout` 後讓 Hermes 繼續；
 3. 新的 `EXTERNAL_USER` 到達；記錄 `preempted_by_interactive`，優先服務使用者。
 
-`/memory/v1` HTTP 200、queued / claimed / processing 都**不是** durability。`consolidation.completed` 只更新 observability，也**不是 barrier**。Memory ingress 維持 active 1 + waiting 1；再多的 request 立即以 `memory_capacity_deferred` defer，不會把整個 Hindsight pending backlog 轉成 Gateway waiters。Shared breaker 非 `CLOSED` 時 Memory 立即回 `upstream_throttle`，不會等 queue timeout，也不會碰 Microsoft。
+`/memory/v1` HTTP 200、queued / claimed / processing 都**不是** durability。`consolidation.completed` 只更新 observability，也**不是 barrier**。Memory ingress 維持 active 1 + waiting 1；再多的 request 立即以 `memory_capacity_deferred` defer，不會把整個 Hindsight pending backlog 轉成 Gateway waiters。Shared breaker 非 `CLOSED` 時，Memory 立即回本地 canonical HTTP `429` + `upstream_throttle` + 既有 breaker 的 `Retry-After`，不會等 queue timeout，也不會碰 Microsoft。這個 projected 429 不算新的 upstream throttle，不增加 breaker counter／level；用途是讓 Hindsight 直接把工作 defer 到 reset 時間，而不是在本地持續短 retry。
 
 Hindsight webhook 使用正式 `X-Hindsight-Signature: sha256=<HMAC-SHA256>` 驗證 raw payload；Gateway 只接受 `retain.completed` / `consolidation.completed`，並用 `event_type + operation_id` 做 bounded at-least-once dedupe。Secret 只存在 runtime secret/config surface，不在 UI 顯示。
 

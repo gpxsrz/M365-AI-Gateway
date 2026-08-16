@@ -88,11 +88,11 @@ Microsoft hard 429 and verified ChatHub soft-throttle notices are both normalize
 
 The shared breaker transitions through `CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY`. Expiry of `OPEN` only permits one controlled external-user interactive probe; autonomous Hermes continuations and Memory backlog cannot auto-probe. A throttled probe advances to the next level from the latest throttle timestamp; a successful probe only enters `RECOVERY` and does not release the Memory backlog. RECOVERY downgrade criteria are decided by controlled live qualification.
 
-`/memory/v1` admission 503 responses distinguish the cause:
+`/memory/v1` admission failures distinguish local capacity from an already-open shared breaker:
 
-- `interactive_capacity_busy`: interactive traffic or holdoff has not yielded capacity yet;
-- `memory_capacity_deferred`: the Gateway already has active 1 + waiting 1 Memory work, so additional requests fail fast;
-- `upstream_throttle`: the shared breaker is not `CLOSED`, so the request is immediately deferred and no ChatHub round is sent.
+- HTTP `503` + `interactive_capacity_busy`: interactive traffic or holdoff has not yielded capacity yet;
+- HTTP `503` + `memory_capacity_deferred`: the Gateway already has active 1 + waiting 1 Memory work, so additional requests fail fast;
+- HTTP `429` + `upstream_throttle` + `Retry-After`: the shared breaker is already not `CLOSED`, so the request is immediately deferred and no ChatHub round is sent. This is a caller-facing projection of the existing breaker state, **not a new Microsoft throttle event**; it does not increment breaker/429 counters or advance the cooldown level. Hindsight v0.9.x can use the long `Retry-After` to defer the pending operation until `next_retry_at` instead of burning short retries during the cooldown.
 
 ### Hindsight durable-event callback
 

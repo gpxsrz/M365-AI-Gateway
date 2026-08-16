@@ -93,11 +93,13 @@ Interactive traffic includes generic chat, Hermes, Responses, and Anthropic. In 
 
 ### Issue #71 milestone / adaptive arbitration
 
-`/hermes/v1` deterministically classifies the latest Hermes framework turn without LLM semantic guessing:
+`/hermes/v1` deterministically classifies Hermes framework provenance plus the latest framework turn without LLM semantic guessing:
 
-- `EXTERNAL_USER`: an ordinary latest user turn; it can move ahead of queued autonomous work and cancels an unfinished milestone yield.
+- `EXTERNAL_USER`: an ordinary latest user turn without delegated-child framework provenance; it can move ahead of queued autonomous work and cancels an unfinished milestone yield.
 - `ASYNC_COMPLETION`: `[ASYNC DELEGATION BATCH COMPLETE — ...]` / `[ASYNC DELEGATION COMPLETE — ...]`; a successful completion arms a milestone Memory barrier.
-- `AUTONOMOUS_CONTINUATION`: fixed Hermes standing-goal, kanban, compression, output-length, tool-continuation, or verify-on-stop system markers.
+- `AUTONOMOUS_CONTINUATION`: fixed Hermes standing-goal, kanban, compression, output-length, tool-continuation, or verify-on-stop markers, plus delegated-child requests where a Hermes runtime-identity paragraph in the leading `role=system` / `role=developer` block contains the request's matching `Model: ...`, a `Provider: ...` line, and `Platform: subagent`, and is immediately followed by Hermes' fixed delegated-child prompt `You are a focused subagent working on a specific delegated task.`.
+
+The async-completion user marker keeps priority over delegated-child provenance, so a nested subagent completion can still arm the barrier. `Platform: subagent` is accepted only when the matching runtime-identity paragraph is paired with the immediately following fixed delegated-child framework prompt; a look-alike identity paragraph embedded in plugin/system data does not count. GPT-5/Codex chat-completions can project the leading Hermes block as `role=developer`, so both `system` and `developer` are recognized. This lets a direct `delegate_task` child wait for retain durability while a genuine user-facing Hermes turn remains able to preempt.
 
 Autonomous/background Hermes is limited to one in flight. Normal account-wide interactive capacity may still use `interactiveMaxConcurrent=2`; under autonomous pressure, Memory pressure, milestone yield, cooldown, or recovery the management projection reports effective Hermes concurrency 1 (0 during cooldown). The Gateway does not semantically deduplicate tasks.
 
@@ -107,7 +109,7 @@ A successful `ASYNC_COMPLETION` starts a Memory lease with a hard ceiling of **3
 2. 300 seconds expires, recording `timeout` and allowing Hermes to continue;
 3. a new `EXTERNAL_USER` arrives, recording `preempted_by_interactive` and prioritizing the user.
 
-`/memory/v1` HTTP 200 and Hindsight queued / claimed / processing states are **not** durability. `consolidation.completed` updates observability only and is **not** a barrier. Memory ingress is bounded to active 1 + waiting 1; additional requests are immediately deferred as `memory_capacity_deferred` instead of becoming Gateway waiters. While the shared breaker is not `CLOSED`, Memory fails fast as `upstream_throttle` without waiting for the queue timeout or touching Microsoft.
+`/memory/v1` HTTP 200 and Hindsight queued / claimed / processing states are **not** durability. `consolidation.completed` updates observability only and is **not** a barrier. Memory ingress is bounded to active 1 + waiting 1; additional requests are immediately deferred as `memory_capacity_deferred` instead of becoming Gateway waiters. While the shared breaker is not `CLOSED`, Memory fails fast as local canonical HTTP `429` + `upstream_throttle` + the existing breaker `Retry-After`, without waiting for the queue timeout or touching Microsoft. This projected 429 does not count as another upstream throttle event or advance breaker counters/level; it lets Hindsight defer work to the reset time instead of short-retrying locally.
 
 The Hindsight webhook uses the official `X-Hindsight-Signature: sha256=<HMAC-SHA256>` over the raw payload. The Gateway accepts only `retain.completed` / `consolidation.completed` and uses bounded `event_type + operation_id` deduplication for at-least-once delivery. The secret stays on runtime secret/config surfaces and is never displayed in the management UI.
 
