@@ -123,6 +123,134 @@ func TestIssue71MilestoneYieldWaitsForDurableRetainEvent(t *testing.T) {
 	}
 }
 
+func TestIssue71AutonomousContinuationFollowsMemoryYieldDeadlinePastOrdinaryQueueTimeout(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	cfg.InteractiveMaxConcurrent = 1
+	cfg.InteractiveQueueTimeoutSeconds = 1
+
+	c.observeHermesCompletion(hermesRequestAsyncCompletion, http.StatusOK)
+	c.mu.Lock()
+	c.memoryYieldDeadline = time.Now().Add(2 * time.Second)
+	c.mu.Unlock()
+
+	type interactiveResult struct {
+		release func(time.Duration)
+		err     error
+	}
+	autonomous := make(chan interactiveResult, 1)
+	go func() {
+		release, err := c.acquireInteractiveClass(context.Background(), cfg, hermesRequestAutonomousContinuation)
+		autonomous <- interactiveResult{release: release, err: err}
+	}()
+	waitForCompatibilityTraffic(t, c, func(snapshot compatibilityTrafficSnapshot) bool {
+		return snapshot.InteractiveWaiting == 1 && snapshot.MemoryYieldPending
+	})
+
+	// The ordinary interactive queue budget is one second, but this request is
+	// blocked specifically by the still-live Memory yield. It must keep waiting
+	// for that barrier's own deadline/outcome rather than fail with a queue 503.
+	select {
+	case got := <-autonomous:
+		if got.release != nil {
+			got.release(0)
+		}
+		t.Fatalf("autonomous continuation used ordinary queue timeout while Memory yield was live: err=%v", got.err)
+	case <-time.After(1100 * time.Millisecond):
+	}
+
+	c.observeHindsightEvent("retain.completed", "retain-op-after-ordinary-queue", "completed", time.Now().UTC())
+	select {
+	case got := <-autonomous:
+		if got.err != nil {
+			t.Fatalf("autonomous continuation did not follow retain-durable barrier outcome: %v", got.err)
+		}
+		got.release(0)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("autonomous continuation remained blocked after durable retain")
+	}
+	if snap := c.snapshot(); snap.LastMemoryYieldOutcome != "retain_durable" {
+		t.Fatalf("unexpected Memory yield outcome: %#v", snap)
+	}
+}
+
+func TestIssue71AutonomousContinuationWithoutMemoryYieldKeepsOrdinaryQueueTimeout(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	cfg.InteractiveMaxConcurrent = 1
+	cfg.InteractiveQueueTimeoutSeconds = 1
+
+	firstRelease, err := c.acquireInteractiveClass(context.Background(), cfg, hermesRequestAutonomousContinuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { firstRelease(0) })
+
+	started := time.Now()
+	_, err = c.acquireInteractiveClass(context.Background(), cfg, hermesRequestAutonomousContinuation)
+	var admission *interactiveAdmissionError
+	if !errors.As(err, &admission) || !errors.Is(admission, context.DeadlineExceeded) {
+		t.Fatalf("ordinary autonomous queue did not time out normally: %v", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 900*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Fatalf("ordinary autonomous queue timeout elapsed=%v want about 1s", elapsed)
+	}
+}
+
+func TestIssue71AutonomousContinuationIsReleasedByMemoryYieldTimeoutAfterOrdinaryQueueBudget(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	cfg.InteractiveMaxConcurrent = 1
+	cfg.InteractiveQueueTimeoutSeconds = 1
+
+	c.observeHermesCompletion(hermesRequestAsyncCompletion, http.StatusOK)
+	c.mu.Lock()
+	c.memoryYieldDeadline = time.Now().Add(1250 * time.Millisecond)
+	c.mu.Unlock()
+
+	started := time.Now()
+	release, err := c.acquireInteractiveClass(context.Background(), cfg, hermesRequestAutonomousContinuation)
+	if err != nil {
+		t.Fatalf("autonomous continuation failed instead of following Memory yield timeout: %v", err)
+	}
+	release(0)
+	elapsed := time.Since(started)
+	if elapsed < 1100*time.Millisecond || elapsed > 1750*time.Millisecond {
+		t.Fatalf("Memory yield timeout elapsed=%v want about 1.25s", elapsed)
+	}
+	if snap := c.snapshot(); snap.MemoryYieldPending || snap.MemoryYieldActive || snap.LastMemoryYieldOutcome != "timeout" {
+		t.Fatalf("Memory yield timeout did not release autonomous continuation: %#v", snap)
+	}
+}
+
+func TestIssue71AutonomousContinuationMemoryYieldNeverOverridesCallerCancellation(t *testing.T) {
+	c := newCompatibilityTrafficController()
+	cfg := trafficTestSettings()
+	cfg.InteractiveMaxConcurrent = 1
+	cfg.InteractiveQueueTimeoutSeconds = 1
+
+	c.observeHermesCompletion(hermesRequestAsyncCompletion, http.StatusOK)
+	c.mu.Lock()
+	c.memoryYieldDeadline = time.Now().Add(2 * time.Second)
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := c.acquireInteractiveClass(ctx, cfg, hermesRequestAutonomousContinuation)
+	var admission *interactiveAdmissionError
+	if !errors.As(err, &admission) || !errors.Is(admission, context.DeadlineExceeded) {
+		t.Fatalf("caller cancellation was not preserved under Memory yield: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 400*time.Millisecond {
+		t.Fatalf("caller cancellation was delayed by Memory yield: %v", elapsed)
+	}
+	if snap := c.snapshot(); snap.InteractiveWaiting != 0 || !snap.MemoryYieldPending {
+		t.Fatalf("caller cancellation corrupted queue/barrier state: %#v", snap)
+	}
+}
+
 type issue71StaticChat struct{ calls int }
 
 func (c *issue71StaticChat) Chat(context.Context, chathub.Account, chathub.Request) (chathub.Result, error) {

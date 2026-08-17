@@ -581,8 +581,7 @@ func (c *compatibilityTrafficController) acquireInteractiveClass(ctx context.Con
 		return func(time.Duration) {}, nil
 	}
 	queueTimeout := time.Duration(cfg.InteractiveQueueTimeoutSeconds) * time.Second
-	queueCtx, cancel := context.WithTimeout(ctx, queueTimeout)
-	defer cancel()
+	queueDeadline := time.Now().Add(queueTimeout)
 
 	c.mu.Lock()
 	c.configuredInteractiveMax = cfg.InteractiveMaxConcurrent
@@ -655,15 +654,32 @@ func (c *compatibilityTrafficController) acquireInteractiveClass(ctx context.Con
 				c.mu.Unlock()
 			}, nil
 		}
+		queueExpired := !now.Before(queueDeadline)
+		if queueExpired && class == hermesRequestAutonomousContinuation &&
+			(c.memoryYieldPending || c.memoryYieldActive) &&
+			!c.memoryYieldDeadline.IsZero() && now.Before(c.memoryYieldDeadline) {
+			// Ordinary interactive admission keeps its configured queue budget.
+			// Only an autonomous continuation that is currently held behind the
+			// M365 milestone barrier follows that barrier's own bounded deadline.
+			// This exception never replaces caller cancellation; ctx.Done below
+			// still terminates the wait independently of the barrier deadline.
+			queueExpired = false
+		}
+		if queueExpired {
+			retryAfter := c.interactiveRetryAfterLocked(cfg, id)
+			c.removeInteractiveWaiterLocked(id)
+			c.mu.Unlock()
+			return nil, &interactiveAdmissionError{err: context.DeadlineExceeded, retryAfter: retryAfter}
+		}
 		c.mu.Unlock()
 
 		select {
-		case <-queueCtx.Done():
+		case <-ctx.Done():
 			c.mu.Lock()
 			retryAfter := c.interactiveRetryAfterLocked(cfg, id)
 			c.removeInteractiveWaiterLocked(id)
 			c.mu.Unlock()
-			return nil, &interactiveAdmissionError{err: queueCtx.Err(), retryAfter: retryAfter}
+			return nil, &interactiveAdmissionError{err: ctx.Err(), retryAfter: retryAfter}
 		case <-ticker.C:
 		}
 	}

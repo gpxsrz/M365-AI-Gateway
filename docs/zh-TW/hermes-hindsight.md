@@ -87,6 +87,8 @@ memoryBackoffInitialSeconds=30
 memoryBackoffMaxSeconds=600
 ```
 
+2026-08-17 controlled live tuning 後，Production 的**普通排隊 baseline** 為 `interactiveQueueTimeoutSeconds=120`、`memoryQueueTimeoutSeconds=120`；`interactiveMaxConcurrent=2`、`chatTimeoutSeconds=1800`、`interactivePriorityHoldoffSeconds=10` 維持不變。這兩個 `120` 不等於 milestone Memory lease；不得為了配合最長 300 秒的 milestone barrier，直接把所有普通流量的 queue timeout 一起拉長。
+
 `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 為舊設定／API 相容欄位；#71 shared-account breaker 不再用它們決定 cooldown。Breaker 的固定工程政策為 `1125 → 2250 → 4500 → 9000 → 18000` 秒，L5 封頂。命中 hard 429 或已驗證的 ChatHub soft-throttle notice 才進 `OPEN`；正常 `item.throttling` quota / metering metadata 不算限流。時間到只進 `HALF_OPEN_READY`，不會自動 retry。只有一筆受控 **external-user** interactive request 可成為 probe；autonomous Hermes continuation 與 Memory backlog 都不得搶 probe。Probe 成功後進 `RECOVERY`，但不直接放行 Memory。`RECOVERY` 期間 `/memory/v1` 仍會 fail-fast；因此這一階段的 controlled qualification 是確認 external-user probe 成功、讀回 `RECOVERY`，並確認沒有競爭中的 in-flight/waiting work。只有 operator 明確完成 recovery 回到 `CLOSED` 後，才允許受限的 Hindsight/Memory live work 恢復。
 
 Interactive traffic 包含 generic chat、Hermes、Responses、Anthropic。正常狀態 Memory 採 FIFO；已經開始的 Memory request 不會被強制 preempt。真實 Microsoft 帳號不以高併發刻意觸發 429，breaker 行為主要用 deterministic test 驗證。
@@ -108,6 +110,8 @@ Autonomous/background Hermes 同時最多 1 筆；正常狀態的 account total 
 1. Hindsight 正式 `retain.completed` webhook 經 HMAC 驗證，代表 retain 已 server-side durable；立即結束 barrier；
 2. 300 秒到期；記錄 `timeout` 後讓 Hermes 繼續；
 3. 新的 `EXTERNAL_USER` 到達；記錄 `preempted_by_interactive`，優先服務使用者。
+
+普通 `120/120` queue baseline 維持原值。唯一例外是：**已被 live `MEMORY_YIELD` 實際擋住的 `AUTONOMOUS_CONTINUATION`**，若普通 interactive queue deadline 先到，不會因此提前回本地 503；它只跟隨該次既有 `memoryYieldDeadline`（milestone 自身仍最多 300 秒），直到 retain durable、milestone timeout 或 external-user preemption 其中之一發生。Barrier 一結束就立刻重新套用正常 admission；若此時仍被其他一般容量條件擋住，已耗盡的普通 queue budget 不會額外重置。這個例外不會延長 caller 自己的 request context；context cancellation 仍可直接結束等待。這是 M365 Gateway compatibility scheduler 的局部規則，不修改 Hermes/Hindsight core，也不改直連 OpenAI、Anthropic 或其他 Provider 的 lifecycle。
 
 `/memory/v1` HTTP 200、queued / claimed / processing 都**不是** durability。`consolidation.completed` 只更新 observability，也**不是 barrier**。Memory ingress 維持 active 1 + waiting 1；再多的 request 立即以 `memory_capacity_deferred` defer，不會把整個 Hindsight pending backlog 轉成 Gateway waiters。Shared breaker 非 `CLOSED` 時，Memory 立即回本地 canonical HTTP `429` + `upstream_throttle` + 既有 breaker 的 `Retry-After`，不會等 queue timeout，也不會碰 Microsoft。這個 projected 429 不算新的 upstream throttle，不增加 breaker counter／level；用途是讓 Hindsight 直接把工作 defer 到 reset 時間，而不是在本地持續短 retry。
 
