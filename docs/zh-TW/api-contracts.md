@@ -91,7 +91,7 @@ Shared breaker 狀態為 `CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGH
 `/memory/v1` admission failure 會區分「本地容量暫滿」與「shared breaker 已經開啟」：
 
 - HTTP `503` + `interactive_capacity_busy`：interactive / holdoff 尚未讓出容量；
-- HTTP `503` + `memory_capacity_deferred`：Gateway 已有 active 1 + waiting 1 的 Memory 工作，額外 request fail-fast；
+- HTTP `503` + `memory_capacity_deferred`：Gateway 已有 active 1 + waiting 8 的 Memory 工作，額外 request fail-fast；
 - HTTP `429` + `upstream_throttle` + `Retry-After`：shared breaker 已經不是 `CLOSED`，因此立即 defer，且不會送 ChatHub round。這是把**既有 breaker 狀態投影給 caller**，不是又發生一筆新的 Microsoft throttle；不會增加 breaker/429 counter，也不會讓 cooldown level 再升級。Hindsight v0.9.x 可利用這個長 `Retry-After`，把 pending operation 延到 `next_retry_at`，而不是在 cooldown 期間一直用短 retry 空轉。
 
 ### Hindsight durable-event callback

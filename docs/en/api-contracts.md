@@ -91,7 +91,7 @@ The shared breaker transitions through `CLOSED → OPEN → HALF_OPEN_READY → 
 `/memory/v1` admission failures distinguish local capacity from an already-open shared breaker:
 
 - HTTP `503` + `interactive_capacity_busy`: interactive traffic or holdoff has not yielded capacity yet;
-- HTTP `503` + `memory_capacity_deferred`: the Gateway already has active 1 + waiting 1 Memory work, so additional requests fail fast;
+- HTTP `503` + `memory_capacity_deferred`: the Gateway already has active 1 + waiting 8 Memory work, so additional requests fail fast;
 - HTTP `429` + `upstream_throttle` + `Retry-After`: the shared breaker is already not `CLOSED`, so the request is immediately deferred and no ChatHub round is sent. This is a caller-facing projection of the existing breaker state, **not a new Microsoft throttle event**; it does not increment breaker/429 counters or advance the cooldown level. Hindsight v0.9.x can use the long `Retry-After` to defer the pending operation until `next_retry_at` instead of burning short retries during the cooldown.
 
 ### Hindsight durable-event callback
