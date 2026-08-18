@@ -12,7 +12,8 @@ import (
 
 const (
 	interactiveQueueMaxWaiting           = 64
-	memoryQueueMaxWaiting                = 1
+	memoryQueueMaxWaiting                = 8
+	sharedAccountMaxConcurrent           = 2
 	sharedThrottleInitialCooldownSeconds = 1125
 	milestoneMemoryLease                 = 300 * time.Second
 )
@@ -192,6 +193,42 @@ func (c *compatibilityTrafficController) autonomousWaitingLocked() int {
 	return count
 }
 
+func sharedAccountConcurrencyLimit(cfg runtimeSettings) int {
+	limit := cfg.InteractiveMaxConcurrent
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > sharedAccountMaxConcurrent {
+		limit = sharedAccountMaxConcurrent
+	}
+	return limit
+}
+
+func (c *compatibilityTrafficController) sharedInFlightLocked() int {
+	return c.interactiveInFlight + c.memoryInFlight
+}
+
+func (c *compatibilityTrafficController) hasExternalUserWaiterLocked() bool {
+	for _, id := range c.interactiveQueue {
+		if c.interactiveWaiterClass[id] == hermesRequestExternalUser {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *compatibilityTrafficController) memoryHeadCanUseSharedSlotLocked(now time.Time, cfg runtimeSettings) bool {
+	if len(c.memoryQueue) == 0 || c.memoryInFlight >= 1 {
+		return false
+	}
+	if c.hasExternalUserWaiterLocked() {
+		return false
+	}
+	return c.sharedInFlightLocked() < sharedAccountConcurrencyLimit(cfg) &&
+		!now.Before(c.sharedCooldownUntil) &&
+		c.sharedCircuitState == sharedCircuitClosed
+}
+
 func (c *compatibilityTrafficController) oldestMemoryAgeLocked(now time.Time) int64 {
 	oldest := c.memoryInFlightStartedAt
 	for _, id := range c.memoryQueue {
@@ -213,6 +250,9 @@ func (c *compatibilityTrafficController) effectiveHermesConcurrencyLocked(now ti
 	maxConcurrent := c.configuredInteractiveMax
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
+	}
+	if maxConcurrent > sharedAccountMaxConcurrent {
+		maxConcurrent = sharedAccountMaxConcurrent
 	}
 	switch c.trafficModeLocked(now) {
 	case "UPSTREAM_COOLDOWN":
@@ -437,15 +477,6 @@ func (c *compatibilityTrafficController) enqueueInteractiveWaiterLocked(id uint6
 	c.interactiveWaiting = len(c.interactiveQueue)
 }
 
-func (c *compatibilityTrafficController) hasBlockingInteractiveWaiterLocked() bool {
-	for _, id := range c.interactiveQueue {
-		if c.interactiveWaiterClass[id] != hermesRequestAutonomousContinuation {
-			return true
-		}
-	}
-	return false
-}
-
 func (c *compatibilityTrafficController) removeWaiterLocked(id uint64) {
 	for i, queued := range c.memoryQueue {
 		if queued == id {
@@ -459,10 +490,7 @@ func (c *compatibilityTrafficController) removeWaiterLocked(id uint64) {
 
 func (c *compatibilityTrafficController) retryAfterLocked(cfg runtimeSettings, id uint64) int {
 	now := time.Now()
-	until := c.interactiveHoldoffUntil
-	if c.sharedCooldownUntil.After(until) {
-		until = c.sharedCooldownUntil
-	}
+	until := c.sharedCooldownUntil
 	seconds := 2 + int(id%4)
 	if until.After(now) {
 		remaining := int(time.Until(until).Seconds()) + 1
@@ -612,14 +640,21 @@ func (c *compatibilityTrafficController) acquireInteractiveClass(ctx context.Con
 				allowed = false
 			} else if class == hermesRequestAutonomousContinuation && (c.memoryYieldPending || c.memoryYieldActive) {
 				allowed = false
+			} else if class != hermesRequestExternalUser && c.memoryHeadCanUseSharedSlotLocked(now, cfg) {
+				// User-originated Hermes traffic is P0, eligible Memory is P1,
+				// and background Hermes work is P2. Only an immediately
+				// admissible Memory head blocks background work; if a Memory
+				// request is already in flight, a queued Memory request is
+				// class-capped and must not leave the second shared slot idle.
+				allowed = false
 			} else {
 				switch c.sharedCircuitState {
 				case sharedCircuitClosed:
-					allowed = c.interactiveInFlight < cfg.InteractiveMaxConcurrent && !now.Before(c.sharedCooldownUntil)
+					allowed = c.sharedInFlightLocked() < sharedAccountConcurrencyLimit(cfg) && !now.Before(c.sharedCooldownUntil)
 				case sharedCircuitHalfOpenReady:
-					allowed = class == hermesRequestExternalUser && c.interactiveInFlight == 0
+					allowed = class == hermesRequestExternalUser && c.sharedInFlightLocked() == 0
 				case sharedCircuitRecovery:
-					allowed = c.interactiveInFlight < 1
+					allowed = c.sharedInFlightLocked() < 1
 				}
 			}
 		}
@@ -721,15 +756,7 @@ func (c *compatibilityTrafficController) acquireMemory(ctx context.Context, cfg 
 		c.refreshSharedCircuitStateLocked(now)
 		c.refreshMemoryYieldLocked(now)
 		atHead := len(c.memoryQueue) > 0 && c.memoryQueue[0] == id
-		interactiveBlocked := c.interactiveWaiting > 0
-		if c.memoryYieldPending || c.memoryYieldActive {
-			interactiveBlocked = c.hasBlockingInteractiveWaiterLocked()
-		}
-		allowed := atHead && c.interactiveInFlight == 0 && !interactiveBlocked &&
-			!now.Before(c.interactiveHoldoffUntil) &&
-			!now.Before(c.sharedCooldownUntil) &&
-			c.sharedCircuitState == sharedCircuitClosed &&
-			c.memoryInFlight < cfg.MemoryMaxConcurrent
+		allowed := atHead && c.memoryHeadCanUseSharedSlotLocked(now, cfg)
 		if allowed {
 			c.memoryQueue = c.memoryQueue[1:]
 			delete(c.memoryWaiterAt, id)

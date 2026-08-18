@@ -479,7 +479,7 @@ func TestIssue71MilestoneYieldTimeoutReleasesAutonomousContinuation(t *testing.T
 	}
 }
 
-func TestIssue71MemoryIngressAllowsOnlyActiveOnePlusWaitingOne(t *testing.T) {
+func TestIssue71MemoryIngressAllowsActiveOnePlusBoundedWaitingBuffer(t *testing.T) {
 	c := newCompatibilityTrafficController()
 	cfg := trafficTestSettings()
 	cfg.MemoryQueueTimeoutSeconds = 2
@@ -491,27 +491,31 @@ func TestIssue71MemoryIngressAllowsOnlyActiveOnePlusWaitingOne(t *testing.T) {
 		release func(int)
 		err     error
 	}
-	second := make(chan memoryResult, 1)
-	go func() {
-		release, err := c.acquireMemory(context.Background(), cfg)
-		second <- memoryResult{release: release, err: err}
-	}()
+	waiters := make(chan memoryResult, memoryQueueMaxWaiting)
+	for i := 0; i < memoryQueueMaxWaiting; i++ {
+		go func() {
+			release, err := c.acquireMemory(context.Background(), cfg)
+			waiters <- memoryResult{release: release, err: err}
+		}()
+	}
 	waitForCompatibilityTraffic(t, c, func(snapshot compatibilityTrafficSnapshot) bool {
-		return snapshot.MemoryInFlight == 1 && snapshot.MemoryWaiting == 1
+		return snapshot.MemoryInFlight == 1 && snapshot.MemoryWaiting == memoryQueueMaxWaiting
 	})
 	start := time.Now()
 	_, err = c.acquireMemory(context.Background(), cfg)
 	var admission *memoryAdmissionError
 	if !errors.As(err, &admission) || admission.code != "memory_capacity_deferred" || time.Since(start) > 30*time.Millisecond {
 		firstRelease(http.StatusOK)
-		t.Fatalf("third Memory request did not fail fast as deferred capacity: err=%v elapsed=%v", err, time.Since(start))
+		t.Fatalf("Memory request beyond bounded waiting buffer did not fail fast: err=%v elapsed=%v", err, time.Since(start))
 	}
 	firstRelease(http.StatusOK)
-	got := <-second
-	if got.err != nil {
-		t.Fatal(got.err)
+	for i := 0; i < memoryQueueMaxWaiting; i++ {
+		got := <-waiters
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		got.release(http.StatusOK)
 	}
-	got.release(http.StatusOK)
 }
 
 func TestIssue71ExternalUserBypassesQueuedAutonomousAndAutonomousConcurrencyIsOne(t *testing.T) {
@@ -609,6 +613,11 @@ func TestIssue71TrafficSnapshotExposesAdaptivePressure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	externalRelease, err := c.acquireInteractiveClass(context.Background(), cfg, hermesRequestExternalUser)
+	if err != nil {
+		autonomousRelease(0)
+		t.Fatal(err)
+	}
 	type memoryResult struct {
 		release func(int)
 		err     error
@@ -632,15 +641,18 @@ func TestIssue71TrafficSnapshotExposesAdaptivePressure(t *testing.T) {
 		t.Fatalf("adaptive pressure projection=%#v", snap)
 	}
 	if snap.MemoryPendingCount != 1 || snap.OldestMemoryAgeSeconds < 4 {
+		externalRelease(0)
 		autonomousRelease(0)
 		t.Fatalf("Memory pressure projection=%#v", snap)
 	}
-	autonomousRelease(0)
+	externalRelease(0)
 	got := <-memory
 	if got.err != nil {
+		autonomousRelease(0)
 		t.Fatal(got.err)
 	}
 	got.release(http.StatusOK)
+	autonomousRelease(0)
 }
 
 func TestIssue71SoftThrottleObservabilityCountsSuppressedReask(t *testing.T) {

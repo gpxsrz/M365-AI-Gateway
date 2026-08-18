@@ -207,7 +207,10 @@ func (s *Server) memoryOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		retryAfter := 1
 		status := http.StatusServiceUnavailable
 		code := "interactive_capacity_busy"
-		message := "Memory Provider request is waiting for interactive capacity"
+		// Preserve the legacy error code for callers that key on it, but make
+		// the human-readable reason match the shared-account scheduler: Memory
+		// may now be waiting on either another Memory lease or a shared slot.
+		message := "Memory Provider request is waiting for shared Microsoft account capacity"
 		if admission, ok := err.(*memoryAdmissionError); ok && admission.retryAfter > 0 {
 			retryAfter = admission.retryAfter
 			if admission.code != "" {

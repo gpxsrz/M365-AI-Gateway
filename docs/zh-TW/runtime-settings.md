@@ -24,6 +24,8 @@
 
 #71 shared-account breaker 使用固定 cooldown 階梯 `1125 / 2250 / 4500 / 9000 / 18000` 秒，不是 runtime-tunable exponential backoff。`GET /api/admin/settings` 的 `compatibilityTraffic` 會回報完整 scheduler projection：`trafficMode`、interactive/external/autonomous in-flight/waiting、`effectiveHermesConcurrency`、Memory pending/oldest age、milestone yield state/deadline/outcome/duration、最近 retain/consolidation、hard/soft throttle、streak/cooldown remaining、suppressed reask，以及 `sharedCircuitState / sharedCooldownLevel / sharedCooldownUntil`。
 
+#75 起，同帳號 admission 的有效硬限制為 shared total `<=2`、Memory `<=1`、background Hermes `<=1`，優先序為 user-originated P0 > eligible Memory P1 > background Hermes P2。`interactiveMaxConcurrent` / `memoryMaxConcurrent` 仍保留設定與 API 相容 surface，但不能把上述 hard ceiling 拉高。`interactivePriorityHoldoffSeconds` 同樣保留為 legacy compatibility 欄位，普通 Memory admission 已不再等待這個 holdoff；priority 由 scheduler queue policy 直接處理。Memory waiting buffer 固定為 8，upstream Memory concurrency 仍只有 1。
+
 Hindsight durable-event callback 使用 `M365_HINDSIGHT_WEBHOOK_SECRET` 作為 HMAC 驗證用 runtime environment setting；它是敏感值，不屬於管理 UI 顯示或 handoff evidence。
 
 管理 UI 會把 `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 明確標成 legacy compatibility 欄位，並顯示 #71 scheduler 狀態。`RECOVERY` 期間會出現受控 completion 操作；它只應在 controlled live qualification 已通過後使用。
