@@ -12,13 +12,16 @@ Current Production operating baseline:
 
 ```text
 model-specific context_length=64000
-compression.proactive_prune_tokens=41000
+compression.proactive_prune_tokens=24000
 compression.max_attempts=3
-compression.protect_last_n=20
-global compression.threshold_tokens = unset
+compression.protect_first_n=3
+compression.protect_last_n=8
+compression.min_tail_user_messages=1
+compression.tail_mode=lean
+global compression.threshold_tokens=42000
 ```
 
-The 2026-08-12 80K/41K result remains a successful historical canary. Tool-heavy evidence from 2026-08-13 showed that 80K was too permissive for the M365 `128000 UTF-16` transport policy, so 64K/41K is the current baseline.
+The 2026-08-12 80K/41K result remains a successful historical canary. Tool-heavy evidence from 2026-08-13 showed that 80K was too permissive for the M365 `128000 UTF-16` transport policy, so the model context was reduced to 64K. The current 2026-08-19 stage-1 baseline keeps that 64K limit while pruning reconstructable old context at 24K and starting full compression at 42K with a lean protected tail. These compression knobs are profile-wide; they do not change M365 or Hindsight limits.
 
 For correctness-first autonomous work, built-in memory and user profile can remain enabled while periodic background reviewers are disabled:
 

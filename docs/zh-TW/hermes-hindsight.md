@@ -12,13 +12,16 @@ Hermes 應使用 `/hermes/v1`。這個 profile 使用獨立 `hermes` checkpoint 
 
 ```text
 model-specific context_length=64000
-compression.proactive_prune_tokens=41000
+compression.proactive_prune_tokens=24000
 compression.max_attempts=3
-compression.protect_last_n=20
-global compression.threshold_tokens = 未設定
+compression.protect_first_n=3
+compression.protect_last_n=8
+compression.min_tail_user_messages=1
+compression.tail_mode=lean
+global compression.threshold_tokens=42000
 ```
 
-2026-08-12 的 80K/41K 是已成功的歷史 canary，但 2026-08-13 tool-heavy 長任務顯示 80K 對 M365 `128000 UTF-16` transport policy 不夠保守，因此 64K/41K 才是 current baseline。
+2026-08-12 的 80K/41K 是已成功的歷史 canary；2026-08-13 tool-heavy 長任務顯示 80K 對 M365 `128000 UTF-16` transport policy 不夠保守，因此 model context 降為 64K。2026-08-19 current stage1 baseline 保留這個 64K 上限，但把可重建舊上下文的 proactive prune 提前到 24K，並在 42K 啟動 full compression，同時使用 lean protected tail。這些 compression knobs 是 Profile-wide 設定，不會修改 M365 或 Hindsight 的限制。
 
 對 correctness-first autonomous work，保留 built-in memory / user profile，但可停掉週期 background reviewer：
 
