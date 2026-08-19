@@ -31,7 +31,7 @@ Usage 欄位使用 `prompt_tokens` / `completion_tokens`；Sidecar 估算值會�
 
 ## Caller-text overflow
 
-Generic `/v1` surfaces 維持：
+Auxiliary `/v1/chat/completions` 與其他 generic compatibility surfaces 維持：
 
 ```text
 HTTP 400
@@ -75,6 +75,19 @@ Router / repair / required-tool retry 使用 scratch ChatHub phase 時，各 pha
 ## Response format
 
 `response_format` / `json_schema` 是 structured-output contract。普通 JSON 不因看起來像 router envelope 就被猜測式剝殼；invalid internal envelope 應 fail closed。
+
+## `/v1/chat/completions` control-plane 契約
+
+Issue #76 起，`POST /v1/chat/completions` 是 auxiliary / control-plane surface。它與 `/hermes/v1` 共用 OpenAI-compatible request/response shape，但 execution policy 不同：
+
+- shared-account scheduler class 固定為 P2；eligible P1 Memory 優先，P0 external user 仍最高；
+- P2 hard ceiling 1、shared hard ceiling 2、breaker/cooldown 與 `MEMORY_YIELD` 規則沿用既有 scheduler；
+- checkpoint control 為 `Namespace=auxiliary-control-plane`、`ForceNew=true`、`Untracked=true`；
+- OpenAI message/tool protocol validation、caller text policy、tool catalog / tool-call safety 仍保留；
+- 不注入 Agent `EVIDENCE_LEDGER` / final-answer completion rule，不以 Hermes 歷史 completed/pending tool ledger 做 control-plane verdict 去重或 success authorization；
+- non-stream 與 SSE 的結構化 `done` verdict 不得被 `completionEvidenceAllows()` 改寫成 `unconfirmedToolOutcomeResponse`。
+
+這個 surface 的目的不是放寬 Hermes Agent 安全規則；Hermes / Atlas 執行面仍使用 `/hermes/v1`。`tool_round_limit` error 中的 `profile=generic` 暫時保留為 wire/runtime compatibility identity，不代表 `/v1/chat/completions` 仍是 user-facing generic chat。
 
 ## Extension observability
 

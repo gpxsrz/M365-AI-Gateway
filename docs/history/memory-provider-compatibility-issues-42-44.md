@@ -137,7 +137,9 @@ Content-Type: application/json
 
 ### 流量與 429
 
-Memory 是背景流量。一般 `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Responses 與 Anthropic 先經同一個帳號級 interactive admission controller，再由 Memory 最後讓位。
+> **歷史註記（已被 #75/#76 取代）**：以下段落描述 2026-08-12 當時的 admission 設計。現行政策已不是「Memory 最後讓位」：目前為 P0 user > P1 Memory > P2 autonomous/control-plane；`/v1/chat/completions` 也已重新定位為 P2 auxiliary/control-plane，而非一般 user-facing generic chat。
+
+Memory 是背景流量。當時一般 `/v1/chat/completions`、Hermes `/hermes/v1/chat/completions`、Responses 與 Anthropic 先經同一個帳號級 interactive admission controller，再由 Memory 最後讓位。
 
 目前 controller 行為：
 
@@ -319,7 +321,9 @@ Then read back `GET /v1/default/banks/{bank_id}/config` and verify the resolved 
 
 ### Traffic and 429 behavior
 
-Memory is background traffic. Generic `/v1/chat/completions`, Hermes `/hermes/v1/chat/completions`, Responses, and Anthropic first share one account-level interactive admission controller; Memory yields after that class.
+> **Historical note (superseded by #75/#76):** the following paragraph describes the admission design as of 2026-08-12. The current policy is no longer "Memory yields last": it is P0 user > P1 Memory > P2 autonomous/control-plane, and `/v1/chat/completions` has been repurposed as the P2 auxiliary/control-plane surface rather than user-facing generic chat.
+
+Memory is background traffic. At that time generic `/v1/chat/completions`, Hermes `/hermes/v1/chat/completions`, Responses, and Anthropic first shared one account-level interactive admission controller; Memory yielded after that class.
 
 The controller provides configurable interactive concurrency and queue timeout with a hard waiting limit of 64 and retryable 503 + `Retry-After` on saturation/timeout. Memory retains its own bounded concurrency, hard waiting limit of 64, queue timeout, and FIFO ordering, but enters only when no interactive request is running or waiting and the interactive holdoff has expired. Microsoft 429 / `Retry-After` creates shared cooldown for subsequent admission in both classes. Work already in flight is not forcibly cancelled. The sidecar does not infer main-agent, subagent, or CLI roles from prompts or User-Agent strings; the basic protection is account-global.
 

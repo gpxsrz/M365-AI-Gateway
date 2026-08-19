@@ -11,10 +11,10 @@ M365 AI Gateway 是社群維護的自架 Microsoft 365 AI interoperability gatew
 ## 架構摘要
 
 - 一個 Sidecar 執行個體對應一個 Microsoft 365 帳號。
-- `/v1/chat/completions`：一般 OpenAI-compatible chat。
-- `/hermes/v1/chat/completions`：Hermes 專用 chat / checkpoint profile。
-- `/memory/v1/chat/completions`：Hindsight / Memory Provider 相容入口。
-- `/v1/responses`、`/v1/messages`：相容介面。
+- `/v1/chat/completions`：auxiliary / control-plane OpenAI-compatible chat；目前用於 Goal Judge 等不應套用 Agent execution-evidence policy 的短控制面 LLM 工作，採 ForceNew / Untracked，並以 P2 進入 shared-account scheduler。
+- `/hermes/v1/chat/completions`：Hermes / Atlas Agent 執行面；保留 checkpoint、tool continuation、execution-evidence 與 completion guard。
+- `/memory/v1/chat/completions`：Hindsight / Memory Provider 相容入口，採 P1 Memory admission。
+- `/v1/responses`、`/v1/messages`：既有相容介面；Anthropic `/v1/messages` 保留。
 - `/v1/mcp`、`/v1/mcp/sse`、`/v1/mcp/message`：MCP transports。
 - 預設聊天模式為 Private；`disableMemory=1` 會在每條新 ChatHub WebSocket 重新套用，但不代表 Microsoft 完全不保留資料。
 - `textInputLimitUTF16=128000` 是 Web 相容 caller-text policy，不是 model token context window。
@@ -86,10 +86,10 @@ M365 AI Gateway is a community-maintained, self-hosted Microsoft 365 AI interope
 ## Architecture summary
 
 - One sidecar instance maps to one Microsoft 365 account.
-- `/v1/chat/completions`: generic OpenAI-compatible chat.
-- `/hermes/v1/chat/completions`: Hermes-specific chat / checkpoint profile.
-- `/memory/v1/chat/completions`: Hindsight / Memory Provider compatibility surface.
-- `/v1/responses` and `/v1/messages`: compatibility surfaces.
+- `/v1/chat/completions`: auxiliary / control-plane OpenAI-compatible chat for short LLM work such as Goal Judge that must not inherit Agent execution-evidence policy; it is ForceNew / Untracked and enters the shared-account scheduler as P2.
+- `/hermes/v1/chat/completions`: Hermes / Atlas Agent execution surface with checkpoint, tool-continuation, execution-evidence, and completion guards preserved.
+- `/memory/v1/chat/completions`: Hindsight / Memory Provider compatibility surface using P1 Memory admission.
+- `/v1/responses` and `/v1/messages`: existing compatibility surfaces; Anthropic `/v1/messages` remains supported.
 - `/v1/mcp`, `/v1/mcp/sse`, `/v1/mcp/message`: MCP transports.
 - The default chat mode is Private. `disableMemory=1` is reapplied on every new ChatHub WebSocket, but it does not imply zero Microsoft retention.
 - `textInputLimitUTF16=128000` is a Web-compatible caller-text policy, not a model token context window.

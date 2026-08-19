@@ -31,7 +31,7 @@ Usage fields use `prompt_tokens` / `completion_tokens`. Sidecar estimates carry 
 
 ## Caller-text overflow
 
-Generic `/v1` surfaces preserve:
+Auxiliary `/v1/chat/completions` and the other generic compatibility surfaces preserve:
 
 ```text
 HTTP 400
@@ -75,6 +75,19 @@ When router / repair / required-tool retry uses scratch ChatHub phases, each pha
 ## Response format
 
 `response_format` / `json_schema` define structured-output contracts. Ordinary JSON is not heuristically stripped merely because it resembles an internal router envelope; invalid internal envelopes fail closed.
+
+## `/v1/chat/completions` control-plane contract
+
+From Issue #76 onward, `POST /v1/chat/completions` is the auxiliary / control-plane surface. It shares the OpenAI-compatible request/response shape with `/hermes/v1` but uses a different execution policy:
+
+- shared-account scheduler class is fixed at P2; eligible P1 Memory outranks it while P0 external-user traffic remains highest;
+- P2 hard ceiling 1, shared hard ceiling 2, breaker/cooldown, and `MEMORY_YIELD` behavior reuse the existing scheduler;
+- checkpoint control is `Namespace=auxiliary-control-plane`, `ForceNew=true`, `Untracked=true`;
+- OpenAI message/tool protocol validation, caller-text policy, and tool-catalog / tool-call safety remain in force;
+- Agent `EVIDENCE_LEDGER` / final-answer completion rules are not injected, and Hermes historical completed/pending tool ledgers are not used for control-plane verdict deduplication or success authorization;
+- structured `done` verdicts in both non-stream and SSE paths must not be rewritten by `completionEvidenceAllows()` into `unconfirmedToolOutcomeResponse`.
+
+This surface does not relax Hermes Agent safety rules; Hermes / Atlas execution continues to use `/hermes/v1`. The `profile=generic` value in `tool_round_limit` errors remains a wire/runtime compatibility identity for now and does not mean `/v1/chat/completions` is still user-facing generic chat.
 
 ## Extension observability
 

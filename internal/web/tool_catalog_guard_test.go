@@ -287,7 +287,7 @@ func TestRouterKnownNativeToolOnlyResultIsSuppressed(t *testing.T) {
 		"tools":[` + routerFallbackTool + `],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -352,7 +352,7 @@ func TestNativeMixedKnownAndNewFencedCallsEmitsOnlyNewCall(t *testing.T) {
 		"tools":[` + routerFallbackTool + `],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)

@@ -18,9 +18,9 @@ Public brand 更名不要求破壞既有 runtime / protocol identity。`m365-nat
 
 | Surface | 用途 |
 |---|---|
-| `/v1/chat/completions` | 一般 OpenAI-compatible chat |
+| `/v1/chat/completions` | auxiliary / control-plane OpenAI-compatible chat；ForceNew / Untracked、P2 admission，不套用 Agent execution-evidence / completion guard |
 | `/v1/models` | 一般 model catalog |
-| `/hermes/v1/chat/completions` | Hermes 專用 chat / checkpoint profile |
+| `/hermes/v1/chat/completions` | Hermes / Atlas Agent 執行面；checkpoint、tool continuation、execution-evidence / completion guard |
 | `/hermes/v1/models` | Hermes profile model catalog |
 | `/memory/v1/chat/completions` | Hindsight / Memory Provider profile |
 | `/memory/v1/models` | Memory profile model catalog |
@@ -31,7 +31,9 @@ Public brand 更名不要求破壞既有 runtime / protocol identity。`m365-nat
 
 ## Request lifecycle
 
-一般 chat request 會依 profile 經過 caller ingress validation、text policy、admission control、必要的 tool routing / checkpoint continuation，再建立 ChatHub transport。Private mode 會在每條新 ChatHub WebSocket 重套 `disableMemory=1`。
+`/hermes/v1` Agent request 會依 profile 經過 caller ingress validation、text policy、P0/P2 admission、必要的 tool routing / checkpoint continuation，再建立 ChatHub transport。`/memory/v1` 走獨立 P1 Memory admission。`/v1/chat/completions` 則是 auxiliary / control-plane surface：保留協議合法性、text policy、router/tool safety 與 shared-account admission，但不把 Hermes/Atlas 的歷史 execution ledger 當成控制面 LLM 的完成證據，也不把合法的 `done` / `verified` 結構化 verdict 改寫成 Agent 的 unconfirmed-success 文案。Private mode 仍會在每條新 ChatHub WebSocket 重套 `disableMemory=1`。
+
+`/v1/chat/completions` 目前定位為 P2。它不能搶過 eligible P1 Memory，也不能成為 breaker half-open probe；若遇到 live `MEMORY_YIELD`，沿用 autonomous P2 的既有 barrier / queue 規則。它採 `ForceNew + Untracked`，不建立可跨 request 延續的 Sidecar transport checkpoint。
 
 Tool-call continuation 必須保留角色、內容、tool call ID 與 arguments identity。內部 router / repair / final-answer phase 不得靠同一個 scratch conversation 偷帶狀態；它們的 conversation boundary 由程式明確控制。
 

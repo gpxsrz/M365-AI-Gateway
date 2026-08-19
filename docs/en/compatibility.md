@@ -4,7 +4,7 @@
 
 | Category | Item | Status | Key point |
 |---|---|---|---|
-| API | `/v1/chat/completions` | Verified | text, SSE, tool continuation |
+| API | `/v1/chat/completions` | Deterministically verified; Production qualification pending | auxiliary / control-plane; non-stream/SSE verdict passthrough, P2 scheduler, ForceNew/Untracked, Agent-evidence isolation |
 | API | `/v1/responses` | Partially verified | compatibility surface retained |
 | API | `/v1/messages` | Partially verified | Anthropic-shaped surface |
 | Streaming | terminal + `[DONE]` | Verified | partial events alone are not success |
@@ -16,7 +16,7 @@
 | Caller tools | multiple tools in one turn | Production verified | only explicit read-only catalogs may exceed one |
 | Caller tools | large structured arguments | Production + deterministic verified | repair no longer truncates at a fixed 6000 characters |
 | Final answer | internal router-envelope normalization | Production verified | strict unwrap / fail closed |
-| Tool rounds | generic/Memory 16, Hermes 128 | Verified | profile-specific terminal ceiling |
+| Tool rounds | auxiliary/Memory 16, Hermes 128 | Verified | profile-specific terminal ceiling |
 | Tool results | large result preservation | Needs work | upstream flattening / truncation risk remains |
 | Bing | native Bing | Verified | grounding / citations work |
 | Bing + caller tools | coexistence | Partially verified | routing wording still matters |
@@ -26,7 +26,7 @@
 | MCP | modern + legacy handlers | Verified | client interoperability still depends on the client |
 | Hermes | `/hermes/v1` | Production verified | checkpoint, overflow, tool continuation, #68 |
 | Hindsight | `/memory/v1` | Core Production verified | retain/recall/reflect, overflow, 40K/retry1 |
-| Traffic | Interactive / Memory admission | Deterministically verified | bounded concurrency, FIFO, shared cooldown |
+| Traffic | P0 user / P1 Memory / P2 autonomous-control-plane admission | Deterministically verified | shared total 2, Memory 1, P2 1, FIFO, breaker/cooldown, MEMORY_YIELD |
 | Deployment identity | binary + Web from one commit | **Production verified** | #69 binds binary + three runtime Web assets into one deterministic release/rollback unit with identity readback |
 
 For evidence rationale, read [`research-evidence.md`](research-evidence.md). For current gaps, read [`known-limitations.md`](known-limitations.md).

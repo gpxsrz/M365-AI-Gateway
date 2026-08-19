@@ -40,7 +40,7 @@ This does not disable `MEMORY.md`, `USER.md`, or the memory tool; it reduces ext
 
 ### Tool rounds
 
-- generic `/v1`: default 16 rounds;
+- auxiliary `/v1/chat/completions`: default 16 rounds;
 - `/memory/v1`: default 16 rounds;
 - `/hermes/v1`: default 128 rounds and independently configurable;
 - exhausting the ceiling is a terminal safety condition, not an automatic replay or checkpoint rebind.
@@ -92,11 +92,32 @@ memoryBackoffMaxSeconds=600
 
 After the controlled live tuning on 2026-08-17, the Production **ordinary queue baseline** is `interactiveQueueTimeoutSeconds=120` and `memoryQueueTimeoutSeconds=120`; `interactiveMaxConcurrent=2`, `chatTimeoutSeconds=1800`, and `interactivePriorityHoldoffSeconds=10` remain unchanged. Those two `120` values are not the milestone Memory lease, and the ordinary queue timeout must not be globally raised merely to match the milestone barrier's 300-second ceiling.
 
-Issue #75 (2026-08-18) restructures ordinary admission around one shared-account capacity policy: **P0 `EXTERNAL_USER` > P1 Memory > P2 Hermes/Atlas background work (`AUTONOMOUS_CONTINUATION` / `ASYNC_COMPLETION`)**. The same Microsoft account has a hard total ceiling of 2, Memory has a hard ceiling of 1, and background Hermes has a hard ceiling of 1; in-flight work is never preempted. Memory may run alongside one Hermes request. Only a Memory head that can actually take a shared slot blocks P2: if one Memory request is already in flight, later Memory work is class-capped at one and P2 may use the other free slot rather than leaving capacity idle. The bounded Memory waiting buffer is 8 and remains FIFO. `interactivePriorityHoldoffSeconds` is retained for legacy settings/API compatibility but is no longer an ordinary Memory-admission prerequisite; the P0/P1/P2 queue policy carries priority directly.
+Issue #75 (2026-08-18) restructures ordinary admission around one shared-account capacity policy: **P0 `EXTERNAL_USER` > P1 Memory > P2 autonomous work**. P2 includes Hermes/Atlas background work (`AUTONOMOUS_CONTINUATION` / `ASYNC_COMPLETION`) plus, from Issue #76 onward, `/v1/chat/completions` auxiliary / control-plane LLM requests such as Goal Judge. The same Microsoft account has a hard total ceiling of 2, Memory has a hard ceiling of 1, and P2 has a hard ceiling of 1; in-flight work is never preempted. Memory may run alongside one P2 request. Only a Memory head that can actually take a shared slot blocks P2: if one Memory request is already in flight, later Memory work is class-capped at one and P2 may use the other free slot rather than leaving capacity idle. The bounded Memory waiting buffer is 8 and remains FIFO. `interactivePriorityHoldoffSeconds` is retained for legacy settings/API compatibility but is no longer an ordinary Memory-admission prerequisite; the P0/P1/P2 queue policy carries priority directly.
 
 `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` are retained as legacy settings/API compatibility fields; the #71 shared-account breaker no longer derives cooldown from them. Its fixed engineering policy is `1125 → 2250 → 4500 → 9000 → 18000` seconds, capped at L5. A hard 429 or a verified ChatHub soft-throttle notice enters `OPEN`; normal quota/metering metadata in `item.throttling` does not. Expiry only transitions to `HALF_OPEN_READY` and does not auto-retry. At most one controlled **external-user** interactive request may become the probe; autonomous Hermes continuations and Memory backlog cannot probe. Probe success enters `RECOVERY` without releasing Memory. During `RECOVERY`, `/memory/v1` is still fail-fast blocked; controlled qualification at this state therefore verifies the successful external-user probe, `RECOVERY` readback, and zero competing in-flight/waiting work. Only after the operator explicitly completes recovery back to `CLOSED` may bounded Hindsight/Memory live work resume.
 
-Interactive traffic includes generic chat, Hermes, Responses, and Anthropic; user-originated traffic remains P0. In normal state Memory is FIFO and, when no P0 waiter exists, outranks new background Hermes work. Already-started requests are not forcibly preempted. Live Microsoft accounts are not deliberately flooded to force 429; breaker behavior is primarily verified deterministically.
+`/hermes/v1` classifies request provenance into P0 user-facing and P2 background Hermes/Atlas work; `/memory/v1` is P1. From Issue #76 onward, `/v1/chat/completions` is fixed P2 auxiliary / control-plane and no longer represents user-facing generic chat. The Responses and Anthropic compatibility surfaces keep their existing admission behavior, and Anthropic `/v1/messages` remains supported. In normal state Memory is FIFO and, when no P0 waiter exists, outranks new P2 work. Already-started requests are not forcibly preempted. Live Microsoft accounts are not deliberately flooded to force 429; breaker behavior is primarily verified deterministically.
+
+The Goal Judge root cause is not upstream Hermes evidence visibility: when the Judge used `/hermes/v1`, a legitimate `{"verdict":"done",...}` could be interpreted by the Gateway Agent completion-evidence guard as an unsupported success claim with no matching tool result, then deterministically replaced with `unconfirmedToolOutcomeResponse`, causing Hermes to report `judge reply was not JSON`. Issue #76 routes Goal Judge through the `/v1/chat/completions` control-plane surface while preserving the Agent completion guard on `/hermes/v1`.
+
+For Hermes 0.20.4, the correct non-core configuration is a **second named route profile to the same M365 Gateway**, not a bare `base_url` under `auxiliary.goal_judge`. A bare task-level URL is resolved as anonymous `custom` and is not guaranteed to inherit the main `m365-copilot` credential. Coordinator and Atlas/manager should each use the same existing `M365_COPILOT2API_KEY` environment source, for example:
+
+```yaml
+providers:
+  m365-copilot-control-plane:
+    base_url: https://<same-m365-gateway>/v1
+    key_env: M365_COPILOT2API_KEY
+    model: gpt-5.6-reasoning
+    models:
+      gpt-5.6-reasoning:
+        context_length: 64000
+auxiliary:
+  goal_judge:
+    provider: m365-copilot-control-plane
+    model: gpt-5.6-reasoning
+```
+
+This does not replace the LLM provider: `m365-copilot` and `m365-copilot-control-plane` point to the same M365 AI Gateway, credential, and model; the names only separate Agent `/hermes/v1` endpoint policy from control-plane `/v1` policy. Apply this configuration only after the #76 Gateway code is deployed so the transition cannot accidentally use the old P0/generic `/v1` behavior.
 
 ### Issue #71 milestone / adaptive arbitration
 

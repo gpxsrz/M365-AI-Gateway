@@ -48,6 +48,12 @@
 
 Production server 從 filesystem 讀取 `web/index.html`、`web/login.html`、`web/debug.html`。過去曾觀察到 binary 已更新、三個 Web asset 仍停在舊 source 的 mixed-source runtime；這是 #69 的直接 evidence basis。部署 helper 現在已把 binary 與三個 Web assets 綁成同一 deterministic release、rollback 與 identity-readback unit；詳見 [`deployment.md`](deployment.md)。
 
+### Goal Judge / control-plane #76
+
+2026-08-19 真實 Kanban Goal Judge 失敗最初看起來像 Hermes evidence visibility 問題，但 request trace 與 source readback 證實根因在 Gateway 自己：Judge request 經 `/hermes/v1/chat/completions`，沒有 tool ledger；合法 `done` verdict 命中 Agent success-claim guard 後，被 deterministic 覆寫成 source constant `unconfirmedToolOutcomeResponse`，因此 Hermes 端收到自然語言而不是 JSON。兩次失敗 request 都是 2-message / 0-tool / non-stream、HTTP 200，沒有 429/503 或 transport failure。
+
+#76 的 source candidate 把 `/v1/chat/completions` 重新定位為 P2 auxiliary / control-plane：ForceNew / Untracked、沿用 shared scheduler / breaker / MEMORY_YIELD，但隔離 Agent evidence ledger 與 completion rewrite。Dedicated regressions 已覆蓋 non-stream `done` passthrough、SSE `done` passthrough、P2 admission、Memory precedence、MEMORY_YIELD、不建立 checkpoint，以及帶 tools 時不注入 Agent ledger；`/hermes/v1` 的 completion-evidence guard 另有 regression 確認仍在。Production qualification 仍需在 exact candidate 部署後完成，未完成前不得寫成 Production verified。
+
 ## 歷史 archive
 
 - Memory Provider Issues #42–#44：[`../history/memory-provider-compatibility-issues-42-44.md`](../history/memory-provider-compatibility-issues-42-44.md)

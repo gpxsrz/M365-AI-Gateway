@@ -344,7 +344,7 @@ func TestHermesInterruptedToolSequenceReturnsUnconfirmedAnswer(t *testing.T) {
 			{"role":"user","content":"Continue from the interruption without repeating completed work."}
 		]
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -397,7 +397,7 @@ func TestHermesInterruptedToolCallIsNotAutomaticallyReissued(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -452,7 +452,7 @@ func TestHermesInterruptedToolSequenceAllowsNewArguments(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -489,7 +489,7 @@ func TestHermesPendingToolSequenceWithoutRecoveryTurnRemainsRejected(t *testing.
 			]}
 		]
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -521,7 +521,7 @@ func TestHermesInterruptedSequenceRejectsReusedToolCallID(t *testing.T) {
 			]}
 		]
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -554,7 +554,7 @@ func TestHermesInterruptedToolSequenceBuffersStreamingSuccessClaim(t *testing.T)
 			{"role":"user","content":"Continue after the interruption."}
 		]
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -600,7 +600,7 @@ func TestHermesInterruptedStreamingAllowsDistinctNewToolCall(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -649,7 +649,7 @@ func TestHermesInterruptedStreamingPreservesImagesWithDistinctToolCall(t *testin
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -693,7 +693,7 @@ func TestHermesInterruptedStreamingPreservesImages(t *testing.T) {
 			{"role":"user","content":"Show any available evidence after the interruption."}
 		]
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -738,7 +738,7 @@ func TestHermesInterruptedFencedToolCallIsNotReissued(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -785,7 +785,7 @@ func TestHermesInterruptedNativeToolCallIsNotReissued(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -833,7 +833,7 @@ func TestHermesInterruptedNativeToolCallPreservesNeutralAnswer(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -886,7 +886,7 @@ func TestHermesCompletedNativeToolCallIsNotReissuedInStream(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -973,7 +973,7 @@ func TestHermesFailedCompletedToolDoesNotAuthorizeStreamingSuccess(t *testing.T)
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -1014,7 +1014,7 @@ func TestHermesFailedCompletedToolWithoutActiveToolsDoesNotAuthorizeStreamingSuc
 			{"role":"user","content":"Explain the current state."}
 		]
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
@@ -1060,7 +1060,7 @@ func TestHermesCompletedFencedToolCallIsNotReissuedInStream(t *testing.T) {
 		}],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)

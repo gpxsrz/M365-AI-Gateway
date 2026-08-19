@@ -40,7 +40,7 @@ agent:
 
 ### Tool rounds
 
-- generic `/v1`：預設 16 rounds。
+- auxiliary `/v1/chat/completions`：預設 16 rounds。
 - `/memory/v1`：預設 16 rounds。
 - `/hermes/v1`：預設 128 rounds，可獨立調整。
 - ceiling 耗盡時是 terminal safety condition，不自動 replay 或重綁 checkpoint。
@@ -92,11 +92,32 @@ memoryBackoffMaxSeconds=600
 
 2026-08-17 controlled live tuning 後，Production 的**普通排隊 baseline** 為 `interactiveQueueTimeoutSeconds=120`、`memoryQueueTimeoutSeconds=120`；`interactiveMaxConcurrent=2`、`chatTimeoutSeconds=1800`、`interactivePriorityHoldoffSeconds=10` 維持不變。這兩個 `120` 不等於 milestone Memory lease；不得為了配合最長 300 秒的 milestone barrier，直接把所有普通流量的 queue timeout 一起拉長。
 
-2026-08-18 Issue #75 將普通 admission 重構為同一個 shared-account capacity policy：**P0 `EXTERNAL_USER` > P1 Memory > P2 Hermes/Atlas background work（`AUTONOMOUS_CONTINUATION` / `ASYNC_COMPLETION`）**。同一 Microsoft 帳號 hard ceiling 為 2、Memory hard ceiling 為 1、background Hermes hard ceiling 為 1；已開始的 request 不會被 preempt。Memory 可以和一筆 Hermes traffic 同時執行。只有「目前真的可取得 shared slot」的 Memory head 會擋 P2；若已有一筆 Memory 在跑，後面的 Memory 因 class ceiling=1 只能等待，P2 仍可使用另一個空 slot，避免為了優先權白白閒置容量。Memory waiting buffer 為 8，維持 FIFO。`interactivePriorityHoldoffSeconds` 保留為舊設定／API 相容欄位，但不再是普通 Memory admission 的 prerequisite；P0/P1/P2 queue policy 本身負責優先序。
+2026-08-18 Issue #75 將普通 admission 重構為同一個 shared-account capacity policy：**P0 `EXTERNAL_USER` > P1 Memory > P2 autonomous work**。P2 包含 Hermes/Atlas background work（`AUTONOMOUS_CONTINUATION` / `ASYNC_COMPLETION`）以及 Issue #76 起的 `/v1/chat/completions` auxiliary / control-plane LLM request（例如 Goal Judge）。同一 Microsoft 帳號 hard ceiling 為 2、Memory hard ceiling 為 1、P2 hard ceiling 為 1；已開始的 request 不會被 preempt。Memory 可以和一筆 P2 traffic 同時執行。只有「目前真的可取得 shared slot」的 Memory head 會擋 P2；若已有一筆 Memory 在跑，後面的 Memory 因 class ceiling=1 只能等待，P2 仍可使用另一個空 slot，避免為了優先權白白閒置容量。Memory waiting buffer 為 8，維持 FIFO。`interactivePriorityHoldoffSeconds` 保留為舊設定／API 相容欄位，但不再是普通 Memory admission 的 prerequisite；P0/P1/P2 queue policy 本身負責優先序。
 
 `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 為舊設定／API 相容欄位；#71 shared-account breaker 不再用它們決定 cooldown。Breaker 的固定工程政策為 `1125 → 2250 → 4500 → 9000 → 18000` 秒，L5 封頂。命中 hard 429 或已驗證的 ChatHub soft-throttle notice 才進 `OPEN`；正常 `item.throttling` quota / metering metadata 不算限流。時間到只進 `HALF_OPEN_READY`，不會自動 retry。只有一筆受控 **external-user** interactive request 可成為 probe；autonomous Hermes continuation 與 Memory backlog 都不得搶 probe。Probe 成功後進 `RECOVERY`，但不直接放行 Memory。`RECOVERY` 期間 `/memory/v1` 仍會 fail-fast；因此這一階段的 controlled qualification 是確認 external-user probe 成功、讀回 `RECOVERY`，並確認沒有競爭中的 in-flight/waiting work。只有 operator 明確完成 recovery 回到 `CLOSED` 後，才允許受限的 Hindsight/Memory live work 恢復。
 
-Interactive traffic 包含 generic chat、Hermes、Responses、Anthropic；其中 user-originated traffic 仍以 P0 處理。正常狀態 Memory 採 FIFO，且在沒有 P0 waiter 時優先於新的 background Hermes work；已經開始的 request 不會被強制 preempt。真實 Microsoft 帳號不以高併發刻意觸發 429，breaker 行為主要用 deterministic test 驗證。
+`/hermes/v1` 由 request provenance 分出 P0 user-facing 與 P2 background Hermes/Atlas；`/memory/v1` 是 P1。`/v1/chat/completions` 自 Issue #76 起固定作 P2 auxiliary / control-plane，不再代表 user-facing generic chat。Responses 與 Anthropic compatibility surface 維持既有 admission 行為，Anthropic `/v1/messages` 保留。正常狀態 Memory 採 FIFO，且在沒有 P0 waiter 時優先於新的 P2 work；已經開始的 request 不會被強制 preempt。真實 Microsoft 帳號不以高併發刻意觸發 429，breaker 行為主要用 deterministic test 驗證。
+
+Goal Judge 的根因不是 Hermes upstream evidence visibility：先前 Judge 經 `/hermes/v1` 時，合法 `{"verdict":"done",...}` 會被 Gateway 的 Agent completion-evidence guard 視為「沒有 matching tool result 的成功宣稱」，再 deterministic 覆寫成 `unconfirmedToolOutcomeResponse`，使 Hermes JSON parser 報 `judge reply was not JSON`。Issue #76 的修正是讓 Goal Judge 改走 `/v1/chat/completions` control-plane surface；`/hermes/v1` 的 Agent completion guard 保留不變。
+
+Hermes 0.20.4 的正確 non-core 設定方式是建立**同一 M365 Gateway 的第二個 named route profile**，而不是直接在 `auxiliary.goal_judge` 只塞 `base_url`。後者會被 auxiliary resolver 轉成匿名 `custom`，無法保證自動繼承主 `m365-copilot` credential。Coordinator 與 Atlas/manager profile 都應各自使用同一個既有 `M365_COPILOT2API_KEY` env source，例如：
+
+```yaml
+providers:
+  m365-copilot-control-plane:
+    base_url: https://<same-m365-gateway>/v1
+    key_env: M365_COPILOT2API_KEY
+    model: gpt-5.6-reasoning
+    models:
+      gpt-5.6-reasoning:
+        context_length: 64000
+auxiliary:
+  goal_judge:
+    provider: m365-copilot-control-plane
+    model: gpt-5.6-reasoning
+```
+
+這不是更換 LLM Provider：`m365-copilot` 與 `m365-copilot-control-plane` 都指向同一個 M365 AI Gateway、同一 credential 與同一模型，只是把 Agent `/hermes/v1` 和 control-plane `/v1` 的 endpoint policy 分開命名。此設定只能在 #76 Gateway code 已部署後套用，避免舊 `/v1` P0/generic 行為在切換窗口被誤用。
 
 ### Issue #71 milestone / adaptive arbitration
 

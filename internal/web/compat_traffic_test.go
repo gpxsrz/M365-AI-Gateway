@@ -239,7 +239,7 @@ func TestInteractiveProtocolHandlersReturnRetryableAdmissionErrors(t *testing.T)
 			name:   "openai",
 			target: "/v1/chat/completions",
 			body:   `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`,
-			invoke: func(server *Server, w http.ResponseWriter, r *http.Request) { server.interactiveOpenAIChat(w, r) },
+			invoke: func(server *Server, w http.ResponseWriter, r *http.Request) { server.auxiliaryOpenAIChat(w, r) },
 		},
 		{
 			name:   "responses",
@@ -307,11 +307,14 @@ func TestCompatibilityTrafficMemoryConcurrency(t *testing.T) {
 	}
 }
 
-func TestLegacyV1ChatCountsAsInteractivePriority(t *testing.T) {
+func TestV1ControlPlaneCountsAsAutonomousPriority(t *testing.T) {
 	blocking := &phase3BlockingChat{started: make(chan struct{}), release: make(chan struct{})}
 	server := newAdminSecurityServer(t, "administrator-password")
 	settings := server.settings.get()
 	settings.HermesCompatibilityEnabled = false
+	settings.InteractiveMaxConcurrent = 2
+	settings.MemoryMaxConcurrent = 1
+	settings.InteractivePriorityHoldoffSeconds = 0
 	if err := server.settings.save(settings); err != nil {
 		t.Fatal(err)
 	}
@@ -323,19 +326,21 @@ func TestLegacyV1ChatCountsAsInteractivePriority(t *testing.T) {
 	chatDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		recorder := httptest.NewRecorder()
-		server.interactiveOpenAIChat(recorder, phase3Request(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"interactive"}]}`))
+		server.auxiliaryOpenAIChat(recorder, phase3Request(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"control-plane"}]}`))
 		chatDone <- recorder
 	}()
 	<-blocking.started
-	if snap := server.compatTraffic.snapshot(); snap.InteractiveInFlight != 1 {
-		t.Fatalf("interactive in flight=%d", snap.InteractiveInFlight)
+	if snap := server.compatTraffic.snapshot(); snap.ExternalUserInFlight != 0 || snap.AutonomousInFlight != 1 {
+		t.Fatalf("control-plane request was not P2 autonomous: %#v", snap)
 	}
-	cfg := trafficTestSettings()
+	cfg := serverRuntimeSettings(server)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 	defer cancel()
-	if _, err := server.compatTraffic.acquireMemory(ctx, cfg); err == nil {
-		t.Fatal("memory request unexpectedly started while legacy /v1 chat was active")
+	memoryRelease, err := server.compatTraffic.acquireMemory(ctx, cfg)
+	if err != nil {
+		t.Fatalf("P1 Memory did not share the second account slot with /v1 P2 traffic: %v", err)
 	}
+	memoryRelease(http.StatusOK)
 	close(blocking.release)
 	if recorder := <-chatDone; recorder.Code != http.StatusOK {
 		t.Fatalf("chat status=%d body=%s", recorder.Code, recorder.Body.String())

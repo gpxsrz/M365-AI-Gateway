@@ -4,7 +4,7 @@
 
 | 類別 | 項目 | 狀態 | 重點 |
 |---|---|---|---|
-| API | `/v1/chat/completions` | 已驗證 | text、SSE、tool continuation |
+| API | `/v1/chat/completions` | deterministic 已驗證，Production qualification 待完成 | auxiliary / control-plane；non-stream/SSE verdict passthrough、P2 scheduler、ForceNew/Untracked、Agent-evidence isolation |
 | API | `/v1/responses` | 部分驗證 | compatibility surface 保留 |
 | API | `/v1/messages` | 部分驗證 | Anthropic-shaped surface |
 | Streaming | terminal + `[DONE]` | 已驗證 | partial event 不單獨算成功 |
@@ -16,7 +16,7 @@
 | Caller tools | 多 tool 同 turn | Production 已驗證 | only explicit read-only catalog 可 >1 |
 | Caller tools | 大型 structured arguments | Production + deterministic 已驗證 | repair 不再固定 6000 字元截斷 |
 | Final answer | internal router envelope normalization | Production 已驗證 | strict unwrap / fail closed |
-| Tool rounds | generic/Memory 16、Hermes 128 | 已驗證 | profile-specific terminal ceiling |
+| Tool rounds | auxiliary/Memory 16、Hermes 128 | 已驗證 | profile-specific terminal ceiling |
 | Tool results | 大型 result 完整保留 | 待補強 | 仍有上游 flatten / truncation 風險 |
 | Bing | native Bing | 已驗證 | grounding / citations 可用 |
 | Bing + caller tools | coexistence | 部分驗證 | 仍受 routing wording 影響 |
@@ -26,7 +26,7 @@
 | MCP | modern + legacy handlers | 已驗證 | caller interoperability 仍依 client |
 | Hermes | `/hermes/v1` | Production 已驗證 | checkpoint、overflow、tool continuation、#68 |
 | Hindsight | `/memory/v1` | 核心 Production 已驗證 | retain/recall/reflect、overflow、40K/retry1 |
-| Traffic | Interactive / Memory admission | deterministic 已驗證 | bounded concurrency、FIFO、shared cooldown |
+| Traffic | P0 user / P1 Memory / P2 autonomous-control-plane admission | deterministic 已驗證 | shared total 2、Memory 1、P2 1、FIFO、breaker/cooldown、MEMORY_YIELD |
 | Deployment identity | binary + Web 同 commit | **Production 已驗證** | #69 已把 binary + 三個 runtime Web assets 綁成同一 deterministic release/rollback unit，並做 identity readback |
 
 更詳細的「為什麼」請讀 [`research-evidence.md`](research-evidence.md)；目前缺口請讀 [`known-limitations.md`](known-limitations.md)。

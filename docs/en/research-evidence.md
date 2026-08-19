@@ -48,6 +48,12 @@ After `stream_options.include_usage` became a first-class request field, the old
 
 The Production server reads `web/index.html`, `web/login.html`, and `web/debug.html` from the filesystem. A mixed-source runtime was observed where the binary was current while all three Web assets remained from older source; that observation is the direct evidence basis for #69. The deployment helper now binds the binary and those three Web assets into one deterministic release, rollback, and identity-readback unit; see [`deployment.md`](deployment.md).
 
+### Goal Judge / control-plane #76
+
+On 2026-08-19 a real Kanban Goal Judge failure initially looked like a Hermes evidence-visibility problem, but request traces and source readback proved the root cause was inside the Gateway itself. The Judge request used `/hermes/v1/chat/completions` with no tool ledger; a legitimate `done` verdict matched the Agent success-claim guard and was deterministically replaced with the source constant `unconfirmedToolOutcomeResponse`, so Hermes received natural language rather than JSON. Both observed failures were 2-message / 0-tool / non-stream HTTP 200 requests, with no 429/503 or transport failure.
+
+The #76 source candidate repurposes `/v1/chat/completions` as a P2 auxiliary / control-plane surface: ForceNew / Untracked, reusing the shared scheduler / breaker / MEMORY_YIELD while isolating Agent evidence-ledger and completion-rewrite policy. Dedicated regressions cover non-stream `done` passthrough, SSE `done` passthrough, P2 admission, Memory precedence, MEMORY_YIELD, no checkpoint persistence, and no Agent-ledger injection even when tools are present; a separate `/hermes/v1` regression confirms the Agent completion-evidence guard remains active. Production qualification still requires deployment of the exact candidate and must not be reported as complete beforehand.
+
 ## Historical archive
 
 - Memory Provider Issues #42–#44: [`../history/memory-provider-compatibility-issues-42-44.md`](../history/memory-provider-compatibility-issues-42-44.md)

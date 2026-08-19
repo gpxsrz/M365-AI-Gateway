@@ -19,9 +19,15 @@ func TestCompatibilityNamespacesAreIsolated(t *testing.T) {
 	if !hermesCompatibilityRequest("/hermes/v1/chat/completions") {
 		t.Fatal("Hermes namespace was not detected")
 	}
-	for _, path := range []string{"/v1/chat/completions", "/v1/models", "/api/chat"} {
+	if !auxiliaryControlPlaneRequest("/v1/chat/completions") {
+		t.Fatal("auxiliary control-plane surface was not detected")
+	}
+	for _, path := range []string{"/v1/models", "/api/chat"} {
 		if memoryCompatibilityRequest(path) || hermesCompatibilityRequest(path) {
 			t.Fatalf("ordinary route %q entered a compatibility profile", path)
+		}
+		if auxiliaryControlPlaneRequest(path) {
+			t.Fatalf("ordinary route %q entered the auxiliary control-plane profile", path)
 		}
 	}
 	memory, ok := compatibilityCheckpointControl("/memory/v1/chat/completions")
@@ -31,6 +37,10 @@ func TestCompatibilityNamespacesAreIsolated(t *testing.T) {
 	hermes, ok := compatibilityCheckpointControl("/hermes/v1/chat/completions")
 	if !ok || hermes.Namespace != "hermes" || hermes.ForceNew {
 		t.Fatalf("Hermes checkpoint control = %#v, %t", hermes, ok)
+	}
+	auxiliary, ok := compatibilityCheckpointControl("/v1/chat/completions")
+	if !ok || auxiliary.Namespace != "auxiliary-control-plane" || !auxiliary.ForceNew || !auxiliary.Untracked {
+		t.Fatalf("auxiliary checkpoint control = %#v, %t", auxiliary, ok)
 	}
 }
 

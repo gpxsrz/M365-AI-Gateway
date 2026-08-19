@@ -9,7 +9,7 @@ This page lists current limitations only and intentionally avoids replaying the 
 5. **Private mode**: `disableMemory=1` prevents ordinary chat history but does not imply zero Microsoft retention; files, images, and artifacts have separate data boundaries.
 6. **MCP**: server routes exist, but not every third-party MCP client has been interoperability-qualified.
 7. **Hermes / Hindsight shared account**: profiles and checkpoint state are isolated, but both still share real Microsoft-account throughput; already-running Memory work is not preempted.
-8. **Tool-round ceilings**: generic/Memory and Hermes use different ceilings; Hermes 128 is still a runaway guard, not unlimited execution.
+8. **Tool-round ceilings**: auxiliary `/v1/chat/completions` / Memory and Hermes use different ceilings; Hermes 128 is still a runaway guard, not unlimited execution.
 9. **WebSocket retry**: retry is limited to transient dial / upgrade failures before the payload is sent; already-sent ChatHub requests are not blindly replayed.
 10. **Hindsight bank mission**: until Hermes upstream #18774 is fixed, bank-mission values may not synchronize to the live bank and require Banks API readback.
 11. **Web model / request-capability drift**: Microsoft Web selector and request capabilities can change independently of a sidecar release; an evidence snapshot is not a permanent capability contract.

@@ -18,9 +18,9 @@ The public rebrand does not require breaking established runtime or protocol ide
 
 | Surface | Purpose |
 |---|---|
-| `/v1/chat/completions` | generic OpenAI-compatible chat |
+| `/v1/chat/completions` | auxiliary / control-plane OpenAI-compatible chat; ForceNew / Untracked, P2 admission, without Agent execution-evidence / completion guards |
 | `/v1/models` | generic model catalog |
-| `/hermes/v1/chat/completions` | Hermes-specific chat / checkpoint profile |
+| `/hermes/v1/chat/completions` | Hermes / Atlas Agent execution surface with checkpoint, tool continuation, and execution-evidence / completion guards |
 | `/hermes/v1/models` | Hermes-profile model catalog |
 | `/memory/v1/chat/completions` | Hindsight / Memory Provider profile |
 | `/memory/v1/models` | Memory-profile model catalog |
@@ -31,7 +31,9 @@ The public rebrand does not require breaking established runtime or protocol ide
 
 ## Request lifecycle
 
-A chat request passes through caller-ingress validation, text policy, account admission, and when needed tool routing / checkpoint continuation before ChatHub transport is created. Private mode reapplies `disableMemory=1` on every new ChatHub WebSocket.
+`/hermes/v1` Agent requests pass through caller-ingress validation, text policy, P0/P2 admission, and when needed tool routing / checkpoint continuation before ChatHub transport is created. `/memory/v1` uses separate P1 Memory admission. `/v1/chat/completions` is the auxiliary / control-plane surface: it keeps protocol validation, text policy, router/tool safety, and shared-account admission, but does not treat Hermes/Atlas historical execution ledgers as control-plane completion evidence and does not rewrite a legitimate structured `done` / `verified` verdict into an Agent unconfirmed-success message. Private mode still reapplies `disableMemory=1` on every new ChatHub WebSocket.
+
+`/v1/chat/completions` is currently P2. It cannot outrank eligible P1 Memory or become the breaker half-open probe; while a live `MEMORY_YIELD` exists, it follows the existing autonomous-P2 barrier / queue rules. It is `ForceNew + Untracked`, so it does not create reusable Sidecar transport checkpoint state across requests.
 
 Tool continuation must preserve role, content, tool-call ID, and argument identity. Internal router / repair / final-answer phases have explicit scratch-conversation boundaries rather than relying on `disableMemory` as a context reset.
 

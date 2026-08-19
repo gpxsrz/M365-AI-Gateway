@@ -201,7 +201,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/conversations", s.conversations)
 	m.HandleFunc("/api/conversations/delete", s.deleteConversation)
 	m.HandleFunc("/v1/models", s.openaiModels)
-	m.HandleFunc("/v1/chat/completions", s.interactiveOpenAIChat)
+	m.HandleFunc("/v1/chat/completions", s.auxiliaryOpenAIChat)
 	m.HandleFunc("/hermes/v1/models", s.openaiModels)
 	m.HandleFunc("/hermes/v1/chat/completions", s.hermesOpenAIChat)
 	m.HandleFunc("/memory/v1/models", s.openaiModels)
@@ -1043,7 +1043,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if execution != nil && execution.turn != nil && execution.turn.turn != nil {
 		ledger = checkpointExecutionLedger(execution.turn.turn.ToolLedger, execution.turn.turn.Outbound)
 	}
-	if body.Stream && (responseFormat != nil || len(ledger.Pending) > 0 || ledger.hasFailedCompletedEvidence() || (len(ledger.Completed) > 0 && len(body.Tools) > 0)) {
+	applyAgentEvidencePolicy := !auxiliaryControlPlaneRequest(r.URL.Path)
+	if body.Stream && (responseFormat != nil || (applyAgentEvidencePolicy && (len(ledger.Pending) > 0 || ledger.hasFailedCompletedEvidence() || (len(ledger.Completed) > 0 && len(body.Tools) > 0)))) {
 		// Tool-history streams must not commit upstream deltas before duplicate
 		// suppression and completion-evidence validation have run. Execute the
 		// existing non-stream pipeline once, then serialize its validated
@@ -1096,6 +1097,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// exact checkpoint outbound delta so accepted tool results are not replayed.
 	if execution == nil || execution.turn == nil || execution.turn.turn == nil {
 		ledger = buildAgentLedger(body.Messages)
+	}
+	// Agent execution evidence is a policy layer, not protocol structure.
+	// The generic /v1 Chat Completions surface is reserved for auxiliary /
+	// control-plane LLM calls, so it must not inherit Hermes tool-result claims,
+	// duplicate-call suppression, or completion semantics even when a caller
+	// supplies tool-shaped history. Keep the real ledger above for message/tool
+	// protocol validation, but use an empty policy ledger for the control plane.
+	policyLedger := ledger
+	if !applyAgentEvidencePolicy {
+		policyLedger = agentLedger{}
 	}
 	// Preserve role boundaries when adapting OpenAI messages to ChatHub's
 	// single message.text field. This keeps system/developer instructions,
@@ -1181,7 +1192,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// Only fall through to text streaming when the router explicitly selects
 		// no tool; this prevents a natural-language preamble from becoming a
 		// completed assistant turn with the actual call lost.
-		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
+		routePrompt := modelToolRouterPrompt(prompt+"\n"+policyLedger.RouterContext(), toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
+		if !applyAgentEvidencePolicy {
+			routePrompt = modelToolRouterPrompt(prompt, toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
+		}
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeReq := modelToolScratchRequest(routePrompt, tone)
 		logModelToolPhaseBinding(requestID, "route", "scratch", "fresh", routeReq)
@@ -1199,7 +1213,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		mergeSearchEvidence(&routerSearchEvidence, routeRes)
 		routeRes, calls, parsed, parseSource := selectModelToolDecisionResult(routeRes, toolMaps, body.ToolChoice)
-		dedup := deduplicateModelToolCalls(calls, ledger, parsed)
+		dedup := deduplicateModelToolCalls(calls, policyLedger, parsed)
 		calls = dedup.Calls
 		knownCallSuppressed := dedup.KnownCallSuppressed
 		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, dedup)
@@ -1223,7 +1237,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				mergeSearchEvidence(&routerSearchEvidence, repairRes)
 				repairRes, calls, parsed, parseSource = selectModelToolDecisionResult(repairRes, toolMaps, body.ToolChoice)
-				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				dedup = deduplicateModelToolCalls(calls, policyLedger, parsed)
 				calls = dedup.Calls
 				knownCallSuppressed = dedup.KnownCallSuppressed
 				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, dedup)
@@ -1232,7 +1246,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if parsed && len(calls) > 0 {
-			scope := fmt.Sprintf("%d:%v:stream", len(body.Messages), completedCallIDs(ledger))
+			scope := fmt.Sprintf("%d:%v:stream", len(body.Messages), completedCallIDs(policyLedger))
 			for i := range calls {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
@@ -1260,7 +1274,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			defs, _ := json.Marshal(toolMaps)
 			retryText := `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
 APPLICATION_REQUEST_AND_EVIDENCE:
-` + prompt + "\n" + ledger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
+` + prompt + "\n" + policyLedger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
+			if !applyAgentEvidencePolicy {
+				retryText = `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
+APPLICATION_REQUEST:
+` + prompt + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
+			}
 			retryReq := modelToolScratchRequest(retryText, tone)
 			logModelToolPhaseBinding(requestID, "required_retry", "scratch", "fresh", retryReq)
 			retryRes, retryErr := s.chat.Chat(ctx, account, retryReq)
@@ -1272,11 +1291,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 				retryRes, calls, parsed, parseSource = selectModelToolDecisionResult(retryRes, toolMaps, body.ToolChoice)
-				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				dedup = deduplicateModelToolCalls(calls, policyLedger, parsed)
 				calls = dedup.Calls
 				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, dedup)
 				if parsed && len(calls) > 0 {
-					scope := fmt.Sprintf("%d:%v:stream-required-retry", len(body.Messages), completedCallIDs(ledger))
+					scope := fmt.Sprintf("%d:%v:stream-required-retry", len(body.Messages), completedCallIDs(policyLedger))
 					for i := range calls {
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
@@ -1303,7 +1322,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	if body.Stream {
-		answerPrompt := prompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Answer the user directly. If a tool is explicitly required, emit its structured call; otherwise return ordinary text."
+		answerPrompt := prompt
+		if !auxiliaryControlPlaneRequest(r.URL.Path) {
+			answerPrompt += "\n" + policyLedger.RouterContext() + "\nFINAL ANSWER RULE: Answer the user directly. If a tool is explicitly required, emit its structured call; otherwise return ordinary text."
+		}
 		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d", requestID, len(answerPrompt))
 		answerReq := execution.Request(chathub.Request{Text: answerPrompt, Tone: tone, Attachments: body.Attachments, Tools: answerTools, ToolChoice: answerToolChoice, ToolCallLimit: configuredRequestToolCallLimit(body, s.settings)})
 		bindingSource := "public_checkpoint"
@@ -1490,7 +1512,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		detectedCalls, rejectedUnavailableCalls := filterAllowedToolCalls(detectedCalls, toolMaps, body.ToolChoice)
 		streamedToolCalls := len(streamedTools) > 0 && len(detectedCalls) > 0
-		calls := filterKnownCalls(detectedCalls, ledger)
+		calls := filterKnownCalls(detectedCalls, policyLedger)
 		suppressedKnownCalls := len(detectedCalls) > len(calls)
 		rejectedRouterCalls := !allowAnswerToolCalls && len(calls) > 0
 		if rejectedRouterCalls {
@@ -1517,7 +1539,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				if strings.TrimSpace(text.String()) != "" {
 					emitText(pending.String())
 				} else {
-					emitText(suppressedKnownCallResponse(ledger))
+					emitText(suppressedKnownCallResponse(policyLedger))
 				}
 			} else {
 				pending.Reset()
@@ -1526,10 +1548,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					prefix = strings.TrimSpace(prefix[:fence])
 				}
 				if first {
-					if prefix != "" && completionEvidenceAllows(prefix, ledger) {
+					if prefix != "" && (!applyAgentEvidencePolicy || completionEvidenceAllows(prefix, policyLedger)) {
 						emitText(prefix)
 					} else {
-						emitText(suppressedKnownCallResponse(ledger))
+						emitText(suppressedKnownCallResponse(policyLedger))
 					}
 				}
 			}
@@ -1564,7 +1586,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// Ask the upstream model to select and validate the next tool. The gateway
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
-		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
+		routePrompt := modelToolRouterPrompt(prompt+"\n"+policyLedger.RouterContext(), toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
+		if !applyAgentEvidencePolicy {
+			routePrompt = modelToolRouterPrompt(prompt, toolMaps, body.ToolChoice, configuredRequestToolCallLimit(body, s.settings))
+		}
 		routeReq := modelToolScratchRequest(routePrompt, tone)
 		logModelToolPhaseBinding(requestID, "route", "scratch", "fresh", routeReq)
 		routeRes, routeErr := s.chat.Chat(ctx, account, routeReq)
@@ -1580,7 +1605,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		mergeSearchEvidence(&routerSearchEvidence, routeRes)
 		routeRes, calls, parsed, parseSource := selectModelToolDecisionResult(routeRes, toolMaps, body.ToolChoice)
-		dedup := deduplicateModelToolCalls(calls, ledger, parsed)
+		dedup := deduplicateModelToolCalls(calls, policyLedger, parsed)
 		calls = dedup.Calls
 		knownCallSuppressed := dedup.KnownCallSuppressed
 		logModelToolDecisionSelection(requestID, "route", routeRes, parseSource, parsed, dedup)
@@ -1604,7 +1629,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 				mergeSearchEvidence(&routerSearchEvidence, repairRes)
 				repairRes, calls, parsed, parseSource = selectModelToolDecisionResult(repairRes, toolMaps, body.ToolChoice)
-				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				dedup = deduplicateModelToolCalls(calls, policyLedger, parsed)
 				calls = dedup.Calls
 				knownCallSuppressed = dedup.KnownCallSuppressed
 				logModelToolDecisionSelection(requestID, "repair", repairRes, parseSource, parsed, dedup)
@@ -1620,7 +1645,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 		}
 		if len(calls) > 0 {
-			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(ledger))
+			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(policyLedger))
 			for i := range calls {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
@@ -1647,7 +1672,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			defs, _ := json.Marshal(toolMaps)
 			retryText := `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
 APPLICATION_REQUEST_AND_EVIDENCE:
-` + prompt + "\n" + ledger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
+` + prompt + "\n" + policyLedger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
+			if !applyAgentEvidencePolicy {
+				retryText = `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
+APPLICATION_REQUEST:
+` + prompt + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
+			}
 			retryReq := modelToolScratchRequest(retryText, tone)
 			logModelToolPhaseBinding(requestID, "required_retry", "scratch", "fresh", retryReq)
 			retryRes, retryErr := s.chat.Chat(ctx, account, retryReq)
@@ -1659,11 +1689,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 				retryRes, calls, parsed, parseSource = selectModelToolDecisionResult(retryRes, toolMaps, body.ToolChoice)
-				dedup = deduplicateModelToolCalls(calls, ledger, parsed)
+				dedup = deduplicateModelToolCalls(calls, policyLedger, parsed)
 				calls = dedup.Calls
 				logModelToolDecisionSelection(requestID, "required_retry", retryRes, parseSource, parsed, dedup)
 				if parsed && len(calls) > 0 {
-					scope := fmt.Sprintf("%d:%v:required-retry", len(body.Messages), completedCallIDs(ledger))
+					scope := fmt.Sprintf("%d:%v:required-retry", len(body.Messages), completedCallIDs(policyLedger))
 					for i := range calls {
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
@@ -1685,7 +1715,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 	}
-	answerPrompt := prompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
+	answerPrompt := prompt
+	if !auxiliaryControlPlaneRequest(r.URL.Path) {
+		answerPrompt += "\n" + policyLedger.RouterContext() + "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
+	}
 	answerReq := execution.Request(chathub.Request{Text: answerPrompt, Tone: tone, Attachments: body.Attachments, Tools: answerTools, ToolChoice: answerToolChoice, ToolCallLimit: configuredRequestToolCallLimit(body, s.settings)})
 	bindingSource := "public_checkpoint"
 	if strings.TrimSpace(answerReq.ConversationID) == "" {
@@ -1734,7 +1767,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	rejectedAnswerToolCall := false
 	if detected := fencedToolCalls(res.Text, toolMaps, body.ToolChoice); len(detected) > 0 {
 		detected, _ = filterAllowedToolCalls(detected, toolMaps, body.ToolChoice)
-		calls := filterKnownCalls(detected, ledger)
+		calls := filterKnownCalls(detected, policyLedger)
 		suppressedKnownCalls := len(detected) > len(calls)
 		if len(calls) > 0 && allowAnswerToolCalls {
 			if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
@@ -1768,7 +1801,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if rejectedUnavailableCalls && len(detected) == 0 {
 			rejectedAnswerToolCall = true
 		}
-		calls := filterKnownCalls(detected, ledger)
+		calls := filterKnownCalls(detected, policyLedger)
 		suppressedKnownCalls := len(detected) > len(calls)
 		if len(calls) > 0 && allowAnswerToolCalls {
 			if err := validateToolCallLimit(calls, requestToolCallLimit(body, calls, s.settings)); err != nil {
@@ -1796,11 +1829,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 	}
-	if !completionEvidenceAllows(res.Text, ledger) {
+	if applyAgentEvidencePolicy && !completionEvidenceAllows(res.Text, policyLedger) {
 		res.Text = unconfirmedToolOutcomeResponse
 	}
 	if knownCallSuppressed && strings.TrimSpace(res.Text) == "" {
-		res.Text = suppressedKnownCallResponse(ledger)
+		res.Text = suppressedKnownCallResponse(policyLedger)
 	}
 	created := time.Now().Unix()
 

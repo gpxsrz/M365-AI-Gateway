@@ -15,6 +15,7 @@ import (
 const (
 	memoryCompatibilityPrefix = "/memory/v1/"
 	hermesCompatibilityPrefix = "/hermes/v1/"
+	auxiliaryControlPlanePath = "/v1/chat/completions"
 )
 
 type hermesRequestClass string
@@ -125,15 +126,39 @@ func hermesCompatibilityRequest(path string) bool {
 	return strings.HasPrefix(path, hermesCompatibilityPrefix)
 }
 
+func auxiliaryControlPlaneRequest(path string) bool {
+	return path == auxiliaryControlPlanePath
+}
+
 func compatibilityCheckpointControl(path string) (checkpointRequestControl, bool) {
 	switch {
 	case memoryCompatibilityRequest(path):
 		return checkpointRequestControl{Namespace: "memory-provider", ForceNew: true, Untracked: true}, true
 	case hermesCompatibilityRequest(path):
 		return checkpointRequestControl{Namespace: "hermes"}, true
+	case auxiliaryControlPlaneRequest(path):
+		return checkpointRequestControl{Namespace: "auxiliary-control-plane", ForceNew: true, Untracked: true}, true
 	default:
 		return checkpointRequestControl{}, false
 	}
+}
+
+// auxiliaryOpenAIChat is the dedicated Chat Completions surface for
+// control-plane LLM work (for example Hermes Goal Judge). It shares the same
+// Microsoft account scheduler as Hermes and Memory, but is deliberately P2:
+// real user turns remain P0 and eligible Memory remains P1. Reusing the
+// autonomous class also preserves the existing MEMORY_YIELD barrier,
+// autonomous concurrency cap, shared breaker, cooldown, and queue semantics.
+//
+// Control-plane calls are ForceNew/Untracked so their short verdict/extraction
+// turns never become Sidecar conversation state.
+func (s *Server) auxiliaryOpenAIChat(w http.ResponseWriter, r *http.Request) {
+	control, _ := compatibilityCheckpointControl(r.URL.Path)
+	control.Mode = checkpointFullHistory
+	r = r.WithContext(withCheckpointRequest(r.Context(), control))
+	s.serveInteractiveRequestClass(w, r, hermesRequestAutonomousContinuation, func(w http.ResponseWriter, status int, message string) {
+		writeOpenAIError(w, status, "rate_limit_error", message)
+	}, s.openaiChat)
 }
 
 func (s *Server) interactiveOpenAIChat(w http.ResponseWriter, r *http.Request) {

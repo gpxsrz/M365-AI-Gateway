@@ -529,7 +529,7 @@ func TestAutoToolRouterFilteredKnownCallDoesNotEnterRepair(t *testing.T) {
 		"tool_choice":"auto"
 	}`
 	rr := httptest.NewRecorder()
-	s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	s.openaiChat(rr, httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body)))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
@@ -792,7 +792,7 @@ func TestAutoToolRouterFallbackStillEnforcesPendingEvidence(t *testing.T) {
 		"tools":[` + routerFallbackTool + `],
 		"tool_choice":"auto"
 	}`
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/hermes/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 
 	s.openaiChat(rr, r)
