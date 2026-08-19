@@ -4,7 +4,7 @@
 
 | Category | Item | Status | Key point |
 |---|---|---|---|
-| API | `/v1/chat/completions` | Deterministically verified; Production qualification pending | auxiliary / control-plane; non-stream/SSE verdict passthrough, P2 scheduler, ForceNew/Untracked, Agent-evidence isolation |
+| API | `/v1/chat/completions` | Production verified (#76 implementation `9928d0e`) | auxiliary / control-plane; non-stream/SSE verdict passthrough, P2 scheduler, ForceNew/Untracked, Agent-evidence isolation; Coordinator/manager Goal Judge live `done` PASS |
 | API | `/v1/responses` | Partially verified | compatibility surface retained |
 | API | `/v1/messages` | Partially verified | Anthropic-shaped surface |
 | Streaming | terminal + `[DONE]` | Verified | partial events alone are not success |

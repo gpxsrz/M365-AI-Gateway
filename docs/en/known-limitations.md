@@ -14,5 +14,6 @@ This page lists current limitations only and intentionally avoids replaying the 
 10. **Hindsight bank mission**: until Hermes upstream #18774 is fixed, bank-mission values may not synchronize to the live bank and require Banks API readback.
 11. **Web model / request-capability drift**: Microsoft Web selector and request capabilities can change independently of a sidecar release; an evidence snapshot is not a permanent capability contract.
 12. **Milestone durable does not mean the same already-built request recalled it**: the Gateway can wait for Hindsight `retain.completed` before autonomous admission, but it cannot retroactively modify an HTTP body Hermes built before the wait; verify fresh memory through a subsequent normal recall/readback when required.
+13. **Hermes Goal Judge caller timeout is currently fixed at 30 seconds**: Hermes 0.20.4 `judge_goal()` explicitly passes `timeout=30s`, so task-level auxiliary timeout cannot override it. Uncontended #76 canaries finish in roughly 5–6 seconds; if P2 waits behind Memory / `MEMORY_YIELD` for longer than 30 seconds, the Judge may fail safe and defer completion. Do not promote `/v1/chat/completions` to P0/P1 or bypass the shared scheduler to avoid this timeout.
 
 See [`compatibility.md`](compatibility.md) for verification status.

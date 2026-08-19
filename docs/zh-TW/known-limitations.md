@@ -14,5 +14,6 @@
 10. **Hindsight bank mission**：Hermes upstream #18774 修復前，`bank_mission` / `bank_retain_mission` 可能不會同步到 live bank，需以 Banks API readback 確認。
 11. **Web model / request capability drift**：Microsoft Web selector 與 request capability 會隨 rollout 改變；evidence snapshot 不是永久 capabilities contract。
 12. **Milestone durable ≠ 同一筆已組好的 request 已 recall**：Gateway 可以等待 Hindsight `retain.completed` 再放 autonomous admission，但無法反向修改 Hermes 在等待前已組好的 HTTP body；需要 fresh memory 時要以後續正常 recall/readback 驗證。
+13. **Hermes Goal Judge caller timeout 目前固定 30 秒**：Hermes 0.20.4 `judge_goal()` 會顯式傳 `timeout=30s`，task-level auxiliary timeout 無法覆蓋。正常無競爭 #76 canary 約 5–6 秒；若 P2 因 Memory / `MEMORY_YIELD` 等待超過 30 秒，Judge 可能 fail-safe 並延後 completion。不得為避免此 timeout 而把 `/v1/chat/completions` 提升成 P0/P1 或繞過 shared scheduler。
 
 驗證狀態請讀 [`compatibility.md`](compatibility.md)。

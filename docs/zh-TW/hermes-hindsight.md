@@ -119,6 +119,8 @@ auxiliary:
 
 這不是更換 LLM Provider：`m365-copilot` 與 `m365-copilot-control-plane` 都指向同一個 M365 AI Gateway、同一 credential 與同一模型，只是把 Agent `/hermes/v1` 和 control-plane `/v1` 的 endpoint policy 分開命名。此設定只能在 #76 Gateway code 已部署後套用，避免舊 `/v1` P0/generic 行為在切換窗口被誤用。
 
+目前 Hermes 0.20.4 還有一個 caller-side 邊界：`hermes_cli.goals.judge_goal()` 明確傳入 `timeout=30s`，因此 `auxiliary.goal_judge.timeout` 無法延長這個特定 call。#76 的實際無競爭 canary 約 5–6 秒完成；但因 `/v1/chat/completions` 正確維持 P2、不得繞過 P1 Memory / live `MEMORY_YIELD`，若未來 control-plane 等待超過 30 秒，Judge 可能先以 transport timeout fail-safe，導致本次 completion 延後而不是錯誤放行。這不是理由去提高 `/v1` 優先權或繞過 scheduler；目前先保留為已知限制並以自然 workload 觀察，不修改 Hermes core。
+
 ### Issue #71 milestone / adaptive arbitration
 
 `/hermes/v1` 會用 Hermes framework provenance 加上最新 framework turn 的穩定 marker 分成三類，不使用 LLM 猜語意：

@@ -4,7 +4,7 @@
 
 | 類別 | 項目 | 狀態 | 重點 |
 |---|---|---|---|
-| API | `/v1/chat/completions` | deterministic 已驗證，Production qualification 待完成 | auxiliary / control-plane；non-stream/SSE verdict passthrough、P2 scheduler、ForceNew/Untracked、Agent-evidence isolation |
+| API | `/v1/chat/completions` | Production 已驗證（#76 implementation `9928d0e`） | auxiliary / control-plane；non-stream/SSE verdict passthrough、P2 scheduler、ForceNew/Untracked、Agent-evidence isolation；Coordinator/manager Goal Judge live `done` PASS |
 | API | `/v1/responses` | 部分驗證 | compatibility surface 保留 |
 | API | `/v1/messages` | 部分驗證 | Anthropic-shaped surface |
 | Streaming | terminal + `[DONE]` | 已驗證 | partial event 不單獨算成功 |

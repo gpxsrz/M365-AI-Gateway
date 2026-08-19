@@ -119,6 +119,8 @@ auxiliary:
 
 This does not replace the LLM provider: `m365-copilot` and `m365-copilot-control-plane` point to the same M365 AI Gateway, credential, and model; the names only separate Agent `/hermes/v1` endpoint policy from control-plane `/v1` policy. Apply this configuration only after the #76 Gateway code is deployed so the transition cannot accidentally use the old P0/generic `/v1` behavior.
 
+Hermes 0.20.4 still has one caller-side boundary: `hermes_cli.goals.judge_goal()` explicitly passes `timeout=30s`, so `auxiliary.goal_judge.timeout` cannot extend this particular call. The uncontended #76 live canaries completed in roughly 5–6 seconds, but because `/v1/chat/completions` correctly remains P2 and must not bypass P1 Memory or a live `MEMORY_YIELD`, a future control-plane wait longer than 30 seconds can cause the Judge to fail safe with a transport timeout and defer that completion attempt. This is not a reason to raise `/v1` priority or bypass the scheduler; it remains a known limitation to observe under natural workloads without modifying Hermes core.
+
 ### Issue #71 milestone / adaptive arbitration
 
 `/hermes/v1` deterministically classifies Hermes framework provenance plus the latest framework turn without LLM semantic guessing:
