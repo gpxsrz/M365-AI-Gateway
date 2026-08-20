@@ -1,37 +1,61 @@
-# Microsoft Web model and request-capability evidence
+# Microsoft Web model-capability evidence
 
-The Microsoft 365 Copilot Web model selector and ChatHub request surface can change with rollout. M365 AI Gateway treats these observations as **external capability evidence**, not as permanent string whitelists in Go source.
+## Understand it in 30 seconds
 
-## Optional model capability
+Seeing a model or field in Microsoft Web does not mean that the API supports it forever. M365 AI Gateway first records the observation as a candidate. It exposes the capability to API callers only after a reproducible test passes.
 
-`settings.json` and the management API can store `optionalModelCapabilities`. Each capability must be bound to real privacy-safe evidence identity; a string that merely resembles a Microsoft model ID is not sufficient evidence.
+This prevents two common failures:
 
-Useful metadata includes:
+- a hard-coded model name breaks when Microsoft changes a rollout;
+- a login, plugin, or confirmation flow owned by the Web app is mistaken for a regular API feature.
 
-- public model ID / display name;
-- resolved upstream tone;
-- reasoning / display metadata;
-- evidence schema / SHA-256 / capture timestamp;
-- enabled / rollout state.
+## Decision order for AI agents
 
-Common evidence fields include `selectorChoiceId`, `wireTone` / `upstreamTone`, `capturedAt`, `temporaryChat`, `usabilityVerified`, `streamingMode`, `optionsSets`, `allowedMessageTypes`, and `projectionPolicy`. Request-side observations should default to `observe_only`; field presence alone is not promotion evidence.
+1. Capture a privacy-safe observation.
+2. Pin its source, schema, capture time, and SHA-256.
+3. Mark it `observe_only`; do not enable it automatically.
+4. Verify the complete API contract with deterministic or isolated live tests.
+5. Promote only after success, and allow rollback after drift or regression.
 
-## Request-capability drift
+## Optional model capabilities
 
-`webRequestCapabilityEvidence` is a request-side snapshot, not a transport setting. It may record the observed tone, streaming mode, option sets, allowed message types, and non-sensitive Private / disable-memory capability metadata.
+`settings.json` and the management API can store `optionalModelCapabilities`. Every item must point to real evidence identity. A string that merely looks like a model ID is not evidence.
 
-Do not automatically project every observed Web-only capability to API callers. Auth, plugin, stateful memory, and user-confirmation message types can depend on Web-app lifecycle ownership; each capability needs an explicit transport contract before promotion.
+Common fields:
 
-## Evidence lifecycle
+| Field group | Examples |
+|---|---|
+| Public display | model ID, display name |
+| Upstream mapping | `selectorChoiceId`, `wireTone` / `upstreamTone` |
+| Behavior | reasoning, `streamingMode`, `optionsSets`, `allowedMessageTypes` |
+| Evidence identity | schema, SHA-256, `capturedAt` |
+| State | enabled, rollout, `projectionPolicy`, `usabilityVerified` |
+| Privacy hints | `temporaryChat` and non-sensitive disable-memory metadata |
 
-1. Capture a privacy-safe raw observation.
-2. Pin source / schema / SHA identity.
-3. Treat it as candidate evidence, not automatic enablement.
-4. Promote only after deterministic / live qualification establishes the API contract.
-5. Allow rollback when capability drift or regression is observed instead of guessing new model strings in source.
+Field presence does not prove API support. Request-side observations default to `observe_only`.
 
-## Privacy boundary
+## Request-capability snapshots
 
-The evidence registry does not store tokens, cookies, account / tenant identifiers, chat content, full request / response bodies, private file URLs, or replayable authentication material.
+`webRequestCapabilityEvidence` records one observation of the Web surface. It is not a transport setting. It may store tone, streaming mode, options, allowed message types, and non-sensitive Private Chat metadata.
 
-See [`compatibility.md`](compatibility.md) for current compatibility status.
+Do not expose these capabilities merely because the Web app displays them:
+
+- authentication lifecycle;
+- plugin lifecycle;
+- stateful memory;
+- user confirmation;
+- other message types whose state belongs to the Web app.
+
+Each capability needs a proven owner and safe transport contract first.
+
+## Data that must never be stored
+
+The evidence registry does not store:
+
+- tokens, cookies, passwords, or API keys;
+- account or tenant identifiers;
+- chat content or full request/response bodies;
+- private file URLs;
+- replayable authentication material.
+
+See [`compatibility.md`](compatibility.md) for current feature status.

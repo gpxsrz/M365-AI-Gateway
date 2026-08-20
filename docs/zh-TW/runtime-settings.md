@@ -1,69 +1,47 @@
-# Runtime / 管理 UI 設定查表
+# Runtime 與管理設定
 
-只在修改設定 schema、管理 UI、環境變數 mapping 或 consumer profile 時讀這份。
+## 30 秒看懂
 
-管理設定 surface：`GET /api/admin/settings` / `PUT /api/admin/settings`。`settings.json` 是保存層，不代表所有欄位都以 file 優先。
+大多數使用者只需要管理頁，不需要碰環境變數。管理 API 是：
 
-## Current setting groups
+- `GET /api/admin/settings`：看目前設定。
+- `PUT /api/admin/settings`：只更新送出的欄位。
+- `GET /api/admin/traffic`：看排隊、限流與 recovery 狀態。
 
-### Chat / compatibility
+管理頁必須同時顯示「現在生效的值」和「值從哪裡來」。灰掉或標示 environment-controlled 的欄位，不能假裝被 UI 覆蓋。Secret 永遠不回顯明文。
 
-- `chatMode`
-- `hermesCompatibilityEnabled`
-- `memoryCompatibilityEnabled`
+## 我該改哪一組
 
-### Account admission / 429
+| 需求 | 設定 |
+|---|---|
+| 開關相容模式 | `chatMode`、`hermesCompatibilityEnabled`、`memoryCompatibilityEnabled` |
+| 一般等待時間 | `interactiveQueueTimeoutSeconds`、`memoryQueueTimeoutSeconds`、`chatTimeoutSeconds` |
+| tools | `toolPlanningMode`、`maxToolCallsPerTurn`、`maxToolRounds`、`hermesMaxToolRounds` |
+| 文字與輸出大小 | `textInputLimitUTF16`、`contextWindow`、`maxOutputTokens` |
+| 模型 | `modelMappings`、`optionalModelCapabilities` |
+| 程序與檔案 | `listenAddress`、`configPath`、`tokenCachePath`、`sessionCachePath`、`debugLogPath` |
+| 網路與 OAuth | `outboundProxy`、`clientId`、`authority`、`redirectUri`、`scope` |
 
-- `interactiveMaxConcurrent`
-- `interactiveQueueTimeoutSeconds`
-- `memoryMaxConcurrent`
-- `memoryQueueTimeoutSeconds`
-- `interactivePriorityHoldoffSeconds`
-- `memoryBackoffInitialSeconds`（legacy compatibility；不再控制 #71 shared breaker）
-- `memoryBackoffMaxSeconds`（legacy compatibility；不再控制 #71 shared breaker）
+## 首次啟動
 
-#71 shared-account breaker 使用固定 cooldown 階梯 `1125 / 2250 / 4500 / 9000 / 18000` 秒，不是 runtime-tunable exponential backoff。`GET /api/admin/settings` 的 `compatibilityTraffic` 會回報完整 scheduler projection：`trafficMode`、interactive/external/autonomous in-flight/waiting、`effectiveHermesConcurrency`、Memory pending/oldest age、milestone yield state/deadline/outcome/duration、最近 retain/consolidation、hard/soft throttle、streak/cooldown remaining、suppressed reask，以及 `sharedCircuitState / sharedCooldownLevel / sharedCooldownUntil`。
+1. 讓 `M365_DATA_DIR` 指向可寫、可持久保存的資料夾。
+2. 可用一次性 `M365_ADMIN_PASSWORD` 建立首次登入。
+3. 第一次成功登入後，立即換成持久管理員密碼。
+4. 若設定 `M365_DEBUG_LOG`，診斷摘要寫到該路徑；否則使用 data directory 下的 `debug-logs.json`。
 
-#75 起，同帳號 admission 的有效硬限制為 shared total `<=2`、Memory `<=1`、P2 `<=1`，優先序為 user-originated P0 > eligible Memory P1 > P2 autonomous/control-plane。P2 包含 background Hermes/Atlas，也包含 #76 起的 `/v1/chat/completions` auxiliary / control-plane request；後者不是新的 tunable class，也不新增額外 queue。`interactiveMaxConcurrent` / `memoryMaxConcurrent` 仍保留設定與 API 相容 surface，但不能把上述 hard ceiling 拉高。`interactivePriorityHoldoffSeconds` 同樣保留為 legacy compatibility 欄位，普通 Memory admission 已不再等待這個 holdoff；priority 由 scheduler queue policy 直接處理。Memory waiting buffer 固定為 8，upstream Memory concurrency 仍只有 1。
+診斷檔要使用 private file 權限，例如 `0600`，並採 atomic replacement、遮蔽、容量與 TTL 限制。
 
-Hindsight durable-event callback 使用 `M365_HINDSIGHT_WEBHOOK_SECRET` 作為 HMAC 驗證用 runtime environment setting；它是敏感值，不屬於管理 UI 顯示或 handoff evidence。
+## 值的優先順序
 
-管理 UI 會把 `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 明確標成 legacy compatibility 欄位，並顯示 #71 scheduler 狀態。`RECOVERY` 期間會出現受控 completion 操作；它只應在 controlled live qualification 已通過後使用。
+設定不是全部用同一套規則：
 
-### Tools / model policy
+| 類型 | 生效規則 |
+|---|---|
+| 一般 runtime，例如 chat/image timeout | environment 提供啟動預設；`settings.json` 已保存時，保存值是 current effective value |
+| 需要重啟，例如 listen、cache path、OAuth、proxy | 明確 process environment 優先；沒有 env 才用保存值 |
+| 直接 override，例如 tool-call / tool-round env | process environment 永遠蓋過 UI 保存值 |
 
-- `toolPlanningMode`
-- `textInputLimitUTF16`
-- `maxToolCallsPerTurn`
-- `maxToolRounds`
-- `hermesMaxToolRounds`
-- `contextWindow`
-- `maxOutputTokens`
-- `modelMappings`
-- `optionalModelCapabilities`
-
-### Runtime
-
-- `chatTimeoutSeconds`
-- `imageTimeoutSeconds`
-- `logLevel`
-- `debugLogPath`
-- `listenAddress`
-- `configPath`
-- `tokenCachePath`
-- `sessionCachePath`
-- `outboundProxy`
-
-### OAuth
-
-- `clientId`
-- `authority`
-- `redirectUri`
-- `scope`
-
-## 重要環境變數
-
-常見 runtime mapping 包含：
+常見環境變數：
 
 - `M365_CHAT_TIMEOUT_SECONDS`
 - `M365_IMAGE_TIMEOUT_SECONDS`
@@ -73,24 +51,43 @@ Hindsight durable-event callback 使用 `M365_HINDSIGHT_WEBHOOK_SECRET` 作為 H
 - `M365_DATA_DIR`
 - `M365_PUBLIC_ORIGIN`
 
-部署 automation 的 `M365_READY_TIMEOUT` 是 deployment control，不是 API product setting。
+`M365_READY_TIMEOUT` 只控制部署腳本，不是 API 產品設定。
 
-## Precedence / UI contract
+## 同帳號流量：不可調高的硬限制
 
-- `chatTimeoutSeconds`、`imageTimeoutSeconds` 等一般執行設定：environment 提供 startup default；`settings.json` 已保存欄位時，以保存值為 current effective value。
-- `listenAddress`、token/session 路徑、OAuth、outbound proxy 等 restart-required 欄位：明確 process environment 優先；只有 environment 不存在時才使用保存值注入啟動環境。
-- `M365_MAX_TOOL_CALLS_PER_TURN`、`M365_MAX_TOOL_ROUNDS` 等 direct runtime override：process environment 存在時蓋過 UI 保存值。新增同類 override 時應維持一致的 source-reporting contract。
-- 管理 UI 應顯示 effective value 與 source（env / saved file / built-in default）。
-- environment-controlled 欄位應在 UI 鎖定或清楚標示，保存值不得假裝覆蓋 live env。
-- sensitive secret 不回顯 plaintext。
+同一 Microsoft 帳號固定遵守：
 
-## Bootstrap / diagnostic storage
+| 項目 | 上限／順序 |
+|---|---|
+| 總執行中請求 | 2 |
+| Memory | 1 |
+| P2 autonomous / control-plane | 1 |
+| 優先順序 | P0 使用者 > P1 Memory > P2 背景／控制面 |
+| Memory 等待 buffer | 8，FIFO |
 
-- 本機首次啟動可使用一次性 `M365_ADMIN_PASSWORD` bootstrap secret；第一次成功登入後應強制切換成持久管理員密碼。
-- `M365_DATA_DIR` 應指向可寫且持久化資料目錄。
-- 明確設定 `M365_DEBUG_LOG` 時使用該路徑；未設定時安全診斷摘要預設放在 settings/data directory 下的 `debug-logs.json`。
-- diagnostic file 應以 private file semantics 保存（例如 `0600`、atomic replacement），並維持既有遮蔽與容量 / TTL policy。
+`interactiveMaxConcurrent`、`memoryMaxConcurrent` 與 `interactivePriorityHoldoffSeconds` 為舊 API 相容欄位，不能把上述硬限制拉高。普通 Memory priority 直接由 queue policy 決定。
 
-## Current profile baselines
+`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 也只保留相容性。Shared breaker 使用固定 cooldown：
 
-Hermes / Hindsight current values 請讀 [`hermes-hindsight.md`](hermes-hindsight.md)，不要在這份 reference 再複製一份會漂移的完整設定組。
+```text
+1125 → 2250 → 4500 → 9000 → 18000 秒
+```
+
+成功 probe 後另有固定 60 秒安靜觀察。這不是第一階 cooldown，也沒有對應的新設定。`compatibilityTraffic` 會顯示 `recoveryObservationSeconds`、`recoveryObservationRemainingSeconds`、`lastRecoveryMode`、`lastRecoveryReason` 與 `lastRecoveryAt`。
+
+Recovery 期間管理員仍可呼叫：
+
+```http
+POST /api/admin/traffic/recovery
+Content-Type: application/json
+
+{"action":"complete"}
+```
+
+這是人工 fallback；自動完成仍必須先有成功 probe、安靜觀察與零衝突流量。
+
+## Hindsight webhook secret
+
+`M365_HINDSIGHT_WEBHOOK_SECRET` 用來驗證 Hindsight callback 的 HMAC。它是 secret：不出現在管理 UI、handoff、log 或 error body。
+
+Hermes / Hindsight 的完整基線只放在 [`hermes-hindsight.md`](hermes-hindsight.md)，避免兩份設定互相漂移。

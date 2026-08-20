@@ -1,14 +1,21 @@
-# Deployment, reverse proxy, and runtime identity
+# Deployment and recovery
 
-This document contains public, reproducible deployment principles only. Private NAS hostnames, paths, credentials, and Production mutation steps belong to the local `m365-ops` skill.
+## Understand it in 30 seconds
 
-## Source of truth
+A deployment is more than replacing one executable. Treat the Rust executable and the three management pages as one release. They must come from one public commit and roll back together.
 
-A deployment candidate must be bound to the exact commit / tree independently read from public `main`, and that exact head must pass CI. NAS state, VM state, a dirty worktree, or an unpublished commit cannot become deployment authority.
+Deployment is complete only when:
 
-## Production is a runtime artifact set
+1. GitHub `main` reads back the intended commit and CI is green for that exact commit.
+2. The complete old release was saved and can be restored.
+3. Post-deploy file identities, service state, and health checks are correct.
+4. Hermes, Hindsight, and other unauthorized services did not change.
 
-The runtime is not only the binary. The server reads these files from its working directory:
+This page contains only public, reproducible rules. NAS hostnames, Production paths, credentials, and mutation steps stay outside the repository; operators use the local `m365-ops` skill.
+
+## Files in one release
+
+The complete runtime set is:
 
 ```text
 m365-native
@@ -17,44 +24,63 @@ web/login.html
 web/debug.html
 ```
 
-Binary and Web assets therefore need to come from the same intended commit, switch in one deployment window, roll back as one set, and receive independent post-deploy identity checks.
+Rust also embeds the page content in the binary, while the Docker image still carries `web/`. Build the whole release from one commit. Never mix files from different versions.
 
-### Release-unit automation
+## Safe deployment order
 
-`scripts/deploy-nas-production.sh` packages the binary and the fixed three Web assets into a deterministic release archive. Its manifest binds the exact commit, tree, and SHA-256 of all four files. The remote side verifies the archive, manifest, and payload identities before placing all four runtime files in one snapshot, switching them in one stopped deployment window, rolling them back as one set, and independently reading back each SHA.
+1. Pin the exact commit and tree read from public `main`.
+2. Wait for CI to succeed on that exact head.
+3. Build the candidate and record every file's SHA-256.
+4. Snapshot the complete current runtime set and prove it can be restored.
+5. Switch the complete set in one stopped-service window.
+6. Read back file hashes, service PID, restart count, listener, and health probes.
+7. If any check fails, restore the complete old set and verify the service again.
 
-The script uses the non-interactive `sudo -n` privilege path and does not accept password-fed `sudo -S`. A missing Web asset, symlinked source, archive/hash/manifest mismatch, or post-deploy identity mismatch fails closed.
+NAS state, VM state, a dirty worktree, and an unpublished commit are not deployment authority.
 
-## Snapshot and rollback
+## Repository deployment helper
 
-The pre-deploy snapshot must cover the complete runtime set that will change. Rollback must restore the same set. Restoring only the binary while leaving mismatched Web files is not a complete rollback.
+`scripts/deploy-nas-production.sh` packages the four files into a reproducible release archive. Its manifest binds the exact commit, tree, and SHA-256 of every file. The remote side verifies the archive, manifest, and payload before switching anything.
 
-## Timeout stack
+The script accepts only non-interactive `sudo -n`. It stops safely when:
 
-`chatTimeoutSeconds` controls how long the sidecar waits after a request enters ChatHub. Admission may add up to `interactiveQueueTimeoutSeconds` before that. Outer reverse-proxy timeouts must exceed the effective inner waiting budget or the proxy will terminate healthy long-running work first.
+- a required file is missing;
+- a source is a symlink;
+- archive, manifest, or hash identity differs;
+- post-deploy readback differs from the candidate.
 
-Proxy timeouts and `textInputLimitUTF16` are independent: one is time, the other is caller-text size measured in UTF-16 code units.
+## Timeout ordering
 
-For example, with `interactiveQueueTimeoutSeconds=300` and `chatTimeoutSeconds=1800`, the inner sidecar waiting budget is roughly `2100` seconds. A reasonable layering example is Hermes stale detection around `2200`, Hermes request timeout around `2300`, and reverse-proxy `proxy_read_timeout` / `proxy_send_timeout` around `2400` seconds. These values illustrate **ordering**, not permanent defaults; recalculate the chain whenever one layer changes. `proxy_connect_timeout` only covers connection establishment and does not need to match long reasoning timeouts.
+A request may wait in a queue before it waits for Microsoft. Outer timeouts must therefore exceed the total inner waiting budget.
 
-## Configuration sources
+Example:
 
-Precedence depends on the setting class rather than one global "env always wins" or "settings file always wins" rule. The management UI should expose effective value and source; environment-controlled values cannot be overridden by saved UI values.
+| Waiting layer | Example value |
+|---|---:|
+| `interactiveQueueTimeoutSeconds` | 300 seconds |
+| `chatTimeoutSeconds` | 1800 seconds |
+| Hermes stale detector | about 2200 seconds |
+| Hermes request timeout | about 2300 seconds |
+| reverse-proxy read/send timeout | about 2400 seconds |
 
-## Container image
+These values show ordering, not permanent defaults. Recalculate the chain whenever one layer changes. `proxy_connect_timeout` covers connection setup only and does not need to match long reasoning timeouts.
 
-The repository `Dockerfile` copies both the binary and `web/` into the image. If Production bind-mounts `/app`, the mounted filesystem becomes the actual runtime source, so deployment qualification must inspect the mounted binary and Web files rather than trusting the image contents.
+`textInputLimitUTF16` controls text size, not time.
 
-## Completion conditions
+## Settings and containers
 
-At minimum:
+Different setting classes have different sources of truth. Do not assume that environment variables or `settings.json` always win. The management page should show the effective value and source; an environment-controlled value cannot be overwritten by a saved UI value.
 
-1. public exact commit / tree readback;
-2. exact-head CI success;
-3. fixed candidate artifact identity;
-4. verified snapshot / rollback set;
-5. Production binary + Web identity equals the intended source;
-6. service state / restart count / health probes are healthy;
-7. unauthorized Hermes / Hindsight / other runtime identity remains unchanged.
+The repository `Dockerfile` includes both the binary and `web/`. If Production bind-mounts an external directory onto `/app`, the mounted files become the real runtime. Qualification must inspect the mount rather than trusting the image contents.
 
-Use the private operations skill for the actual Production mutation procedure.
+## Machine-checkable completion table
+
+| Check | Required result |
+|---|---|
+| Public source | exact commit / tree equals intended source |
+| CI | exact-head success |
+| Candidate | artifact identities are pinned |
+| Recovery | snapshot covers the full runtime set |
+| Production | binary and all Web identities match |
+| Service | state, restart count, listener, and health are correct |
+| Boundaries | unauthorized runtime identities did not drift |

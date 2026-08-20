@@ -1,13 +1,22 @@
-FROM golang:1.25-alpine AS build
+FROM rust:1.97-alpine AS build
 
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
+RUN apk add --no-cache musl-dev
+COPY Cargo.toml Cargo.lock ./
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/m365-native ./cmd/server
+ARG M365_BUILD_VERSION=dev
+ARG M365_BUILD_COMMIT=dev
+ARG M365_BUILD_TIME=unknown
+ENV M365_BUILD_VERSION=${M365_BUILD_VERSION} \
+    M365_BUILD_COMMIT=${M365_BUILD_COMMIT} \
+    M365_BUILD_TIME=${M365_BUILD_TIME}
+RUN cargo build --locked --release \
+    && mkdir -p /out \
+    && cp target/release/m365-native /out/m365-native
 
 FROM alpine:3.20
-RUN addgroup -S m365 && adduser -S -G m365 m365 \
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S m365 && adduser -S -G m365 m365 \
     && mkdir -p /data /app
 WORKDIR /app
 COPY --from=build /out/m365-native /app/m365-native

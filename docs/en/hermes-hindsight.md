@@ -1,14 +1,18 @@
-# Hermes / Hindsight integration
+# Hermes and Hindsight
 
-This document describes the current integration baseline only. Historical canaries and the full Issues #42–#44 hardening record live under [`../history/README.md`](../history/README.md).
+## Understand it in 30 seconds
 
-## Hermes route
+- Hermes Agent uses `/hermes/v1`.
+- Hindsight Memory uses `/memory/v1`.
+- Goal Judge and similar control work use `/v1/chat/completions`, not the Hermes Agent route.
+- One Microsoft account runs at most two requests. Users come first, Memory second, and background/control work third.
+- The Gateway does not modify Hermes or Hindsight core code.
 
-Hermes should use `/hermes/v1`. This profile has an isolated `hermes` checkpoint namespace and a larger tool-round ceiling. MCP, artifact, and general capabilities remain on the normal `/v1/*` surfaces.
+If you only need to connect the services, use the next section. Exact scheduler, barrier, and webhook rules follow later.
 
-### Current correctness-first baseline
+## Recommended settings
 
-Current Production operating baseline:
+### Hermes: correctness first
 
 ```text
 model-specific context_length=64000
@@ -21,9 +25,9 @@ compression.tail_mode=lean
 global compression.threshold_tokens=42000
 ```
 
-The 2026-08-12 80K/41K result remains a successful historical canary. Tool-heavy evidence from 2026-08-13 showed that 80K was too permissive for the M365 `128000 UTF-16` transport policy, so the model context was reduced to 64K. The current 2026-08-19 stage-1 baseline keeps that 64K limit while pruning reconstructable old context at 24K and starting full compression at 42K with a lean protected tail. These compression knobs are profile-wide; they do not change M365 or Hindsight limits.
+64K is the current conservative limit. Reconstructable old context is pruned at 24K and full compression starts at 42K. A historical 80K/41K canary passed, but tool-heavy work showed that it was too permissive for the M365 `128000 UTF-16` transport policy.
 
-For correctness-first autonomous work, built-in memory and user profile can remain enabled while periodic background reviewers are disabled:
+Built-in memory and user profile can remain enabled while periodic background reviewers are disabled, reducing competition with the foreground agent:
 
 ```yaml
 memory:
@@ -36,20 +40,9 @@ agent:
   intent_ack_continuation: true
 ```
 
-This does not disable `MEMORY.md`, `USER.md`, or the memory tool; it reduces extra LLM forks competing with the foreground agent for the same Microsoft account.
+This does not disable `MEMORY.md`, `USER.md`, or the memory tool.
 
-### Tool rounds
-
-- auxiliary `/v1/chat/completions`: default 16 rounds;
-- `/memory/v1`: default 16 rounds;
-- `/hermes/v1`: default 128 rounds and independently configurable;
-- exhausting the ceiling is a terminal safety condition, not an automatic replay or checkpoint rebind.
-
-## Hindsight / Memory Provider
-
-The operating principle is: Hermes foreground correctness wins; Hindsight background work may wait instead of competing with the main agent.
-
-### Current Hindsight baseline
+### Hindsight: background work may wait
 
 ```text
 memory_mode=hybrid
@@ -74,33 +67,23 @@ HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
 HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
 ```
 
-`observation` is the consolidated high-density knowledge layer and is appropriate for automatic injection. `recall_types` also affects the `hindsight_recall` tool; use `hindsight_reflect` for broader synthesis over the bank. `HINDSIGHT_API_LLM_TIMEOUT=120` is deliberately bounded because M365 admission control can block new Memory work but cannot preempt a request that already started.
+`observation` is suitable for automatic injection. Use `hindsight_reflect` for deeper synthesis across a bank. Run one worker slot and reserve no separate consolidation slot. Only startup LLM connection verification is skipped; real retain/recall/reflect calls still report provider failures.
 
-The live 2026-08-16 recovery baseline intentionally runs only one Hindsight worker slot with no separately reserved consolidation slot. It also skips Hindsight's startup-only LLM connection verification so restarting the API/worker does not consume an unplanned shared-account probe; real retain/recall/reflect calls still surface their own provider failures. Shared-account safety is enforced by the Gateway scheduler and breaker; consolidation remains background work and is not the milestone durability barrier. `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` remains fixed at `1`.
+### Tool rounds
 
-## Shared-account traffic policy
+| Route | Default ceiling |
+|---|---:|
+| `/v1/chat/completions` | 16 |
+| `/memory/v1` | 16 |
+| `/hermes/v1` | 128 |
 
-M365 admission baseline observed by live readback during the 2026-08-16 incident:
+Exhausting a ceiling is a terminal safety condition. It does not replay work or rebind a checkpoint.
 
-```text
-memoryMaxConcurrent=1
-memoryQueueTimeoutSeconds=30
-interactivePriorityHoldoffSeconds=10
-memoryBackoffInitialSeconds=30
-memoryBackoffMaxSeconds=600
-```
+## Connecting Goal Judge
 
-After the controlled live tuning on 2026-08-17, the Production **ordinary queue baseline** is `interactiveQueueTimeoutSeconds=120` and `memoryQueueTimeoutSeconds=120`; `interactiveMaxConcurrent=2`, `chatTimeoutSeconds=1800`, and `interactivePriorityHoldoffSeconds=10` remain unchanged. Those two `120` values are not the milestone Memory lease, and the ordinary queue timeout must not be globally raised merely to match the milestone barrier's 300-second ceiling.
+Hermes 0.20.4 needs a second named provider for the same Gateway. Do not place only a `base_url` under `auxiliary.goal_judge`; an anonymous `custom` route is not guaranteed to inherit the main provider credential.
 
-Issue #75 (2026-08-18) restructures ordinary admission around one shared-account capacity policy: **P0 `EXTERNAL_USER` > P1 Memory > P2 autonomous work**. P2 includes Hermes/Atlas background work (`AUTONOMOUS_CONTINUATION` / `ASYNC_COMPLETION`) plus, from Issue #76 onward, `/v1/chat/completions` auxiliary / control-plane LLM requests such as Goal Judge. The same Microsoft account has a hard total ceiling of 2, Memory has a hard ceiling of 1, and P2 has a hard ceiling of 1; in-flight work is never preempted. Memory may run alongside one P2 request. Only a Memory head that can actually take a shared slot blocks P2: if one Memory request is already in flight, later Memory work is class-capped at one and P2 may use the other free slot rather than leaving capacity idle. The bounded Memory waiting buffer is 8 and remains FIFO. `interactivePriorityHoldoffSeconds` is retained for legacy settings/API compatibility but is no longer an ordinary Memory-admission prerequisite; the P0/P1/P2 queue policy carries priority directly.
-
-`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` are retained as legacy settings/API compatibility fields; the #71 shared-account breaker no longer derives cooldown from them. Its fixed engineering policy is `1125 → 2250 → 4500 → 9000 → 18000` seconds, capped at L5. A hard 429 or a verified ChatHub soft-throttle notice enters `OPEN`; normal quota/metering metadata in `item.throttling` does not. Expiry only transitions to `HALF_OPEN_READY` and does not auto-retry. At most one controlled **external-user** interactive request may become the probe; autonomous Hermes continuations and Memory backlog cannot probe. Probe success enters `RECOVERY` without releasing Memory. During `RECOVERY`, `/memory/v1` is still fail-fast blocked; controlled qualification at this state therefore verifies the successful external-user probe, `RECOVERY` readback, and zero competing in-flight/waiting work. Only after the operator explicitly completes recovery back to `CLOSED` may bounded Hindsight/Memory live work resume.
-
-`/hermes/v1` classifies request provenance into P0 user-facing and P2 background Hermes/Atlas work; `/memory/v1` is P1. From Issue #76 onward, `/v1/chat/completions` is fixed P2 auxiliary / control-plane and no longer represents user-facing generic chat. The Responses and Anthropic compatibility surfaces keep their existing admission behavior, and Anthropic `/v1/messages` remains supported. In normal state Memory is FIFO and, when no P0 waiter exists, outranks new P2 work. Already-started requests are not forcibly preempted. Live Microsoft accounts are not deliberately flooded to force 429; breaker behavior is primarily verified deterministically.
-
-The Goal Judge root cause is not upstream Hermes evidence visibility: when the Judge used `/hermes/v1`, a legitimate `{"verdict":"done",...}` could be interpreted by the Gateway Agent completion-evidence guard as an unsupported success claim with no matching tool result, then deterministically replaced with `unconfirmedToolOutcomeResponse`, causing Hermes to report `judge reply was not JSON`. Issue #76 routes Goal Judge through the `/v1/chat/completions` control-plane surface while preserving the Agent completion guard on `/hermes/v1`.
-
-For Hermes 0.20.4, the correct non-core configuration is a **second named route profile to the same M365 Gateway**, not a bare `base_url` under `auxiliary.goal_judge`. A bare task-level URL is resolved as anonymous `custom` and is not guaranteed to inherit the main `m365-copilot` credential. Coordinator and Atlas/manager should each use the same existing `M365_COPILOT2API_KEY` environment source, for example:
+Coordinator and Atlas/manager reuse the existing `M365_COPILOT2API_KEY` environment source:
 
 ```yaml
 providers:
@@ -117,65 +100,80 @@ auxiliary:
     model: gpt-5.6-reasoning
 ```
 
-This does not replace the LLM provider: `m365-copilot` and `m365-copilot-control-plane` point to the same M365 AI Gateway, credential, and model; the names only separate Agent `/hermes/v1` endpoint policy from control-plane `/v1` policy. Apply this configuration only after the #76 Gateway code is deployed so the transition cannot accidentally use the old P0/generic `/v1` behavior.
+Both provider names still point to the same Gateway, credential, and model. The names only separate Agent `/hermes/v1` policy from control-plane `/v1` policy.
 
-Hermes 0.20.4 still has one caller-side boundary: `hermes_cli.goals.judge_goal()` explicitly passes `timeout=30s`, so `auxiliary.goal_judge.timeout` cannot extend this particular call. The uncontended #76 live canaries completed in roughly 5–6 seconds, but because `/v1/chat/completions` correctly remains P2 and must not bypass P1 Memory or a live `MEMORY_YIELD`, a future control-plane wait longer than 30 seconds can cause the Judge to fail safe with a transport timeout and defer that completion attempt. This is not a reason to raise `/v1` priority or bypass the scheduler; it remains a known limitation to observe under natural workloads without modifying Hermes core.
+Why this matters: when Goal Judge used `/hermes/v1`, a valid `{"verdict":"done"}` could be mistaken by the Agent completion guard for an unsupported success claim, rewritten as prose, and rejected by Hermes's JSON parser. The control-plane route isolates Agent evidence rules while preserving the original guard on `/hermes/v1`.
 
-### Issue #71 milestone / adaptive arbitration
+Hermes 0.20.4 `judge_goal()` still fixes `timeout=30s`; a task-level timeout cannot extend it. Normal canaries took about 5–6 seconds, but P2 may wait behind Memory long enough for the Judge to fail safe and defer completion. Do not raise `/v1` priority or bypass the scheduler.
 
-`/hermes/v1` deterministically classifies Hermes framework provenance plus the latest framework turn without LLM semantic guessing:
+## Same-account scheduling
 
-- `EXTERNAL_USER`: an ordinary latest user turn without delegated-child framework provenance; it can move ahead of queued autonomous work and cancels an unfinished milestone yield.
-- `ASYNC_COMPLETION`: `[ASYNC DELEGATION BATCH COMPLETE — ...]` / `[ASYNC DELEGATION COMPLETE — ...]`; a successful completion arms a milestone Memory barrier.
-- `AUTONOMOUS_CONTINUATION`: fixed Hermes standing-goal, kanban, compression, output-length, tool-continuation, or verify-on-stop markers, plus delegated-child requests where a Hermes runtime-identity paragraph in the leading `role=system` / `role=developer` block contains the request's matching `Model: ...`, a `Provider: ...` line, and `Platform: subagent`, and is immediately followed by Hermes' fixed delegated-child prompt `You are a focused subagent working on a specific delegated task.`.
+Normal Production baseline:
 
-The async-completion user marker keeps priority over delegated-child provenance, so a nested subagent completion can still arm the barrier. `Platform: subagent` is accepted only when the matching runtime-identity paragraph is paired with the immediately following fixed delegated-child framework prompt; a look-alike identity paragraph embedded in plugin/system data does not count. GPT-5/Codex chat-completions can project the leading Hermes block as `role=developer`, so both `system` and `developer` are recognized. This lets a direct `delegate_task` child wait for retain durability while a genuine user-facing Hermes turn remains able to preempt.
+```text
+interactiveMaxConcurrent=2
+interactiveQueueTimeoutSeconds=120
+memoryMaxConcurrent=1
+memoryQueueTimeoutSeconds=120
+chatTimeoutSeconds=1800
+interactivePriorityHoldoffSeconds=10  # legacy compatibility only
+```
 
-Autonomous/background Hermes is limited to one in flight. Normal **shared-account total running capacity is hard-capped at 2**, counting both Memory and Hermes traffic. The `interactiveMaxConcurrent` setting surface remains for compatibility, but it cannot raise the same-account shared ceiling above 2. Under autonomous pressure, Memory pressure, milestone yield, cooldown, or recovery the management surface reports the corresponding adaptive projection. The Gateway does not semantically deduplicate tasks.
+Actual hard rules:
 
-A successful `ASYNC_COMPLETION` starts a Memory lease with a hard ceiling of **300 seconds**. The next `AUTONOMOUS_CONTINUATION` waits until one of these conditions occurs:
+| Class | Work | Rule |
+|---|---|---|
+| P0 | `EXTERNAL_USER` | highest priority; may cancel an unfinished milestone yield |
+| P1 | `/memory/v1` | outranks new P2 work when no P0 waiter exists |
+| P2 | background Hermes/Atlas and control-plane work such as Goal Judge | at most one running |
 
-1. an HMAC-verified official Hindsight `retain.completed` webhook proves the retain is server-side durable, immediately ending the barrier;
-2. 300 seconds expires, recording `timeout` and allowing Hermes to continue;
-3. a new `EXTERNAL_USER` arrives, recording `preempted_by_interactive` and prioritizing the user.
+Shared total is 2, Memory is 1, and the Memory waiting buffer is 8 FIFO. Running work is never preempted. If one Memory request is running, later Memory work waits at its class limit while P2 may use the other free slot.
 
-The ordinary `120/120` queue baseline stays unchanged. The only exception is an **`AUTONOMOUS_CONTINUATION` that is actually blocked by a live `MEMORY_YIELD`**: if its ordinary interactive queue deadline expires first, the Gateway does not return a premature local 503. That waiter follows the already-existing `memoryYieldDeadline` (the milestone itself still has a 300-second hard ceiling) until retain durability, milestone timeout, or external-user preemption resolves the barrier. As soon as the barrier ends, normal admission rules apply again; if another ordinary capacity condition is still blocking the request, the already-consumed ordinary queue budget is not reset. Caller request-context cancellation is never extended by this exception and still terminates the wait through the request context. This is local to the M365 Gateway compatibility scheduler; it does not modify Hermes/Hindsight core or the lifecycle of direct OpenAI, Anthropic, or other providers.
+See [`api-contracts.md`](api-contracts.md) for breaker states and errors. Cooldown is fixed at `1125 → 2250 → 4500 → 9000 → 18000` seconds and no longer derives from legacy `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds`.
 
-`/memory/v1` HTTP 200 and Hindsight queued / claimed / processing states are **not** durability. `consolidation.completed` updates observability only and is **not** a barrier. Memory ingress is active 1 + waiting 8; requests beyond the eighth waiter are immediately deferred as `memory_capacity_deferred` instead of becoming Gateway waiters. While the shared breaker is not `CLOSED`, Memory fails fast as local canonical HTTP `429` + `upstream_throttle` + the existing breaker `Retry-After`, without waiting for the queue timeout or touching Microsoft. This projected 429 does not count as another upstream throttle event or advance breaker counters/level; it lets Hindsight defer work to the reset time instead of short-retrying locally.
+## Milestone Memory barrier
 
-The Hindsight webhook uses the official `X-Hindsight-Signature: sha256=<HMAC-SHA256>` over the raw payload. The Gateway accepts only `retain.completed` / `consolidation.completed` and uses bounded `event_type + operation_id` deduplication for at-least-once delivery. The secret stays on runtime secret/config surfaces and is never displayed in the management UI.
+The Gateway classifies stable Hermes framework markers; it does not ask an LLM to guess intent:
 
-### Context / memory handoff boundary
+| Type | Recognition | Effect |
+|---|---|---|
+| `EXTERNAL_USER` | ordinary user turn without trusted delegated-child provenance | serves the user first and cancels unfinished yield |
+| `ASYNC_COMPLETION` | `[ASYNC DELEGATION BATCH COMPLETE — ...]` or `[ASYNC DELEGATION COMPLETE — ...]` | creates a Memory barrier after success |
+| `AUTONOMOUS_CONTINUATION` | fixed Hermes continuation marker or a strictly proven child request | waits for the barrier, then uses normal admission |
 
-The Gateway does not delete Hermes working context. The milestone barrier exposes a checkpoint that says a fresh retain is durable, so Hermes can subsequently compact low-value history while exact source/log/report artifacts remain authoritative.
+A delegated child must satisfy all of these:
 
-The Gateway cannot retroactively inject a recall that completes after Hermes has already built the HTTP request body. Therefore "retain durable" does not imply that the same already-built autonomous request contains the newest memory context; when fresh memory matters, verify it through the **next** normal Hindsight recall/readback. This limitation is not solved by carrying Hermes or Hindsight core patches.
+1. A leading `role=system` or `role=developer` block contains Hermes runtime identity.
+2. `Model: ...` matches the request model and the block includes `Provider: ...` plus `Platform: subagent`.
+3. The next paragraph is exactly `You are a focused subagent working on a specific delegated task.`.
 
-`compatibilityTraffic` projects `NORMAL / HERMES_BUSY / MEMORY_YIELD / UPSTREAM_COOLDOWN / RECOVERY`, external/autonomous in-flight counts, effective Hermes concurrency, Memory pending/oldest age, milestone state/deadline/outcome, latest retain/consolidation, hard/soft throttle timestamps, streak/cooldown remaining, and suppressed-reask count. `RECOVERY` never auto-closes; management may explicitly complete recovery only after controlled live qualification. A post-recovery Hindsight canary is therefore a **CLOSED-state** bounded-resumption check, not a RECOVERY-state Memory probe.
+Look-alike identity text in plugin/system data cannot impersonate a child. An async-completion marker outranks child provenance, so nested child completion can still create a barrier.
 
-## Overflow recovery
+A successful `ASYNC_COMPLETION` creates a lease of at most 300 seconds. The next autonomous continuation waits until:
 
-- `128000` is a UTF-16 transport policy, not a Hermes or Hindsight token context.
-- Hermes receives a recognizable context-length recovery signal and can follow its existing compression → retry path.
-- `/memory/v1` returns a Hindsight-recognizable `context_length_exceeded` / `input is too long` signal; Reflect uses the current 40K / retry-1 baseline.
+1. an HMAC-verified `retain.completed` proves server-side durability; or
+2. 300 seconds expires and records `timeout`; or
+3. a new external user arrives and records `preempted_by_interactive`.
 
-## Hermes upstream bank-mission gap
+Only an autonomous request actually blocked by `MEMORY_YIELD` may continue waiting on the existing `memoryYieldDeadline` after the ordinary 120-second queue deadline. Normal admission resumes as soon as the barrier ends. Consumed queue budget is not reset, and caller context cancellation is never extended.
 
-As documented for upstream #18774 on 2026-08-13, the Hermes plugin may read `bank_mission` / `bank_retain_mission` without synchronizing them into live Hindsight `reflect_mission` / `retain_mission` overrides.
+`/memory/v1` HTTP 200, queued, claimed, and processing do not mean durable. `consolidation.completed` is observability only. Only an HMAC-verified `retain.completed` passes the barrier.
 
-Until fixed upstream, apply the desired values through the Hindsight Banks Config API and require a GET readback. This is not an M365 AI Gateway core defect and should not be carried as a Hermes-core patch here.
+The Gateway does not delete Hermes working context and cannot insert a later recall into an already-built HTTP body. "Retain durable" does not mean the same old request saw new memory. Confirm fresh memory through the next normal recall/readback.
 
-Current workaround surface:
+## Overflow and upstream bank mission
+
+- `128000` is a UTF-16 transport policy, not Hermes/Hindsight token context.
+- Hermes receives a recognizable context-length signal and can run compression → retry.
+- Hindsight receives `context_length_exceeded` / `input is too long`; Reflect baseline is 40K / retry 1.
+
+Until Hermes upstream #18774 is fixed, `bank_mission` / `bank_retain_mission` may not reach live Hindsight `reflect_mission` / `retain_mission`. Apply them through the Banks Config API and require a GET readback:
 
 ```text
 PATCH /v1/default/banks/{bank_id}/config
 GET   /v1/default/banks/{bank_id}/config
 ```
 
-Use the same `HINDSIGHT_API_KEY` Bearer credential as the normal Hindsight client; handoff / evidence records only the readback result, never the key value. PATCH updates map to `reflect_mission` / `retain_mission`, and only a matching GET of resolved config proves application.
+Use the normal `HINDSIGHT_API_KEY` Bearer credential. Documentation and evidence may record the readback result, never the key. This is an upstream boundary; do not patch Hermes/Hindsight core to work around it.
 
-## More
-
-- Architecture: [`architecture.md`](architecture.md)
-- Verification: [`compatibility.md`](compatibility.md)
-- Historical Issues #42–#44: [`../history/memory-provider-compatibility-issues-42-44.md`](../history/memory-provider-compatibility-issues-42-44.md)
+Historical canaries and Issues #42–#44 are indexed by [`../history/README.md`](../history/README.md).

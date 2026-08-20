@@ -1,11 +1,15 @@
-# Historical evidence index
+# 歷史證據 / Historical evidence
 
-此目錄不是日常操作手冊。只有在追 regression、舊 Issue、歷史 canary、決策來源或 evidence provenance 時才載入。
+## 30 秒看懂 / Understand it in 30 seconds
 
-This directory is not an operating manual. Load it only for regressions, historical Issues, canaries, decision provenance, or evidence provenance.
+這裡是唯讀歷史，不是目前操作手冊。AI Agent 平常不要載入；只有追 regression、舊 Issue、歷史 canary 或決策來源時才讀。
 
-## Archives
+This is read-only history, not the current operating guide. AI agents should load it only for regressions, old Issues, historical canaries, or decision provenance.
 
-- [`memory-provider-compatibility-issues-42-44.md`](memory-provider-compatibility-issues-42-44.md): Issues #42–#44 的 Memory Provider hardening、歷史 canary 與 live-qualification 記錄。
+## Archive
 
-其他已被 current-state 文件吸收的舊內容仍可由 Git history / public Issues 取得，不在 `docs/` 另外複製一份，避免同一事實出現多個長期權威版本。
+- [`memory-provider-compatibility-issues-42-44.md`](memory-provider-compatibility-issues-42-44.md): Issues #42–#44 的 Memory Provider hardening、舊 canary 與 live-qualification 記錄。
+
+Archive 內的 PASS 只適用於當時固定的 source、帳號、route 與 runtime，不能直接當成現在 Rust 或 Production 的 PASS。
+
+Archived PASS results apply only to their pinned source, account, route, and runtime. They cannot be inherited by current Rust or Production.

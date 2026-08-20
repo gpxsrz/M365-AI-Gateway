@@ -1,39 +1,61 @@
 # 安全性說明
 
-此公開快照只適用於你有權使用的 Microsoft 365 帳號與租戶環境。
+## 先記住三件事
 
-## 最低限度安全原則
+1. 只使用你有權使用的 Microsoft 365 帳號與資料。
+2. 預設只在本機 `127.0.0.1` 使用。對外開放前，要先有 TLS、可信反向代理與網路限制。
+3. 不要公開任何可登入、可重播或可下載私人內容的資料。
 
-- 預設只綁定在 `127.0.0.1`；若要對外暴露，請自行補上可信的認證、TLS、反向代理與網路邊界控管。
-- 不要在任何公開紀錄中提交 token、cookies、HAR、OneDrive / SharePoint 私有連結、artifact 原始位址或帳號快取。
-- `Private / Temporary Chat` 只代表 no-ordinary-history transport policy，不代表 Microsoft 完全不保留任何資料；一般文件上傳仍可能建立 OneDrive / SharePoint staging copy。
-- `Code Interpreter` 產生的 artifact 若要回傳給 consumer，必須走 authenticated artifact fetch；不要直接暴露瀏覽器 `blob:` URL 或未驗證的上游暫時連結。
-- Hermes 與 Hindsight 可以共用同一個 Microsoft 365 帳號，但 checkpoint 邊界與相容入口必須彼此隔離。帳號級吞吐量仍然共用，因此所有 chat 類 interactive route 必須經有界 admission，新的 Memory 背景工作再讓位；不得以主代理、subagent、CLI 或一般 caller 的大量併發壓 ChatHub。
-- 不要用真實 Microsoft 帳號故意製造高併發來探 429 上限；429／退避行為應以本地 deterministic test 驗證，線上驗證維持低併發。
+## 不可公開的資料
 
-## 回報方式
+- 密碼、API key、token、cookie、HAR 或 token cache。
+- 帳號、租戶與個人識別資訊。
+- OneDrive／SharePoint 私有網址。
+- Microsoft 暫時檔案網址、Code Interpreter 原始網址或產出檔案內容。
+- 完整錯誤回應或封包，只要其中可能帶有上述資料。
 
-若你在這個衍生快照中發現安全問題，請直接私下聯絡目前維護者，附上最小重現資訊、影響範圍與版本描述，並先自行遮蔽所有敏感資料。
+Gateway 會先用已登入狀態取得受保護檔案，再存到本機私有區域，最後提供短效下載能力。不要直接把 Microsoft 或瀏覽器的暫時網址交給呼叫端。
 
-請不要把私密憑證、個資或可重放的封包直接貼進公開議題、公開討論串或上游專案。
+## Private mode 的真正意思
+
+Private mode 會要求上游不要建立一般聊天記錄。這不等於零保留：文件或圖片仍可能經過 OneDrive／SharePoint 暫存，Microsoft 也可能依其服務政策處理資料。
+
+## 共用帳號流量
+
+Hermes、Hindsight 與一般呼叫可以共用同一帳號，但 Gateway 會限制同時請求數並安排優先順序。不要用真實帳號故意製造高併發來測 429。限流與退避應先用本機測試驗證，線上測試保持低頻、可停止。
+
+## 回報安全問題
+
+請私下聯絡維護者，提供最小重現步驟、影響範圍與版本。先遮蔽所有敏感資料；不要把私密憑證、個資或可重播封包放進公開 Issue 或討論。
 
 ---
 
 # Security
 
-This public snapshot is intended only for Microsoft 365 accounts and tenants you are authorized to use.
+## Remember three things
 
-## Minimum security requirements
+1. Use only Microsoft 365 accounts and data you are authorized to access.
+2. Keep the default `127.0.0.1` local binding. Add TLS, a trusted reverse proxy, and network restrictions before exposing the service.
+3. Never publish data that can authenticate, replay a session, or download private content.
 
-- Bind to `127.0.0.1` by default. Before exposing the service externally, add trusted authentication, TLS, reverse proxy controls, and network access boundaries.
-- Never publish tokens, cookies, HAR files, private OneDrive / SharePoint URLs, original artifact URLs, or account caches.
-- `Private / Temporary Chat` means a no-ordinary-history transport policy; it does not mean Microsoft retains no data. Ordinary document uploads may still create OneDrive / SharePoint staging copies.
-- Code Interpreter artifacts returned to consumers must use authenticated artifact fetch. Never expose browser `blob:` URLs or unverified upstream temporary links directly.
-- Hermes and Hindsight may share one Microsoft 365 account, but their checkpoint boundaries and compatibility endpoints must remain isolated. Account-level throughput is still shared, so all chat-like interactive routes must use bounded admission before Memory yields; main-agent, subagent, CLI, and ordinary callers must not be used to intentionally stress ChatHub concurrently.
-- Do not deliberately create high concurrency against a real Microsoft account to discover rate limits. Verify 429/backoff behavior with deterministic local tests and keep live validation low-concurrency.
+## Data that must stay private
 
-## Reporting
+- Passwords, API keys, tokens, cookies, HAR files, and token caches.
+- Account, tenant, or personal identifiers.
+- Private OneDrive or SharePoint URLs.
+- Microsoft temporary file URLs, raw Code Interpreter URLs, or generated file contents.
+- Full error bodies or packets when they may contain any of the above.
 
-If you find a security issue in this derivative snapshot, contact the current maintainer privately with minimal reproduction information, impact scope, and version details. Redact all sensitive information before sending it.
+The gateway fetches protected files with authenticated state, stores them in a private local area, and exposes a short-lived download capability. Do not return Microsoft or browser temporary URLs directly to callers.
 
-Do not post private credentials, personal data, or replayable packets in public issues, public discussions, or upstream projects.
+## What Private mode means
+
+Private mode asks the upstream service not to create ordinary chat history. It does not mean zero retention. Documents and images may still use OneDrive or SharePoint staging, and Microsoft may process data under its service policies.
+
+## Shared-account traffic
+
+Hermes, Hindsight, and ordinary callers may share one account. The gateway limits concurrent requests and orders the work. Do not deliberately stress a real account to discover 429 limits. Verify throttling and backoff locally first; keep live checks low-rate and stoppable.
+
+## Report a security issue
+
+Contact the maintainer privately with minimal reproduction steps, impact, and version. Redact sensitive data first. Do not put credentials, personal data, or replayable packets in public Issues or discussions.

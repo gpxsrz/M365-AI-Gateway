@@ -1,19 +1,35 @@
 # Known limitations
 
-This page lists current limitations only and intentionally avoids replaying the full implementation history.
+## Understand it in 30 seconds
 
-1. **Large caller text**: `128000` UTF-16 code units is the default Web-compatible policy, not a model-token hard limit.
-2. **Large tool results**: caller-tool results may still be compressed, flattened, or truncated upstream; this remains an explicit work item.
-3. **Multiple caller tools**: parallelism above one is available only when every selectable tool is explicitly read-only and carries no mutation/destructive signal.
-4. **Bing + caller tools**: coexistence is possible, but routing prompts and upstream behavior can still influence selection.
-5. **Private mode**: `disableMemory=1` prevents ordinary chat history but does not imply zero Microsoft retention; files, images, and artifacts have separate data boundaries.
-6. **MCP**: server routes exist, but not every third-party MCP client has been interoperability-qualified.
-7. **Hermes / Hindsight shared account**: profiles and checkpoint state are isolated, but both still share real Microsoft-account throughput; already-running Memory work is not preempted.
-8. **Tool-round ceilings**: auxiliary `/v1/chat/completions` / Memory and Hermes use different ceilings; Hermes 128 is still a runaway guard, not unlimited execution.
-9. **WebSocket retry**: retry is limited to transient dial / upgrade failures before the payload is sent; already-sent ChatHub requests are not blindly replayed.
-10. **Hindsight bank mission**: until Hermes upstream #18774 is fixed, bank-mission values may not synchronize to the live bank and require Banks API readback.
-11. **Web model / request-capability drift**: Microsoft Web selector and request capabilities can change independently of a sidecar release; an evidence snapshot is not a permanent capability contract.
-12. **Milestone durable does not mean the same already-built request recalled it**: the Gateway can wait for Hindsight `retain.completed` before autonomous admission, but it cannot retroactively modify an HTTP body Hermes built before the wait; verify fresh memory through a subsequent normal recall/readback when required.
-13. **Hermes Goal Judge caller timeout is currently fixed at 30 seconds**: Hermes 0.20.4 `judge_goal()` explicitly passes `timeout=30s`, so task-level auxiliary timeout cannot override it. Uncontended #76 canaries finish in roughly 5–6 seconds; if P2 waits behind Memory / `MEMORY_YIELD` for longer than 30 seconds, the Judge may fail safe and defer completion. Do not promote `/v1/chat/completions` to P0/P1 or bypass the shared scheduler to avoid this timeout.
+Know these three things first:
 
-See [`compatibility.md`](compatibility.md) for verification status.
+1. Private Chat does not mean that Microsoft retains nothing.
+2. Large tool results may still be flattened or shortened upstream.
+3. Passing local tests does not qualify every Microsoft rollout, MCP client, or Production environment.
+
+The rest of this page lists current limits without replaying implementation history.
+
+## Input, tools, and streaming
+
+1. **Text size**: the default `128000` is measured in UTF-16 code units for Web compatibility. It is not a model-token hard limit.
+2. **Large tool results**: Microsoft upstream may compress, flatten, or truncate a result. This remains an open hardening item.
+3. **Multiple caller tools**: they may run together only when every selectable tool is explicitly read-only and has no mutation or destructive signal. Other cases are serialized first.
+4. **Bing plus caller tools**: they can coexist, but prompt wording and upstream routing still affect actual selection.
+5. **Tool-round limits**: general/Memory and Hermes use different ceilings. Hermes's 128-round limit prevents runaway work; it is not unlimited execution.
+6. **WebSocket retry**: only connection or upgrade failures before payload send are retried. A sent ChatHub request is never blindly replayed.
+
+## Privacy, files, and external clients
+
+7. **Private mode**: `disableMemory=1` prevents ordinary chat history. It does not promise zero Microsoft retention. Files, images, and artifacts have separate boundaries.
+8. **MCP**: server routes exist, but each third-party MCP client still needs separate interoperability qualification.
+9. **Web capabilities drift**: Microsoft's model selector and request capabilities may change during rollout. One evidence snapshot is not a permanent contract.
+
+## Hermes and Hindsight
+
+10. **Shared account throughput**: Hermes and Hindsight keep separate profiles and checkpoints, but still share real Microsoft-account capacity. Running Memory work is not preempted.
+11. **Bank mission**: until Hermes upstream #18774 is fixed, `bank_mission` / `bank_retain_mission` may not reach the live bank. Confirm through a Banks API readback.
+12. **Durable does not mean an old request saw new memory**: the Gateway can wait for `retain.completed` before admitting autonomous work, but cannot rewrite an HTTP body Hermes already built. Confirm fresh memory through a later normal recall/readback.
+13. **Goal Judge has a fixed 30-second caller timeout**: Hermes 0.20.4 `judge_goal()` explicitly uses `timeout=30s`, so a task-level auxiliary timeout cannot override it. If P2 waits too long behind Memory or `MEMORY_YIELD`, the Judge may fail safe and defer completion. Do not promote `/v1/chat/completions` to P0/P1 or bypass the shared scheduler to avoid this limit.
+
+See [`compatibility.md`](compatibility.md) for current verification status.

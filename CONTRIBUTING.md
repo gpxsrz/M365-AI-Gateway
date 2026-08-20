@@ -1,71 +1,93 @@
 # 貢獻指南
 
-公開 `gpxsrz/M365-AI-Gateway` 的 `main` 是唯一開發權威；`HEXUXIU/M365-Copilot2API` 只供唯讀比較。
+## 30 秒版本
 
-## 工作流程
+1. 只從公開 `gpxsrz/M365-AI-Gateway` 的 `main` 開發。
+2. 先重現問題，再找共同根因。
+3. 改最少的程式，留下會抓到退步的測試。
+4. 跑完 Rust release gate。
+5. 用精確 commit、CI 與實際讀回證明完成。
 
-1. 先固定可觀察問題、重現方式與完成條件；需要長期追蹤時建立公開 Issue。
-2. 從 current public `main` 追實際執行路徑，先做 deterministic reproduction。
-3. 修 shared root cause，不只補單一 caller。
-4. 留下最小 regression test，再跑完整 release gate。
-5. 發佈後以 exact commit / CI /必要 runtime readback 驗證，不把「命令成功」當成完成。
+`HEXUXIU/M365-Copilot2API` 只能閱讀比較，不可推送或建立 Issue。
 
-## 程式與文件範圍
+## 寫程式時
 
-- 維持單一 Microsoft 365 帳號架構。
-- 不新增未被需求證明的抽象層、相容層、設定或依賴。
-- Hermes / Hindsight core 不因本專案相容性問題修改；設定可以配合。
-- 管理 UI 與公開繁中使用台灣繁體中文。
-- 深度文件採語言分檔：`docs/zh-TW/` 與 `docs/en/`；舊文件路徑只作短路由頁。
-- 歷史 issue-specific evidence 放 `docs/history/`，不要把歷史操作紀錄塞回 README 或 current-state 文件。
-- Agent / contributor 先讀 `docs/README.md` 路由表，只載入目前主題；不要 bulk-read 整個文件樹。
+- 一個 Gateway 仍只對應一個 Microsoft 365 帳號。
+- 相容問題修在 Gateway，不修改 Hermes 或 Hindsight 核心。
+- 不為「以後可能用到」增加抽象層、設定或依賴。
+- 改到串流、工具續接、checkpoint、並發或生命週期時，要測完整路徑，不只測輸入格式。
+- 新增或修改 Rust 行為時，至少留一個能實際執行的 regression test。
 
-## 驗證
+## 寫文件時
 
-Go 變更至少執行：
+- 台灣繁中用白話、短句與台灣用語；英文內容要對稱。
+- 每頁先放「30 秒看懂」，再放操作步驟，最後才放精確查表。
+- 一頁只處理一個主題。AI Agent 應先讀 `docs/README.md`，不要一次載入全部文件。
+- Current 文件只描述現在怎麼用；舊 Issue、舊 canary 與過去 Production 證據放 `docs/history/`。
+- 不用大量縮寫或技術名詞堆砌。無法避免的名詞，第一次出現就用一句白話解釋。
+
+## 提交前檢查
 
 ```bash
-gofmt -w <changed-go-files>
-go mod verify
-go test ./...
-go vet ./...
-go build ./...
+cargo fmt --all --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 git diff --check
 ```
 
-併發、串流、checkpoint 或生命週期變更另跑 `go test -race ./...`。管理 UI 變更需實際檢查登入頁、主頁、診斷頁與 browser console。
+- 改到串流、並發、checkpoint 或生命週期時，完整測試至少再跑一次。
+- 改管理頁面時，實際檢查登入頁、主頁、診斷頁與 browser console。
+- Go source 只供遷移比較；只有改到它或用它做 parity gate 時，才跑 Go 的 verify/test/vet/build。
 
-## 安全與隱私
+## 安全底線
 
-不得提交密碼、API key、token、cookie、token cache、HAR、私有檔案網址、artifact 內容、帳號或租戶識別資訊。安全問題依 [`SECURITY.md`](SECURITY.md) 回報。
+不得提交或輸出密碼、API key、token、cookie、token cache、HAR、帳號／租戶識別、私有檔案網址或產出檔案內容。安全問題請依 [`SECURITY.md`](SECURITY.md) 私下回報。
 
 ---
 
-# Contributing Guide
+# Contributing guide
 
-Public `gpxsrz/M365-AI-Gateway` `main` is the single development source of truth; `HEXUXIU/M365-Copilot2API` is read-only reference material.
+## 30-second version
 
-## Workflow
+1. Develop only from public `gpxsrz/M365-AI-Gateway` `main`.
+2. Reproduce the problem before changing code.
+3. Fix the shared cause with the smallest change and a regression test.
+4. Run the Rust release gate.
+5. Prove completion with an exact commit, exact-head CI, and required runtime readback.
 
-1. Fix the observable behavior, reproduction, and acceptance criteria first; open a public Issue when durable tracking is needed.
-2. Trace the real path from current public `main` and establish a deterministic reproduction.
-3. Fix the shared root cause rather than one caller symptom.
-4. Add the smallest useful regression test and run the full release gate.
-5. After publication, verify exact commit / CI / required runtime identity. Command success alone is not completion.
+`HEXUXIU/M365-Copilot2API` is read-only comparison material. Do not push to it or open Issues there.
 
-## Code and documentation scope
+## When changing code
 
-- Preserve the single-account architecture.
-- Do not add speculative abstractions, compatibility layers, settings, or dependencies.
-- Do not patch Hermes / Hindsight core for M365 compatibility; consumer settings may be adjusted.
-- Deep documentation is split by language under `docs/zh-TW/` and `docs/en/`; legacy paths are short routing pages.
-- Issue-specific historical evidence belongs under `docs/history/`, not in the landing README or current-state docs.
-- Read `docs/README.md` as a router and load only the current topic instead of bulk-reading the documentation tree.
+- One gateway still maps to one Microsoft 365 account.
+- Fix compatibility in the gateway. Do not patch Hermes or Hindsight core.
+- Do not add abstractions, settings, or dependencies for hypothetical future needs.
+- Changes to streaming, tool continuation, checkpoints, concurrency, or lifecycle must test the full path, not only request validation.
+- Every non-trivial Rust behavior change needs at least one runnable regression test.
 
-## Validation
+## When changing documentation
 
-At minimum, Go changes must run `gofmt`, `go mod verify`, `go test ./...`, `go vet ./...`, `go build ./...`, and `git diff --check`. Concurrency, streaming, checkpoint, or lifecycle changes also require `go test -race ./...`. UI changes require real login/main/debug page and browser-console checks.
+- Use plain, short Traditional Chinese with Taiwan wording. Keep the English page equivalent.
+- Start each page with a 30-second summary, then actions, then exact reference details.
+- Keep one topic per page. AI agents should route through `docs/README.md` instead of loading every document.
+- Current pages describe current behavior. Old Issues, canaries, and Production evidence belong under `docs/history/`.
+- Avoid acronym and jargon stacks. Explain an unavoidable term in plain language when it first appears.
 
-## Security and privacy
+## Checks before commit
 
-Never commit passwords, API keys, tokens, cookies, token caches, HAR files, private file URLs, artifact contents, account identifiers, or tenant identifiers. Follow [`SECURITY.md`](SECURITY.md) for security reports.
+```bash
+cargo fmt --all --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+git diff --check
+```
+
+- Repeat the full test suite after streaming, concurrency, checkpoint, or lifecycle changes.
+- For management UI changes, inspect the login, main, and debug pages plus the browser console.
+- Go source is migration reference only. Run its verify/test/vet/build gate only when it changes or when a parity review explicitly depends on it.
+
+## Security boundary
+
+Never commit or print passwords, API keys, tokens, cookies, token caches, HAR files, account or tenant identifiers, private file URLs, or generated file contents. Follow [`SECURITY.md`](SECURITY.md) for private security reports.

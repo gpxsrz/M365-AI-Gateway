@@ -1,62 +1,73 @@
 # Research and verification evidence
 
-This document preserves current conclusions and evidence methodology, not operating procedures. Step-by-step historical Issue work lives under `docs/history/` or in public Git history / Issues.
+## Understand it in 30 seconds
 
-## Evidence rules
+“Tests passed” must name the kind of test:
 
-- Distinguish deterministic tests, Production live evidence, historical canaries, and inference.
-- Do not present partial success as full official equivalence.
-- Bind source commit, tree, binary, settings, artifacts, and evidence payloads to immutable identities.
-- After a Production mutation, independently read back the target surface; command exit status is not sufficient evidence of completion.
+| Level | What it proves | What it does not prove |
+|---|---|---|
+| Deterministic test | code follows a contract for fixed input | a real Microsoft rollout behaves identically |
+| Local runtime smoke | the release binary starts and completes a local flow | OAuth, ChatHub, or Production passed |
+| Live canary | real behavior for one account, route, and time | permanent support or identical behavior for every account |
+| Production readback | one commit/artifact is active on one runtime | every remote and backup is synchronized |
+| Inference | the most likely explanation from evidence | a directly observed fact |
 
-## Established conclusions
+Every PASS should bind source commit, tree, binary, settings, artifacts, and evidence identity. Command exit zero is not completion; independently read back the target surface.
 
-### Text / checkpoint
+## Current conclusions
 
-- The Web editor has direct evidence around the 128000 UTF-16 boundary. The sidecar uses a compatible caller-text policy, but this is not a model-token context limit.
-- Checkpoint reuse follows strict history-prefix identity; tool-call IDs, arguments, and roles must not be silently rebound.
+### Text and checkpoints
+
+- The `128000` UTF-16 boundary has Web-compatibility evidence but is not model-token context.
+- Checkpoint reuse accepts only a strictly identical history prefix. Tool-call IDs, arguments, and roles cannot be silently rebound.
 
 ### Private mode
 
-- Reapplying `disableMemory=1` on every new ChatHub WebSocket has direct no-ordinary-history effect.
-- No-history is distinct from OneDrive / SharePoint staging and artifact side effects.
+- Every new ChatHub WebSocket reapplies `disableMemory=1`, preventing ordinary chat history.
+- This does not remove OneDrive / SharePoint staging or artifact side effects.
 
-### Files / Vision / Code Interpreter
+### Files, images, and Code Interpreter
 
-- Ordinary documents obtain Microsoft file identity / annotations before ChatHub grounding.
-- Images use a different transport path and should not be collapsed into document transport.
-- Code Interpreter can execute Python upstream and produce output-file metadata; protected artifacts are fetched with authenticated state and materialized by the sidecar.
+- Ordinary documents obtain Microsoft file identity / annotation before ChatHub grounding.
+- Images use a separate transport and must not be collapsed into document upload.
+- A protected artifact must be fetched with authenticated Gateway state, placed in private storage, and exposed through an authorized download. Its upstream private URL cannot be leaked first.
+- Rust has local transport/security coverage; real Microsoft file/image/artifact flows still require live qualification.
 
-### Tools / routing
+### Tools, routing, and streaming
 
-- Caller tools and native Bing can coexist in some cases.
-- Multi-tool ceilings are fixed before generation to avoid post-generation truncation that would split caller and checkpoint state.
-- Router repair no longer applies a fixed 6000-character argument truncation; requests beyond the UTF-16 repair budget fail closed.
-- Router / repair / final-answer phases have explicit scratch-conversation boundaries to avoid context contamination.
+- A multi-tool ceiling is decided before generation. Generating first and truncating later would split caller and checkpoint state.
+- Router repair no longer truncates at a fixed 6000 characters. It stops when the UTF-16 budget is exceeded and never guesses missing content.
+- Router, repair, and final-answer phases use separate scratch conversations.
+- An internal non-stream adapter must remove `stream_options`; outer SSE still ends with one usage chunk and one `[DONE]`.
 
-### Streaming #68
+### Hermes and Hindsight
 
-After `stream_options.include_usage` became a first-class request field, the old buffered adapter changed `stream` to false but re-marshaled `stream_options`, causing the sidecar's own external validation to reject its internal request. The fix clears stream-only options only on the inner adapter copy while preserving the outer SSE usage contract. The regression test and a live Hermes two-call tool continuation both passed.
+- A historical 80K/41K canary passed, while later long work supports the current 64K/41K correctness-first baseline.
+- Hindsight retain/recall/reflect have historical live PoC evidence. Reflect's current baseline is 40K with one retry.
+- Memory admission and breaker behavior are mainly tested deterministically to avoid deliberately forcing 429 on a real account.
 
-### Hermes / Hindsight
+### Deployment
 
-- The 80K/41K Hermes historical canary succeeded, but later long-task evidence supports the current 64K/41K correctness-first baseline.
-- Hindsight retain / recall / reflect have live PoC evidence; Reflect 40K / retry 1 is the current baseline.
-- Memory admission and 429 policy are primarily verified deterministically to avoid deliberately throttling a live Microsoft account.
+A Production runtime once had a current binary with three older Web files. That mixed-source observation is why the binary and all three Web assets now form one release, snapshot, rollback, and identity-readback unit. See [`deployment.md`](deployment.md).
 
-### Deployment #69
+### Goal Judge control plane
 
-The Production server reads `web/index.html`, `web/login.html`, and `web/debug.html` from the filesystem. A mixed-source runtime was observed where the binary was current while all three Web assets remained from older source; that observation is the direct evidence basis for #69. The deployment helper now binds the binary and those three Web assets into one deterministic release, rollback, and identity-readback unit; see [`deployment.md`](deployment.md).
+Historical live traces showed that a valid Goal Judge `done` JSON response could be rewritten as prose by Agent completion-evidence policy when sent through `/hermes/v1`. Goal Judge now uses P2 `/v1/chat/completions` with ForceNew / Untracked checkpoint policy. It keeps scheduler / breaker / `MEMORY_YIELD` behavior but does not inject the Agent evidence ledger. The original completion guard remains on `/hermes/v1`.
 
-### Goal Judge / control-plane #76
+Exact identities from the old Go implementation, CI, NAS, Production, and live canaries are historical evidence. They cannot be inherited as Rust PASS. See [`rust-rewrite-parity.md`](rust-rewrite-parity.md); new live/Production checks must pin the Rust commit and artifact again.
 
-On 2026-08-19 a real Kanban Goal Judge failure initially looked like a Hermes evidence-visibility problem, but request traces and source readback proved the root cause was inside the Gateway itself. The Judge request used `/hermes/v1/chat/completions` with no tool ledger; a legitimate `done` verdict matched the Agent success-claim guard and was deterministically replaced with the source constant `unconfirmedToolOutcomeResponse`, so Hermes received natural language rather than JSON. Both observed failures were 2-message / 0-tool / non-stream HTTP 200 requests, with no 429/503 or transport failure.
+## How to record evidence
 
-The #76 implementation `9928d0e077925cec6ab1b2085c3c7a8dbc6084ca` repurposes `/v1/chat/completions` as a P2 auxiliary / control-plane surface: ForceNew / Untracked, reusing the shared scheduler / breaker / MEMORY_YIELD while isolating Agent evidence-ledger and completion-rewrite policy. Dedicated regressions cover non-stream `done` passthrough, SSE `done` passthrough, P2 admission, Memory precedence, MEMORY_YIELD, no checkpoint persistence, and no Agent-ledger injection even when tools are present; a separate `/hermes/v1` regression confirms the Agent completion-evidence guard remains active. Local full validation, exact-head CI `32206768862`, NAS mirroring, and exact-commit Production deployment all passed. The Production binary SHA-256 is `3d4ffad62ed5c93e9369459c6ffdbc163b6309cfc99b387824eedfff9d8c3027`, container restart count is zero, Web/settings/compose identities remain unchanged, and Hindsight containers remain healthy.
+A useful verification record answers:
 
-Hermes 0.20.4 default and manager profiles both use a named `m365-copilot-control-plane` route that reuses the same M365 Gateway, the same `M365_COPILOT2API_KEY` environment credential, and the same `gpt-5.6-reasoning` model while changing only the auxiliary Goal Judge base route to `/v1`; the Gateway PID did not restart. Two real Goal Judge canaries, one from each profile, reached Production as `/v1/chat/completions`, 2 messages, 0 tools, HTTP 200. Both returned `verdict=done`, `parse_failed=false`, `transport_failed=false` in about 6.4s and 5.3s, with no recurrence of the prior non-JSON overwrite.
+1. Which source commit / tree was tested?
+2. Which route, isolated account, or runtime performed it?
+3. What were the input, settings, and artifact identities?
+4. What was expected and what was independently read back?
+5. Which boundaries were not tested?
+6. Does it contain secrets or replayable material? If so, it cannot enter the repository.
 
-## Historical archive
+## Historical entry points
 
 - Memory Provider Issues #42–#44: [`../history/memory-provider-compatibility-issues-42-44.md`](../history/memory-provider-compatibility-issues-42-44.md)
-- Other historical evidence remains in public Issues and Git history instead of being duplicated as a second long-term authority in current docs.
+- Other step-by-step records: [`../history/README.md`](../history/README.md), public Issues, and Git history.

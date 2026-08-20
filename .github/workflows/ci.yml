@@ -15,29 +15,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  go:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: dtolnay/rust-toolchain@master
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: '1.97'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
-        run: test -z "$(gofmt -l .)"
-      - name: Verify modules
-        run: go mod verify
+        run: cargo fmt --all --check
       - name: Test
-        run: go test ./...
-      - name: Vet
-        run: go vet ./...
+        run: cargo test --locked --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build
-        run: go build ./...
-      - name: Cross-build Windows release targets
-        run: |
-          set -euo pipefail
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/m365-native-windows-amd64.exe ./cmd/server
-          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o /tmp/m365-native-windows-arm64.exe ./cmd/server
+        run: cargo build --locked --release
+      - name: Check container build
+        run: docker build -t m365-ai-gateway-ci .
       - name: Check NAS deployment automation
         run: |
           set -euo pipefail

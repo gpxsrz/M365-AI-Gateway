@@ -1,16 +1,30 @@
-# API 契約查表
+# API 契約
 
-只在改 API compatibility、error mapping、streaming、usage、response format 或 tool continuation 時讀這份。
+## 30 秒看懂
 
-## Models surfaces
+一般 client 只要先記住四件事：
 
-- `GET /v1/models`
-- `GET /hermes/v1/models`
-- `GET /memory/v1/models`
+1. 串流最後只能有一個 usage chunk，再有一個 `[DONE]`。
+2. `128000` 是 UTF-16 文字大小，不是 token 上限。
+3. 已送到 Microsoft 的請求不會因網路問題被盲目重送。
+4. `/v1/chat/completions` 是 P2 control-plane；真正 Hermes Agent 流量走 `/hermes/v1`。
 
-`context_window` / `max_input_tokens` 是 token-oriented catalog metadata，不等於 `textInputLimitUTF16`。
+本頁後半是給實作與 AI Agent 的精確 wire contract。
 
-## Streaming usage
+## 常用入口
+
+| 用途 | Route |
+|---|---|
+| OpenAI chat control-plane | `POST /v1/chat/completions` |
+| OpenAI Responses | `POST /v1/responses` |
+| Anthropic Messages | `POST /v1/messages` |
+| Hermes Agent | `/hermes/v1/*` |
+| Hindsight Memory | `/memory/v1/*` |
+| Model catalogs | `GET /v1/models`、`GET /hermes/v1/models`、`GET /memory/v1/models` |
+
+Catalog 的 `context_window` / `max_input_tokens` 是 token-oriented metadata，和 `textInputLimitUTF16` 不同。
+
+## 串流與 usage
 
 Request：
 
@@ -18,20 +32,25 @@ Request：
 {"stream":true,"stream_options":{"include_usage":true}}
 ```
 
-契約：
+Response 順序：
 
-- ordinary SSE chunks：`usage:null`；
-- terminal 前：唯一 `choices:[]` usage-only chunk；
-- 最後：唯一 `[DONE]`；
-- `include_usage=false` 不增加 usage chunk；
-- `stream_options.include_obfuscation` 是 recognized-but-ignored；
-- `stream=false` 搭配 `stream_options` 是 external invalid request；內部 adapter 若強制 non-stream 必須先清除 stream-only options。
+1. 一般 SSE chunks 都是 `usage:null`。
+2. 結尾前只有一個 `choices:[]` usage-only chunk。
+3. 最後只有一個 `[DONE]`。
 
-Usage 欄位使用 `prompt_tokens` / `completion_tokens`；Sidecar 估算值會以 `m365.usage_source`、`usage_values_are_estimates=true`、`usage_estimate_scope=visible_request_and_completion` 標示 provenance。
+`include_usage=false` 不加 usage chunk。`stream_options.include_obfuscation` 會被辨識但忽略。外部 request 若 `stream=false` 又帶 `stream_options`，回 invalid request；內部 adapter 改成 non-stream 時，必須先移除 stream-only 欄位。
 
-## Caller-text overflow
+Usage 使用 `prompt_tokens` / `completion_tokens`。Sidecar 估算值會標示：
 
-Auxiliary `/v1/chat/completions` 與其他 generic compatibility surfaces 維持：
+```text
+m365.usage_source
+usage_values_are_estimates=true
+usage_estimate_scope=visible_request_and_completion
+```
+
+## 文字太長與 tool 回合耗盡
+
+一般相容入口的 caller text 太長時：
 
 ```text
 HTTP 400
@@ -42,11 +61,9 @@ received=<actual>
 retryable_after_reduction=true
 ```
 
-Hermes / Memory compatibility surface 會提供 consumer 可辨識的 `context_length_exceeded` / `input is too long` recovery signal，同時保留真實 UTF-16 metadata；不要把它描述成 token hard limit。
+Hermes / Memory 會另外提供 consumer 看得懂的 `context_length_exceeded` / `input is too long` 訊號，同時保留真實 UTF-16 metadata。
 
-## Tool-round terminal contract
-
-耗盡 profile ceiling 時回 terminal HTTP `409`，不自動 replay：
+Tool rounds 耗盡時回 terminal HTTP `409`，不自動重播：
 
 ```text
 code=tool_round_limit
@@ -59,64 +76,78 @@ retryable=false
 recommended_action=<consumer guidance>
 ```
 
-## Router repair overflow
+Router repair input 若本身超過限制，在第二次 upstream call 前停止：`code=tool_router_repair_input_too_large`、`limit_type=repair_prompt_utf16`。不能先截掉大型 structured arguments 再猜。
 
-若 bounded repair input 本身超過 caller-text budget，第二次 upstream call 前 fail closed；error 使用 `tool_router_repair_input_too_large` / `limit_type=repair_prompt_utf16`，不得截短大型 structured arguments 後繼續猜測 repair。
+## Tool 與 structured output
 
-## Tool identity
+- 只有所有可選 tools 都有 `annotations.readOnlyHint=true`，也沒有修改／破壞訊號時，才允許同時呼叫多個；`tool_choice` 也算在可選集合內。
+- `tool_calls[].id` 必須和後續 `tool_call_id` 完全相同。
+- `arguments` 在 transport、repair、checkpoint 途中不能被截半，也不能補造不存在的事實。
+- Internal `calls/answer` envelope 不是公開 API。只有嚴格符合 direct-answer 形狀時，才可在 final boundary 解包。
+- `response_format` / `json_schema` 是 structured-output contract。普通 JSON 不會因為看起來像 router envelope 就被剝殼；不合法 internal envelope 會 fail closed。
 
-- 只有所有可選 tool 都明確帶 `annotations.readOnlyHint=true` 且無 mutation / destructive 訊號時，才可開放平行 caller calls > 1；`tool_choice` 也必須納入本輪 selectable set 判斷。
-- `tool_calls[].id` 與後續 `tool_call_id` 必須一致。
-- `arguments` 不得在 transport / repair / checkpoint 階段被從中截斷或重新生成不存在的事實。
-- Internal `calls/answer` router envelope（例如 `{"calls":[],"answer":"..."}`）不是 public API contract；只有 strict direct-answer envelope 可以在 final-answer boundary 解包。
+Router、repair 與 required-tool retry 的 scratch phase 各使用新的 `ConversationId` / `SessionId`。Private mode 每條新 WebSocket 都重送 `disableMemory=1`，但這個欄位本身不是 context reset。
 
-Router / repair / required-tool retry 使用 scratch ChatHub phase 時，各 phase 使用新的 `ConversationId` / `SessionId`；Private mode 的 `disableMemory=1` 仍需在每條新 WebSocket 套用，但它本身不是 context reset。
+## `/v1/chat/completions` control-plane
 
-## Response format
+這個 route 固定是 P2 auxiliary / control-plane：
 
-`response_format` / `json_schema` 是 structured-output contract。普通 JSON 不因看起來像 router envelope 就被猜測式剝殼；invalid internal envelope 應 fail closed。
+- 使用 shared scheduler、breaker 與 `MEMORY_YIELD`；P0 使用者與 eligible P1 Memory 優先。
+- P2 同時最多 1，shared total 最多 2。
+- Checkpoint 使用 `Namespace=auxiliary-control-plane`、`ForceNew=true`、`Untracked=true`。
+- 保留 OpenAI message/tool validation、文字政策與 tool 安全規則。
+- 不注入 Hermes Agent 的 `EVIDENCE_LEDGER` 或 final-answer completion rule。
+- Non-stream 或 SSE 的 structured `done` verdict 不得被 `completionEvidenceAllows()` 改寫。
 
-## `/v1/chat/completions` control-plane 契約
+Hermes / Atlas 執行面仍用 `/hermes/v1`。`tool_round_limit` 的 `profile=generic` 只為 wire/runtime 相容，不表示 `/v1/chat/completions` 是 user-facing chat。
 
-Issue #76 起，`POST /v1/chat/completions` 是 auxiliary / control-plane surface。它與 `/hermes/v1` 共用 OpenAI-compatible request/response shape，但 execution policy 不同：
+Forward-compatible extension 可以在 observability 中記錄欄位名稱或數量，不得記錄敏感 payload value。
 
-- shared-account scheduler class 固定為 P2；eligible P1 Memory 優先，P0 external user 仍最高；
-- P2 hard ceiling 1、shared hard ceiling 2、breaker/cooldown 與 `MEMORY_YIELD` 規則沿用既有 scheduler；
-- checkpoint control 為 `Namespace=auxiliary-control-plane`、`ForceNew=true`、`Untracked=true`；
-- OpenAI message/tool protocol validation、caller text policy、tool catalog / tool-call safety 仍保留；
-- 不注入 Agent `EVIDENCE_LEDGER` / final-answer completion rule，不以 Hermes 歷史 completed/pending tool ledger 做 control-plane verdict 去重或 success authorization；
-- non-stream 與 SSE 的結構化 `done` verdict 不得被 `completionEvidenceAllows()` 改寫成 `unconfirmedToolOutcomeResponse`。
+## 排隊、429 與重試
 
-這個 surface 的目的不是放寬 Hermes Agent 安全規則；Hermes / Atlas 執行面仍使用 `/hermes/v1`。`tool_round_limit` error 中的 `profile=generic` 暫時保留為 wire/runtime compatibility identity，不代表 `/v1/chat/completions` 仍是 user-facing generic chat。
+本地 queue full / timeout 回 HTTP `503` 並附 `Retry-After`。這與 Microsoft 429 不同，也不代表所有 5xx 都可安全重送。
 
-## Extension observability
+Microsoft hard 429 或已驗證的 ChatHub soft-throttle 會正規化為 HTTP `429 rate_limit_error`。非空 `item.throttling` 可能只是一般 quota / metering metadata，不足以開 breaker。有效 upstream `Retry-After` 會保留；soft throttle 沒提供時使用第一階 1125 秒。Throttle 成立後，repair、reask 與 required-tool/router retry 都必須停止。
 
-Forward-compatible ingress 若保存／忽略 caller extensions，可透過既有 observability metadata（例如 preserved extension count/name、ignored parameters）呈現；這些 diagnostics 不應帶出 sensitive payload value。
+Breaker 狀態：
 
-## Admission / retry signaling
+```text
+CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
+```
 
-Interactive queue full / timeout 等可重試 admission failure 使用 HTTP `503` 並附 `Retry-After`。這和 Microsoft upstream 429 cooldown 是不同層級；caller 不應把任何 5xx 都當成可無條件 replay 已送出的 ChatHub request。
+- `OPEN` 到期只代表可以 probe，不會直接關閉。
+- 只有一筆 external-user request 可以 probe；背景 Hermes、Goal Judge 與 Memory 都不行。
+- Probe 再被 throttle 會回 `OPEN` 並提高 cooldown。
+- Probe 成功才進 `RECOVERY`。
+- `RECOVERY` shared concurrency 仍是 1，Memory 仍不進 upstream。
+- 完成一筆成功 request 後，要安靜觀察 60 秒；沒有執行中或排隊流量時，下一次 admission／snapshot 才自動回 `CLOSED`。
 
-Microsoft hard 429 與已驗證的 ChatHub soft-throttle notice 都正規化為 canonical HTTP `429 rate_limit_error`。**非空的 `item.throttling` object 本身不足以證明正在限流**：正常成功 turn 也會攜帶每個 conversation 的 quota / metering metadata，例如訊息計數與 metering 欄位。Gateway 仍保存這些 metadata供觀測，但只有真正 hard 429 或已驗證的 soft-throttle notice/message shape 才能開 breaker。若 upstream 有有效的 `Retry-After` 就保留；若 soft-throttle 沒提供，第一階使用 shared breaker 的 `1125` 秒 cooldown，而不是快速 `1s` replay。Throttle 一旦成立，`response_format` repair/reask 與 required-tool/router retry 都必須停止，不得把 throttle prose 當 malformed model output 再送一次。
+Memory admission errors：
 
-Shared breaker 狀態為 `CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY`。`OPEN` 的時間到期只代表可接受一筆受控 external-user interactive probe；autonomous Hermes continuation 與 Memory backlog 都不會自動成為 probe。Probe 再 throttle 會從最新 throttle timestamp 升到下一階；成功只進 `RECOVERY`，不會自動釋放 Memory backlog。RECOVERY 的降階條件由 controlled live qualification 決定。
+| HTTP / code | 意思 |
+|---|---|
+| `503 interactive_capacity_busy` | 使用者流量／容量尚未讓出 |
+| `503 memory_capacity_deferred` | 已有 active 1 + waiting 8 |
+| `429 upstream_throttle` + `Retry-After` | Shared breaker 非 `CLOSED`，請延後到 reset time |
 
-`/memory/v1` admission failure 會區分「本地容量暫滿」與「shared breaker 已經開啟」：
+Projected 429 不會碰 Microsoft，也不會增加 breaker counter 或 level。
 
-- HTTP `503` + `interactive_capacity_busy`：interactive / holdoff 尚未讓出容量；
-- HTTP `503` + `memory_capacity_deferred`：Gateway 已有 active 1 + waiting 8 的 Memory 工作，額外 request fail-fast；
-- HTTP `429` + `upstream_throttle` + `Retry-After`：shared breaker 已經不是 `CLOSED`，因此立即 defer，且不會送 ChatHub round。這是把**既有 breaker 狀態投影給 caller**，不是又發生一筆新的 Microsoft throttle；不會增加 breaker/429 counter，也不會讓 cooldown level 再升級。Hindsight v0.9.x 可利用這個長 `Retry-After`，把 pending operation 延到 `next_retry_at`，而不是在 cooldown 期間一直用短 retry 空轉。
+## Hindsight webhook
 
-### Hindsight durable-event callback
+`POST /internal/hindsight/webhook` 使用 machine auth，不接受 admin session 或 caller API key。Runtime 必須設定 `M365_HINDSIGHT_WEBHOOK_SECRET`。
 
-`POST /internal/hindsight/webhook` 是 machine-auth callback，不使用 admin session 或 caller API key。Runtime 必須設定 `M365_HINDSIGHT_WEBHOOK_SECRET`；Hindsight 以 raw JSON body 計算 HMAC-SHA256，並送出 `X-Hindsight-Signature: sha256=<hex>`。可附 `X-Hindsight-Event`，若存在必須和 payload `event` 相符。
+Hindsight 對 raw JSON body 計算 HMAC-SHA256，送出：
 
-Gateway 只接受 `retain.completed` 與 `consolidation.completed`，且要求 `operation_id` / `timestamp`。`retain.completed` 可通過 active milestone durability barrier；`consolidation.completed` 只記錄 observability。Webhook delivery 是 at-least-once，因此 Gateway 對 `event + operation_id` 做 bounded dedupe。Secret 不會回傳到管理 UI、log 或 error body。
+```text
+X-Hindsight-Signature: sha256=<hex>
+```
 
-### Controlled recovery completion
+可選的 `X-Hindsight-Event` 若存在，必須等於 payload `event`。Gateway 只接受 `retain.completed` 與 `consolidation.completed`，且要求 `operation_id` / `timestamp`。只有 `retain.completed` 可通過 milestone durability barrier；`consolidation.completed` 只做觀測。Delivery 是 at-least-once，所以以 `event + operation_id` 做 bounded dedupe。Secret 永不出現在 UI、log 或 error body。
 
-`POST /api/admin/traffic/recovery` body `{"action":"complete"}` 只允許在 shared breaker 已是 `RECOVERY` 時由管理者使用；其他 state 回 `409 recovery_not_ready`。這不是自動 recovery policy，也不能拿來跳過 qualification；用途是 controlled live qualification 完成後明確把 `RECOVERY` 關回 `CLOSED` 並重設 cooldown level。
+## 人工 recovery 與 WebSocket retry
 
-ChatHub WebSocket bounded retry 只涵蓋 payload 尚未送出前的 transient dial / HTTP-upgrade failure；目前涵蓋 HTTP `500` / `502` / `503` / `504` 與沒有 HTTP response 的 transient network dial error。Payload 已送出後不得套同一規則盲目 replay。
+Shared breaker 在 `RECOVERY` 時，管理員可以呼叫 `POST /api/admin/traffic/recovery`，body 為 `{"action":"complete"}`。其他狀態回 `409 recovery_not_ready`。`GET /api/admin/traffic` 會顯示觀察秒數，以及最後一次是 `manual` 或 `automatic` 完成。
 
-Current verification status：[`compatibility.md`](compatibility.md)。
+ChatHub WebSocket 只在 payload 尚未送出前，對 HTTP `500` / `502` / `503` / `504` upgrade failure 或沒有 HTTP response 的暫時 network dial error 做有限重試。Payload 一旦送出，就不套用同一規則。
+
+目前驗證狀態請讀 [`compatibility.md`](compatibility.md)。

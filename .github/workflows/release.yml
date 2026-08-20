@@ -20,7 +20,6 @@ permissions:
   contents: write
 
 env:
-  CGO_ENABLED: 0
   BINARY_NAME: m365-native
 
 jobs:
@@ -29,57 +28,78 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && inputs.stable == true)
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: windows
-            goarch: amd64
-          - goos: windows
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: linux-amd64
+            extension: ''
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: linux-arm64
+            extension: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows-amd64
+            extension: .exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact: windows-arm64
+            extension: .exe
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: darwin-amd64
+            extension: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: darwin-arm64
+            extension: ''
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      - name: Test
-        run: go test ./...
+      - name: Resolve build identity
+        shell: bash
+        env:
+          EVENT_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then tag="${INPUT_TAG}"; fi
+          if [[ ! "${tag}" =~ ^stable-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must use stable-vX.Y.Z, got: ${tag}"
+            exit 1
+          fi
+          echo "M365_BUILD_VERSION=${tag#stable-v}" >> "${GITHUB_ENV}"
+          echo "M365_BUILD_COMMIT=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          echo "M365_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_ENV}"
 
       - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          toolchain: '1.97'
+          args: --locked --release
+
+      - name: Package
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          suffix=""
-          if [ "${GOOS}" = "windows" ]; then suffix=".exe"; fi
-          output="dist/${BINARY_NAME}-${GOOS}-${GOARCH}${suffix}"
-          version="${GITHUB_REF_NAME#stable-v}"
-          commit="$(git rev-parse HEAD)"
-          build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          ldflags="-s -w -X m365-native/internal/web.Version=${version} -X m365-native/internal/web.Commit=${commit} -X m365-native/internal/web.BuildTime=${build_time}"
-          go build -trimpath -ldflags="${ldflags}" -o "${output}" ./cmd/server
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}${{ matrix.extension }}" \
+            "dist/${BINARY_NAME}-${{ matrix.artifact }}${{ matrix.extension }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: ${{ env.BINARY_NAME }}-${{ matrix.artifact }}
           path: dist/*
           if-no-files-found: error
 
@@ -116,10 +136,10 @@ jobs:
           set -euo pipefail
           tag="${EVENT_TAG}"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then tag="${INPUT_TAG}"; fi
-          case "${tag}" in
-            stable-v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "Tag must use stable-vX.Y.Z, got: ${tag}"; exit 1 ;;
-          esac
+          if [[ ! "${tag}" =~ ^stable-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must use stable-vX.Y.Z, got: ${tag}"
+            exit 1
+          fi
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Publish GitHub Release

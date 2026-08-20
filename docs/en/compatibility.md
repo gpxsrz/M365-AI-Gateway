@@ -1,32 +1,40 @@
 # Compatibility and verification status
 
-`Verified` means deterministic tests, live evidence, or an enforced code contract exist. `Partially verified` means only part of the path is proven. `Needs work` means the current implementation has a known gap.
+## Understand it in 30 seconds
 
-| Category | Item | Status | Key point |
-|---|---|---|---|
-| API | `/v1/chat/completions` | Production verified (#76 implementation `9928d0e`) | auxiliary / control-plane; non-stream/SSE verdict passthrough, P2 scheduler, ForceNew/Untracked, Agent-evidence isolation; Coordinator/manager Goal Judge live `done` PASS |
-| API | `/v1/responses` | Partially verified | compatibility surface retained |
-| API | `/v1/messages` | Partially verified | Anthropic-shaped surface |
-| Streaming | terminal + `[DONE]` | Verified | partial events alone are not success |
-| Streaming usage | `stream_options.include_usage` | Verified | one terminal usage chunk + one `[DONE]` |
-| Streaming continuation | buffered tool continuation + `stream_options` | Production verified | #68 strips stream-only options from the inner non-stream adapter |
-| Text policy | 128000 UTF-16 | Verified | Web-compatible caller-text policy, not token context |
-| Private mode | `disableMemory=1` per WebSocket | Verified | no-ordinary-history control |
-| Caller tools | single tool continuation | Verified | tool call/result identity preserved |
-| Caller tools | multiple tools in one turn | Production verified | only explicit read-only catalogs may exceed one |
-| Caller tools | large structured arguments | Production + deterministic verified | repair no longer truncates at a fixed 6000 characters |
-| Final answer | internal router-envelope normalization | Production verified | strict unwrap / fail closed |
-| Tool rounds | auxiliary/Memory 16, Hermes 128 | Verified | profile-specific terminal ceiling |
-| Tool results | large result preservation | Needs work | upstream flattening / truncation risk remains |
-| Bing | native Bing | Verified | grounding / citations work |
-| Bing + caller tools | coexistence | Partially verified | routing wording still matters |
-| Vision | single / multiple images | Verified | image transport path |
-| Files | document grounding | Verified | Microsoft file identity / annotation path |
-| Code Interpreter | execution + artifacts | Verified | artifacts safely materialized by the sidecar |
-| MCP | modern + legacy handlers | Verified | client interoperability still depends on the client |
-| Hermes | `/hermes/v1` | Production verified | checkpoint, overflow, tool continuation, #68 |
-| Hindsight | `/memory/v1` | Core Production verified | retain/recall/reflect, overflow, 40K/retry1 |
-| Traffic | P0 user / P1 Memory / P2 autonomous-control-plane admission | Deterministically verified | shared total 2, Memory 1, P2 1, FIFO, breaker/cooldown, MEMORY_YIELD |
-| Deployment identity | binary + Web from one commit | **Production verified** | #69 binds binary + three runtime Web assets into one deterministic release/rollback unit with identity readback |
+The Rust version has passed local code, test, and release-binary checks. That does not mean a real Microsoft account or Production has passed.
 
-For evidence rationale, read [`research-evidence.md`](research-evidence.md). For current gaps, read [`known-limitations.md`](known-limitations.md).
+This page uses three status labels:
+
+| Status | Plain meaning |
+|---|---|
+| Locally verified | Automated tests or a real local startup path passed |
+| Live check required | Local wiring is complete, but an isolated Microsoft account must still be tested |
+| Known limit | The feature works within a documented boundary |
+
+## What is confirmed now
+
+| Feature | Status | Key point |
+|---|---|---|
+| `/v1/chat/completions` | Locally verified | regular replies, streaming, tools, usage, and `[DONE]` |
+| `/v1/responses` | Locally verified | parent continuation, tool results, reasoning, and media events |
+| `/v1/messages` | Locally verified | Anthropic-shaped adapter; streaming is sliced after completion |
+| Hermes `/hermes/v1` | Locally verified | checkpoints, multi-round tools, completion evidence, and traffic admission |
+| Hindsight `/memory/v1` | Locally verified | retain, recall, reflect, webhooks, and retain barriers |
+| MCP modern + legacy | Locally verified | built-in routes and echo tool; each third-party client still needs qualification |
+| Images, files, and vision | Live check required | local upload/transport boundaries pass; real Microsoft transfer is pending |
+| Code Interpreter artifacts | Live check required | private storage and download authorization pass locally; real artifacts are pending |
+| Admin and API keys | Locally verified | bootstrap, password change, re-login, key creation, and authorized model catalog |
+| Model-capability evidence | Locally verified | only evidence-bound optional capabilities can be enabled |
+| Release / Docker | Exact-head CI required | local release build passed; GitHub CI must execute the container gate |
+| Production replacement | Not declared | GitHub, NAS, VM, live-account, and recovery gates must pass separately |
+
+## Important boundaries
+
+- `128000` means UTF-16 text units, not model tokens.
+- Private mode sends `disableMemory=1`; it does not promise zero Microsoft retention.
+- Multiple caller tools may run together only when all are explicitly read-only.
+- WebSocket retry is allowed only before a payload is sent; sent requests are never blindly replayed.
+- Large tool results may still be flattened or shortened upstream.
+
+For the complete Rust matrix, read [`rust-rewrite-parity.md`](rust-rewrite-parity.md). For risks, start with [`known-limitations.md`](known-limitations.md). Evidence rules are in [`research-evidence.md`](research-evidence.md).

@@ -1,71 +1,72 @@
-# Architecture and product boundaries
+# Architecture and data boundaries
 
-This document answers only what M365 AI Gateway is, how requests flow, and where the data boundaries are. Use the other topic documents for consumer settings, deployment, or historical evidence.
+## Understand it in 30 seconds
 
-## Core model
+The gateway is a translation and safety layer between a caller and Microsoft 365 Copilot.
 
-- One sidecar instance maps to one Microsoft 365 account.
-- The gateway projects OpenAI / Anthropic / MCP-compatible requests onto Microsoft 365 Copilot ChatHub and provides workload profiles, checkpoints, and shared-account admission control for consumers such as Hermes and Hindsight.
-- Long-term conversation history and durable memory belong to the caller / Hermes / Hindsight. The sidecar keeps only short-lived transport continuation state.
-- Public `gpxsrz/M365-AI-Gateway` `main` is the single development line.
-- This is an independent community project, not an official Microsoft product; `m365-native` remains a runtime compatibility identity.
+```text
+Your tool → M365 AI Gateway → Microsoft 365 Copilot
+```
 
-### Compatibility identifiers
+It translates API shapes, keeps short-lived continuation state, protects files, and prevents too much work from hitting one account at once.
 
-The public rebrand does not require breaking established runtime or protocol identities. The `m365-native` binary, Go module and configuration directory, plus deployed `m365-copilot2api` Compose project / paths, MCP server names / URNs, and artifact upstream client-version identifiers may remain unchanged unless a separate compatibility migration is backed by live evidence. These legacy identifiers are not the current product name.
+## The most important boundaries
 
-## Main surfaces
+- One running gateway serves one Microsoft 365 account.
+- Durable conversations and memory belong to the caller, Hermes, or Hindsight. The gateway keeps only short-lived state needed to continue transport and tools.
+- The gateway is a Rust program. The `m365-native` executable name remains for compatibility and does not imply the old product name.
+- This is a community project, not an official Microsoft product.
 
-| Surface | Purpose |
+## Choose an endpoint
+
+| Goal | Endpoint | Plain explanation |
+|---|---|---|
+| Auxiliary/control work such as Goal Judge | `/v1/chat/completions` | Starts fresh and does not inherit Agent execution evidence |
+| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | Keeps tool continuation and completion evidence |
+| Hindsight Memory | `/memory/v1/chat/completions` | Uses the background Memory priority class |
+| OpenAI Responses shape | `/v1/responses` | Converts a Responses request onto the shared chat core |
+| Anthropic Messages shape | `/v1/messages` | Returns Anthropic-shaped data; streaming is adapted after completion |
+| Image generation | `/v1/images/generations` | Uses the Microsoft image path and protects result URLs |
+| MCP | `/v1/mcp` | Lets MCP clients list and call gateway tools |
+
+The corresponding model catalogs are `/v1/models`, `/hermes/v1/models`, and `/memory/v1/models`.
+
+## How one request moves through the gateway
+
+1. Validate the administrator session or API key.
+2. Check input size, roles, and tool data.
+3. Order shared-account work across users, Memory, and background Agents.
+4. When needed, read a short-lived checkpoint and attach the next tool result.
+5. Open a new Microsoft ChatHub connection. Private mode reapplies `disableMemory=1` every time.
+6. Convert the Microsoft response into the caller's requested format.
+7. Mark the request complete and save continuation state only after terminal evidence is present.
+
+General `/v1/chat/completions` does not inherit the Hermes execution ledger and does not rewrite a valid `done` or `verified` verdict as unconfirmed work.
+
+## Streaming and tools
+
+- A partial streaming sentence is not completion; the terminal event is.
+- When usage is requested, one usage-only chunk appears before the single `[DONE]`.
+- Tool continuation preserves role, tool-call ID, and arguments. It must not guess or rebuild them.
+- Parallel caller tools are allowed only when every selectable tool is explicitly read-only. Any mutation risk reduces the limit to one.
+
+## Data stays in separate boundaries
+
+| Data | Gateway behavior |
 |---|---|
-| `/v1/chat/completions` | auxiliary / control-plane OpenAI-compatible chat; ForceNew / Untracked, P2 admission, without Agent execution-evidence / completion guards |
-| `/v1/models` | generic model catalog |
-| `/hermes/v1/chat/completions` | Hermes / Atlas Agent execution surface with checkpoint, tool continuation, and execution-evidence / completion guards |
-| `/hermes/v1/models` | Hermes-profile model catalog |
-| `/memory/v1/chat/completions` | Hindsight / Memory Provider profile |
-| `/memory/v1/models` | Memory-profile model catalog |
-| `/v1/responses` | OpenAI Responses-shaped compatibility |
-| `/v1/messages` | Anthropic-shaped compatibility |
-| `/v1/mcp` | MCP Streamable HTTP |
-| `/v1/mcp/sse` + `/v1/mcp/message` | legacy MCP SSE transport |
+| Ordinary chat | Private mode requests no ordinary history, but does not promise zero Microsoft retention |
+| Documents and images | May use OneDrive or SharePoint staging, separate from chat history |
+| Code Interpreter files | Fetched with authenticated state and materialized into private local storage |
+| Download URLs | Callers receive short-lived capability URLs, not protected Microsoft temporary URLs |
+| Checkpoints | Store only continuation summaries and identifiers, not complete private content |
 
-## Request lifecycle
+## Two size limits that are often confused
 
-`/hermes/v1` Agent requests pass through caller-ingress validation, text policy, P0/P2 admission, and when needed tool routing / checkpoint continuation before ChatHub transport is created. `/memory/v1` uses separate P1 Memory admission. `/v1/chat/completions` is the auxiliary / control-plane surface: it keeps protocol validation, text policy, router/tool safety, and shared-account admission, but does not treat Hermes/Atlas historical execution ledgers as control-plane completion evidence and does not rewrite a legitimate structured `done` / `verified` verdict into an Agent unconfirmed-success message. Private mode still reapplies `disableMemory=1` on every new ChatHub WebSocket.
+`textInputLimitUTF16=128000` limits outgoing text length in UTF-16 units. A model context window limits tokens. They are different measurements and must not be treated as the same number.
 
-`/v1/chat/completions` is currently P2. It cannot outrank eligible P1 Memory or become the breaker half-open probe; while a live `MEMORY_YIELD` exists, it follows the existing autonomous-P2 barrier / queue rules. It is `ForceNew + Untracked`, so it does not create reusable Sidecar transport checkpoint state across requests.
+## Read deeper only when needed
 
-Tool continuation must preserve role, content, tool-call ID, and argument identity. Internal router / repair / final-answer phases have explicit scratch-conversation boundaries rather than relying on `disableMemory` as a context reset.
-
-## Streaming
-
-- Partial SSE events are not completion evidence; a terminal condition is required.
-- With `stream_options.include_usage=true`, ordinary chunks keep `usage:null` and one usage-only chunk is emitted before the single `[DONE]`.
-- If an internal adapter temporarily converts a request to non-streaming mode, stream-only fields must not be forwarded into that inner non-stream request.
-
-## Caller tools and Microsoft-native tools
-
-- Caller tools and Microsoft-native capabilities have separate ownership boundaries.
-- `maxToolCallsPerTurn` is a ceiling, not a guarantee of parallel calls.
-- A ceiling above one is available only when every selectable caller tool is explicitly read-only and carries no destructive / mutation signal.
-- One assistant tool-call turn counts as one tool round regardless of how many valid parallel calls it contains.
-
-## Text policy and token context are different limits
-
-`textInputLimitUTF16=128000` is a Web-compatible caller-text policy measured in UTF-16 code units. Model `context_window`, Hermes compression, and usage accounting are token-oriented concepts and must not be numerically equated.
-
-## Data boundaries
-
-- `disableMemory=1` primarily prevents ordinary chat history; it does not imply zero retention.
-- Documents, images, and Code Interpreter artifacts use separate transport / storage boundaries.
-- OneDrive / SharePoint staging side effects are distinct from ordinary chat history.
-- Protected upstream artifacts are fetched with authenticated Microsoft state, materialized into private local storage, and exposed through short-lived local capability URLs rather than leaking protected Microsoft temporary URLs.
-
-## Next document
-
+- Exact requests, streaming, and errors: [`api-contracts.md`](api-contracts.md)
 - Hermes / Hindsight: [`hermes-hindsight.md`](hermes-hindsight.md)
-- Deployment: [`deployment.md`](deployment.md)
-- Verification status: [`compatibility.md`](compatibility.md)
-- Known gaps: [`known-limitations.md`](known-limitations.md)
-- Exact contracts: [`api-contracts.md`](api-contracts.md)
-- Setting keys: [`runtime-settings.md`](runtime-settings.md)
+- Settings: [`runtime-settings.md`](runtime-settings.md)
+- Security and retention limits: [`../../SECURITY.md`](../../SECURITY.md)

@@ -1,124 +1,147 @@
 # M365 AI Gateway
 
-M365 AI Gateway 是社群維護的自架 Microsoft 365 AI interoperability gateway。它以 Microsoft 365 Copilot ChatHub 為上游，對外提供 OpenAI / Anthropic 相容介面，並把 Hermes Agent、Hindsight Memory Provider、caller tools、多模態輸入、Bing、Code Interpreter、artifact、MCP 與共享帳號流量仲裁放在同一個可維運邊界內。
+## 30 秒看懂
 
-> 本專案為非官方社群專案，與 Microsoft 無隸屬或背書關係。`m365-native` binary / Go module / config directory 是既有 runtime compatibility identity，與 public product name 分開維護。
+M365 AI Gateway 是一個自己架設的小型服務。它讓支援 OpenAI、Anthropic 或 MCP 的工具，可以使用你自己的 Microsoft 365 Copilot 帳號。
 
-> 專案原名為 `M365-Copilot2API`。更名只改 public brand / repository identity；既有 runtime identity 與歷史 evidence 不會為了品牌重寫。
+- 核心程式以 Rust 編寫，執行檔叫 `m365-native`。
+- 一個執行中的 Gateway 只服務一個 Microsoft 365 帳號。
+- 預設只接受本機連線。
+- 這是社群專案，不是 Microsoft 官方產品。
+- Private mode 會關閉一般聊天記錄，但不代表 Microsoft 完全不保留資料。
 
-> 深度文件已改成 **progressive-loading** 架構。請從 [`docs/README.md`](docs/README.md) 選擇主題，不要一次讀完整 `docs/`。
+如果你只想安裝，直接看[快速開始](docs/zh-TW/getting-started.md)。AI Agent 或貢獻者應先看[文件路由](docs/README.md)，一次只載入目前需要的主題。
 
-## 架構摘要
+## 最快啟動方式
 
-- 一個 Sidecar 執行個體對應一個 Microsoft 365 帳號。
-- `/v1/chat/completions`：auxiliary / control-plane OpenAI-compatible chat；目前用於 Goal Judge 等不應套用 Agent execution-evidence policy 的短控制面 LLM 工作，採 ForceNew / Untracked，並以 P2 進入 shared-account scheduler。
-- `/hermes/v1/chat/completions`：Hermes / Atlas Agent 執行面；保留 checkpoint、tool continuation、execution-evidence 與 completion guard。
-- `/memory/v1/chat/completions`：Hindsight / Memory Provider 相容入口，採 P1 Memory admission。
-- `/v1/responses`、`/v1/messages`：既有相容介面；Anthropic `/v1/messages` 保留。
-- `/v1/mcp`、`/v1/mcp/sse`、`/v1/mcp/message`：MCP transports。
-- 預設聊天模式為 Private；`disableMemory=1` 會在每條新 ChatHub WebSocket 重新套用，但不代表 Microsoft 完全不保留資料。
-- `textInputLimitUTF16=128000` 是 Web 相容 caller-text policy，不是 model token context window。
-
-## 快速開始
-
-需求：Go 版本以 `go.mod` 為準；若使用容器，請使用 Docker / 相容 runtime。
+需求：使用 `Cargo.toml` 指定的 Rust 版本，以及一個你有權使用的 Microsoft 365 Copilot 帳號。
 
 ```bash
-go build ./cmd/server
-./server
+export M365_ADMIN_PASSWORD='請換成只用一次的管理密碼'
+cargo run --locked --bin m365-native
 ```
 
-預設管理介面：`http://127.0.0.1:4141`
+接著開啟 `http://127.0.0.1:4141`：
 
-API key 由管理介面建立，呼叫時使用：
+1. 用剛才的一次性密碼登入。
+2. 依畫面要求換成正式管理密碼。
+3. 完成 Microsoft 登入。
+4. 建立 API key。
 
-```text
-Authorization: Bearer <API_KEY>
-```
+不要把真實密碼、API key、token 或 cookie 貼進指令紀錄、Issue 或文件。
 
-容器映像可直接由 repo 的 `Dockerfile` 建置。首次登入、API key、設定來源與 consumer-specific configuration 請依主題文件操作。
+## 它提供什麼
+
+| 你要做的事 | 使用的入口 |
+|---|---|
+| OpenAI 相容的輔助／控制工作 | `/v1/chat/completions` |
+| Hermes / Atlas Agent 工作 | `/hermes/v1/chat/completions` |
+| Hindsight Memory 工作 | `/memory/v1/chat/completions` |
+| OpenAI Responses 格式 | `/v1/responses` |
+| Anthropic Messages 格式 | `/v1/messages` |
+| 圖片生成 | `/v1/images/generations` |
+| MCP | `/v1/mcp`；舊客戶端可用 `/v1/mcp/sse` |
+| 模型清單 | `/v1/models` |
+
+Gateway 也會處理工具呼叫、圖片與文件輸入、Code Interpreter 產出檔案、短期續接狀態，以及同一帳號下的流量排序。
 
 ## 文件入口
 
-| 需求 | 繁中 | English |
+| 我現在要做什麼 | 台灣繁中 | English |
 |---|---|---|
-| 安裝、首次登入、API key | [快速開始](docs/zh-TW/getting-started.md) | [Getting started](docs/en/getting-started.md) |
-| 架構、API、隱私邊界 | [架構](docs/zh-TW/architecture.md) | [Architecture](docs/en/architecture.md) |
-| Hermes / Hindsight | [整合](docs/zh-TW/hermes-hindsight.md) | [Integration](docs/en/hermes-hindsight.md) |
-| 部署、timeout、反向代理 | [部署](docs/zh-TW/deployment.md) | [Deployment](docs/en/deployment.md) |
-| 相容性狀態 | [相容性矩陣](docs/zh-TW/compatibility.md) | [Compatibility](docs/en/compatibility.md) |
-| 已知限制 | [已知限制](docs/zh-TW/known-limitations.md) | [Known limitations](docs/en/known-limitations.md) |
-| 研究與驗證證據 | [研究證據](docs/zh-TW/research-evidence.md) | [Research evidence](docs/en/research-evidence.md) |
-| Microsoft Web model / capability drift | [模型能力](docs/zh-TW/model-capabilities.md) | [Model capabilities](docs/en/model-capabilities.md) |
-| API error / streaming / usage 精確契約 | [API 契約](docs/zh-TW/api-contracts.md) | [API contracts](docs/en/api-contracts.md) |
-| Runtime / UI 設定鍵 | [Runtime 設定](docs/zh-TW/runtime-settings.md) | [Runtime settings](docs/en/runtime-settings.md) |
+| 安裝與第一次登入 | [快速開始](docs/zh-TW/getting-started.md) | [Getting started](docs/en/getting-started.md) |
+| 理解系統怎麼運作 | [架構](docs/zh-TW/architecture.md) | [Architecture](docs/en/architecture.md) |
+| 設定 Hermes / Hindsight | [整合指南](docs/zh-TW/hermes-hindsight.md) | [Integration guide](docs/en/hermes-hindsight.md) |
+| 部署與回滾 | [部署](docs/zh-TW/deployment.md) | [Deployment](docs/en/deployment.md) |
+| 查功能是否真的驗過 | [相容性](docs/zh-TW/compatibility.md) | [Compatibility](docs/en/compatibility.md) |
+| 查已知限制 | [已知限制](docs/zh-TW/known-limitations.md) | [Known limitations](docs/en/known-limitations.md) |
+| 查精確 API 或設定 | [API 契約](docs/zh-TW/api-contracts.md)／[設定](docs/zh-TW/runtime-settings.md) | [API contracts](docs/en/api-contracts.md) / [Settings](docs/en/runtime-settings.md) |
 
-完整文件路由與歷史 archive：[`docs/README.md`](docs/README.md)。
+完整路由與 AI Agent 的分層讀取規則在 [`docs/README.md`](docs/README.md)。
 
-## 開發
-
-請先讀 [`CONTRIBUTING.md`](CONTRIBUTING.md)。Go 變更至少執行：
+## 開發者最小檢查
 
 ```bash
-go mod verify
-go test ./...
-go vet ./...
-go build ./...
+cargo fmt --all --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 git diff --check
 ```
 
-串流、併發、checkpoint 或生命週期變更另跑 `go test -race ./...`。
-
-安全問題請見 [`SECURITY.md`](SECURITY.md)。一般 bug、功能需求與相容性問題使用公開 GitHub Issues。
+詳細規則見 [`CONTRIBUTING.md`](CONTRIBUTING.md)；安全問題見 [`SECURITY.md`](SECURITY.md)。
 
 ---
 
 # English
 
-M365 AI Gateway is a community-maintained, self-hosted Microsoft 365 AI interoperability gateway. It uses Microsoft 365 Copilot ChatHub as its upstream while exposing OpenAI- and Anthropic-compatible surfaces and bringing Hermes Agent, Hindsight Memory Provider, caller tools, multimodal input, Bing, Code Interpreter, artifacts, MCP, and shared-account traffic arbitration under one operable boundary.
+## Understand it in 30 seconds
 
-> This is an independent community project and is not affiliated with or endorsed by Microsoft. The existing `m365-native` binary, Go module, and configuration directory remain runtime compatibility identities and are intentionally separate from the public product name.
+M365 AI Gateway is a small self-hosted service. It lets tools that speak OpenAI, Anthropic, or MCP use your own Microsoft 365 Copilot account.
 
-> The project was formerly named `M365-Copilot2API`. The rebrand changes the public product / repository identity without rewriting established runtime identities or historical evidence.
+- The core is written in Rust. The executable is named `m365-native`.
+- One running gateway serves one Microsoft 365 account.
+- It listens on the local machine by default.
+- This is a community project, not an official Microsoft product.
+- Private mode disables ordinary chat history. It does not promise that Microsoft retains nothing.
 
-> Deep documentation now uses a **progressive-loading** layout. Start from [`docs/README.md`](docs/README.md) and load only the topic you need instead of reading the entire `docs/` tree.
+If you only want to install it, open [Getting started](docs/en/getting-started.md). AI agents and contributors should start from the [documentation router](docs/README.md) and load one topic at a time.
 
-## Architecture summary
+## Fastest local start
 
-- One sidecar instance maps to one Microsoft 365 account.
-- `/v1/chat/completions`: auxiliary / control-plane OpenAI-compatible chat for short LLM work such as Goal Judge that must not inherit Agent execution-evidence policy; it is ForceNew / Untracked and enters the shared-account scheduler as P2.
-- `/hermes/v1/chat/completions`: Hermes / Atlas Agent execution surface with checkpoint, tool-continuation, execution-evidence, and completion guards preserved.
-- `/memory/v1/chat/completions`: Hindsight / Memory Provider compatibility surface using P1 Memory admission.
-- `/v1/responses` and `/v1/messages`: existing compatibility surfaces; Anthropic `/v1/messages` remains supported.
-- `/v1/mcp`, `/v1/mcp/sse`, `/v1/mcp/message`: MCP transports.
-- The default chat mode is Private. `disableMemory=1` is reapplied on every new ChatHub WebSocket, but it does not imply zero Microsoft retention.
-- `textInputLimitUTF16=128000` is a Web-compatible caller-text policy, not a model token context window.
-
-## Quick start
-
-Use the Go version declared by `go.mod`.
+Use the Rust version in `Cargo.toml` and an authorized Microsoft 365 Copilot account.
 
 ```bash
-go build ./cmd/server
-./server
+export M365_ADMIN_PASSWORD='replace-with-a-one-time-admin-password'
+cargo run --locked --bin m365-native
 ```
 
-Default management UI: `http://127.0.0.1:4141`
+Then open `http://127.0.0.1:4141`:
 
-Create API keys in the management UI and send them as:
+1. Sign in with the one-time password.
+2. Change it when prompted.
+3. Complete Microsoft sign-in.
+4. Create an API key.
 
-```text
-Authorization: Bearer <API_KEY>
-```
+Never put real passwords, API keys, tokens, or cookies in command logs, Issues, or documentation.
 
-The repository `Dockerfile` builds a container image. Use [Getting started](docs/en/getting-started.md) for the bootstrap flow, then load only the topic-specific document you need.
+## What it provides
+
+| Goal | Endpoint |
+|---|---|
+| OpenAI-compatible auxiliary/control work | `/v1/chat/completions` |
+| Hermes / Atlas Agent work | `/hermes/v1/chat/completions` |
+| Hindsight Memory work | `/memory/v1/chat/completions` |
+| OpenAI Responses shape | `/v1/responses` |
+| Anthropic Messages shape | `/v1/messages` |
+| Image generation | `/v1/images/generations` |
+| MCP | `/v1/mcp`; older clients can use `/v1/mcp/sse` |
+| Model catalog | `/v1/models` |
+
+The gateway also handles tool calls, image and document input, Code Interpreter files, short-lived continuation state, and fair use of the shared account.
 
 ## Documentation
 
-Use the table above or [`docs/README.md`](docs/README.md) to select only the relevant document. English deep documents live under `docs/en/`; Traditional Chinese documents live under `docs/zh-TW/`.
+| What you need | Traditional Chinese | English |
+|---|---|---|
+| Install and first sign-in | [快速開始](docs/zh-TW/getting-started.md) | [Getting started](docs/en/getting-started.md) |
+| Understand the system | [架構](docs/zh-TW/architecture.md) | [Architecture](docs/en/architecture.md) |
+| Configure Hermes / Hindsight | [整合指南](docs/zh-TW/hermes-hindsight.md) | [Integration guide](docs/en/hermes-hindsight.md) |
+| Deploy and roll back | [部署](docs/zh-TW/deployment.md) | [Deployment](docs/en/deployment.md) |
+| Check verified behavior | [相容性](docs/zh-TW/compatibility.md) | [Compatibility](docs/en/compatibility.md) |
+| Check known limits | [已知限制](docs/zh-TW/known-limitations.md) | [Known limitations](docs/en/known-limitations.md) |
+| Look up exact API or settings | [API 契約](docs/zh-TW/api-contracts.md)／[設定](docs/zh-TW/runtime-settings.md) | [API contracts](docs/en/api-contracts.md) / [Settings](docs/en/runtime-settings.md) |
 
-## Development
+The full topic map and progressive-loading rules are in [`docs/README.md`](docs/README.md).
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md). At minimum, Go changes should run `go mod verify`, `go test ./...`, `go vet ./...`, `go build ./...`, and `git diff --check`. Streaming, concurrency, checkpoint, or lifecycle changes also require `go test -race ./...`.
+## Minimum developer checks
 
-See [`SECURITY.md`](SECURITY.md) for security reporting. Use public GitHub Issues for ordinary bugs, features, and compatibility reports.
+```bash
+cargo fmt --all --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+git diff --check
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development rules and [`SECURITY.md`](SECURITY.md) for security reports.

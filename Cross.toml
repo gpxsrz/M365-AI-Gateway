@@ -1,0 +1,2 @@
+[build.env]
+passthrough = ["M365_BUILD_VERSION", "M365_BUILD_COMMIT", "M365_BUILD_TIME"]

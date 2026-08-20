@@ -1,55 +1,70 @@
-# 快速開始與首次設定
+# 快速開始與第一次設定
 
-這份文件只處理「怎麼安全啟動、第一次登入、建立 API key」。架構、部署與 Hermes/Hindsight 設定請分開讀。
+## 30 秒看懂
 
-## 需求
+你只需要做四件事：啟動 Gateway、換掉一次性管理密碼、登入 Microsoft、建立 API key。
 
-- Go 版本以 `go.mod` 為準；
-- 有權使用 Microsoft 365 Copilot 的帳號；
-- 可完成 Microsoft 登入的瀏覽器。
+預設網址是 `http://127.0.0.1:4141`，只讓同一台電腦連線。
 
-## 本機啟動
+## 開始前確認
 
-使用一次性管理 bootstrap secret：
+- 已安裝 `Cargo.toml` 指定的 Rust 版本。
+- 你有權使用一個 Microsoft 365 Copilot 帳號。
+- 這台電腦能開啟瀏覽器完成 Microsoft 登入。
+
+## 第一步：啟動
+
+先設定一個只用一次的管理密碼：
 
 ```bash
-export M365_ADMIN_PASSWORD='replace-with-a-unique-bootstrap-secret'
-go run ./cmd/server
+export M365_ADMIN_PASSWORD='請換成只用一次的管理密碼'
+cargo run --locked --bin m365-native
 ```
 
-預設只監聽：`http://127.0.0.1:4141`。
+看到服務監聽 `127.0.0.1:4141` 後，開啟 `http://127.0.0.1:4141`。
 
-## 首次設定
+## 第二步：完成設定
 
-1. 開啟 `http://127.0.0.1:4141`。
-2. 使用本次部署提供的一次性 bootstrap secret 登入；本機直接執行時就是 `M365_ADMIN_PASSWORD`。
-3. 第一次成功登入後 bootstrap secret 應失效，管理 UI 會要求設定持久管理員密碼。
-4. 在管理 UI 完成 Microsoft 365 帳號登入。
-5. 建立 API key。
-6. 測試 model catalog：
+1. 用剛才的一次性密碼登入。
+2. 依畫面要求換成正式管理密碼。換完後要重新登入。
+3. 在管理頁面啟動 Microsoft 登入，並在瀏覽器完成授權。
+4. 建立 API key。原始 key 只會顯示一次，請立即存到安全位置。
+
+## 第三步：確認可以使用
+
+先把 API key 放進目前的 shell，不要寫進 repo：
 
 ```bash
-export M365_API_KEY='replace-with-your-api-key'
+export M365_API_KEY='請換成剛建立的 API key'
 curl -sS http://127.0.0.1:4141/v1/models \
   -H "Authorization: Bearer ${M365_API_KEY}"
 ```
 
-不要把真實 bootstrap secret 或 API key 寫入 repo、Issue、handoff 或 log。
+看到模型清單就代表本機 Gateway、管理流程與 API key 都能運作。這一步不等於已測過真實聊天；聊天驗證要另外送一筆低頻請求。
 
-## Container image
+## 使用 Container
 
 ```bash
 docker build -t m365-ai-gateway .
 ```
 
-`Dockerfile` 是建置基礎，不代表通用 Production Compose。管理 bootstrap 只信任真正 loopback；一般 bridge/NAT request 不會自動被當成 loopback。要把服務暴露到 localhost 以外，必須先設計 TLS、可信 reverse proxy、網路邊界與持久管理員密碼流程。
+Container 要把 `M365_DATA_DIR` 指到可寫、會保留的資料卷。`Dockerfile` 只是安全建置基礎，不是任何環境都能直接套用的 Production 設定。
 
-Container / host 部署應把 `M365_DATA_DIR` 指向可寫、持久化的資料卷。未指定 `M365_DEBUG_LOG` 時，診斷摘要會使用 data/settings directory 下的 `debug-logs.json`。
+管理密碼的第一次啟用只信任真正的 loopback。Container bridge 或 NAT 不會自動被當成本機。若要讓別台電腦連線，先讀[部署與反向代理](deployment.md)。
 
-## 下一步
+## 卡住時先看
 
-- API / 架構：[`architecture.md`](architecture.md)
-- Runtime setting keys：[`runtime-settings.md`](runtime-settings.md)
-- Hermes / Hindsight：[`hermes-hindsight.md`](hermes-hindsight.md)
-- Production 原則：[`deployment.md`](deployment.md)
-- 安全：[`../../SECURITY.md`](../../SECURITY.md)
+| 現象 | 先確認 |
+|---|---|
+| 無法開啟管理頁 | 程序仍在執行，且網址是 `127.0.0.1:4141` |
+| 登入回 403 | request 是否只有一個正確的 `Origin`，反向代理設定是否可信 |
+| 一次性密碼不能再用 | 這是預期行為；請用換好的正式密碼 |
+| API 回 401 | `Authorization: Bearer ...` 是否使用有效 API key |
+| Microsoft 登入未完成 | 回到管理頁看狀態；不要把 callback、token 或錯誤全文貼到公開紀錄 |
+
+## 下一頁
+
+- 想了解資料怎麼走：[`architecture.md`](architecture.md)
+- 想接 Hermes / Hindsight：[`hermes-hindsight.md`](hermes-hindsight.md)
+- 想部署：[`deployment.md`](deployment.md)
+- 想查設定：[`runtime-settings.md`](runtime-settings.md)

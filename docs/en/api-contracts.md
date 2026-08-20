@@ -1,16 +1,30 @@
-# API contract reference
+# API contracts
 
-Read this only when changing API compatibility, error mapping, streaming, usage, response format, or tool continuation.
+## Understand it in 30 seconds
 
-## Model surfaces
+Most clients need four rules first:
 
-- `GET /v1/models`
-- `GET /hermes/v1/models`
-- `GET /memory/v1/models`
+1. A stream ends with one usage chunk and then one `[DONE]`.
+2. `128000` is a UTF-16 text-size limit, not a token limit.
+3. A request already sent to Microsoft is never blindly replayed after a network error.
+4. `/v1/chat/completions` is P2 control-plane traffic; real Hermes Agent traffic uses `/hermes/v1`.
 
-`context_window` / `max_input_tokens` are token-oriented catalog metadata and are distinct from `textInputLimitUTF16`.
+The rest of this page is the exact wire contract for implementers and AI agents.
 
-## Streaming usage
+## Common endpoints
+
+| Use | Route |
+|---|---|
+| OpenAI chat control-plane | `POST /v1/chat/completions` |
+| OpenAI Responses | `POST /v1/responses` |
+| Anthropic Messages | `POST /v1/messages` |
+| Hermes Agent | `/hermes/v1/*` |
+| Hindsight Memory | `/memory/v1/*` |
+| Model catalogs | `GET /v1/models`, `GET /hermes/v1/models`, `GET /memory/v1/models` |
+
+Catalog `context_window` / `max_input_tokens` values are token-oriented metadata. They are not `textInputLimitUTF16`.
+
+## Streaming and usage
 
 Request:
 
@@ -18,20 +32,25 @@ Request:
 {"stream":true,"stream_options":{"include_usage":true}}
 ```
 
-Contract:
+Response order:
 
-- ordinary SSE chunks carry `usage:null`;
-- one `choices:[]` usage-only chunk appears before termination;
-- exactly one `[DONE]` terminates the stream;
-- `include_usage=false` adds no usage chunk;
-- `stream_options.include_obfuscation` is recognized-but-ignored;
-- external `stream=false` plus `stream_options` is invalid; an internal adapter that forces non-streaming mode must clear stream-only options first.
+1. Ordinary SSE chunks carry `usage:null`.
+2. Exactly one `choices:[]` usage-only chunk appears before the end.
+3. Exactly one `[DONE]` appears last.
 
-Usage fields use `prompt_tokens` / `completion_tokens`. Sidecar estimates carry provenance such as `m365.usage_source`, `usage_values_are_estimates=true`, and `usage_estimate_scope=visible_request_and_completion`.
+`include_usage=false` adds no usage chunk. `stream_options.include_obfuscation` is recognized but ignored. An external request with `stream=false` plus `stream_options` is invalid. An internal adapter forcing non-stream mode must first remove stream-only fields.
 
-## Caller-text overflow
+Usage uses `prompt_tokens` / `completion_tokens`. Sidecar estimates are marked with:
 
-Auxiliary `/v1/chat/completions` and the other generic compatibility surfaces preserve:
+```text
+m365.usage_source
+usage_values_are_estimates=true
+usage_estimate_scope=visible_request_and_completion
+```
+
+## Oversized text and exhausted tool rounds
+
+Generic compatibility endpoints return:
 
 ```text
 HTTP 400
@@ -42,11 +61,9 @@ received=<actual>
 retryable_after_reduction=true
 ```
 
-Hermes / Memory compatibility surfaces provide consumer-recognizable `context_length_exceeded` / `input is too long` recovery signals while preserving the real UTF-16 metadata. Do not describe this as a token hard limit.
+Hermes / Memory also return consumer-readable `context_length_exceeded` / `input is too long` signals while preserving the real UTF-16 metadata.
 
-## Tool-round terminal contract
-
-Exhausting the profile ceiling returns terminal HTTP `409` with no automatic replay:
+Exhausting tool rounds returns terminal HTTP `409` and is not replayed:
 
 ```text
 code=tool_round_limit
@@ -59,64 +76,78 @@ retryable=false
 recommended_action=<consumer guidance>
 ```
 
-## Router-repair overflow
+If the router-repair input itself is too large, processing stops before a second upstream call with `code=tool_router_repair_input_too_large` and `limit_type=repair_prompt_utf16`. Large structured arguments are never truncated and guessed.
 
-If bounded repair input itself exceeds the caller-text budget, fail closed before a second upstream call. The error uses `tool_router_repair_input_too_large` / `limit_type=repair_prompt_utf16`; do not truncate large structured arguments and continue with a guessed repair.
+## Tools and structured output
 
-## Tool identity
+- Multiple calls are allowed only when every selectable tool has `annotations.readOnlyHint=true` and no mutation/destructive signal. `tool_choice` is part of the selectable set.
+- `tool_calls[].id` must exactly match the later `tool_call_id`.
+- `arguments` cannot be cut mid-value or have facts invented during transport, repair, or checkpoint handling.
+- Internal `calls/answer` envelopes are not public API. Only a strict direct-answer shape may be unwrapped at the final boundary.
+- `response_format` / `json_schema` is a structured-output contract. Ordinary JSON is not stripped merely because it resembles a router envelope; invalid internal envelopes fail closed.
 
-- Parallel caller calls above one are available only when every selectable tool explicitly carries `annotations.readOnlyHint=true` and no mutation / destructive signal; `tool_choice` is part of the selectable-set decision.
-- `tool_calls[].id` must match the later `tool_call_id`.
-- `arguments` must not be truncated or regenerated with facts absent from the original candidate during transport / repair / checkpoint handling.
-- The internal `calls/answer` router envelope (for example `{"calls":[],"answer":"..."}`) is not a public API contract; only a strict direct-answer envelope may be unwrapped at the final-answer boundary.
+Router, repair, and required-tool retry scratch phases each use a new `ConversationId` / `SessionId`. Private mode reapplies `disableMemory=1` to every new WebSocket, but that field is not a context reset.
 
-When router / repair / required-tool retry uses scratch ChatHub phases, each phase receives a fresh `ConversationId` / `SessionId`. Private mode still reapplies `disableMemory=1` to each new WebSocket, but that flag is not itself a context reset.
+## `/v1/chat/completions` control plane
 
-## Response format
+This route is fixed P2 auxiliary/control-plane traffic:
 
-`response_format` / `json_schema` define structured-output contracts. Ordinary JSON is not heuristically stripped merely because it resembles an internal router envelope; invalid internal envelopes fail closed.
+- It uses the shared scheduler, breaker, and `MEMORY_YIELD`; P0 users and eligible P1 Memory take priority.
+- P2 concurrency is 1 and shared total concurrency is 2.
+- Checkpoints use `Namespace=auxiliary-control-plane`, `ForceNew=true`, and `Untracked=true`.
+- OpenAI message/tool validation, text policy, and tool safety remain active.
+- Hermes Agent `EVIDENCE_LEDGER` and final-answer completion rules are not injected.
+- Structured `done` verdicts in non-stream or SSE responses cannot be rewritten by `completionEvidenceAllows()`.
 
-## `/v1/chat/completions` control-plane contract
+Hermes / Atlas execution still uses `/hermes/v1`. `profile=generic` in `tool_round_limit` remains only for wire/runtime compatibility; it does not make `/v1/chat/completions` user-facing chat.
 
-From Issue #76 onward, `POST /v1/chat/completions` is the auxiliary / control-plane surface. It shares the OpenAI-compatible request/response shape with `/hermes/v1` but uses a different execution policy:
+Forward-compatible extension observability may record field names or counts, never sensitive payload values.
 
-- shared-account scheduler class is fixed at P2; eligible P1 Memory outranks it while P0 external-user traffic remains highest;
-- P2 hard ceiling 1, shared hard ceiling 2, breaker/cooldown, and `MEMORY_YIELD` behavior reuse the existing scheduler;
-- checkpoint control is `Namespace=auxiliary-control-plane`, `ForceNew=true`, `Untracked=true`;
-- OpenAI message/tool protocol validation, caller-text policy, and tool-catalog / tool-call safety remain in force;
-- Agent `EVIDENCE_LEDGER` / final-answer completion rules are not injected, and Hermes historical completed/pending tool ledgers are not used for control-plane verdict deduplication or success authorization;
-- structured `done` verdicts in both non-stream and SSE paths must not be rewritten by `completionEvidenceAllows()` into `unconfirmedToolOutcomeResponse`.
+## Queues, 429, and retry
 
-This surface does not relax Hermes Agent safety rules; Hermes / Atlas execution continues to use `/hermes/v1`. The `profile=generic` value in `tool_round_limit` errors remains a wire/runtime compatibility identity for now and does not mean `/v1/chat/completions` is still user-facing generic chat.
+Local queue full/timeout errors use HTTP `503` with `Retry-After`. They are different from Microsoft 429 and do not make every 5xx safe to replay.
 
-## Extension observability
+A Microsoft hard 429 or verified ChatHub soft-throttle is normalized to HTTP `429 rate_limit_error`. A non-empty `item.throttling` may be ordinary quota/metering metadata and is not enough to open the breaker. A valid upstream `Retry-After` is preserved; a soft throttle without one uses the first 1125-second level. Once throttling is confirmed, repair, re-ask, and required-tool/router retry stop.
 
-Forward-compatible ingress may expose existing diagnostic metadata for preserved extensions or ignored parameters, but diagnostics must not leak sensitive payload values.
+Breaker states:
 
-## Admission / retry signaling
+```text
+CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
+```
 
-Retryable interactive queue saturation / timeout uses HTTP `503` with `Retry-After`. This is distinct from Microsoft upstream 429 cooldown; callers must not treat every 5xx as permission to blindly replay a ChatHub request whose payload may already have been sent.
+- `OPEN` expiry only makes a probe possible; it does not close the breaker.
+- Only one external-user request may probe. Background Hermes, Goal Judge, and Memory cannot.
+- A throttled probe returns to `OPEN` at a higher cooldown.
+- A successful probe enters `RECOVERY`.
+- `RECOVERY` keeps shared concurrency at 1 and still blocks Memory upstream.
+- After a successful request, the Gateway observes 60 quiet seconds. With no running or queued work, the next admission/snapshot returns to `CLOSED` automatically.
 
-Microsoft hard 429 and verified ChatHub soft-throttle notices are both normalized to canonical HTTP `429 rate_limit_error`. A non-empty ChatHub `item.throttling` object is **not** sufficient evidence of a throttle: normal successful turns also carry per-conversation quota/metering metadata such as message counters and metering fields. The Gateway preserves that metadata for observability, but opens the breaker only on an actual hard 429 or a verified soft-throttle notice/message shape. A valid upstream `Retry-After` is preserved; when a soft throttle provides none, the first shared-breaker cooldown is `1125` seconds rather than a fast `1s` replay. Once throttle is established, `response_format` repair/reask and required-tool/router retry stop instead of treating throttle prose as malformed model output.
+Memory admission errors:
 
-The shared breaker transitions through `CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY`. Expiry of `OPEN` only permits one controlled external-user interactive probe; autonomous Hermes continuations and Memory backlog cannot auto-probe. A throttled probe advances to the next level from the latest throttle timestamp; a successful probe only enters `RECOVERY` and does not release the Memory backlog. RECOVERY downgrade criteria are decided by controlled live qualification.
+| HTTP / code | Meaning |
+|---|---|
+| `503 interactive_capacity_busy` | user traffic/capacity has not yielded |
+| `503 memory_capacity_deferred` | active 1 + waiting 8 is already full |
+| `429 upstream_throttle` + `Retry-After` | shared breaker is not `CLOSED`; defer until reset time |
 
-`/memory/v1` admission failures distinguish local capacity from an already-open shared breaker:
+A projected 429 never touches Microsoft and does not increment breaker counters or levels.
 
-- HTTP `503` + `interactive_capacity_busy`: interactive traffic or holdoff has not yielded capacity yet;
-- HTTP `503` + `memory_capacity_deferred`: the Gateway already has active 1 + waiting 8 Memory work, so additional requests fail fast;
-- HTTP `429` + `upstream_throttle` + `Retry-After`: the shared breaker is already not `CLOSED`, so the request is immediately deferred and no ChatHub round is sent. This is a caller-facing projection of the existing breaker state, **not a new Microsoft throttle event**; it does not increment breaker/429 counters or advance the cooldown level. Hindsight v0.9.x can use the long `Retry-After` to defer the pending operation until `next_retry_at` instead of burning short retries during the cooldown.
+## Hindsight webhook
 
-### Hindsight durable-event callback
+`POST /internal/hindsight/webhook` uses machine authentication, not an admin session or caller API key. Runtime must set `M365_HINDSIGHT_WEBHOOK_SECRET`.
 
-`POST /internal/hindsight/webhook` is a machine-auth callback and does not use an admin session or caller API key. Runtime must configure `M365_HINDSIGHT_WEBHOOK_SECRET`; Hindsight signs the raw JSON body with HMAC-SHA256 and sends `X-Hindsight-Signature: sha256=<hex>`. An optional `X-Hindsight-Event` header must match the payload `event` when present.
+Hindsight computes HMAC-SHA256 over the raw JSON body and sends:
 
-The Gateway accepts only `retain.completed` and `consolidation.completed`, with `operation_id` and `timestamp` required. `retain.completed` may pass an active milestone durability barrier; `consolidation.completed` is observability only. Webhook delivery is at-least-once, so `event + operation_id` is deduplicated with bounded state. The secret is never returned through the management UI, logs, or error bodies.
+```text
+X-Hindsight-Signature: sha256=<hex>
+```
 
-### Controlled recovery completion
+Optional `X-Hindsight-Event`, when present, must equal payload `event`. The Gateway accepts only `retain.completed` and `consolidation.completed`, with required `operation_id` / `timestamp`. Only `retain.completed` can pass the milestone durability barrier; `consolidation.completed` is observability only. Delivery is at-least-once, so bounded deduplication uses `event + operation_id`. The secret never appears in UI, logs, or error bodies.
 
-`POST /api/admin/traffic/recovery` with `{"action":"complete"}` is an administrator action valid only while the shared breaker is in `RECOVERY`; other states return `409 recovery_not_ready`. This is not an automatic recovery policy and must not bypass qualification. It exists so an operator can explicitly close `RECOVERY` back to `CLOSED` and reset the cooldown level after controlled live qualification succeeds.
+## Manual recovery and WebSocket retry
 
-Bounded ChatHub WebSocket retry covers only transient dial / HTTP-upgrade failures before the payload is sent: HTTP `500` / `502` / `503` / `504` and transient network dial failures with no HTTP response. Once a payload may have been sent, do not apply the same rule as a blind replay policy.
+While the shared breaker is in `RECOVERY`, an administrator may call `POST /api/admin/traffic/recovery` with `{"action":"complete"}`. Other states return `409 recovery_not_ready`. `GET /api/admin/traffic` reports observation time and whether the last completion was `manual` or `automatic`.
 
-Current verification status: [`compatibility.md`](compatibility.md).
+ChatHub WebSocket retry is bounded to pre-payload HTTP `500` / `502` / `503` / `504` upgrade failures and transient network dial errors with no HTTP response. Once the payload is sent, the same retry rule cannot be used.
+
+See [`compatibility.md`](compatibility.md) for current verification status.

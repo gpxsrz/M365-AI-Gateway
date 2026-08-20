@@ -1,69 +1,47 @@
-# Runtime / management-UI setting reference
+# Runtime and management settings
 
-Read this only when changing the setting schema, management UI, environment-variable mapping, or consumer profiles.
+## Understand it in 30 seconds
 
-Management-setting surface: `GET /api/admin/settings` / `PUT /api/admin/settings`. `settings.json` is the persistence layer; it does not imply file precedence for every field.
+Most users should use the management page and leave environment variables alone. The management APIs are:
 
-## Current setting groups
+- `GET /api/admin/settings`: read current settings.
+- `PUT /api/admin/settings`: update only the fields you send.
+- `GET /api/admin/traffic`: inspect queues, throttling, and recovery.
 
-### Chat / compatibility
+The UI must show both the effective value and its source. A disabled or environment-controlled field must not pretend that a saved UI value won. Secrets are never echoed in plaintext.
 
-- `chatMode`
-- `hermesCompatibilityEnabled`
-- `memoryCompatibilityEnabled`
+## Which setting group do I need?
 
-### Account admission / 429
+| Need | Settings |
+|---|---|
+| Compatibility modes | `chatMode`, `hermesCompatibilityEnabled`, `memoryCompatibilityEnabled` |
+| Ordinary waiting | `interactiveQueueTimeoutSeconds`, `memoryQueueTimeoutSeconds`, `chatTimeoutSeconds` |
+| Tools | `toolPlanningMode`, `maxToolCallsPerTurn`, `maxToolRounds`, `hermesMaxToolRounds` |
+| Text and output size | `textInputLimitUTF16`, `contextWindow`, `maxOutputTokens` |
+| Models | `modelMappings`, `optionalModelCapabilities` |
+| Process and files | `listenAddress`, `configPath`, `tokenCachePath`, `sessionCachePath`, `debugLogPath` |
+| Network and OAuth | `outboundProxy`, `clientId`, `authority`, `redirectUri`, `scope` |
 
-- `interactiveMaxConcurrent`
-- `interactiveQueueTimeoutSeconds`
-- `memoryMaxConcurrent`
-- `memoryQueueTimeoutSeconds`
-- `interactivePriorityHoldoffSeconds`
-- `memoryBackoffInitialSeconds` (legacy compatibility; no longer controls the #71 shared breaker)
-- `memoryBackoffMaxSeconds` (legacy compatibility; no longer controls the #71 shared breaker)
+## First startup
 
-The #71 shared-account breaker uses the fixed cooldown ladder `1125 / 2250 / 4500 / 9000 / 18000` seconds rather than runtime-tunable exponential backoff. `GET /api/admin/settings` exposes the full scheduler projection under `compatibilityTraffic`: `trafficMode`, interactive/external/autonomous in-flight/waiting counts, `effectiveHermesConcurrency`, Memory pending/oldest age, milestone yield state/deadline/outcome/duration, latest retain/consolidation, hard/soft throttle timestamps, streak/cooldown remaining, suppressed reask count, and `sharedCircuitState / sharedCooldownLevel / sharedCooldownUntil`.
+1. Point `M365_DATA_DIR` to writable persistent storage.
+2. Optionally use one-time `M365_ADMIN_PASSWORD` for the first login.
+3. Replace it with a persistent administrator password after the first successful login.
+4. If `M365_DEBUG_LOG` is set, diagnostics use that path; otherwise they use `debug-logs.json` under the data directory.
 
-From #75 onward, effective same-account admission is hard-capped at shared total `<=2`, Memory `<=1`, and P2 `<=1`, with user-originated P0 > eligible Memory P1 > P2 autonomous/control-plane. P2 includes background Hermes/Atlas and, from #76 onward, `/v1/chat/completions` auxiliary / control-plane requests; this is not a new tunable class and does not add another queue. `interactiveMaxConcurrent` / `memoryMaxConcurrent` remain on the settings/API compatibility surface but cannot raise those hard ceilings. `interactivePriorityHoldoffSeconds` is likewise retained as a legacy compatibility field; ordinary Memory admission no longer waits for that holdoff because priority is enforced directly by the scheduler queue policy. The Memory waiting buffer is fixed at 8 while upstream Memory concurrency remains 1.
+Diagnostic files should use private permissions such as `0600`, atomic replacement, redaction, capacity limits, and TTL cleanup.
 
-The Hindsight durable-event callback uses `M365_HINDSIGHT_WEBHOOK_SECRET` as an HMAC verification runtime environment setting. Its value is sensitive and is not part of management-UI display or handoff evidence.
+## Value precedence
 
-The management UI explicitly labels `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` as legacy compatibility fields and shows the #71 scheduler state. While in `RECOVERY`, it exposes a controlled completion action that should be used only after controlled live qualification passes.
+Settings do not all follow one rule:
 
-### Tools / model policy
+| Class | Effective-value rule |
+|---|---|
+| General runtime, such as chat/image timeout | environment supplies the startup default; a saved `settings.json` field becomes the current effective value |
+| Restart-required, such as listen address, cache paths, OAuth, and proxy | explicit process environment wins; saved value is used only when the environment is absent |
+| Direct override, such as tool-call / tool-round environment fields | process environment always overrides the saved UI value |
 
-- `toolPlanningMode`
-- `textInputLimitUTF16`
-- `maxToolCallsPerTurn`
-- `maxToolRounds`
-- `hermesMaxToolRounds`
-- `contextWindow`
-- `maxOutputTokens`
-- `modelMappings`
-- `optionalModelCapabilities`
-
-### Runtime
-
-- `chatTimeoutSeconds`
-- `imageTimeoutSeconds`
-- `logLevel`
-- `debugLogPath`
-- `listenAddress`
-- `configPath`
-- `tokenCachePath`
-- `sessionCachePath`
-- `outboundProxy`
-
-### OAuth
-
-- `clientId`
-- `authority`
-- `redirectUri`
-- `scope`
-
-## Important environment variables
-
-Common runtime mappings include:
+Common environment variables:
 
 - `M365_CHAT_TIMEOUT_SECONDS`
 - `M365_IMAGE_TIMEOUT_SECONDS`
@@ -73,24 +51,43 @@ Common runtime mappings include:
 - `M365_DATA_DIR`
 - `M365_PUBLIC_ORIGIN`
 
-`M365_READY_TIMEOUT` controls deployment automation and is not an API product setting.
+`M365_READY_TIMEOUT` controls deployment automation, not an API product setting.
 
-## Precedence / UI contract
+## Same-account traffic: fixed hard limits
 
-- General runtime settings such as `chatTimeoutSeconds` and `imageTimeoutSeconds`: environment values provide startup defaults; a value persisted in `settings.json` becomes the current effective value.
-- Restart-required fields such as `listenAddress`, token/session paths, OAuth, and outbound proxy: an explicit process environment value wins; saved values are injected only when the environment does not provide the field.
-- Direct runtime overrides such as `M365_MAX_TOOL_CALLS_PER_TURN` and `M365_MAX_TOOL_ROUNDS`: a process environment value overrides the saved UI value. New overrides in this class should preserve the same source-reporting contract.
-- The management UI should display effective value and source (env / saved file / built-in default).
-- Environment-controlled fields should be locked or clearly marked; saving a UI value must not pretend to override the live environment.
-- Sensitive secrets are never echoed in plaintext.
+One Microsoft account always follows:
 
-## Bootstrap / diagnostic storage
+| Item | Limit / order |
+|---|---|
+| Total running requests | 2 |
+| Memory | 1 |
+| P2 autonomous / control-plane | 1 |
+| Priority | P0 user > P1 Memory > P2 background/control-plane |
+| Memory waiting buffer | 8, FIFO |
 
-- Local first startup may use a one-time `M365_ADMIN_PASSWORD` bootstrap secret; the first successful login should require transition to a persistent administrator password.
-- `M365_DATA_DIR` should point to writable persistent storage.
-- If `M365_DEBUG_LOG` is set, that path is used; otherwise safe diagnostic summaries default to `debug-logs.json` under the settings/data directory.
-- Diagnostic files should use private-file semantics such as `0600`, atomic replacement, and the existing redaction / capacity / TTL policy.
+`interactiveMaxConcurrent`, `memoryMaxConcurrent`, and `interactivePriorityHoldoffSeconds` remain for old API compatibility. They cannot raise these hard limits. Ordinary Memory priority is enforced directly by queue policy.
 
-## Current profile baselines
+`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` are also compatibility-only. The shared breaker uses a fixed cooldown ladder:
 
-Read [`hermes-hindsight.md`](hermes-hindsight.md) for current Hermes / Hindsight values instead of duplicating a second drift-prone baseline here.
+```text
+1125 → 2250 → 4500 → 9000 → 18000 seconds
+```
+
+A successful probe is followed by a separate fixed 60-second quiet observation. This is not the first cooldown level and adds no setting. `compatibilityTraffic` reports `recoveryObservationSeconds`, `recoveryObservationRemainingSeconds`, `lastRecoveryMode`, `lastRecoveryReason`, and `lastRecoveryAt`.
+
+During recovery an administrator may still call:
+
+```http
+POST /api/admin/traffic/recovery
+Content-Type: application/json
+
+{"action":"complete"}
+```
+
+This is a manual fallback. Automatic completion still requires a successful probe, quiet observation, and no conflicting traffic.
+
+## Hindsight webhook secret
+
+`M365_HINDSIGHT_WEBHOOK_SECRET` verifies Hindsight callback HMACs. It is secret and never appears in the management UI, handoff records, logs, or error bodies.
+
+The single source for complete Hermes / Hindsight baselines is [`hermes-hindsight.md`](hermes-hindsight.md).

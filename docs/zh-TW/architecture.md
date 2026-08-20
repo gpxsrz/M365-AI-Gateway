@@ -1,71 +1,72 @@
-# 架構與產品邊界
+# 架構與資料邊界
 
-這份文件只回答「M365 AI Gateway 現在是什麼、請求怎麼走、資料邊界在哪」。Consumer-specific 設定、部署與歷史 evidence 請讀其他主題文件。
+## 30 秒看懂
 
-## 核心模型
+Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 
-- 一個 Sidecar 執行個體對應一個 Microsoft 365 帳號。
-- Gateway 負責把 OpenAI / Anthropic / MCP 相容請求投影到 Microsoft 365 Copilot ChatHub，並為 Hermes / Hindsight 等不同工作負載提供 profile、checkpoint 與共享帳號 admission control。
-- 長期對話歷史與長期記憶由 caller / Hermes / Hindsight 管理；Sidecar 只保留必要的短期 transport continuation state。
-- 公開 `gpxsrz/M365-AI-Gateway` `main` 是本專案唯一開發主線。
-- 本專案是獨立社群專案，不是 Microsoft 官方產品；`m365-native` 保留作 runtime compatibility identity。
+```text
+你的工具 → M365 AI Gateway → Microsoft 365 Copilot
+```
 
-### 相容識別符
+它做四件事：轉換 API 格式、管理短期續接、保護檔案、避免同一帳號被太多工作同時壓垮。
 
-Public brand 更名不要求破壞既有 runtime / protocol identity。`m365-native` binary、Go module、設定目錄，以及已部署的 `m365-copilot2api` Compose project / path、MCP server name / URN、artifact upstream client-version 等識別符可維持原值，除非另有獨立相容性遷移與實測證據。這些 legacy identifiers 不代表目前產品名稱。
+## 最重要的邊界
 
-## 主要介面
+- 一個執行中的 Gateway 只服務一個 Microsoft 365 帳號。
+- 長期對話與記憶由呼叫端、Hermes 或 Hindsight 保存。Gateway 只留必要的短期續接資料。
+- Gateway 是 Rust 程式。`m365-native` 舊名稱為了相容性保留，不代表產品仍使用舊品牌。
+- 這是社群專案，不是 Microsoft 官方產品。
 
-| Surface | 用途 |
+## 入口怎麼選
+
+| 你要做的事 | 入口 | 白話說明 |
+|---|---|---|
+| Goal Judge 等輔助／控制工作 | `/v1/chat/completions` | 每次都是新的，不沿用 Agent 的執行證據 |
+| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | 會保存工具續接與完成證據 |
+| Hindsight Memory | `/memory/v1/chat/completions` | 走背景 Memory 優先順序 |
+| OpenAI Responses 格式 | `/v1/responses` | 把 Responses request 轉到同一聊天核心 |
+| Anthropic Messages 格式 | `/v1/messages` | 回傳 Anthropic 形狀；串流是完成後再轉成事件 |
+| 圖片生成 | `/v1/images/generations` | 使用 Microsoft 圖片能力並保護結果網址 |
+| MCP | `/v1/mcp` | 讓 MCP client 列出與呼叫 Gateway 工具 |
+
+各 profile 的模型清單分別在 `/v1/models`、`/hermes/v1/models`、`/memory/v1/models`。
+
+## 一筆請求怎麼走
+
+1. 驗證管理 session 或 API key。
+2. 檢查輸入大小、角色與工具資料。
+3. 依「使用者、Memory、背景 Agent」安排共享帳號的順序。
+4. 必要時讀取短期 checkpoint，接回上一輪工具結果。
+5. 建立新的 Microsoft ChatHub 連線；Private mode 每次都重新帶上 `disableMemory=1`。
+6. 把 Microsoft 回應轉成呼叫端要求的格式。
+7. 只有看到完整結束證據，才宣告完成並保存可續接狀態。
+
+一般 `/v1/chat/completions` 不會沿用 Hermes 的執行紀錄，也不會把合法的 `done` 或 `verified` 判定改寫成「尚未確認」。
+
+## 串流與工具
+
+- 串流中的半句話不是完成；最後事件才算。
+- 要求 usage 時，最後會在唯一的 `[DONE]` 前多一個只有 usage 的 chunk。
+- 工具續接必須保留角色、tool call ID 與 arguments，不能猜測重建。
+- 多工具平行呼叫只允許明確標示為唯讀的工具；有修改風險時降回一次一個。
+
+## 資料不會混在一起
+
+| 資料 | Gateway 的處理方式 |
 |---|---|
-| `/v1/chat/completions` | auxiliary / control-plane OpenAI-compatible chat；ForceNew / Untracked、P2 admission，不套用 Agent execution-evidence / completion guard |
-| `/v1/models` | 一般 model catalog |
-| `/hermes/v1/chat/completions` | Hermes / Atlas Agent 執行面；checkpoint、tool continuation、execution-evidence / completion guard |
-| `/hermes/v1/models` | Hermes profile model catalog |
-| `/memory/v1/chat/completions` | Hindsight / Memory Provider profile |
-| `/memory/v1/models` | Memory profile model catalog |
-| `/v1/responses` | OpenAI Responses-shaped compatibility |
-| `/v1/messages` | Anthropic-shaped compatibility |
-| `/v1/mcp` | MCP Streamable HTTP |
-| `/v1/mcp/sse` + `/v1/mcp/message` | legacy MCP SSE transport |
+| 一般聊天 | Private mode 要求不建立一般歷史，但不保證 Microsoft 零保留 |
+| 文件與圖片 | 可能使用 OneDrive／SharePoint 暫存，和聊天歷史是不同邊界 |
+| Code Interpreter 檔案 | 先由 Gateway 以已登入狀態取回，再存入本機私有區域 |
+| 下載網址 | 對外只給短效 capability URL，不直接洩漏 Microsoft 暫時網址 |
+| Checkpoint | 只保存續接需要的摘要與識別，不保存完整私密內容 |
 
-## Request lifecycle
+## 兩種常被混淆的大小
 
-`/hermes/v1` Agent request 會依 profile 經過 caller ingress validation、text policy、P0/P2 admission、必要的 tool routing / checkpoint continuation，再建立 ChatHub transport。`/memory/v1` 走獨立 P1 Memory admission。`/v1/chat/completions` 則是 auxiliary / control-plane surface：保留協議合法性、text policy、router/tool safety 與 shared-account admission，但不把 Hermes/Atlas 的歷史 execution ledger 當成控制面 LLM 的完成證據，也不把合法的 `done` / `verified` 結構化 verdict 改寫成 Agent 的 unconfirmed-success 文案。Private mode 仍會在每條新 ChatHub WebSocket 重套 `disableMemory=1`。
+`textInputLimitUTF16=128000` 是送出文字的長度上限，用 UTF-16 單位計算。模型的 context window 是 token 上限。兩者不是同一個數字，也不能直接互換。
 
-`/v1/chat/completions` 目前定位為 P2。它不能搶過 eligible P1 Memory，也不能成為 breaker half-open probe；若遇到 live `MEMORY_YIELD`，沿用 autonomous P2 的既有 barrier / queue 規則。它採 `ForceNew + Untracked`，不建立可跨 request 延續的 Sidecar transport checkpoint。
+## 需要更多細節時
 
-Tool-call continuation 必須保留角色、內容、tool call ID 與 arguments identity。內部 router / repair / final-answer phase 不得靠同一個 scratch conversation 偷帶狀態；它們的 conversation boundary 由程式明確控制。
-
-## Streaming
-
-- SSE partial event 不等於完成；terminal evidence 才能結束 response。
-- `stream_options.include_usage=true` 時，一般 chunk 維持 `usage:null`，最後在唯一 `[DONE]` 前送一個 usage-only chunk。
-- 內部 adapter 若暫時改成 non-stream，stream-only 欄位不得被帶入內部 non-stream request。
-
-## Caller tools 與 Microsoft native tools
-
-- Caller tools 與 Microsoft native capabilities 是不同 ownership boundary。
-- `maxToolCallsPerTurn` 是 ceiling，不代表每一輪都能平行呼叫相同數量。
-- 只有當本輪所有可選 caller tools 都明確 read-only 且沒有 destructive / mutation 訊號時，才可開放大於 1 的平行 caller tool call。
-- 一個 assistant tool-call turn 不論包含幾個合法平行 calls，都只算 1 個 tool round。
-
-## 文字與 token 是不同限制
-
-`textInputLimitUTF16=128000` 是 caller outbound text 的 Web 相容政策，單位是 UTF-16 code units；model `context_window`、Hermes compression 與 usage token 都是 token-oriented 概念，不能直接用同一個數字互換。
-
-## 資料邊界
-
-- `disableMemory=1` 主要避免一般 chat history，不代表零保留。
-- 一般文件、圖片與 Code Interpreter artifact 使用不同 transport / storage boundary。
-- OneDrive / SharePoint staging side effect 不等於一般聊天歷史。
-- Protected upstream artifact 需由 Sidecar 以已登入身分擷取後，物化到本機私有儲存，再提供短期下載能力；不得把受保護的 Microsoft 暫時 URL 直接交給 caller。
-
-## 下一份該讀什麼
-
+- 精確 request、stream 與錯誤：[`api-contracts.md`](api-contracts.md)
 - Hermes / Hindsight：[`hermes-hindsight.md`](hermes-hindsight.md)
-- 部署：[`deployment.md`](deployment.md)
-- 驗證狀態：[`compatibility.md`](compatibility.md)
-- 已知限制：[`known-limitations.md`](known-limitations.md)
-- 精確協定：[`api-contracts.md`](api-contracts.md)
-- 設定鍵：[`runtime-settings.md`](runtime-settings.md)
+- 設定：[`runtime-settings.md`](runtime-settings.md)
+- 安全與保留限制：[`../../SECURITY.md`](../../SECURITY.md)

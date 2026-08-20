@@ -1,14 +1,21 @@
-# 部署、Reverse Proxy 與 runtime identity
+# 部署與回復
 
-這份文件只描述公開可重現的部署原則。私人 NAS hostname、路徑、credential 與正式 Production 操作 SOP 不放在 repo；實際維運使用本機 `m365-ops` skill。
+## 30 秒看懂
 
-## Source of truth
+部署不是只換一個執行檔。請把 Rust 執行檔和三個管理網頁視為同一包；它們要來自同一個公開 commit，也要能一起回復。
 
-Deployment candidate 必須綁定公開 `main` 的 exact commit / tree，並先通過該 exact head 的 CI。NAS、VM、dirty worktree 或未公開 commit 都不能成為部署權威。
+只有這些條件都成立，才算部署完成：
 
-## 一個 Production deployment 是一組 runtime artifact
+1. GitHub `main` 已讀回正確 commit，該 commit 的 CI 全綠。
+2. 上線前已保存完整舊版本，失敗時可以整包回復。
+3. 上線後的檔案、服務狀態與健康檢查都正確。
+4. Hermes、Hindsight 或其他未授權服務沒有被改動。
 
-Runtime 不只包含 binary。Server 會從工作目錄讀取：
+本頁只放可公開重現的原則。NAS 主機名、Production 路徑、帳密與實際操作步驟不進 repo；維運時使用本機 `m365-ops` skill。
+
+## 要部署哪些檔案
+
+目前的完整 runtime set 是：
 
 ```text
 m365-native
@@ -17,44 +24,63 @@ web/login.html
 web/debug.html
 ```
 
-因此 binary 與 Web assets 必須來自同一 intended commit，在同一部署視窗切換、同一 rollback set 還原，並在部署後逐一做 identity readback。
+Rust 也會把網頁內容編進 binary，Docker image 仍會帶上 `web/`。部署工具必須以同一個 commit 建出整包內容，不能把不同版本混在一起。
 
-### Release-unit automation
+## 安全部署順序
 
-`scripts/deploy-nas-production.sh` 將 binary 與固定三個 Web assets 打包成 deterministic release archive；manifest 綁定 exact commit、tree 與四個檔案的 SHA-256。部署端會先驗 archive／manifest／payload identity，再把四個 runtime 檔案納入同一 snapshot、同一停機視窗切換、同一 rollback，最後逐一讀回 SHA。
+1. 固定 public `main` 的 exact commit 與 tree。
+2. 等該 exact head 的 CI 成功。
+3. 建立 candidate，記錄每個檔案的 SHA-256。
+4. 對目前整組 runtime 做 snapshot，先證明可回復。
+5. 在同一個停止服務的視窗切換整組檔案。
+6. 逐一讀回檔案 hash、服務 PID、restart count、listener 與 health probe。
+7. 任一檢查失敗，就回復整組舊檔案，再次驗證服務。
 
-腳本採 non-interactive `sudo -n` privilege path，不接受 password-fed `sudo -S`。缺任一 Web asset、來源是 symlink、archive/hash/manifest 不一致或部署後 identity 不符時都 fail closed。
+NAS、VM、dirty worktree 或尚未公開的 commit 都不是部署權威。
 
-## Snapshot / rollback 原則
+## Repo 內的部署工具
 
-部署前 snapshot 必須涵蓋本次會切換或 mutation 的完整 runtime set。部署失敗時 rollback 也要還原同一組 artifact；只還 binary 而留下新／舊 Web 混搭不是完整 rollback。
+`scripts/deploy-nas-production.sh` 會把上述四個檔案打成可重現的 release archive。Manifest 綁定 exact commit、tree 與各檔案 SHA-256。遠端會先驗 archive、manifest 與 payload，才允許切換。
 
-## Timeout stack
+腳本只接受非互動式 `sudo -n`。以下任一情況都會停止，不會勉強部署：
 
-`chatTimeoutSeconds` 只控制 request 進入 ChatHub 後 Sidecar 等待時間；request 在 admission queue 可能另外等待 `interactiveQueueTimeoutSeconds`。外層 reverse proxy timeout 必須大於這些有效等待層級，否則會先被 proxy 終止。
+- 少任何一個檔案；
+- 來源是 symlink；
+- archive、manifest 或 hash 不一致；
+- 部署後讀回的檔案 identity 不一致。
 
-Proxy timeout 與 `textInputLimitUTF16` 是兩種不同限制：前者是時間，後者是 caller text 的 UTF-16 policy。
+## Timeout 怎麼排
 
-例如 `interactiveQueueTimeoutSeconds=300`、`chatTimeoutSeconds=1800` 時，Sidecar 內層最長等待預算約為 `2100` 秒。此時可讓 Hermes stale detector 約 `2200` 秒、Hermes request timeout 約 `2300` 秒、reverse proxy `proxy_read_timeout` / `proxy_send_timeout` 約 `2400` 秒。這是**層級關係示例**，不是永久固定值；任一層修改後都要重新計算整條 timeout chain。`proxy_connect_timeout` 只控制建立到 Sidecar 的連線，不需要跟 reasoning timeout 一樣長。
+一個請求可能先排隊，再等 Microsoft 回應。因此外層 timeout 必須比內層總等待時間長。
 
-## 設定來源
+例如：
 
-設定 precedence 依欄位類型而定，不應假設「環境變數永遠優先」或「settings.json 永遠優先」。管理 UI 應顯示 effective value 與 source；標示 environment-controlled 的欄位不能被 UI 保存值覆蓋。
+| 等待層 | 範例值 |
+|---|---:|
+| `interactiveQueueTimeoutSeconds` | 300 秒 |
+| `chatTimeoutSeconds` | 1800 秒 |
+| Hermes stale detector | 約 2200 秒 |
+| Hermes request timeout | 約 2300 秒 |
+| reverse proxy read/send timeout | 約 2400 秒 |
 
-## Container image
+這些數字只示範先後關係，不是永久預設值。改任何一層後都要重算。`proxy_connect_timeout` 只管建立連線，不必跟長推理 timeout 一樣久。
 
-Repo `Dockerfile` 會把 binary 與 `web/` 一起放入 image。若 Production 額外 bind-mount `/app`，外部 `/app` 會成為實際 runtime source，因此部署 gate 必須驗證 mount 上的 binary 與 Web assets，而不能只相信 image 內建內容。
+`textInputLimitUTF16` 是文字大小限制，與 timeout 無關。
 
-## 完成條件
+## 設定與 Container
 
-Deployment 完成至少需要：
+不同設定欄位有不同優先來源，不能假設環境變數或 `settings.json` 永遠勝出。管理頁應顯示目前生效值與來源；標成 environment-controlled 的值不能被管理頁覆蓋。
 
-1. public exact commit / tree 已讀回；
-2. exact-head CI success；
-3. candidate artifact identity 固定；
-4. snapshot / rollback set 已驗證；
-5. Production binary + Web identity 等於 intended source；
-6. service state / restart count / health probe 正常；
-7. 未授權的 Hermes / Hindsight /其他 runtime identity 沒漂移。
+Repo `Dockerfile` 同時放入 binary 與 `web/`。如果 Production 把外部目錄 bind-mount 到 `/app`，真正執行的是 mount 內的檔案；驗收時要查 mount，不能只看 image。
 
-真正的 Production mutation 細節不在本文件，請使用私人 operations skill。
+## 可機械檢查的完成表
+
+| 檢查 | 必須看到 |
+|---|---|
+| 公開來源 | exact commit / tree 與 intended source 相同 |
+| CI | exact-head 成功 |
+| Candidate | artifact identity 已固定 |
+| 回復 | snapshot 涵蓋完整 runtime set |
+| Production | binary 與 Web identity 全部吻合 |
+| 服務 | state、restart count、listener、health 正常 |
+| 邊界 | 未授權 runtime identity 沒有漂移 |

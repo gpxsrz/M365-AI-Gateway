@@ -1,62 +1,73 @@
 # 研究與驗證證據
 
-這份文件只保存 current conclusions 與 evidence 方法，不當操作手冊。舊 Issue 的逐步過程放 `docs/history/` 或 public Git history / Issues。
+## 30 秒看懂
 
-## Evidence 原則
+「測試通過」要說清楚是哪一種測試：
 
-- 區分 deterministic test、Production live evidence、historical canary 與 inference。
-- partial success 不寫成完整官方等價保證。
-- source commit、tree、binary、settings、artifact、evidence payload 應以 immutable identity 綁定。
-- Production mutation 後必須從目標表面獨立 readback，不能只相信執行命令 exit 0。
+| 等級 | 能證明什麼 | 不能推定什麼 |
+|---|---|---|
+| Deterministic test | 程式在固定輸入下遵守契約 | 真實 Microsoft rollout 一定相同 |
+| 本機 runtime smoke | Release binary 能啟動並完成本機流程 | OAuth、ChatHub 或 Production 已通過 |
+| Live canary | 某帳號、某時間、某 route 的真實行為 | 永久支援、所有帳號都相同 |
+| Production readback | 指定 commit/artifact 確實在指定 runtime 運作 | 其他 remote 或備份也已同步 |
+| Inference | 根據證據最合理的判斷 | 已直接觀察到的事實 |
 
-## 已建立的重要結論
+任何 PASS 都要綁定 source commit、tree、binary、settings、artifact 與 evidence identity。執行命令 exit 0 不算完成；要從目標表面獨立讀回。
 
-### Text / checkpoint
+## 現在採用的結論
 
-- Web editor 的 `128000` UTF-16 boundary 已有直接相容證據；Sidecar current policy 使用相同量級，但這不是 model token context。
-- checkpoint reuse 以 strict history-prefix identity 為原則；tool call ID / arguments / role 不得被無意重綁。
+### 文字與 checkpoint
+
+- `128000` UTF-16 boundary 有 Web 相容證據，但不是 model token context。
+- Checkpoint reuse 只接受嚴格相同的 history prefix；tool call ID、arguments 與 role 不能被偷偷重綁。
 
 ### Private mode
 
-- 每條新 ChatHub WebSocket 重套 `disableMemory=1` 對 no-ordinary-history outcome 有直接作用。
-- no-history 不等於沒有 OneDrive / SharePoint staging 或 artifact side effect。
+- 每條新 ChatHub WebSocket 都重送 `disableMemory=1`，可避免一般聊天歷史。
+- 這不等於沒有 OneDrive / SharePoint 暫存或 artifact side effect。
 
-### Files / Vision / Code Interpreter
+### 檔案、圖片與 Code Interpreter
 
-- 一般文件先取得 Microsoft file identity / annotation，再進 ChatHub grounding。
-- 圖片走不同 transport，不能把文件與 Vision path 硬合併。
-- Code Interpreter 可真實執行 Python 並產生 output-file metadata；protected artifact 由 Sidecar 以登入狀態擷取後物化。
+- 一般文件先取得 Microsoft file identity / annotation，再做 ChatHub grounding。
+- 圖片使用另一條 transport，不能和文件 upload 混成一種流程。
+- Protected artifact 必須由 Gateway 用登入狀態抓回、放進私有暫存，再提供有權限的下載；上游私有 URL 不可先漏出。
+- Rust 已完成本機 transport/security tests；真實 Microsoft file/image/artifact 仍要 live qualification。
 
-### Tools / routing
+### Tools、routing 與串流
 
-- Caller tools 與 native Bing 可在部分情況共存。
-- 多 caller tool ceiling 在 generation 前決定，避免 post-generation truncation 造成 checkpoint / caller state 分叉。
-- Router repair 已移除固定 6000 字元 arguments truncation；超過 UTF-16 budget 時 fail closed。
-- Router / repair / final answer 使用明確 scratch phase boundary，避免 context contamination。
+- 多 tool 上限要在 generation 前決定，不能先生成再截掉，否則 caller 與 checkpoint state 會分叉。
+- Router repair 不再固定截 6000 字元；超過 UTF-16 budget 時停止，不猜內容。
+- Router、repair 與 final-answer phase 使用分開的 scratch conversation。
+- 內部 non-stream adapter 必須移除 `stream_options`；外層 SSE 仍保留一個 usage chunk 與一個 `[DONE]`。
 
-### Streaming #68
+### Hermes 與 Hindsight
 
-`stream_options.include_usage` 被加入正式 request struct 後，舊 buffered adapter 的 `stream=false` 會把 `stream_options` 一起重新 marshal，造成 Sidecar 內部 request 被自己的 external validation 拒絕。修正只清 inner adapter copy 的 stream-only options，外層 SSE usage contract 保留。Regression test 與 Production Hermes two-call tool continuation 均通過。
+- 歷史 80K/41K canary 曾成功，後續長任務支持現在的 64K/41K correctness-first baseline。
+- Hindsight retain/recall/reflect 有過 live PoC；Reflect 現行基線是 40K、retry 1。
+- Memory admission 與 breaker 主要用 deterministic test 驗證，避免刻意對真實帳號製造 429。
 
-### Hermes / Hindsight
+### 部署
 
-- 80K/41K Hermes 歷史 canary 曾成功，但後續長任務證據支持 current 64K/41K correctness-first baseline。
-- Hindsight retain / recall / reflect 有 live PoC；Reflect 40K / retry 1 為 current baseline。
-- Memory admission / 429 policy 主要以 deterministic test 驗證，避免故意對真實帳號製造高併發 throttling。
+Production runtime 曾出現 binary 已更新、三個 Web 檔仍是舊版的 mixed-source 狀態。這是為什麼現在把 binary 與三個 Web assets 綁成同一 release、snapshot、rollback 與 identity readback 單位。詳見 [`deployment.md`](deployment.md)。
 
-### Deployment #69
+### Goal Judge control-plane
 
-Production server 從 filesystem 讀取 `web/index.html`、`web/login.html`、`web/debug.html`。過去曾觀察到 binary 已更新、三個 Web asset 仍停在舊 source 的 mixed-source runtime；這是 #69 的直接 evidence basis。部署 helper 現在已把 binary 與三個 Web assets 綁成同一 deterministic release、rollback 與 identity-readback unit；詳見 [`deployment.md`](deployment.md)。
+歷史 live trace 證明：Goal Judge 經 `/hermes/v1` 時，合法 `done` JSON 曾被 Agent completion-evidence guard 改成自然語言。修正後 Goal Judge 走 P2 `/v1/chat/completions`，使用 ForceNew / Untracked checkpoint policy，保留 scheduler / breaker / `MEMORY_YIELD`，但不注入 Agent evidence ledger。`/hermes/v1` 原本的 completion guard 沒有移除。
 
-### Goal Judge / control-plane #76
+舊 Go implementation、CI、NAS、Production 與 live canary 的 exact identities 是歷史證據，不可直接當成 Rust PASS。Rust 狀態請讀 [`rust-rewrite-parity.md`](rust-rewrite-parity.md)；新的 live／Production 驗證必須重新固定 Rust commit 與 artifact。
 
-2026-08-19 真實 Kanban Goal Judge 失敗最初看起來像 Hermes evidence visibility 問題，但 request trace 與 source readback 證實根因在 Gateway 自己：Judge request 經 `/hermes/v1/chat/completions`，沒有 tool ledger；合法 `done` verdict 命中 Agent success-claim guard 後，被 deterministic 覆寫成 source constant `unconfirmedToolOutcomeResponse`，因此 Hermes 端收到自然語言而不是 JSON。兩次失敗 request 都是 2-message / 0-tool / non-stream、HTTP 200，沒有 429/503 或 transport failure。
+## 證據寫法
 
-#76 的 implementation `9928d0e077925cec6ab1b2085c3c7a8dbc6084ca` 把 `/v1/chat/completions` 重新定位為 P2 auxiliary / control-plane：ForceNew / Untracked、沿用 shared scheduler / breaker / MEMORY_YIELD，但隔離 Agent evidence ledger 與 completion rewrite。Dedicated regressions 覆蓋 non-stream `done` passthrough、SSE `done` passthrough、P2 admission、Memory precedence、MEMORY_YIELD、不建立 checkpoint，以及帶 tools 時不注入 Agent ledger；`/hermes/v1` 的 completion-evidence guard 另有 regression 確認仍在。該 implementation 的 local full validation、exact-head CI `32206768862`、NAS mirror、exact-commit Production deploy 均 PASS；Production binary SHA-256=`3d4ffad62ed5c93e9369459c6ffdbc163b6309cfc99b387824eedfff9d8c3027`，container restart count 0，settings/compose/Web identities unchanged，Hindsight containers healthy。
+一筆可用的驗證紀錄至少回答：
 
-Hermes 0.20.4 default 與 manager profile 都以 named `m365-copilot-control-plane` 重用同一 M365 Gateway、同一 `M365_COPILOT2API_KEY` env credential、同一 `gpt-5.6-reasoning`，只把 auxiliary Goal Judge base route 切到 `/v1`；Gateway PID 未 restart。兩筆實際 Goal Judge canary 分別從 default 與 manager profile 送出，Production trace 都是 `/v1/chat/completions`、2 messages、0 tools、HTTP 200；回傳均為 `verdict=done`、`parse_failed=false`、`transport_failed=false`，約 6.4 秒與 5.3 秒，原本的 non-JSON overwrite 未再出現。
+1. 測的是哪個 source commit / tree？
+2. 從哪條 route、哪個隔離帳號或 runtime 執行？
+3. 輸入、設定與 artifact identity 是什麼？
+4. 預期結果與實際讀回是什麼？
+5. 哪些邊界沒有測？
+6. 是否含 secret 或可重放材料？若有，就不能進 repo。
 
-## 歷史 archive
+## 歷史入口
 
 - Memory Provider Issues #42–#44：[`../history/memory-provider-compatibility-issues-42-44.md`](../history/memory-provider-compatibility-issues-42-44.md)
-- 其他舊 evidence：public Issues 與 Git history；不在 current docs 複製長篇第二份權威。
+- 其他逐步紀錄：[`../history/README.md`](../history/README.md)、public Issues 與 Git history。
