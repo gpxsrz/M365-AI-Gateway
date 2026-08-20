@@ -182,6 +182,53 @@ pub struct Permit {
     finished: bool,
 }
 
+#[derive(Clone, Copy)]
+enum QueueKind {
+    Interactive,
+    Memory,
+}
+
+struct QueueWaiterGuard {
+    controller: Arc<TrafficController>,
+    id: u64,
+    kind: QueueKind,
+    armed: bool,
+}
+
+impl QueueWaiterGuard {
+    fn new(controller: &Arc<TrafficController>, id: u64, kind: QueueKind) -> Self {
+        Self {
+            controller: Arc::clone(controller),
+            id,
+            kind,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QueueWaiterGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .controller
+            .state
+            .lock()
+            .expect("traffic state poisoned");
+        match self.kind {
+            QueueKind::Interactive => state.remove_interactive(self.id),
+            QueueKind::Memory => state.remove_memory(self.id),
+        }
+        drop(state);
+        self.controller.changed.notify_waiters();
+    }
+}
+
 impl TrafficController {
     pub fn new() -> Arc<Self> {
         Self::with_policy(DEFAULT_COOLDOWNS, DEFAULT_RECOVERY_OBSERVATION)
@@ -263,6 +310,7 @@ impl TrafficController {
             }
             id
         };
+        let mut waiter_guard = QueueWaiterGuard::new(self, id, QueueKind::Interactive);
 
         loop {
             let notified = self.changed.notified();
@@ -275,6 +323,7 @@ impl TrafficController {
                 }
                 if state.can_admit_interactive(id, class, now) {
                     state.remove_interactive(id);
+                    waiter_guard.disarm();
                     state.interactive_in_flight += 1;
                     if class.is_external() {
                         state.external_in_flight += 1;
@@ -298,6 +347,7 @@ impl TrafficController {
                             .is_some_and(|yield_state| now < yield_state.deadline))
                 {
                     state.remove_interactive(id);
+                    waiter_guard.disarm();
                     return Err(capacity_error(
                         "interactive_capacity_busy",
                         limits.interactive_queue_timeout,
@@ -346,6 +396,7 @@ impl TrafficController {
                 .push_back(MemoryWaiter { id, queued_at: now });
             id
         };
+        let mut waiter_guard = QueueWaiterGuard::new(self, id, QueueKind::Memory);
 
         loop {
             let notified = self.changed.notified();
@@ -355,10 +406,12 @@ impl TrafficController {
                 state.refresh(now, self.recovery_observation);
                 if state.circuit != CircuitState::Closed {
                     state.remove_memory(id);
+                    waiter_guard.disarm();
                     return Err(state.throttle_error(now, &self.cooldowns));
                 }
                 if state.can_admit_memory(id) {
                     state.remove_memory(id);
+                    waiter_guard.disarm();
                     state.memory_in_flight = 1;
                     if let Some(yield_state) = state.memory_yield.as_mut() {
                         yield_state.active = true;
@@ -372,6 +425,7 @@ impl TrafficController {
                 }
                 if now >= deadline {
                     state.remove_memory(id);
+                    waiter_guard.disarm();
                     return Err(capacity_error(
                         "interactive_capacity_busy",
                         limits.memory_queue_timeout,
@@ -812,6 +866,71 @@ mod tests {
         assert_eq!(controller.snapshot().autonomous_in_flight, 1);
         memory.finish(StatusCode::OK, None);
         autonomous.finish(StatusCode::OK, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_interactive_waiter_is_removed_immediately() {
+        let controller = fast_controller();
+        let active = controller
+            .acquire(WorkloadClass::Autonomous, fast_limits())
+            .await
+            .unwrap();
+        let limits = TrafficLimits {
+            interactive_queue_timeout: Duration::from_secs(5),
+            memory_queue_timeout: Duration::from_secs(5),
+        };
+        let waiting = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.acquire(WorkloadClass::Autonomous, limits).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while controller.snapshot().interactive_waiting != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        waiting.abort();
+        match waiting.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("cancelled interactive waiter unexpectedly completed"),
+        }
+        assert_eq!(controller.snapshot().interactive_waiting, 0);
+        assert_eq!(controller.snapshot().autonomous_waiting, 0);
+        active.finish(StatusCode::OK, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_memory_waiter_is_removed_immediately() {
+        let controller = fast_controller();
+        let active = controller
+            .acquire(WorkloadClass::Memory, fast_limits())
+            .await
+            .unwrap();
+        let limits = TrafficLimits {
+            interactive_queue_timeout: Duration::from_secs(5),
+            memory_queue_timeout: Duration::from_secs(5),
+        };
+        let waiting = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.acquire(WorkloadClass::Memory, limits).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while controller.snapshot().memory_waiting != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        waiting.abort();
+        match waiting.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("cancelled memory waiter unexpectedly completed"),
+        }
+        assert_eq!(controller.snapshot().memory_waiting, 0);
+        active.finish(StatusCode::OK, None);
     }
 
     #[tokio::test]
