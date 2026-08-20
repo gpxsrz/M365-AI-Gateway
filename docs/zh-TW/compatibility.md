@@ -24,7 +24,7 @@ Rust 已涵蓋原 Go Gateway 的公開 API 與主要執行路徑。一次 Micros
 | `/v1/chat/completions` | 自動測試＋本機實跑 | 一般回覆、SSE、tools、usage、單一 `[DONE]` |
 | `/v1/responses` | 自動測試 | parent、tool result、reasoning 與媒體事件 |
 | `/v1/messages` | 自動測試 | Anthropic 轉接；串流為完成後再轉成事件 |
-| Hermes `/hermes/v1` | 自動測試 | checkpoint、多輪 tools、完成證據與排程 |
+| Hermes `/hermes/v1` | 自動測試 | 有非空 `session_key` 才綁 implicit checkpoint；無可靠 key 時不跨 session 猜測續接；多輪 tools、完成證據與排程 |
 | Hindsight `/memory/v1` | 自動測試 | retain、recall、reflect、webhook 與 barrier |
 | MCP modern HTTP | Live 通過一次 | 官方 Python SDK 完成 initialize、list、call、close |
 | MCP legacy SSE | 自動測試 | 其他舊 client／版本仍要各自驗證 |

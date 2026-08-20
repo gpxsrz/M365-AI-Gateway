@@ -24,7 +24,7 @@ Rust covers the public API and main execution paths of the former Go gateway. On
 | `/v1/chat/completions` | Automated + local runtime | regular replies, SSE, tools, usage, and one `[DONE]` |
 | `/v1/responses` | Automated | parents, tool results, reasoning, and media events |
 | `/v1/messages` | Automated | Anthropic adapter; streaming is converted after completion |
-| Hermes `/hermes/v1` | Automated | checkpoints, multi-round tools, completion evidence, scheduling |
+| Hermes `/hermes/v1` | Automated | implicit checkpoints require a non-empty `session_key`; without a reliable key the gateway does not guess continuation across sessions; multi-round tools, completion evidence, scheduling |
 | Hindsight `/memory/v1` | Automated | retain, recall, reflect, webhooks, and barriers |
 | MCP modern HTTP | Live passed once | official Python SDK completed initialize, list, call, and close |
 | MCP legacy SSE | Automated | other legacy clients and versions still need individual checks |

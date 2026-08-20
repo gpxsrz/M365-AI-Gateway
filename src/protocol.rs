@@ -350,7 +350,9 @@ pub(crate) async fn execute_chat_request(
         .cloned()
         .map(CheckpointMessage::from)
         .collect::<Vec<_>>();
-    let implicit_hermes = path.starts_with("/hermes/v1/") && body.checkpoint_mode.is_empty();
+    let implicit_hermes = path.starts_with("/hermes/v1/")
+        && body.checkpoint_mode.is_empty()
+        && !body.session_key.trim().is_empty();
     let checkpoint_result = if implicit_hermes {
         gateway
             .checkpoints
@@ -3199,6 +3201,106 @@ mod tests {
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["choices"][0]["message"]["content"], "fixture");
         assert_eq!(value["m365"]["conversationId"], "conversation-1");
+    }
+
+    #[tokio::test]
+    async fn unkeyed_hermes_sessions_do_not_share_an_inflight_checkpoint() {
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (app, raw_key) = app_with_chat(Arc::new(HangingTransport {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        }));
+        let request_body = r#"{"model":"gpt-5.6-terra","stream":true,"messages":[{"role":"user","content":"fresh session"}]}"#;
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::OK);
+        drop(second);
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn keyed_hermes_session_keeps_single_flight_checkpointing() {
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (app, raw_key) = app_with_chat(Arc::new(HangingTransport {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        }));
+        let request_body = r#"{"model":"gpt-5.6-terra","stream":true,"session_key":"session-a","messages":[{"role":"user","content":"same session"}]}"#;
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "checkpoint_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("in-flight"))
+        );
+        drop(first);
     }
 
     #[tokio::test]
