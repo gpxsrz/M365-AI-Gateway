@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> AI Agent：先判斷你需要哪一種證據，再只讀同名小節。不要用「測試通過」四個字代替 commit、route 與讀回範圍。
+
 「測試通過」要說清楚是哪一種測試：
 
 | 等級 | 能證明什麼 | 不能推定什麼 |
@@ -31,8 +33,10 @@
 - 一般文件先取得 Microsoft file identity / annotation，再做 ChatHub grounding。
 - 圖片使用另一條 transport，不能和文件 upload 混成一種流程。
 - Protected artifact 必須由 Gateway 用登入狀態抓回、放進私有暫存，再提供有權限的下載；上游私有 URL 不可先漏出。
-- 發布前 Rust 候選版本已用真實帳號通過 file+Vision input。圖片生成回 `no_image_resource`，只能判定該次沒有 image resource。
-- 真實 Code Interpreter 回應已出現 artifact metadata。舊下載使用錯誤 client/scope；現在改成同一受控瀏覽器依序取得 Microsoft 聊天與 Teams 檔案授權，並只接受同帳號。完整 artifact bytes 尚未在新流程讀回。
+- 隔離 Rust release binary 已用真實帳號通過 file+Vision input。圖片生成回 `no_image_resource`，只能判定該次沒有 image resource。
+- 真實 Code Interpreter 測試已讀回完整 bytes。non-stream、stream 與服務重啟後再下載都成功，且 API 回應沒有出現受保護網址。
+- 原 Go 與先前 Rust 都會直接抓含顯示檔名的 artifact URL，真實端點回 404。第一方瀏覽器對照證明：保留 query、只移除 `/views/original` 後的一段顯示檔名即可讀取同一物件。
+- Microsoft 登入只有一次。Gateway 需要檔案時，使用同一份主要更新憑證換取短效 IC3 token；沒有第二段 Teams OAuth。
 
 ### Tools、routing 與串流
 
@@ -40,7 +44,7 @@
 - Router repair 不再固定截 6000 字元；超過 UTF-16 budget 時停止，不猜內容。
 - Router、repair 與 final-answer phase 使用分開的 scratch conversation。
 - 內部 non-stream adapter 必須移除 `stream_options`；外層 SSE 仍保留一個 usage chunk 與一個 `[DONE]`。
-- 官方 Python MCP SDK 已對發布前候選版本完成 modern HTTP initialize、tool list、`wp6_echo` 與正常關閉。這只證明該 SDK／版本／route，不自動涵蓋所有 client。
+- 官方 Python MCP SDK 已對隔離 release binary 完成 modern HTTP initialize、tool list、`wp6_echo` 與正常關閉。這只證明該 SDK／版本／route，不自動涵蓋所有 client。
 
 ### Hermes 與 Hindsight
 
@@ -56,7 +60,7 @@ Production runtime 曾出現 binary 已更新、三個 Web 檔仍是舊版的 mi
 
 歷史 live trace 證明：Goal Judge 經 `/hermes/v1` 時，合法 `done` JSON 曾被 Agent completion-evidence guard 改成自然語言。修正後 Goal Judge 走 P2 `/v1/chat/completions`，使用 ForceNew / Untracked checkpoint policy，保留 scheduler / breaker / `MEMORY_YIELD`，但不注入 Agent evidence ledger。`/hermes/v1` 原本的 completion guard 沒有移除。
 
-舊 Go implementation、CI、NAS、Production 與 live canary 的 exact identities 是歷史證據，不可直接當成 Rust PASS。Rust 狀態請讀 [`rust-rewrite-parity.md`](rust-rewrite-parity.md)；新的 live／Production 驗證必須重新固定 Rust commit 與 artifact。
+舊 Go implementation、CI、NAS、Production 與 live canary 的 exact identities 是歷史證據，不可直接當成 Rust PASS。Rust 對照請讀 [`rust-rewrite-parity.md`](rust-rewrite-parity.md)；每次新的 live／Production 驗證都要重新固定 Rust commit 與 artifact。
 
 ## 證據寫法
 

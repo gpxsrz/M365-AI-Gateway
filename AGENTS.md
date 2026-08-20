@@ -1,6 +1,6 @@
 # M365 AI Gateway — Agent Core Rules
 
-這是 always-loaded core。只保留每次都要遵守的規則；操作手冊與歷史證據放到對應文件。
+這是 AI Agent 唯一要先載入的 core。讀完本頁就停，再由 `docs/README.md` 選一個任務主題；不要預先讀完整文件樹。
 
 ## 不可變規則
 

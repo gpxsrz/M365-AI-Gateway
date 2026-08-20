@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> AI Agent：先做「判斷順序」，不要先開啟 capability。只有在建立或審查 evidence 時，才讀欄位表與隱私限制。
+
 Microsoft Web 顯示某個模型或欄位，不代表 API 永遠支援它。M365 AI Gateway 只會把「看過」記成候選資料；通過可重現測試後，才會真的開放給 API caller。
 
 這樣做可以避免兩種錯誤：

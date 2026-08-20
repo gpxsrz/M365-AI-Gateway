@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> 第一次使用先讀本節和「最快啟動方式」即可。AI Agent 請改走[文件路由](docs/README.md)，一次只載入一個主題。
+
 M365 AI Gateway 是一個自己架設的小型服務。它讓支援 OpenAI、Anthropic 或 MCP 的工具，可以使用你自己的 Microsoft 365 Copilot 帳號。
 
 - 核心程式以 Rust 編寫，執行檔叫 `m365-native`。
@@ -25,7 +27,7 @@ cargo run --locked --bin m365-native
 
 1. 用剛才的一次性密碼登入。
 2. 依畫面要求換成正式管理密碼。
-3. 按「自動登入 Microsoft 帳號」，在同一個受控視窗完成聊天與 Teams 檔案授權。
+3. 按「自動登入 Microsoft 帳號」，在受控視窗完成一次 Microsoft 登入。
 4. 建立 API key。
 
 不要把真實密碼、API key、token 或 cookie 貼進指令紀錄、Issue 或文件。
@@ -77,6 +79,8 @@ git diff --check
 
 ## Understand it in 30 seconds
 
+> First-time users can stop after this section and **Fastest local start**. AI agents should use the [documentation router](docs/README.md) and load one topic at a time.
+
 M365 AI Gateway is a small self-hosted service. It lets tools that speak OpenAI, Anthropic, or MCP use your own Microsoft 365 Copilot account.
 
 - The core is written in Rust. The executable is named `m365-native`.
@@ -100,7 +104,7 @@ Then open `http://127.0.0.1:4141`:
 
 1. Sign in with the one-time password.
 2. Change it when prompted.
-3. Select **Automatically Sign in to Microsoft Account** and complete chat plus Teams file permission in the same controlled window.
+3. Select **Automatically Sign in to Microsoft Account** and complete one Microsoft sign-in in the controlled window.
 4. Create an API key.
 
 Never put real passwords, API keys, tokens, or cookies in command logs, Issues, or documentation.

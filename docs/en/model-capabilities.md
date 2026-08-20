@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: follow **Decision order** before enabling any capability. Open field tables and privacy limits only when creating or reviewing evidence.
+
 Seeing a model or field in Microsoft Web does not mean that the API supports it forever. M365 AI Gateway first records the observation as a candidate. It exposes the capability to API callers only after a reproducible test passes.
 
 This prevents two common failures:

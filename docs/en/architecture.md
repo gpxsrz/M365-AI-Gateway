@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: read this section and **The most important boundaries** first. Open the endpoint table only to choose an API, and open `api-contracts.md` only for exact wire behavior.
+
 The gateway is a translation and safety layer between a caller and Microsoft 365 Copilot.
 
 ```text
@@ -56,7 +58,7 @@ General `/v1/chat/completions` does not inherit the Hermes execution ledger and 
 |---|---|
 | Ordinary chat | Private mode requests no ordinary history, but does not promise zero Microsoft retention |
 | Documents and images | May use OneDrive or SharePoint staging, separate from chat history |
-| Sign-in permissions | Chat and Teams files use separate refresh credentials; the gateway binds them only when account and tenant identifiers match exactly |
+| Sign-in permissions | Microsoft sign-in happens once; short-lived IC3 file tokens come from the same primary refresh credential |
 | Code Interpreter files | Fetched with authenticated state and materialized into private local storage |
 | Download URLs | Callers receive short-lived capability URLs, not protected Microsoft temporary URLs |
 | Checkpoints | Store only continuation summaries and identifiers, not complete private content |

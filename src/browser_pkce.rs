@@ -22,8 +22,6 @@ pub struct Capture {
     pub code: String,
     pub state: String,
     pub error: String,
-    pub teams_code: String,
-    pub teams_verifier: String,
 }
 
 pub type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<Capture, String>> + Send + 'a>>;
@@ -133,7 +131,7 @@ async fn capture_from_browser(
         ))
         .await
         .map_err(|error| format!("navigate browser: {error}"))?;
-    let mut capture = loop {
+    loop {
         let Some(message) = socket.next().await else {
             return Err("browser closed before OAuth callback".to_owned());
         };
@@ -146,48 +144,9 @@ async fn capture_from_browser(
         };
         let candidate = event_url(&value);
         if let Some(capture) = callback_capture(candidate, redirect_uri, state) {
-            break capture;
+            return Ok(capture);
         }
-    };
-    if !capture.error.is_empty() {
-        return Ok(capture);
     }
-
-    let teams_state = crate::auth::verifier();
-    let teams_verifier = crate::auth::verifier();
-    let teams_url = crate::auth::teams_authorization_url(&teams_state, &teams_verifier)
-        .map_err(|_| "build Teams authorization URL".to_owned())?;
-    socket
-        .send(Message::Text(
-            json!({"id":4,"method":"Page.navigate","params":{"url":teams_url.as_str()}})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .map_err(|error| format!("navigate browser for Teams authorization: {error}"))?;
-    while let Some(message) = socket.next().await {
-        let message = message.map_err(|error| format!("read browser devtools event: {error}"))?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        let Some(teams) = callback_capture(
-            event_url(&value),
-            crate::auth::TEAMS_REDIRECT_URI,
-            &teams_state,
-        ) else {
-            continue;
-        };
-        if !teams.error.is_empty() {
-            return Err("browser Teams authorization failed".to_owned());
-        }
-        capture.teams_code = teams.code;
-        capture.teams_verifier = teams_verifier;
-        return Ok(capture);
-    }
-    Err("browser closed before Teams authorization callback".to_owned())
 }
 
 fn event_url(value: &Value) -> &str {
@@ -328,14 +287,11 @@ fn callback_capture(candidate: &str, redirect_uri: &str, expected_state: &str) -
         code,
         state: state.to_owned(),
         error,
-        teams_code: String::new(),
-        teams_verifier: String::new(),
     })
 }
 
 fn callback_path_matches(candidate: &str, redirect: &Url) -> bool {
     candidate == redirect.path()
-        || (redirect.as_str() == crate::auth::TEAMS_REDIRECT_URI && candidate == "/v2/")
 }
 
 fn validate_authorization_url(raw: &str) -> Result<(), String> {
@@ -457,33 +413,6 @@ mod tests {
                 "https://example.invalid/?code=secret&state=expected",
                 redirect,
                 "expected"
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn teams_callback_accepts_the_canonical_trailing_slash_and_exact_state() {
-        let captured = callback_capture(
-            "https://teams.microsoft.com/v2/?code=secret&state=expected",
-            crate::auth::TEAMS_REDIRECT_URI,
-            "expected",
-        )
-        .unwrap();
-        assert_eq!(captured.code, "secret");
-        assert!(
-            callback_capture(
-                "https://teams.microsoft.com/v2/?code=secret&state=spoof",
-                crate::auth::TEAMS_REDIRECT_URI,
-                "expected",
-            )
-            .is_none()
-        );
-        assert!(
-            callback_capture(
-                "https://teams.microsoft.com/v2/extra?code=secret&state=expected",
-                crate::auth::TEAMS_REDIRECT_URI,
-                "expected",
             )
             .is_none()
         );

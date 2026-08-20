@@ -2,43 +2,46 @@
 
 ## Understand it in 30 seconds
 
-The Rust version has passed local code, test, and release-binary checks. The isolated-account primary sign-in, text chat, file/vision input, and official Python MCP client also passed. Image generation, complete artifact download, exact-head CI, and Production have not passed.
+> AI agents: start with the status table. Read the last section only to judge evidence strength; never turn one live pass into a permanent guarantee.
 
-This page uses three status labels:
+Rust covers the public API and main execution paths of the retained Go gateway. One Microsoft sign-in, text chat, file/vision input, Code Interpreter files, and modern MCP all have real-path evidence.
+
+“Live pass” means one isolated check succeeded. Microsoft capabilities can vary by account and rollout, so every release must still bind an exact commit, CI run, binary, and runtime readback.
+
+## Status labels
 
 | Status | Plain meaning |
 |---|---|
-| Locally verified | Automated tests or a real local startup path passed |
-| Isolated live verified | The current candidate passed with an isolated account or real client; rerun on the exact published commit |
-| Live check required | Local wiring is complete, but an isolated Microsoft account must still be tested |
-| Known limit | The feature works within a documented boundary |
+| Automated | Repeatable fixed-input checks; the best regression signal |
+| Local runtime | A real local release-binary path passed |
+| Live passed once | One account, route, and point in time passed; not a permanent promise |
+| Recheck every release | The result depends on an external environment and needs fresh readback |
 
-## What is confirmed now
+## Feature table
 
-| Feature | Status | Key point |
+| Feature | Current evidence | Boundary |
 |---|---|---|
-| `/v1/chat/completions` | Locally verified | regular replies, streaming, tools, usage, and `[DONE]` |
-| `/v1/responses` | Locally verified | parent continuation, tool results, reasoning, and media events |
-| `/v1/messages` | Locally verified | Anthropic-shaped adapter; streaming is sliced after completion |
-| Hermes `/hermes/v1` | Locally verified | checkpoints, multi-round tools, completion evidence, and traffic admission |
-| Hindsight `/memory/v1` | Locally verified | retain, recall, reflect, webhooks, and retain barriers |
-| MCP modern | Isolated live verified | the official Python SDK completed initialize, tool listing, `wp6_echo`, and session close |
-| MCP legacy | Locally verified | SSE/message boundary route tests pass; qualify other legacy clients individually |
-| Files and vision | Isolated live verified | real file-plus-image input passed; rerun on the published commit |
-| Image generation | Known limit | the test account returned `no_image_resource`; this does not prove support or a code defect |
-| Code Interpreter artifacts | Live check required | a real response returned artifact metadata; the Teams dual-authorization/download fix is complete but needs one full-flow rerun |
-| Automatic Microsoft sign-in | Partly live verified | button launch, controlled-Chrome retry, and both PKCE legs passed separately; one combined interactive controlled-browser run remains |
-| Admin and API keys | Locally verified | bootstrap, password change, re-login, key creation, and authorized model catalog |
-| Model-capability evidence | Locally verified | only evidence-bound optional capabilities can be enabled |
-| Release / Docker | Exact-head CI required | local release build passed; GitHub CI must execute the container gate |
-| Production replacement | Not declared | GitHub, NAS, VM, exact-head live, and recovery gates must pass separately |
+| `/v1/chat/completions` | Automated + local runtime | regular replies, SSE, tools, usage, and one `[DONE]` |
+| `/v1/responses` | Automated | parents, tool results, reasoning, and media events |
+| `/v1/messages` | Automated | Anthropic adapter; streaming is converted after completion |
+| Hermes `/hermes/v1` | Automated | checkpoints, multi-round tools, completion evidence, scheduling |
+| Hindsight `/memory/v1` | Automated | retain, recall, reflect, webhooks, and barriers |
+| MCP modern HTTP | Live passed once | official Python SDK completed initialize, list, call, and close |
+| MCP legacy SSE | Automated | other legacy clients and versions still need individual checks |
+| File and vision input | Live passed once | documents and images use separate transports |
+| Code Interpreter files | Live passed once | one sign-in; protected URLs stayed private; fetch and post-restart refetch passed |
+| Automatic Microsoft sign-in | Live passed once | real button, controlled Chrome, completion state, and online-account readback passed |
+| Image generation | Recheck every release | one `no_image_resource` result means only that the account lacked an image resource then |
+| Admin and API keys | Automated + local runtime | bootstrap, password change, re-login, key creation, authorized models |
+| Release / container | Recheck every release | local gates do not replace exact-head CI and container build |
+| Production | Recheck every release | read back GitHub, NAS, VM, recovery, deployment, and health separately |
 
-## Important boundaries
+## Boundaries that do not move
 
 - `128000` means UTF-16 text units, not model tokens.
 - Private mode sends `disableMemory=1`; it does not promise zero Microsoft retention.
-- Multiple caller tools may run together only when all are explicitly read-only.
-- WebSocket retry is allowed only before a payload is sent; sent requests are never blindly replayed.
-- Large tool results may still be flattened or shortened upstream.
+- Caller tools run in parallel only when every selected tool is explicitly read-only.
+- WebSocket retry is allowed only before the payload is sent.
+- Image, model-catalog, and Web capabilities may vary by account or rollout.
 
-For the complete Rust matrix, read [`rust-rewrite-parity.md`](rust-rewrite-parity.md). For risks, start with [`known-limitations.md`](known-limitations.md). Evidence rules are in [`research-evidence.md`](research-evidence.md).
+For the Rust comparison, read [`rust-rewrite-parity.md`](rust-rewrite-parity.md). For risks, read [`known-limitations.md`](known-limitations.md). For evidence rules, read [`research-evidence.md`](research-evidence.md).

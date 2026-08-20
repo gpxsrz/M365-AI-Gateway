@@ -15,13 +15,13 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use crate::attachment;
+use crate::{attachment, runtime_settings};
 
 const RECORD_SEPARATOR: char = '\x1e';
 const WS_BASE: &str = "wss://substrate.office.com/m365Copilot/Chathub";
 const DEFAULT_TONE: &str = "magic";
 const STREAMING_MODE: &str = "ConciseWithPadding";
-const VARIANTS: &str = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.EnableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix";
+const VARIANTS: &str = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableImageGenInsufficientTokensThrottled,feature.EnableImageGenSystemCapacityThrottled,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,feature.IsCitationsReferencesOutputEnabled,feature.enableDeltaStreamingForReferences,feature.enableIncludeReferencesInDeltaResponse,feature.enablereferencesforagents,feature.EnableCodeInterpreterConversion,agt_module_attr_enableReferencesForCodeInterpreter,agt_module_enableCodeInterpreterHallucinatedUrlFilter,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,SingletonEnvOn,cdxenablefccinmainline,EnableComposeWidget,-agt_researcheragent_enableMemoryRead,feature.cwcallowedos,feature.EnableMergingPureDeltas,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.EnableConversationShareApis,feature.EnableConversationShareApisForMsa,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableContentApiandDocTypeHtmlInRichAnswers,cdxgrounding_api_v2_rich_web_answers_reference_bottom_force,cdxenablerenderforisocomp,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.EnableSkipRehydrationForSpeCIdImages,feature.EnablePersonalization,rich_responses,feature.EnableBase64DataInMessageAnnotations,feature.EnableSkipEmittingMessageOnFlush,feature.EnableRemoveEmptySourceAttributions,feature.EnableRemoveStreamingMode,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix";
 
 const OPTIONS: &[&str] = &[
     "search_result_progress_messages_with_search_queries",
@@ -34,9 +34,9 @@ const OPTIONS: &[&str] = &[
     "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
     "gptvnorm2048",
     "cwc_code_interpreter_citation_fix",
-    "code_interpreter_interactive_charts_inline_image",
-    "code_interpreter_matplotlib_patching",
     "code_interpreter_interactive_charts",
+    "cwc_code_interpreter_interactive_charts_inline_image",
+    "code_interpreter_matplotlib_patching",
     "cwc_fileupload_odb",
     "update_memory_plugin",
     "add_custom_instructions",
@@ -44,23 +44,53 @@ const OPTIONS: &[&str] = &[
     "flux_v3_progress_messages",
     "enable_batch_token_processing",
     "enable_gg_gpt",
+    "cwc_table_context",
+    "flux_v3_references",
+    "flux_v3_references_entities",
+    "flux_v3_references_ci",
+    "add_filestore_filetype",
+    "cwc_code_interpreter_citation_sourceannotations",
+    "cdxcwc_code_interpreter_hallucinated_url_filter",
+    "flux_v3_image_gen_enable_dimensions",
+    "flux_v3_image_gen_enable_non_watermarked_storage",
+    "flux_v3_image_gen_enable_icon_dimensions",
+    "flux_v3_image_gen_enable_system_text_with_params",
+    "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+    "flux_v3_image_gen_enable_story",
+    "rich_responses",
 ];
 
 const ALLOWED_MESSAGE_TYPES: &[&str] = &[
     "Chat",
     "Suggestion",
-    "Disengaged",
-    "Progress",
-    "EndOfRequest",
-    "InternalLoaderMessage",
-    "GeneratedCode",
-    "GenerateContentQuery",
-    "ReferencesListComplete",
-    "RenderCardRequest",
-    "SearchQuery",
     "InternalSearchQuery",
+    "Disengaged",
+    "InternalLoaderMessage",
+    "Progress",
+    "GeneratedCode",
+    "RenderCardRequest",
+    "AdsQuery",
     "SemanticSerp",
+    "GenerateContentQuery",
+    "GenerateGraphicArt",
+    "SearchQuery",
+    "ConfirmationCard",
     "AuthError",
+    "DeveloperLogs",
+    "TriggerPlugin",
+    "HintInvocation",
+    "MemoryUpdate",
+    "EndOfRequest",
+    "TriggerConfirmation",
+    "ResumeInvokeAction",
+    "ResumeUserInputRequest",
+    "TriggerUserInputRequest",
+    "EscapeHatch",
+    "TriggerPluginAuth",
+    "ResumePluginAuth",
+    "SideBySide",
+    "ReferencesListComplete",
+    "SwitchRespondingEndpoint",
 ];
 
 pub fn request_capability_baseline() -> Value {
@@ -201,8 +231,15 @@ pub trait ChatHubTransport: Send + Sync {
     ) -> ChatFuture<'a>;
 }
 
-#[derive(Default)]
-pub struct LiveChatHub;
+pub struct LiveChatHub {
+    settings: runtime_settings::Store,
+}
+
+impl LiveChatHub {
+    pub fn new(settings: runtime_settings::Store) -> Self {
+        Self { settings }
+    }
+}
 
 impl ChatHubTransport for LiveChatHub {
     fn chat<'a>(
@@ -211,13 +248,15 @@ impl ChatHubTransport for LiveChatHub {
         request: ChatRequest,
         events: &'a mut (dyn EventSink + Send),
     ) -> ChatFuture<'a> {
-        Box::pin(async move { live_chat(account, request, events).await })
+        let private_mode = self.settings.current().chat_mode != "normal";
+        Box::pin(async move { live_chat(account, request, private_mode, events).await })
     }
 }
 
 async fn live_chat(
     account: Account,
     mut request: ChatRequest,
+    private_mode: bool,
     events: &mut (dyn EventSink + Send),
 ) -> Result<ChatResult, ChatError> {
     if account.access_token.is_empty() || account.oid.is_empty() || account.tid.is_empty() {
@@ -231,15 +270,13 @@ async fn live_chat(
     }
     if request.session_id.is_empty() {
         request.session_id = uuid_v4();
-        request.started = true;
     }
     if request.conversation_id.is_empty() {
         request.conversation_id = uuid_v4();
-        request.started = true;
     }
     attachment::prepare(&account, &request.conversation_id, &mut request.attachments).await?;
     let request_id = uuid_v4();
-    let url = websocket_url(&account, &request, &request_id)?;
+    let url = websocket_url(&account, &request, &request_id, private_mode)?;
     let payload = chat_payload(&request, &request_id)?;
 
     let mut socket = None;
@@ -738,12 +775,14 @@ fn websocket_url(
     account: &Account,
     request: &ChatRequest,
     request_id: &str,
+    private_mode: bool,
 ) -> Result<Url, ChatError> {
     let mut url = Url::parse(&format!("{WS_BASE}/{}@{}", account.oid, account.tid))
         .map_err(|error| ChatError::Transport(error.to_string()))?;
     url.query_pairs_mut()
         .append_pair("chatsessionid", request_id)
         .append_pair("clientrequestid", request_id)
+        .append_pair("XRoutingParameterSessionKey", request_id)
         .append_pair("X-SessionId", &request.session_id)
         .append_pair("ConversationId", &request.conversation_id)
         .append_pair("access_token", &account.access_token)
@@ -754,7 +793,11 @@ fn websocket_url(
         .append_pair("licenseType", "Starter")
         .append_pair("agent", "web")
         .append_pair("scenario", "OfficeWebIncludedCopilot")
-        .append_pair("disableMemory", "1");
+        .append_pair("developerMode", "Basic")
+        .append_pair("isEdu", "false");
+    if private_mode {
+        url.query_pairs_mut().append_pair("disableMemory", "1");
+    }
     Ok(url)
 }
 
@@ -765,18 +808,32 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
         &request.tool_choice,
         request.tool_call_limit,
     );
+    let client_info = json!({
+        "clientPlatform": "mcmcopilot-web",
+        "clientAppName": "Office",
+        "clientEntrypoint": "mcmcopilot-officeweb",
+        "clientSessionId": request.session_id,
+        "ProductCategory": "Chat",
+        "clientAppType": "Web",
+        "productEntryPoint": "ChatPanel",
+        "deviceOS": "macOS",
+        "deviceType": "Desktop",
+        "clientPlatformVersion": "10.15.7",
+    });
     let mut message = json!({
         "author": "user",
         "inputMethod": "Keyboard",
         "text": text,
         "entityAnnotationTypes": ["People", "File", "Event", "Email", "TeamsMessage"],
         "requestId": request_id,
-        "locationInfo": {"timeZoneOffset": 8, "timeZone": "Asia/Shanghai"},
-        "locale": "zh-cn",
+        "locationInfo": {"timeZoneOffset": 8, "timeZone": "Asia/Taipei"},
+        "locale": "zh-tw",
         "messageType": "Chat",
         "experienceType": "Default",
         "adaptiveCards": [],
         "clientPreferences": {},
+        "clientInfo": client_info.clone(),
+        "connectedFederatedConnections": ["dummyId"],
     });
     let annotations = request
         .attachments
@@ -815,29 +872,38 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
         .collect::<Vec<_>>();
     if !annotations.is_empty() {
         message["messageAnnotations"] = Value::Array(annotations);
-        message["connectedFederatedConnections"] = json!(["dummyId"]);
     }
-    let chat = json!({
-        "arguments": [{
+    let mut argument = json!({
             "source": "officeweb",
-            "clientCorrelationId": uuid_v4(),
+            "clientCorrelationId": request_id,
             "sessionId": request.session_id,
             "optionsSets": OPTIONS,
             "options": {},
             "allowedMessageTypes": ALLOWED_MESSAGE_TYPES,
             "sliceIds": [],
             "threadLevelGptId": {},
-            "conversationId": request.conversation_id,
-            "traceId": uuid_v4(),
+            "traceId": request_id,
             "isStartOfSession": request.started,
-            "productThreadType": "Office",
-            "clientInfo": {"clientPlatform": "mcmcopilot-web", "clientAppName": "Office"},
+            "clientInfo": client_info,
             "tone": request.tone,
             "streamingMode": STREAMING_MODE,
             "message": message,
+            "disconnectBehavior": "continue",
+            "extraExtensionParameters": {},
+            "isSbsSupported": true,
+            "renderReferencesBehindEOS": true,
             "plugins": plugins(request),
-            "toolChoice": request.tool_choice,
-        }],
+    });
+    if !request.tools.is_empty()
+        || request
+            .tool_choice
+            .as_str()
+            .is_some_and(|value| value != "auto")
+    {
+        argument["toolChoice"] = request.tool_choice.clone();
+    }
+    let chat = json!({
+        "arguments": [argument],
         "invocationId": "0",
         "target": "chat",
         "type": 4,
@@ -1116,6 +1182,105 @@ pub(crate) fn contains_protected_artifact_reference(raw: &str) -> bool {
         || raw.contains("blob:")
 }
 
+pub(crate) fn semantic_events(events: &[Value]) -> Vec<Value> {
+    let mut projected = Vec::new();
+    for event in events {
+        if event.get("target").and_then(Value::as_str) != Some("update") {
+            continue;
+        }
+        let Some(arguments) = event.get("arguments").and_then(Value::as_array) else {
+            continue;
+        };
+        for argument in arguments {
+            let Some(messages) = argument.get("messages").and_then(Value::as_array) else {
+                continue;
+            };
+            for message in messages {
+                let message_type = message
+                    .get("messageType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let content_type = message
+                    .get("contentType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let content_origin = message
+                    .get("contentOrigin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let text = message
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let queries = message
+                    .get("searchQueries")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let generated_artifact = message_type.eq_ignore_ascii_case("GeneratedCode")
+                    && content_origin.eq_ignore_ascii_case("CodeInterpreter");
+                if generated_artifact
+                    || contains_protected_artifact_reference(text)
+                    || queries
+                        .iter()
+                        .any(|query| contains_protected_artifact_reference(query))
+                {
+                    continue;
+                }
+                let add_to_chain_of_thought = message
+                    .get("addToChainOfThought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let kind = if message_type == "Progress"
+                    && !text.trim().is_empty()
+                    && (content_origin == "ChainOfThoughtSummary" || add_to_chain_of_thought)
+                {
+                    "reasoning.summary"
+                } else if content_type == "SearchResults" {
+                    "search.progress"
+                } else if content_type == "Code" {
+                    "code.progress"
+                } else if message_type == "Progress" {
+                    "tool.progress"
+                } else {
+                    "message"
+                };
+                let mut value = serde_json::Map::from_iter([(
+                    "kind".to_owned(),
+                    Value::String(kind.to_owned()),
+                )]);
+                for (key, field) in [
+                    ("contentType", content_type),
+                    ("messageType", message_type),
+                    ("contentOrigin", content_origin),
+                    ("text", text),
+                ] {
+                    if !field.is_empty() {
+                        value.insert(key.to_owned(), Value::String(field.to_owned()));
+                    }
+                }
+                if add_to_chain_of_thought {
+                    value.insert("addToChainOfThought".to_owned(), Value::Bool(true));
+                }
+                if !queries.is_empty() {
+                    value.insert(
+                        "queries".to_owned(),
+                        Value::Array(queries.into_iter().map(Value::String).collect()),
+                    );
+                }
+                projected.push(Value::Object(value));
+            }
+        }
+    }
+    projected
+}
+
 fn normalize_retry_after(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.parse::<u64>().is_ok() {
@@ -1218,6 +1383,35 @@ mod tests {
     }
 
     #[test]
+    fn semantic_events_omit_artifacts_and_keep_safe_progress() {
+        let protected =
+            "https://us.asyncgw.teams.microsoft.com/v1/objects/id/views/original/report.csv";
+        let frame = json!({
+            "type": 1,
+            "target": "update",
+            "arguments": [{"messages": [
+                {
+                    "messageType": "Progress",
+                    "contentType": "SearchResults",
+                    "text": "Found one source",
+                    "searchQueries": ["safe query"]
+                },
+                {
+                    "messageType": "GeneratedCode",
+                    "contentOrigin": "CodeInterpreter",
+                    "text": format!(r#"{{"codeResultFileUrl":"{protected}"}}"#)
+                }
+            ]}]
+        });
+
+        let projected = semantic_events(&[frame]);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0]["kind"], "search.progress");
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(!contains_protected_artifact_reference(&encoded));
+    }
+
+    #[test]
     fn cumulative_stream_frames_do_not_duplicate_text() {
         assert_eq!(
             fold_stream_text("Hello", "Hello world", true),
@@ -1271,7 +1465,7 @@ mod tests {
             tone: DEFAULT_TONE.to_owned(),
             conversation_id: "conversation".to_owned(),
             session_id: "session".to_owned(),
-            started: true,
+            started: false,
             ..ChatRequest::default()
         };
         let account = Account {
@@ -1280,12 +1474,61 @@ mod tests {
             oid: "oid".to_owned(),
             tid: "tid".to_owned(),
         };
-        let url = websocket_url(&account, &request, "request").unwrap();
+        let url = websocket_url(&account, &request, "request", true).unwrap();
+        let query = url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query["chatsessionid"], "request");
+        assert_eq!(query["clientrequestid"], "request");
+        assert_eq!(query["XRoutingParameterSessionKey"], "request");
+        assert_eq!(query["developerMode"], "Basic");
+        assert_eq!(query["isEdu"], "false");
+        assert_eq!(query["disableMemory"], "1");
+        let normal_url = websocket_url(&account, &request, "request", false).unwrap();
         assert!(
-            url.query_pairs()
-                .any(|(name, value)| name == "disableMemory" && value == "1")
+            !normal_url
+                .query_pairs()
+                .any(|(key, _)| key == "disableMemory")
         );
         let payload = chat_payload(&request, "request").unwrap();
+        let chat: Value =
+            serde_json::from_str(payload.split(RECORD_SEPARATOR).next().unwrap()).unwrap();
+        let argument = &chat["arguments"][0];
+        assert_eq!(argument["clientCorrelationId"], "request");
+        assert_eq!(argument["traceId"], "request");
+        assert_eq!(argument["message"]["requestId"], "request");
+        assert_eq!(argument["isStartOfSession"], false);
+        assert_eq!(argument["message"]["locale"], "zh-tw");
+        assert_eq!(
+            argument["message"]["locationInfo"]["timeZone"],
+            "Asia/Taipei"
+        );
+        assert_eq!(argument["clientInfo"], argument["message"]["clientInfo"]);
+        assert_eq!(argument["clientInfo"]["deviceOS"], "macOS");
+        assert_eq!(argument["clientInfo"]["clientPlatformVersion"], "10.15.7");
+        assert_eq!(argument["disconnectBehavior"], "continue");
+        assert_eq!(
+            argument["message"]["connectedFederatedConnections"],
+            json!(["dummyId"])
+        );
+        assert!(argument.get("conversationId").is_none());
+        assert!(argument.get("productThreadType").is_none());
+        assert!(argument.get("toolChoice").is_none());
+        assert_eq!(argument["isSbsSupported"], true);
+        assert_eq!(argument["renderReferencesBehindEOS"], true);
+        assert!(
+            argument["optionsSets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option == "add_filestore_filetype")
+        );
+        assert!(
+            VARIANTS
+                .split(',')
+                .any(|variant| variant == "feature.EnableCodeInterpreterConversion")
+        );
         assert!(payload.contains(STREAMING_MODE));
         assert!(payload.contains("BingWebSearch"));
     }

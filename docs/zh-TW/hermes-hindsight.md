@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> AI Agent：只接服務時，讀本節和「建議設定」就停。只有在排隊、memory freshness 或 webhook 出問題時，才讀後半契約。
+
 - Hermes Agent 用 `/hermes/v1`。
 - Hindsight Memory 用 `/memory/v1`。
 - Goal Judge 等控制工作用 `/v1/chat/completions`，不要走 Hermes Agent route。

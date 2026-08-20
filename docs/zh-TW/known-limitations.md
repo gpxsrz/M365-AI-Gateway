@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> AI Agent：先讀這三點。只有你的任務碰到同名功能，才往下讀那一節；不要把其他限制一起載入。
+
 最需要先知道的三件事：
 
 1. Private Chat 不是「Microsoft 完全不留資料」。
@@ -23,7 +25,7 @@
 
 7. **Private mode**：`disableMemory=1` 避免一般聊天歷史，不代表 Microsoft 零保留。檔案、圖片與 artifact 各有自己的資料邊界。
 8. **MCP**：官方 Python SDK 的 modern HTTP 已實測通過；其他 SDK、舊式 SSE client 與版本仍要個別驗證。
-9. **受控瀏覽器是獨立登入狀態**：第一次自動登入可能要在受控 Chrome 再登入一次。一般 Chrome 的相容備援只完成主要聊天登入；Code Interpreter 檔案需要自動流程的 Teams 授權。
+9. **受控瀏覽器是獨立登入狀態**：第一次自動登入可能仍要在受控 Chrome 輸入 Microsoft 帳號。登入本身只有一次；之後的 Code Interpreter 檔案 token 由 Gateway 自動取得。一般 Chrome 的相容備援也可完成同一份主要登入。
 10. **圖片與 Web capability 會變**：Microsoft 的 model selector、圖片資源與 request capability 可能隨帳號或 rollout 改變。一次 `no_image_resource` 或 evidence snapshot 不是永久承諾。
 
 ## Hermes 與 Hindsight

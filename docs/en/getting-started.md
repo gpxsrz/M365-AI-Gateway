@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: for first-time setup, stop after **Step 3**. Open troubleshooting only after a failure; do not preload deployment or protocol internals.
+
 You need four steps: start the gateway, replace the one-time administrator password, sign in to Microsoft, and create an API key.
 
 The default address is `http://127.0.0.1:4141`, which accepts connections from the same computer only.
@@ -32,12 +34,9 @@ When the service reports that it is listening on `127.0.0.1:4141`, open `http://
 
 ### Choose a Microsoft sign-in path
 
-Start with **Automatic Sign-in**. One click completes two steps in the same controlled Chrome window:
+Start with **Automatic Sign-in**. One click opens controlled Chrome and captures one Microsoft sign-in result. There is no second Teams authorization step.
 
-1. Capture the Microsoft chat sign-in result.
-2. Capture the Teams file-access result. Files created by Code Interpreter need this step.
-
-The page may switch quickly. Keep the window open until the management page reports completion. The gateway receives only the one-time sign-in results; it does not store the full error page.
+The window may briefly show a Microsoft completion or error page. Keep it open until the management page reports completion. Automatic mode captures the one-time result before useful page state disappears; the gateway does not store the complete error page.
 
 On first use, you may still need to sign in once inside that window. It then keeps its own browser session.
 
@@ -47,7 +46,7 @@ Your regular Chrome session is not copied into the controlled Chrome. If you are
 2. Microsoft may show “This isn't the right page.” The authorization result is still available.
 3. A trusted local AI agent can read the error page's `referrer` without displaying it and submit it directly to the local gateway.
 
-This fallback completes the main chat sign-in only. To download files created by Code Interpreter, complete **Automatic Sign-in** successfully at least once.
+This fallback completes the same primary sign-in. When a Code Interpreter file is needed, the gateway uses that refresh credential to obtain a short-lived IC3 token automatically. It does not ask for a second Teams sign-in.
 
 Never paste the callback URL, authorization code, or complete error page into chat, logs, or documentation.
 
@@ -82,8 +81,8 @@ First-use administrator bootstrap trusts real loopback only. A container bridge 
 | The one-time password no longer works | This is expected; use the persistent password you created |
 | The API returns 401 | `Authorization: Bearer ...` contains a valid API key |
 | Automatic sign-in stops at a Microsoft sign-in field | First use requires a separate sign-in in the controlled Chrome; the regular Chrome session is not copied |
-| The page briefly switches to Teams after sign-in | This is the file-access step; keep the window open until the management page reports completion |
-| Teams file permission fails | Make sure the controlled Chrome uses the same Microsoft account, then restart sign-in from the management page |
+| The sign-in button appears to do nothing | Wait for controlled Chrome to open; if it is already open, complete Microsoft sign-in there, then check the management-page status |
+| Sign-in completed but an artifact download fails | Do not repeat a second Teams authorization; confirm the account is online, then inspect the gateway's safe error code |
 | Microsoft shows an error page | Return to the management page for status; automatic mode captures before the error page, while a trusted local agent may securely submit the `referrer` for the compatibility fallback |
 | Microsoft sign-in did not finish | Close any controlled Chrome window that is still waiting, then start again; never share callbacks, tokens, or full error bodies |
 

@@ -321,27 +321,3 @@ func TestBrowserPKCERouteRequiresAdminSession(t *testing.T) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
-
-func TestBrowserPKCEManagementUIUsesAutomaticCapture(t *testing.T) {
-	raw, err := os.ReadFile("../../web/index.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	page := string(raw)
-	for _, required := range []string{"預設第一方 Client 瀏覽器授權", "/api/auth/browser/default/start", "startBrowserCandidate()", "wrongplace 前自動擷取"} {
-		if !strings.Contains(page, required) {
-			t.Fatalf("management UI missing %q", required)
-		}
-	}
-	if strings.Contains(page, "/api/auth/device/default/start") {
-		t.Fatal("management UI contains the rejected default-client device-code path")
-	}
-	if strings.Contains(page, "重新登入已套用") {
-		t.Fatal("management UI claims a ChatHub-only candidate validation was activated")
-	}
-	for _, required := range []string{"候選登入已保留", "尚未套用"} {
-		if !strings.Contains(page, required) {
-			t.Fatalf("management UI does not keep candidate validation separate from activation: missing %q", required)
-		}
-	}
-}

@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> AI Agent：第一次安裝只讀到「第三步」。只有遇到錯誤才展開「卡住時先看」；不要先載入部署或內部協定。
+
 你只需要做四件事：啟動 Gateway、換掉一次性管理密碼、登入 Microsoft、建立 API key。
 
 預設網址是 `http://127.0.0.1:4141`，只讓同一台電腦連線。
@@ -32,12 +34,9 @@ cargo run --locked --bin m365-native
 
 ### Microsoft 登入怎麼選
 
-先用「自動登入」。按一次後，Gateway 會在同一個受控 Chrome 依序完成兩件事：
+先用「自動登入」。按一次後，Gateway 會開啟受控 Chrome，接住同一筆 Microsoft 登入結果。沒有第二段 Teams 授權。
 
-1. 接住 Microsoft 聊天的登入結果。
-2. 接住 Teams 檔案存取的授權結果。Code Interpreter 產出的檔案需要這一步。
-
-頁面可能會快速切換。完成前不要關閉視窗。Gateway 只接收一次性的登入結果，不保存錯誤頁全文。
+頁面可能會短暫顯示 Microsoft 的完成頁或錯誤頁。完成前不要關閉視窗。自動流程會在可用資訊消失前擷取一次性登入結果；Gateway 不保存完整錯誤頁。
 
 第一次使用時，你仍可能要在這個視窗登入一次。之後它會保留自己的登入狀態。
 
@@ -47,7 +46,7 @@ cargo run --locked --bin m365-native
 2. Microsoft 可能顯示「這不是正確的頁面」。這不代表授權資料消失。
 3. 受信任的本機 AI Agent 可以讀取錯誤頁的 `referrer`，不顯示內容，直接送回本機 Gateway。
 
-這條備援只完成主要聊天登入。若要下載 Code Interpreter 產出的檔案，仍要至少成功執行一次「自動登入」。
+這條備援完成的也是同一份主要登入。需要 Code Interpreter 檔案時，Gateway 會用這份更新憑證自動換取短效 IC3 token，不會再要求一次 Teams 登入。
 
 不要把 callback 網址、授權碼或錯誤頁全文貼到聊天、日誌或文件。
 
@@ -82,8 +81,8 @@ Container 要把 `M365_DATA_DIR` 指到可寫、會保留的資料卷。`Dockerf
 | 一次性密碼不能再用 | 這是預期行為；請用換好的正式密碼 |
 | API 回 401 | `Authorization: Bearer ...` 是否使用有效 API key |
 | 自動登入停在 Microsoft 登入欄 | 受控 Chrome 第一次使用要另外登入；一般 Chrome 的登入不會自動複製 |
-| 登入後又短暫切到 Teams | 這是檔案存取授權；保持視窗開啟，等待管理頁顯示完成 |
-| Teams 檔案授權失敗 | 確認受控 Chrome 使用同一個 Microsoft 帳號，然後從管理頁重新開始 |
+| 按登入後看似沒有反應 | 等待受控 Chrome 開啟；若已開啟，完成其中的 Microsoft 登入，再回管理頁看狀態 |
+| 登入完成但檔案下載失敗 | 不要重做第二次 Teams 授權；先確認帳號仍在線，再查 Gateway 的安全錯誤碼 |
 | Microsoft 顯示錯誤頁 | 回到管理頁看狀態；自動模式會在錯誤頁前擷取，相容備援可由受信任的本機 Agent 安全送回 `referrer` |
 | Microsoft 登入未完成 | 關閉仍在等待的受控 Chrome 後重新開始；不要分享 callback、token 或錯誤全文 |
 

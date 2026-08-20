@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: read these three points first. Continue only into the section that names the feature in scope; do not load unrelated limits.
+
 Know these three things first:
 
 1. Private Chat does not mean that Microsoft retains nothing.
@@ -23,7 +25,7 @@ The rest of this page lists current limits without replaying implementation hist
 
 7. **Private mode**: `disableMemory=1` prevents ordinary chat history. It does not promise zero Microsoft retention. Files, images, and artifacts have separate boundaries.
 8. **MCP**: modern HTTP passed with the official Python SDK. Other SDKs, legacy SSE clients, and versions still need separate qualification.
-9. **The controlled browser has separate sign-in state**: first automatic use may require another sign-in inside controlled Chrome. The regular-Chrome compatibility fallback completes main chat sign-in only; Code Interpreter files need the automatic Teams permission step.
+9. **The controlled browser has separate sign-in state**: first automatic use may still require entering the Microsoft account inside controlled Chrome. Sign-in itself happens once; the gateway later obtains Code Interpreter file tokens automatically. The regular-Chrome compatibility fallback can complete the same primary sign-in.
 10. **Images and Web capabilities drift**: Microsoft's model selector, image resources, and request capabilities vary by account or rollout. One `no_image_resource` result or evidence snapshot is not a permanent contract.
 
 ## Hermes and Hindsight

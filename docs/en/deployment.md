@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: this section is enough to decide whether deployment may start. For execution, read **Safe deployment order** and the completion table; private host details are intentionally absent.
+
 A deployment is more than replacing one executable. Treat the Rust executable and the three management pages as one release. They must come from one public commit and roll back together.
 
 Deployment is complete only when:

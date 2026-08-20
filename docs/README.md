@@ -1,6 +1,6 @@
 # 文件路由 / Documentation router
 
-## 30 秒看懂
+## 先選一條路（30 秒）
 
 不要一次讀完全部文件。先選語言，再只讀一個符合目前任務的主題。
 
@@ -8,10 +8,10 @@ AI Agent 的順序固定為：
 
 1. 先讀 repo 根目錄的 `AGENTS.md`。
 2. 回到本頁選一個主題。
-3. 先讀「30 秒看懂」；只有需要時才往下讀操作與查表。
+3. 先讀每頁的「30 秒看懂」與 AI Agent 停止提示；夠用就停。
 4. 只有追舊問題時才進 `history/`。
 
-Do not load every document at once. Choose a language and one topic. Read the 30-second summary first, then open deeper sections only when the task needs them.
+Do not load every document at once. Choose one language and one topic. Obey the page's stop hint, and open deeper sections only when the task needs them.
 
 ## 台灣繁中
 

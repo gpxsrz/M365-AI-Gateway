@@ -20,12 +20,8 @@ pub const DEFAULT_REDIRECT_URI: &str =
     "https://login.microsoftonline.com/common/oauth2/nativeclient";
 pub const DEFAULT_SCOPE: &str = "openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read https://substrate.office.com/sydney/sydney.readwrite";
 pub const TOKEN_CACHE_SCHEMA: &str = "m365-oauth-token-cache/v1";
-const TEAMS_WEB_CLIENT_ID: &str = "5e3ce6c0-2b1f-4285-8d4b-75ee78787346";
-const TEAMS_WEB_ORIGIN: &str = "https://teams.microsoft.com";
-pub(crate) const TEAMS_REDIRECT_URI: &str = "https://teams.microsoft.com/v2";
-pub(crate) const TEAMS_AUTHORIZE_SCOPE: &str =
-    "openid profile offline_access https://ic3.teams.office.com/.default";
-const TEAMS_IC3_SCOPE: &str = "https://ic3.teams.office.com/.default offline_access";
+const ARTIFACT_IC3_SCOPE: &str =
+    "https://ic3.teams.office.com/.default openid profile offline_access";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OAuthConfig {
@@ -106,8 +102,6 @@ pub struct AccountToken {
     pub access_token: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub refresh_token: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub teams_refresh_token: String,
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -124,7 +118,6 @@ pub struct AccountToken {
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: String,
-    pub teams_refresh_token: String,
     pub id_token: String,
     pub token_type: String,
     pub scope: String,
@@ -134,20 +127,6 @@ pub struct TokenSet {
     pub display_name: String,
     pub home_oid: String,
     pub tenant_id: String,
-}
-
-impl TokenSet {
-    pub(crate) fn bind_teams_refresh(mut self, teams: Self) -> Result<Self, AuthError> {
-        if teams.refresh_token.is_empty()
-            || !valid_teams_token_for(&teams, &self.home_oid, &self.tenant_id)
-        {
-            return Err(AuthError::Storage(
-                "Teams authorization does not match the Microsoft account".to_owned(),
-            ));
-        }
-        self.teams_refresh_token = teams.refresh_token;
-        Ok(self)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -259,13 +238,6 @@ impl TokenStore {
             } else {
                 token.refresh_token
             },
-            teams_refresh_token: if token.teams_refresh_token.is_empty() {
-                previous_same_account
-                    .map(|account| account.teams_refresh_token.clone())
-                    .unwrap_or_default()
-            } else {
-                token.teams_refresh_token
-            },
             expires_at: token.expires_at,
             updated_at: now,
             oid: if token.home_oid.is_empty() {
@@ -309,6 +281,7 @@ impl TokenStore {
     }
 
     pub async fn ensure_valid(&self, id: &str) -> Result<AccountToken, AuthError> {
+        let _refresh = self.resource_refresh.lock().await;
         let account = self
             .first()
             .filter(|account| account.id == id || account.oid == id || account.email == id)
@@ -387,49 +360,23 @@ impl TokenStore {
         Ok(token.access_token)
     }
 
-    pub(crate) async fn teams_ic3_access_token(&self) -> Result<(String, String), AuthError> {
+    pub(crate) async fn artifact_ic3_access_token(&self) -> Result<(String, String), AuthError> {
         let _refresh = self.resource_refresh.lock().await;
         let account = self.first().ok_or(AuthError::AccountUnavailable)?;
-        if account.teams_refresh_token.is_empty() {
+        if account.refresh_token.is_empty() {
             return Err(AuthError::Expired);
         }
         let token = self
-            .request_token_with_origin(
-                [
-                    ("client_id", TEAMS_WEB_CLIENT_ID),
-                    ("grant_type", "refresh_token"),
-                    ("refresh_token", account.teams_refresh_token.as_str()),
-                    ("scope", TEAMS_IC3_SCOPE),
-                ],
-                Some(TEAMS_WEB_ORIGIN),
-            )
+            .refresh(&account.refresh_token, ARTIFACT_IC3_SCOPE)
             .await?;
-        if !valid_teams_token_for(&token, &account.oid, &account.tid) {
+        if !valid_ic3_resource_token_for(&token, &account.oid, &account.tid, &self.config.client_id)
+        {
             return Err(AuthError::Storage(
-                "Teams IC3 token has the wrong audience, scope, or account".to_owned(),
+                "IC3 authorization does not match the Microsoft account".to_owned(),
             ));
         }
-        self.accept_teams_refresh(&account, &token.refresh_token)?;
+        self.accept_resource_refresh(&account, &token.refresh_token)?;
         Ok((token.access_token, account.oid))
-    }
-
-    pub(crate) async fn exchange_teams_code(
-        &self,
-        code: &str,
-        verifier: &str,
-    ) -> Result<TokenSet, AuthError> {
-        self.request_token_with_origin(
-            [
-                ("client_id", TEAMS_WEB_CLIENT_ID),
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", TEAMS_REDIRECT_URI),
-                ("code_verifier", verifier),
-                ("scope", TEAMS_AUTHORIZE_SCOPE),
-            ],
-            Some(TEAMS_WEB_ORIGIN),
-        )
-        .await
     }
 
     fn accept_resource_refresh(
@@ -461,58 +408,14 @@ impl TokenStore {
         Ok(())
     }
 
-    fn accept_teams_refresh(
-        &self,
-        account: &AccountToken,
-        rotated_refresh_token: &str,
-    ) -> Result<(), AuthError> {
-        let mut cache = self.cache.lock().expect("token store poisoned");
-        let Some(current) = cache.accounts.first_mut() else {
-            return Err(AuthError::AccountUnavailable);
-        };
-        if current.id != account.id
-            || current.updated_at != account.updated_at
-            || current.teams_refresh_token != account.teams_refresh_token
-        {
-            return Err(AuthError::Storage(
-                "active account changed during Teams refresh".to_owned(),
-            ));
-        }
-        if rotated_refresh_token.is_empty() || rotated_refresh_token == account.teams_refresh_token
-        {
-            return Ok(());
-        }
-        let previous = std::mem::replace(
-            &mut current.teams_refresh_token,
-            rotated_refresh_token.to_owned(),
-        );
-        if let Err(error) = save_cache(&self.path, &cache) {
-            cache.accounts[0].teams_refresh_token = previous;
-            return Err(error);
-        }
-        Ok(())
-    }
-
     async fn request_token<const N: usize>(
         &self,
         form: [(&str, &str); N],
     ) -> Result<TokenSet, AuthError> {
-        self.request_token_with_origin(form, None).await
-    }
-
-    async fn request_token_with_origin<const N: usize>(
-        &self,
-        form: [(&str, &str); N],
-        origin: Option<&str>,
-    ) -> Result<TokenSet, AuthError> {
-        let mut request = self
+        let response = self
             .client
             .post(&self.config.token_endpoint)
-            .form(form.as_slice());
-        if let Some(origin) = origin {
-            request = request.header(reqwest::header::ORIGIN, origin);
-        }
-        let response = request
+            .form(form.as_slice())
             .send()
             .await
             .map_err(|error| AuthError::Http(error.to_string()))?;
@@ -624,22 +527,6 @@ pub fn authorization_url(
     Ok(url)
 }
 
-pub(crate) fn teams_authorization_url(state: &str, verifier: &str) -> Result<Url, AuthError> {
-    let mut url = Url::parse("https://login.microsoftonline.com/common/oauth2/v2.0/authorize")
-        .map_err(|_| AuthError::Configuration("invalid Teams authorize endpoint".to_owned()))?;
-    url.query_pairs_mut()
-        .append_pair("client_id", TEAMS_WEB_CLIENT_ID)
-        .append_pair("response_type", "code")
-        .append_pair("redirect_uri", TEAMS_REDIRECT_URI)
-        .append_pair("response_mode", "query")
-        .append_pair("scope", TEAMS_AUTHORIZE_SCOPE)
-        .append_pair("state", state)
-        .append_pair("code_challenge", &challenge(verifier))
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("prompt", "none");
-    Ok(url)
-}
-
 fn token_set(payload: TokenResponse) -> TokenSet {
     let access_claims = decode_jwt_claims(&payload.access_token).unwrap_or_default();
     let id_claims = decode_jwt_claims(&payload.id_token).unwrap_or_default();
@@ -647,7 +534,6 @@ fn token_set(payload: TokenResponse) -> TokenSet {
     TokenSet {
         access_token: payload.access_token,
         refresh_token: payload.refresh_token,
-        teams_refresh_token: String::new(),
         id_token: payload.id_token,
         token_type: payload.token_type,
         scope: payload.scope,
@@ -685,8 +571,8 @@ fn decode_jwt_claims(token: &str) -> Option<serde_json::Map<String, serde_json::
         .cloned()
 }
 
-pub(crate) fn teams_ic3_token_class(token: &str) -> &'static str {
-    let claims = decode_jwt_claims(token);
+fn valid_ic3_resource_token_for(token: &TokenSet, oid: &str, tid: &str, client_id: &str) -> bool {
+    let claims = decode_jwt_claims(&token.access_token);
     let audience = claims
         .as_ref()
         .and_then(|claims| claims.get("aud"))
@@ -697,29 +583,8 @@ pub(crate) fn teams_ic3_token_class(token: &str) -> &'static str {
         .and_then(|claims| claims.get("appid").or_else(|| claims.get("azp")))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let scopes = claims
-        .as_ref()
-        .and_then(|claims| claims.get("scp"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if audience == "https://ic3.teams.office.com"
-        && app_id == TEAMS_WEB_CLIENT_ID
-        && scopes
-            .split_ascii_whitespace()
-            .any(|scope| scope == "Teams.AccessAsUser.All")
-    {
-        "ic3_teams_access"
-    } else if audience == "https://ic3.teams.office.com" {
-        "ic3_other_scope"
-    } else if claims.is_some() {
-        "other_audience"
-    } else {
-        "opaque"
-    }
-}
-
-fn valid_teams_token_for(token: &TokenSet, oid: &str, tid: &str) -> bool {
-    teams_ic3_token_class(&token.access_token) == "ic3_teams_access"
+    audience == "https://ic3.teams.office.com"
+        && app_id == client_id
         && !oid.is_empty()
         && token.home_oid == oid
         && !tid.is_empty()
@@ -786,89 +651,6 @@ mod tests {
         assert_eq!(query["code_challenge"], challenge(&verifier));
         assert_eq!(query["code_challenge_method"], "S256");
         assert!(!url.as_str().contains(&verifier));
-    }
-
-    #[test]
-    fn teams_pkce_url_contains_challenge_without_verifier() {
-        let verifier = verifier();
-        let url = teams_authorization_url("teams-state", &verifier).unwrap();
-        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(query["client_id"], TEAMS_WEB_CLIENT_ID);
-        assert_eq!(query["redirect_uri"], TEAMS_REDIRECT_URI);
-        assert_eq!(query["scope"], TEAMS_AUTHORIZE_SCOPE);
-        assert_eq!(query["state"], "teams-state");
-        assert_eq!(query["code_challenge"], challenge(&verifier));
-        assert_eq!(query["code_challenge_method"], "S256");
-        assert_eq!(query["prompt"], "none");
-        assert!(!url.as_str().contains(&verifier));
-    }
-
-    #[test]
-    fn teams_refresh_is_bound_only_to_the_same_account() {
-        let primary = token_for(
-            "same-oid",
-            "same-tenant",
-            "primary-access",
-            "primary-refresh",
-        );
-        let teams = token_for(
-            "same-oid",
-            "same-tenant",
-            &teams_access_token("same-oid", "same-tenant"),
-            "teams-refresh",
-        );
-        let bound = primary.clone().bind_teams_refresh(teams).unwrap();
-        assert_eq!(bound.refresh_token, "primary-refresh");
-        assert_eq!(bound.teams_refresh_token, "teams-refresh");
-
-        let wrong_account = token_for(
-            "other-oid",
-            "same-tenant",
-            &teams_access_token("other-oid", "same-tenant"),
-            "teams-refresh",
-        );
-        assert!(primary.bind_teams_refresh(wrong_account).is_err());
-    }
-
-    #[test]
-    fn upsert_does_not_reuse_teams_access_for_a_different_account_with_the_same_email() {
-        let root = tempfile::tempdir().unwrap();
-        let store = TokenStore::open(root.path().join("accounts.json"), config()).unwrap();
-        let mut first = token_for("first-oid", "first-tenant", "access-1", "refresh-1");
-        first.email = "shared@example.invalid".to_owned();
-        first.teams_refresh_token = "teams-refresh-1".to_owned();
-        store.upsert(first).unwrap();
-
-        let mut same_account = token_for("first-oid", "first-tenant", "access-1b", "refresh-1b");
-        same_account.email = "shared@example.invalid".to_owned();
-        assert_eq!(
-            store.upsert(same_account).unwrap().teams_refresh_token,
-            "teams-refresh-1"
-        );
-
-        let mut second = token_for("second-oid", "second-tenant", "access-2", "refresh-2");
-        second.email = "shared@example.invalid".to_owned();
-        let account = store.upsert(second).unwrap();
-
-        assert_eq!(account.oid, "second-oid");
-        assert_eq!(account.tid, "second-tenant");
-        assert!(account.teams_refresh_token.is_empty());
-    }
-
-    #[test]
-    fn teams_token_class_accepts_the_exact_client_in_v1_or_v2_claims() {
-        for client_claim in ["appid", "azp"] {
-            let mut payload = serde_json::json!({
-                "aud": "https://ic3.teams.office.com",
-                "scp": "Teams.AccessAsUser.All",
-            });
-            payload[client_claim] = TEAMS_WEB_CLIENT_ID.into();
-            let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
-            assert_eq!(
-                teams_ic3_token_class(&format!("header.{claims}.signature")),
-                "ic3_teams_access"
-            );
-        }
     }
 
     #[test]
@@ -945,30 +727,23 @@ mod tests {
                 .accept_resource_refresh(&original, &original.refresh_token)
                 .is_err()
         );
-        assert!(
-            store
-                .accept_teams_refresh(&original, &original.teams_refresh_token)
-                .is_err()
-        );
     }
 
     #[tokio::test]
-    async fn teams_ic3_refresh_uses_the_teams_client_and_spa_origin() {
+    async fn artifact_ic3_refresh_uses_the_configured_client_and_primary_refresh() {
         let captured = std::sync::Arc::new(Mutex::new(None));
         let server_capture = captured.clone();
-        let access_token = teams_access_token("active", "tenant");
+        let access_token = ic3_access_token("active", "tenant", DEFAULT_CLIENT_ID);
         let app = axum::Router::new().route(
             "/",
-            axum::routing::post(
-                move |headers: axum::http::HeaderMap, body: String| async move {
-                    *server_capture.lock().unwrap() = Some((headers, body));
-                    axum::Json(serde_json::json!({
-                        "access_token": access_token,
-                        "refresh_token": "teams-refresh-rotated",
-                        "expires_in": 3600
-                    }))
-                },
-            ),
+            axum::routing::post(move |body: String| async move {
+                *server_capture.lock().unwrap() = Some(body);
+                axum::Json(serde_json::json!({
+                    "access_token": access_token,
+                    "refresh_token": "refresh-rotated",
+                    "expires_in": 3600
+                }))
+            }),
         );
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -980,7 +755,6 @@ mod tests {
         let path = root.path().join("accounts.json");
         let mut original = account("active", 20);
         original.tid = "tenant".to_owned();
-        original.teams_refresh_token = "teams-refresh".to_owned();
         private_file::write_json(
             &path,
             &TokenCache {
@@ -992,45 +766,40 @@ mod tests {
         let mut oauth = config();
         oauth.token_endpoint = format!("http://{address}/");
         let store = TokenStore::open(&path, oauth).unwrap();
-        let (token, account_oid) = store.teams_ic3_access_token().await.unwrap();
-        assert_eq!(teams_ic3_token_class(&token), "ic3_teams_access");
+        let (_, account_oid) = store.artifact_ic3_access_token().await.unwrap();
         assert_eq!(account_oid, "active");
 
-        let (headers, body) = captured.lock().unwrap().take().unwrap();
-        assert_eq!(
-            headers.get(reqwest::header::ORIGIN).unwrap(),
-            TEAMS_WEB_ORIGIN
-        );
+        let body = captured.lock().unwrap().take().unwrap();
         let form = url::form_urlencoded::parse(body.as_bytes())
             .into_owned()
             .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(form["client_id"], TEAMS_WEB_CLIENT_ID);
-        assert_eq!(form["scope"], TEAMS_IC3_SCOPE);
+        assert_eq!(form["client_id"], DEFAULT_CLIENT_ID);
+        assert_eq!(form["scope"], ARTIFACT_IC3_SCOPE);
         assert_eq!(form["grant_type"], "refresh_token");
-        assert_eq!(form["refresh_token"], "teams-refresh");
+        assert_eq!(form["refresh_token"], "refresh");
         let persisted = store.first().unwrap();
-        assert_eq!(persisted.refresh_token, "refresh");
-        assert_eq!(persisted.teams_refresh_token, "teams-refresh-rotated");
+        assert_eq!(persisted.refresh_token, "refresh-rotated");
         server.abort();
     }
 
     #[tokio::test]
-    async fn teams_code_exchange_uses_pkce_and_the_fixed_teams_redirect() {
-        let captured = std::sync::Arc::new(Mutex::new(None));
-        let server_capture = captured.clone();
-        let access_token = teams_access_token("active", "tenant");
+    async fn primary_refresh_is_serialized_with_the_shared_resource_lock() {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
         let app = axum::Router::new().route(
             "/",
-            axum::routing::post(
-                move |headers: axum::http::HeaderMap, body: String| async move {
-                    *server_capture.lock().unwrap() = Some((headers, body));
+            axum::routing::post(move || {
+                let server_requests = server_requests.clone();
+                async move {
+                    server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     axum::Json(serde_json::json!({
-                        "access_token": access_token,
-                        "refresh_token": "teams-refresh",
+                        "access_token": "refreshed-access",
+                        "refresh_token": "refresh-rotated",
                         "expires_in": 3600
                     }))
-                },
-            ),
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1039,32 +808,62 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("accounts.json");
+        private_file::write_json(
+            &path,
+            &TokenCache {
+                schema: TOKEN_CACHE_SCHEMA.to_owned(),
+                accounts: vec![account("active", 20)],
+            },
+        )
+        .unwrap();
         let mut oauth = config();
         oauth.token_endpoint = format!("http://{address}/");
-        let store = TokenStore::open(root.path().join("accounts.json"), oauth).unwrap();
-        let token = store
-            .exchange_teams_code("one-time-code", "pkce-verifier")
-            .await
-            .unwrap();
-        assert_eq!(token.refresh_token, "teams-refresh");
-        assert_eq!(token.home_oid, "active");
-        assert_eq!(token.tenant_id, "tenant");
+        let store = std::sync::Arc::new(TokenStore::open(&path, oauth).unwrap());
 
-        let (headers, body) = captured.lock().unwrap().take().unwrap();
-        assert_eq!(
-            headers.get(reqwest::header::ORIGIN).unwrap(),
-            TEAMS_WEB_ORIGIN
-        );
-        let form = url::form_urlencoded::parse(body.as_bytes())
-            .into_owned()
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(form["client_id"], TEAMS_WEB_CLIENT_ID);
-        assert_eq!(form["grant_type"], "authorization_code");
-        assert_eq!(form["code"], "one-time-code");
-        assert_eq!(form["redirect_uri"], TEAMS_REDIRECT_URI);
-        assert_eq!(form["code_verifier"], "pkce-verifier");
-        assert_eq!(form["scope"], TEAMS_AUTHORIZE_SCOPE);
+        let left = tokio::spawn({
+            let store = store.clone();
+            async move { store.ensure_valid("active").await }
+        });
+        let right = tokio::spawn({
+            let store = store.clone();
+            async move { store.ensure_valid("active").await }
+        });
+        left.await.unwrap().unwrap();
+        right.await.unwrap().unwrap();
+
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(store.first().unwrap().refresh_token, "refresh-rotated");
         server.abort();
+    }
+
+    #[test]
+    fn artifact_ic3_token_requires_the_configured_client() {
+        let configured = token_for(
+            "active",
+            "tenant",
+            &ic3_access_token("active", "tenant", DEFAULT_CLIENT_ID),
+            "refresh",
+        );
+        assert!(valid_ic3_resource_token_for(
+            &configured,
+            "active",
+            "tenant",
+            DEFAULT_CLIENT_ID
+        ));
+
+        let other_client = token_for(
+            "active",
+            "tenant",
+            &ic3_access_token("active", "tenant", "different-client"),
+            "refresh",
+        );
+        assert!(!valid_ic3_resource_token_for(
+            &other_client,
+            "active",
+            "tenant",
+            DEFAULT_CLIENT_ID
+        ));
     }
 
     #[test]
@@ -1081,7 +880,6 @@ mod tests {
             status: "online".to_owned(),
             access_token: "secret".to_owned(),
             refresh_token: "refresh".to_owned(),
-            teams_refresh_token: String::new(),
             expires_at: OffsetDateTime::from_unix_timestamp(updated + 1_000).unwrap(),
             updated_at: OffsetDateTime::from_unix_timestamp(updated).unwrap(),
             oid: id.to_owned(),
@@ -1090,12 +888,16 @@ mod tests {
         }
     }
 
-    fn teams_access_token(oid: &str, tid: &str) -> String {
+    fn ic3_access_token(oid: &str, tid: &str, client_id: &str) -> String {
+        ic3_access_token_with_scope(oid, tid, client_id, "")
+    }
+
+    fn ic3_access_token_with_scope(oid: &str, tid: &str, client_id: &str, scope: &str) -> String {
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&serde_json::json!({
                 "aud": "https://ic3.teams.office.com",
-                "appid": TEAMS_WEB_CLIENT_ID,
-                "scp": "Teams.AccessAsUser.All",
+                "appid": client_id,
+                "scp": scope,
                 "oid": oid,
                 "tid": tid,
             }))
@@ -1108,7 +910,6 @@ mod tests {
         TokenSet {
             access_token: access_token.to_owned(),
             refresh_token: refresh_token.to_owned(),
-            teams_refresh_token: String::new(),
             id_token: String::new(),
             token_type: "Bearer".to_owned(),
             scope: String::new(),

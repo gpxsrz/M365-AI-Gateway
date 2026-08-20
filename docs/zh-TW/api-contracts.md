@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> AI Agent：一般 client 讀完四條規則就停。只有實作 adapter、排查錯誤或驗證相容性時，才往下讀對應小節。
+
 一般 client 只要先記住四件事：
 
 1. 串流最後只能有一個 usage chunk，再有一個 `[DONE]`。
@@ -39,6 +41,8 @@ Response 順序：
 3. 最後只有一個 `[DONE]`。
 
 `include_usage=false` 不加 usage chunk。`stream_options.include_obfuscation` 會被辨識但忽略。外部 request 若 `stream=false` 又帶 `stream_options`，回 invalid request；內部 adapter 改成 non-stream 時，必須先移除 stream-only 欄位。
+
+呼叫端若中途關閉串流，Gateway 會立即取消同一筆 ChatHub 工作並釋放帳號容量，不會讓背景工作繼續占用到 `chatTimeoutSeconds`。
 
 Usage 使用 `prompt_tokens` / `completion_tokens`。Sidecar 估算值會標示：
 
@@ -87,6 +91,14 @@ Router repair input 若本身超過限制，在第二次 upstream call 前停止
 - `response_format` / `json_schema` 是 structured-output contract。普通 JSON 不會因為看起來像 router envelope 就被剝殼；不合法 internal envelope 會 fail closed。
 
 Router、repair 與 required-tool retry 的 scratch phase 各使用新的 `ConversationId` / `SessionId`。Private mode 每條新 WebSocket 都重送 `disableMemory=1`，但這個欄位本身不是 context reset。
+
+## Code Interpreter 檔案
+
+- 成功回應只提供本機 `GET /v1/artifacts/{capability}/content` 連結，不提供 Microsoft 私密網址。
+- `{capability}` 本身就是短效下載權限。不要寫進 log、Issue 或公開文件；下載時不需要再附 API key。
+- Gateway 只接受核准的 Microsoft HTTPS host 與 artifact path，接著以同一 Microsoft 登入取得短效 IC3 token。
+- 下載若失敗，整筆 materialization 會 fail closed；stream 不得先送出正常完成再補錯誤。
+- 原始 `semanticEvents` 只保留安全進度欄位。artifact URL、file token 與可重播內容不會被放進相容 metadata。
 
 ## `/v1/chat/completions` control-plane
 

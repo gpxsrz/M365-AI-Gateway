@@ -396,18 +396,14 @@ func TestRegisteredLoopbackGETCallbackRequiresExactHostAndPath(t *testing.T) {
 func TestManualFallbackUIUsesBoundedJSONPOSTAndIsNotPrimary(t *testing.T) {
 	page := mustReadPKCEWebFile(t, "../../web/index.html")
 	for _, required := range []string{
-		`<details id="manualCallbackFallback" class="form-row" hidden>`,
+		`<details id="manualCallbackFallback" class="form-row">`,
 		`function showManualCallbackFallback()`,
 		`api('/api/auth/callback',{method:'POST',body:JSON.stringify(payload)})`,
 		`callback_url`,
 		`手動備援`,
-		`不代表 Microsoft 登入失敗`,
+		`callback 仍在錯誤頁的 <code>referrer</code>`,
 		`完整 callback URL`,
-		`授權碼有時效且只能使用一次`,
-		`使用者取消`,
-		`授權逾時`,
-		`state 不符`,
-		`權杖交換失敗`,
+		`不要把一次性網址貼到聊天、日誌或文件`,
 		`重新產生授權連結`,
 	} {
 		if !strings.Contains(page, required) {

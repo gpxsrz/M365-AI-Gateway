@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: ordinary clients should stop after these four rules. Continue only into the matching section when implementing an adapter, diagnosing an error, or checking compatibility.
+
 Most clients need four rules first:
 
 1. A stream ends with one usage chunk and then one `[DONE]`.
@@ -39,6 +41,8 @@ Response order:
 3. Exactly one `[DONE]` appears last.
 
 `include_usage=false` adds no usage chunk. `stream_options.include_obfuscation` is recognized but ignored. An external request with `stream=false` plus `stream_options` is invalid. An internal adapter forcing non-stream mode must first remove stream-only fields.
+
+If the caller closes a stream early, the gateway cancels that ChatHub job and releases account capacity immediately. It does not leave detached work running until `chatTimeoutSeconds`.
 
 Usage uses `prompt_tokens` / `completion_tokens`. Sidecar estimates are marked with:
 
@@ -87,6 +91,14 @@ If the router-repair input itself is too large, processing stops before a second
 - `response_format` / `json_schema` is a structured-output contract. Ordinary JSON is not stripped merely because it resembles a router envelope; invalid internal envelopes fail closed.
 
 Router, repair, and required-tool retry scratch phases each use a new `ConversationId` / `SessionId`. Private mode reapplies `disableMemory=1` to every new WebSocket, but that field is not a context reset.
+
+## Code Interpreter files
+
+- A successful response exposes only a local `GET /v1/artifacts/{capability}/content` link, never a protected Microsoft URL.
+- `{capability}` is the short-lived download authority. Keep it out of logs, Issues, and public docs; downloading does not require another API key.
+- The gateway accepts only approved Microsoft HTTPS hosts and artifact paths, then obtains a short-lived IC3 token from the same Microsoft sign-in.
+- Materialization fails closed. A stream cannot report normal completion and then append an artifact error.
+- Raw `semanticEvents` are projected to safe progress fields. Artifact URLs, file tokens, and replayable values are excluded from compatibility metadata.
 
 ## `/v1/chat/completions` control plane
 

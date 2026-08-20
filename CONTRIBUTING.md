@@ -2,6 +2,8 @@
 
 ## 30 秒版本
 
+> AI Agent：先做這五步。只有改到特定 surface 時，才讀對應文件與測試；不要先載入全部歷史。
+
 1. 只從公開 `gpxsrz/M365-AI-Gateway` 的 `main` 開發。
 2. 先重現問題，再找共同根因。
 3. 改最少的程式，留下會抓到退步的測試。
@@ -49,6 +51,8 @@ git diff --check
 # Contributing guide
 
 ## 30-second version
+
+> AI agents: start with these five steps. Open only the topic and tests for the surface being changed; do not preload the full history.
 
 1. Develop only from public `gpxsrz/M365-AI-Gateway` `main`.
 2. Reproduce the problem before changing code.

@@ -1,62 +1,61 @@
-# Rust 改寫完成度
+# Rust 改寫對照
 
 ## 30 秒看懂
 
-Rust 已完成 Go `f038c86e62c7390c442f30043715255576db4e19` 的離線契約搬移，也能以 release binary 在本機啟動。主要 OAuth、文字聊天、檔案／Vision 與官方 Python MCP client 已在隔離環境實測。
+> AI Agent：先讀「這次抓到的偏差」。要查單一功能才讀對照表；要發布才讀最後的 gate。不要把保留的 Go 程式當成建置來源。
 
-目前仍不包含：圖片生成成功、Code Interpreter artifact 完整下載、GitHub exact-head CI、container、NAS／VM 或 Production。現在的 live 結果來自發布前候選版本，commit 後仍要以 exact head 重跑。
+Rust 是唯一 release／container 建置來源。Go `f038c86e62c7390c442f30043715255576db4e19` 保留為唯讀比較基準，用來回答「原本真的怎麼做」，不能憑印象補流程。
 
-| 問題 | 現在答案 |
-|---|---|
-| Rust 是 release / container 唯一建置來源嗎？ | 是 |
-| 保留 Go source 的用途？ | 只做 deterministic comparison |
-| 本機測試與啟動？ | PASS |
-| 已批准替換 Production？ | 尚未由本機 PASS 推定 |
-| 可以刪掉 Go comparison source 嗎？ | 不可以，沒有這項授權 |
+目前已對到的核心原則：
+
+- 一個 Gateway 只對一個 Microsoft 365 帳號。
+- Microsoft 瀏覽器登入只有一次。
+- 檔案需要的 IC3 token 由同一份主要更新憑證取得。
+- ChatHub payload、stream、tools、checkpoint 與錯誤形狀要由測試鎖住。
+- 本機 PASS、live PASS、CI 與 Production 是四個不同 gate。
+
+## 這次抓到的偏差
+
+先前 Rust 版本自行加入第二段 Teams OAuth。這不在原 Go 流程裡，因此使用者按一次登入後，畫面會無聲等待第二段授權。
+
+另一個問題是 artifact 測試只證明「找到 metadata」，沒有證明「真的讀到檔案 bytes」。真實 Microsoft 回傳的網址在 `/views/original` 後多一個顯示檔名；直接抓整條網址會 404，下載端點要保留 query、移除那一段顯示檔名。
+
+串流還有一個生命週期偏差：Rust 曾把上游工作放進獨立 task，呼叫端斷線後仍會占住帳號容量；原 Go request context 會跟著客戶端取消。Rust 現在也會在 response body 被丟棄時取消上游工作。
+
+修正後的共同路徑是：
+
+1. 只保存主要 Microsoft refresh credential。
+2. 需要檔案時，用它換取同帳號的短效 IC3 access token。
+3. 只接受核准的 HTTPS host 與 artifact path。
+4. 只移除一個顯示檔名；更深或不明路徑一律拒絕。
+5. 私密上游網址與原始 artifact event 不交給 API 呼叫端。
+6. 同一份 refresh credential 的一般更新與資源 token 更新共用鎖，避免旋轉憑證互撞。
 
 ## 功能對照
 
-| Surface | 狀態 | 已覆蓋重點 |
+| Surface | Rust 保留的契約 | 最小證據 |
 |---|---|---|
-| OpenAI Chat Completions | 本機 PASS | non-stream/SSE、structured output、tools、usage、`[DONE]` |
-| Responses | 本機 PASS | parent continuation、tool result、parallel calls、reasoning/media events |
-| Anthropic Messages | 本機 PASS | error、tool/image round trip、posthoc stream 與 ignored-parameter headers |
-| Hermes | 本機 PASS | provenance、execution ledger、completion guard、多輪 tools、排程 |
-| Hindsight | 本機 PASS | retain/recall/reflect、breaker、`MEMORY_YIELD`、webhook、barrier |
-| MCP modern | 候選 live PASS | 官方 Python SDK：initialize → list tools → `wp6_echo` → close |
-| MCP legacy | 本機 PASS | session/Origin、legacy SSE/message boundary |
-| Files / Vision | 候選 live PASS | 真實 file+image input；本機另驗 magic/name/SSRF/quota/reuse |
-| Images | 帳號能力未證明 | 真實請求回 `no_image_resource`；不可推定支援或 regression |
-| Code Interpreter artifact | 部分 live | 真實 metadata 已出現；私有暫存、雙重授權、account/path/network boundary 已實作，完整下載待重跑 |
-| 自動 Microsoft 登入 | 部分 live | 按鈕啟動與失敗後重試通過；主 OAuth 與 Teams PKCE 分別通過，同一受控視窗完整流程待驗 |
-| Checkpoint continuation | 本機 PASS | history prefix、rollback-safe clear、parent、tool ledger、restart persistence |
-| Caller tools | 本機 PASS | call identity、fail-closed limits、唯讀平行 allowlist、router/repair/final boundary |
-| Streaming | 本機 PASS | frame 去重、usage、單一 `[DONE]`、error SSE、artifact URL holdback |
-| Admin/settings/debug | 本機 PASS | bootstrap、API keys、partial update、env source、redaction、persistence |
-| Legacy routes | Offline PASS | Go literal routes 與動態 Hindsight/artifact routes 已映射；另有 `/api/admin/traffic` |
-| Model capability | 本機 PASS | built-in/configured/optional、evidence binding、observe-only drift |
-| Release definition | 本機 PASS | pinned toolchain、locked build、Rust Dockerfile、六平台 matrix、checksum |
+| OpenAI Chat Completions | non-stream／SSE、tools、usage、單一 `[DONE]`、斷線取消 | adapter 與 route tests |
+| Responses | parent、tool result、parallel calls、reasoning／media events | continuation tests |
+| Anthropic Messages | error、tool／image round trip、posthoc stream | adapter tests |
+| Hermes | provenance、ledger、completion guard、多輪 tools、排程 | full continuation tests |
+| Hindsight | retain／recall／reflect、breaker、webhook、barrier | Memory profile tests |
+| OAuth | 一次登入、帳號綁定、refresh rotation | browser + auth lifecycle tests |
+| Code Interpreter | 私有暫存、短效下載、stream holdback、重啟續取 | deterministic + isolated live |
+| MCP | modern HTTP 與 legacy SSE 邊界 | route tests + official Python client |
+| Admin | bootstrap、密碼、API key、設定來源、redaction | HTTP tests + browser path |
+| Release | pinned toolchain、locked build、Rust container | local release gate + exact-head CI |
 
-## 本機完成證據
+## 發布 gate
 
-```text
-cargo fmt --all --check
-cargo test --locked --all-targets       # 141 passed, 0 failed
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked --release
-git diff --check
-```
+每個候選版本都要依序完成：
 
-Release binary smoke 已完成：bootstrap login → 改密碼 → 重新登入 → 建立 API key → 用該 key 讀 `/v1/models`，全部 HTTP 200；沒有授權的 models request 是 401。
+1. Rust format、完整 tests、Clippy、release build、diff check。
+2. 若 parity 判斷依賴 Go，跑 Go verify／test／vet／build。
+3. Serena 與 Code Review Graph 檢查受影響路徑；graph 的零影響不能取代原碼搜尋。
+4. Commit 後，以 exact head 跑 GitHub CI 與 container build。
+5. 分別讀回 public ref、NAS、VM 與 release artifact。
+6. 建立可驗證 recovery，再部署 Production。
+7. 以低頻 live request、服務狀態、binary／Web hash 與 rollback 證據收尾。
 
-Source 也經 Serena semantic review 與 Code Review Graph incremental review。Graph 提醒的 test gaps 已逐項對照同模組或 route regression。
-
-## 尚未完成的外部 gate
-
-1. Commit 並發布到 public `main`。
-2. GitHub exact-head CI 與 container build。
-3. NAS / VM exact commit 同步。
-4. 以發布後 exact commit 重跑 live；完成受控瀏覽器雙重登入、圖片能力判定與 artifact 完整下載。
-5. 完整 rollback 證據與 Production promotion/readback。
-
-每一項都要固定 commit、route、帳號／runtime scope，並遵守 secret 零輸出。後續若完成，必須更新本頁，不能讓舊的「尚未執行」留在 current docs。
+任何一步失敗，都只能回報部分完成。精確結果放在 CI、Git history 與部署讀回，不把會過期的 PID、container ID 或帳號資料寫進 current 文件。

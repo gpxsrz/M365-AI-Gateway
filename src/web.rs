@@ -82,9 +82,6 @@ pub struct Gateway {
 #[derive(Clone, Debug)]
 pub(crate) struct ApiKeyOwner(pub String);
 
-#[derive(Clone)]
-struct BrowserTeamsToken(TokenSet);
-
 impl Gateway {
     pub fn open(config: Config) -> Result<Self, GatewayError> {
         std::fs::create_dir_all(&config.data_dir).map_err(|error| {
@@ -113,7 +110,7 @@ impl Gateway {
             browser_pkce_active: AtomicBool::new(false),
             browser_pkce: Arc::new(crate::browser_pkce::LiveRunner),
             oauth_profiles,
-            chat: Arc::new(LiveChatHub),
+            chat: Arc::new(LiveChatHub::new(settings.clone())),
             traffic: TrafficController::new(),
             settings,
             settings_lifecycle: Mutex::new(()),
@@ -1100,11 +1097,6 @@ impl Gateway {
 
     async fn auth_callback(State(gateway): State<Arc<Self>>, request: Request) -> Response {
         let method = request.method().clone();
-        let browser_teams_token = request
-            .extensions()
-            .get::<BrowserTeamsToken>()
-            .cloned()
-            .map(|token| token.0);
         let input = match parse_callback(&gateway.pkce, request).await {
             Ok(input) => input,
             Err(response) => return response,
@@ -1180,26 +1172,6 @@ impl Gateway {
                     "OAuth 授權碼交換失敗，請重新開始授權",
                 );
             }
-        };
-        let token = if let Some(teams_token) = browser_teams_token {
-            match token.bind_teams_refresh(teams_token) {
-                Ok(token) => token,
-                Err(_) => {
-                    gateway.pkce.failed(
-                        &input.state,
-                        "oauth_browser_teams_account_mismatch",
-                        "Teams 檔案授權與 Microsoft 帳號不一致，請重新開始授權",
-                    );
-                    discard_failed_oauth(&gateway, &claimed);
-                    return oauth_error(
-                        StatusCode::BAD_GATEWAY,
-                        "oauth_browser_teams_account_mismatch",
-                        "Teams 檔案授權與 Microsoft 帳號不一致，請重新開始授權",
-                    );
-                }
-            }
-        } else {
-            token
         };
         let account = match store_oauth_token(&gateway, token_store, token, !claimed.staged) {
             Ok(account) => account,
@@ -1888,50 +1860,15 @@ fn launch_browser_capture(
             .await;
         match capture {
             Ok(capture) => {
-                let teams_token = if capture.error.is_empty() {
-                    let exchanged = if let Some(profile_id) = discard_profile.as_deref() {
-                        match gateway.oauth_profiles.open_store(profile_id) {
-                            Ok((_, store)) => store
-                                .exchange_teams_code(&capture.teams_code, &capture.teams_verifier)
-                                .await
-                                .ok(),
-                            Err(_) => None,
-                        }
-                    } else {
-                        gateway
-                            .tokens
-                            .exchange_teams_code(&capture.teams_code, &capture.teams_verifier)
-                            .await
-                            .ok()
-                    };
-                    let Some(token) = exchanged else {
-                        gateway.pkce.fail_pending(
-                            &state,
-                            "oauth_browser_teams_token_exchange_failed",
-                            "Teams 檔案授權交換失敗，請重新開始授權",
-                        );
-                        if let Some(profile_id) = discard_profile.as_deref() {
-                            gateway.oauth_profiles.discard(profile_id);
-                        }
-                        gateway.browser_pkce_active.store(false, Ordering::Release);
-                        return;
-                    };
-                    Some(token)
-                } else {
-                    None
-                };
                 let body = serde_json::json!({
                     "code": capture.code,
                     "state": capture.state,
                     "error": capture.error,
                 });
-                let mut request = Request::post("/api/auth/callback")
+                let request = Request::post("/api/auth/callback")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body.to_string()))
                     .expect("internal OAuth callback request");
-                if let Some(token) = teams_token {
-                    request.extensions_mut().insert(BrowserTeamsToken(token));
-                }
                 let response = Gateway::auth_callback(State(Arc::clone(&gateway)), request).await;
                 if !response.status().is_success()
                     && let Some(profile_id) = discard_profile.as_deref()
@@ -1941,19 +1878,14 @@ fn launch_browser_capture(
             }
             Err(error) => {
                 let timeout = error.contains("timed out");
-                let teams = error.contains("Teams authorization");
                 gateway.pkce.fail_pending(
                     &state,
-                    if teams {
-                        "oauth_browser_teams_authorization_failed"
-                    } else if timeout {
+                    if timeout {
                         "oauth_browser_capture_timeout"
                     } else {
                         "oauth_browser_capture_failed"
                     },
-                    if teams {
-                        "瀏覽器未能完成 Teams 檔案授權，請重新開始授權"
-                    } else if timeout {
+                    if timeout {
                         "瀏覽器授權等待逾時，請重新開始授權"
                     } else {
                         "瀏覽器未能擷取 Microsoft 授權回呼，請重新開始授權"
@@ -2209,7 +2141,6 @@ mod tests {
         crate::auth::TokenSet {
             access_token: format!("token-{id}"),
             refresh_token: format!("refresh-{id}"),
-            teams_refresh_token: String::new(),
             id_token: String::new(),
             token_type: "Bearer".to_owned(),
             scope: DEFAULT_SCOPE.to_owned(),
@@ -2239,6 +2170,8 @@ mod tests {
             authorize_endpoint: format!("{}/oauth2/v2.0/authorize", crate::auth::DEFAULT_AUTHORITY),
             token_endpoint: format!("{}/oauth2/v2.0/token", crate::auth::DEFAULT_AUTHORITY),
         };
+        let settings =
+            crate::runtime_settings::Store::open(&root, &Config::for_test(root.clone())).unwrap();
         Arc::new(Gateway {
             started_at: Instant::now(),
             admin,
@@ -2252,10 +2185,9 @@ mod tests {
                 root.join("accounts.json").as_path(),
             )
             .unwrap(),
-            chat: Arc::new(LiveChatHub),
+            chat: Arc::new(LiveChatHub::new(settings.clone())),
             traffic: TrafficController::new(),
-            settings: crate::runtime_settings::Store::open(&root, &Config::for_test(root.clone()))
-                .unwrap(),
+            settings,
             settings_lifecycle: Mutex::new(()),
             checkpoints: CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap(),
             hindsight_webhook_secret: String::new(),

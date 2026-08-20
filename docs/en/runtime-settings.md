@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: select one group under **Which setting group do I need?** Do not load the whole page for one setting, and never read back or print secret values.
+
 Most users should use the management page and leave environment variables alone. The management APIs are:
 
 - `GET /api/admin/settings`: read current settings.

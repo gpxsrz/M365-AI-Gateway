@@ -2,6 +2,8 @@
 
 ## Understand it in 30 seconds
 
+> AI agents: for basic integration, stop after **Recommended settings**. Read the later contracts only for scheduling, memory freshness, or webhook work.
+
 - Hermes Agent uses `/hermes/v1`.
 - Hindsight Memory uses `/memory/v1`.
 - Goal Judge and similar control work use `/v1/chat/completions`, not the Hermes Agent route.

@@ -2,6 +2,8 @@
 
 ## 先記住三件事
 
+> AI Agent：先套用這三條。只有要處理檔案、Private mode 或流量時，才讀對應小節；任何秘密都不要讀回到輸出。
+
 1. 只使用你有權使用的 Microsoft 365 帳號與資料。
 2. 預設只在本機 `127.0.0.1` 使用。對外開放前，要先有 TLS、可信反向代理與網路限制。
 3. 不要公開任何可登入、可重播或可下載私人內容的資料。
@@ -16,7 +18,7 @@
 
 Gateway 會先用已登入狀態取得受保護檔案，再存到本機私有區域，最後提供短效下載能力。不要直接把 Microsoft 或瀏覽器的暫時網址交給呼叫端。
 
-聊天與 Teams 檔案權限使用不同的更新憑證。Gateway 只在帳號與租戶識別都完全相同時綁定；重新登入另一個帳號時，不得沿用舊的檔案權限。
+Gateway 只保存主要 Microsoft 登入的更新憑證。需要下載 Code Interpreter 檔案時，它才用同一份憑證換取短效 IC3 資源 token；不需要第二次瀏覽器授權，也不保存另一份 Teams 更新憑證。帳號識別若改變，舊帳號的登入狀態與本機檔案能力都不得沿用。
 
 ## Private mode 的真正意思
 
@@ -36,6 +38,8 @@ Hermes、Hindsight 與一般呼叫可以共用同一帳號，但 Gateway 會限�
 
 ## Remember three things
 
+> AI agents: apply these three rules first. Read the file, Private-mode, or traffic sections only when that surface is in scope, and never copy secrets into output.
+
 1. Use only Microsoft 365 accounts and data you are authorized to access.
 2. Keep the default `127.0.0.1` local binding. Add TLS, a trusted reverse proxy, and network restrictions before exposing the service.
 3. Never publish data that can authenticate, replay a session, or download private content.
@@ -50,7 +54,7 @@ Hermes、Hindsight 與一般呼叫可以共用同一帳號，但 Gateway 會限�
 
 The gateway fetches protected files with authenticated state, stores them in a private local area, and exposes a short-lived download capability. Do not return Microsoft or browser temporary URLs directly to callers.
 
-Chat and Teams file access use separate refresh credentials. The gateway binds them only when both account and tenant identities match exactly; signing in as another account must not reuse the old file permission.
+The gateway stores only the primary Microsoft sign-in refresh credential. When a Code Interpreter file is needed, it uses that same credential to obtain a short-lived IC3 resource token. There is no second browser authorization or separate Teams refresh credential. If the account identity changes, neither the old sign-in state nor its local file capabilities may be reused.
 
 ## What Private mode means
 

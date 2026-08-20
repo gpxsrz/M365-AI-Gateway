@@ -809,7 +809,7 @@ async fn complete_chat(
                     "artifacts": artifacts,
                     "images": result.images,
                     "throttling": result.throttling,
-                    "semanticEvents": result.events,
+                    "semanticEvents": crate::chathub::semantic_events(&result.events),
                 }
             }))
             .into_response()
@@ -897,11 +897,17 @@ async fn stream_chat(
             );
             Ok(())
         };
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
-            gateway.chat.chat(account, request, &mut sink),
-        )
-        .await;
+        let result = tokio::select! {
+            biased;
+            _ = sender.closed() => {
+                permit.finish(StatusCode::REQUEST_TIMEOUT, None);
+                return;
+            }
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
+                gateway.chat.chat(account, request, &mut sink),
+            ) => result,
+        };
         match result {
             Ok(Ok(result)) => {
                 let mut result = match qualify_response_format(
@@ -2607,7 +2613,15 @@ fn send_sse_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, path::PathBuf, sync::Mutex, time::Instant};
+    use std::{
+        collections::VecDeque,
+        path::PathBuf,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     use axum::{Router, http::Request};
     use tower::ServiceExt;
@@ -2654,6 +2668,36 @@ mod tests {
                     request_id: "request-1".to_owned(),
                     ..ChatResult::default()
                 })
+            })
+        }
+    }
+
+    struct HangingTransport {
+        started: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl ChatHubTransport for HangingTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            let started = self.started.clone();
+            let dropped = self.dropped.clone();
+            Box::pin(async move {
+                started.store(true, Ordering::Release);
+                let _marker = DropMarker(dropped);
+                std::future::pending::<Result<ChatResult, ChatError>>().await
             })
         }
     }
@@ -2713,6 +2757,44 @@ mod tests {
         }
     }
 
+    struct ProtectedEventTransport;
+
+    impl ChatHubTransport for ProtectedEventTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                let protected = "https://artifact.asyncgw.teams.microsoft.com/v1/objects/id/views/original/private.txt";
+                Ok(ChatResult {
+                    text: "safe answer".to_owned(),
+                    final_text: "safe answer".to_owned(),
+                    conversation_id: "event-conversation".to_owned(),
+                    session_id: "event-session".to_owned(),
+                    events: vec![json!({
+                        "type": 1,
+                        "target": "update",
+                        "arguments": [{"messages": [
+                            {
+                                "messageType": "Progress",
+                                "contentType": "SearchResults",
+                                "text": "safe progress"
+                            },
+                            {
+                                "messageType": "GeneratedCode",
+                                "contentOrigin": "CodeInterpreter",
+                                "text": format!(r#"{{"codeResultFileUrl":"{protected}"}}"#)
+                            }
+                        ]}]
+                    })],
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
     fn oauth() -> OAuthConfig {
         OAuthConfig {
             client_id: DEFAULT_CLIENT_ID.to_owned(),
@@ -2739,7 +2821,6 @@ mod tests {
             .upsert(TokenSet {
                 access_token: "access".to_owned(),
                 refresh_token: "refresh".to_owned(),
-                teams_refresh_token: String::new(),
                 id_token: String::new(),
                 token_type: "Bearer".to_owned(),
                 scope: DEFAULT_SCOPE.to_owned(),
@@ -3361,6 +3442,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_stream_response_cancels_the_upstream_request() {
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (app, raw_key) = app_with_chat(Arc::new(HangingTransport {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        }));
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","stream":true,"messages":[{"role":"user","content":"wait"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the response body must cancel the upstream stream");
+    }
+
+    #[tokio::test]
     async fn streaming_holds_urls_until_artifact_reconciliation() {
         let public = "ready https://example.test/page";
         let (app, raw_key) = app_with_chat(Arc::new(StreamTextTransport {
@@ -3422,6 +3543,34 @@ mod tests {
         assert!(!body.contains("asyncgw.teams.microsoft.com"));
         assert!(!body.contains("\"finish_reason\":\"stop\""));
         assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn non_stream_metadata_projects_semantic_events_without_artifact_secrets() {
+        let (app, raw_key) = app_with_chat(Arc::new(ProtectedEventTransport));
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("safe progress"));
+        assert!(!body.contains("codeResultFileUrl"));
+        assert!(!body.contains("asyncgw.teams.microsoft.com"));
     }
 
     #[tokio::test]

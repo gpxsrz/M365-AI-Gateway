@@ -2,6 +2,8 @@
 
 ## 30 秒看懂
 
+> AI Agent：先讀本節和「最重要的邊界」。只有要選 API 時才讀入口表；只有要查精確格式時才前往 `api-contracts.md`。
+
 Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 
 ```text
@@ -56,7 +58,7 @@ Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 |---|---|
 | 一般聊天 | Private mode 要求不建立一般歷史，但不保證 Microsoft 零保留 |
 | 文件與圖片 | 可能使用 OneDrive／SharePoint 暫存，和聊天歷史是不同邊界 |
-| 登入權限 | 聊天與 Teams 檔案使用分開的更新憑證；Gateway 只在兩者帳號識別完全相同時綁在一起 |
+| 登入權限 | 只做一次 Microsoft 登入；檔案需要的短效 IC3 token 由同一份主要更新憑證取得 |
 | Code Interpreter 檔案 | 先由 Gateway 以已登入狀態取回，再存入本機私有區域 |
 | 下載網址 | 對外只給短效 capability URL，不直接洩漏 Microsoft 暫時網址 |
 | Checkpoint | 只保存續接需要的摘要與識別，不保存完整私密內容 |

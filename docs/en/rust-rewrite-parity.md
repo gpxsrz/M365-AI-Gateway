@@ -1,62 +1,61 @@
-# Rust rewrite completion status
+# Rust rewrite comparison
 
 ## Understand it in 30 seconds
 
-Rust has completed the offline contract port from Go `f038c86e62c7390c442f30043715255576db4e19` and starts successfully as a local release binary. Primary OAuth, text chat, file/vision input, and the official Python MCP client passed in an isolated environment.
+> AI agents: start with **Drift found during qualification**. Open the feature table only for one surface, and open the final gates only for a release. Never treat retained Go code as a build source.
 
-The remaining exclusions are successful image generation, complete Code Interpreter artifact download, GitHub exact-head CI, containers, NAS/VM, and Production. Current live results are from a pre-publication candidate and must be rerun on the exact committed head.
+Rust is the only release and container build source. Go `f038c86e62c7390c442f30043715255576db4e19` remains a read-only comparison baseline for answering “what did the original actually do?” without filling gaps from memory.
 
-| Question | Current answer |
-|---|---|
-| Is Rust the only release/container build source? | Yes |
-| Why is Go source retained? | Deterministic comparison only |
-| Did local tests and startup pass? | PASS |
-| Is Production replacement approved? | Not implied by local PASS |
-| May Go comparison source be deleted? | No; no such authorization exists |
+Core parity rules now confirmed:
 
-## Surface comparison
+- One gateway maps to one Microsoft 365 account.
+- Browser-based Microsoft sign-in happens once.
+- IC3 file tokens come from the same primary refresh credential.
+- Tests bind ChatHub payloads, streams, tools, checkpoints, and error shapes.
+- Local PASS, live PASS, CI, and Production are four separate gates.
 
-| Surface | Status | Covered behavior |
+## Drift found during qualification
+
+An earlier Rust version added a second Teams OAuth leg that did not exist in Go. One button click could therefore wait silently for a second permission flow.
+
+Artifact tests also proved only that metadata was found, not that file bytes were fetched. Real Microsoft output appended one display filename after `/views/original`. Fetching that full URL returned 404; the usable download endpoint keeps the query and removes that display-filename segment.
+
+Streaming had a lifecycle drift too: Rust once detached upstream work in its own task, so a disconnected caller could keep account capacity occupied. The original Go request context followed client cancellation. Rust now cancels upstream work when the response body is dropped.
+
+The corrected shared path is:
+
+1. Store only the primary Microsoft refresh credential.
+2. Use it to obtain a short-lived IC3 access token for the same account when a file is needed.
+3. Accept only approved HTTPS hosts and artifact paths.
+4. Remove at most one display filename; reject deeper or unknown paths.
+5. Never return protected upstream URLs or raw artifact events to API callers.
+6. Serialize normal refresh and resource-token refresh around the same credential so rotations cannot race.
+
+## Feature comparison
+
+| Surface | Contract retained in Rust | Smallest useful evidence |
 |---|---|---|
-| OpenAI Chat Completions | Local PASS | non-stream/SSE, structured output, tools, usage, `[DONE]` |
-| Responses | Local PASS | parent continuation, tool results, parallel calls, reasoning/media events |
-| Anthropic Messages | Local PASS | errors, tool/image round trips, posthoc stream, ignored-parameter headers |
-| Hermes | Local PASS | provenance, execution ledger, completion guard, multi-round tools, scheduling |
-| Hindsight | Local PASS | retain/recall/reflect, breaker, `MEMORY_YIELD`, webhooks, barriers |
-| MCP modern | Candidate live PASS | official Python SDK: initialize → list tools → `wp6_echo` → close |
-| MCP legacy | Local PASS | session/Origin and legacy SSE/message boundaries |
-| Files / vision | Candidate live PASS | real file-plus-image input; local magic/name/SSRF/quota/reuse checks also pass |
-| Images | Account capability unproven | a real request returned `no_image_resource`; do not infer support or regression |
-| Code Interpreter artifacts | Partial live | real metadata appeared; private storage, dual authorization, account/path/network boundaries are implemented; full download needs rerun |
-| Automatic Microsoft sign-in | Partial live | button launch and post-failure retry pass; primary OAuth and Teams PKCE passed separately; one combined controlled-window run remains |
-| Checkpoint continuation | Local PASS | history prefix, rollback-safe clear, parents, tool ledger, restart persistence |
-| Caller tools | Local PASS | call identity, fail-closed limits, read-only parallel allowlist, router/repair/final boundaries |
-| Streaming | Local PASS | frame dedupe, usage, single `[DONE]`, error SSE, artifact URL holdback |
-| Admin/settings/debug | Local PASS | bootstrap, API keys, partial update, env source, redaction, persistence |
-| Legacy routes | Offline PASS | literal Go routes and dynamic Hindsight/artifact routes mapped; adds `/api/admin/traffic` |
-| Model capabilities | Local PASS | built-in/configured/optional, evidence binding, observe-only drift |
-| Release definition | Local PASS | pinned toolchain, locked build, Rust Dockerfile, six-platform matrix, checksums |
+| OpenAI Chat Completions | non-stream/SSE, tools, usage, one `[DONE]`, disconnect cancellation | adapter and route tests |
+| Responses | parents, tool results, parallel calls, reasoning/media events | continuation tests |
+| Anthropic Messages | errors, tool/image round trips, posthoc stream | adapter tests |
+| Hermes | provenance, ledger, completion guard, multi-round tools, scheduling | full continuation tests |
+| Hindsight | retain/recall/reflect, breaker, webhooks, barriers | Memory-profile tests |
+| OAuth | one sign-in, account binding, refresh rotation | browser + auth-lifecycle tests |
+| Code Interpreter | private storage, short-lived downloads, stream holdback, restart reuse | deterministic + isolated live |
+| MCP | modern HTTP and legacy SSE boundaries | route tests + official Python client |
+| Admin | bootstrap, passwords, API keys, setting sources, redaction | HTTP tests + browser path |
+| Release | pinned toolchain, locked build, Rust container | local release gate + exact-head CI |
 
-## Local completion evidence
+## Release gates
 
-```text
-cargo fmt --all --check
-cargo test --locked --all-targets       # 141 passed, 0 failed
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked --release
-git diff --check
-```
+Every candidate follows this order:
 
-The release-binary smoke completed bootstrap login → password change → re-login → API-key creation → authenticated `/v1/models`, all HTTP 200. An unauthenticated models request returned 401.
+1. Rust formatting, full tests, Clippy, release build, and diff check.
+2. When parity relies on Go, run Go verify, test, vet, and build.
+3. Review affected paths with Serena and Code Review Graph; zero graph impact never replaces source search.
+4. After commit, run exact-head GitHub CI and container build.
+5. Read back the public ref, NAS, VM, and release artifact separately.
+6. Create verified recovery evidence before Production deployment.
+7. Close with a low-rate live request, service state, binary/Web hashes, and rollback evidence.
 
-Source also received Serena semantic review and incremental Code Review Graph review. Each graph-reported test gap was checked against same-module or route regressions.
-
-## External gates still open
-
-1. Commit and publish public `main`.
-2. GitHub exact-head CI and container build.
-3. NAS / VM exact-commit synchronization.
-4. Rerun live checks on the published exact commit; complete combined controlled-browser authorization, image-capability determination, and full artifact download.
-5. Complete rollback evidence and Production promotion/readback.
-
-Every gate must pin commit, route, account/runtime scope, and produce zero secret output. Update this page when a gate completes; current documentation must not keep stale “not run” claims.
+If any step fails, report partial completion. Exact results belong in CI, Git history, and deployment readback; current docs do not carry expiring PIDs, container IDs, or account data.

@@ -4,6 +4,8 @@ Status / 狀態: **DEPLOYED AND LIVE-QUALIFIED — Issues #42–#44 / 已部署�
 
 Date / 日期: 2026-08-12
 
+> **Archive only / 僅供歷史追溯**：以下的「目前」「current」都指 2026-08-12 當時，不是現在的 Rust 或 Production 操作指引。Current guidance: [`../README.md`](../README.md).
+
 ## 繁體中文
 
 ### 目前實際架構
