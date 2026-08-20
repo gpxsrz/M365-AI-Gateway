@@ -2481,7 +2481,7 @@ fn request_class(path: &str, body: &ChatCompletionRequest) -> WorkloadClass {
         return WorkloadClass::Memory;
     }
     if path == "/v1/chat/completions" {
-        return WorkloadClass::Autonomous;
+        return WorkloadClass::ControlPlane;
     }
     let latest_user = body
         .messages
@@ -3133,7 +3133,7 @@ mod tests {
         let body = hermes_body(vec![OpenAiMessage::text("user", "ordinary user text")]);
         assert_eq!(
             request_class("/v1/chat/completions", &body),
-            WorkloadClass::Autonomous
+            WorkloadClass::ControlPlane
         );
     }
 

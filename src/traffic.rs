@@ -26,6 +26,7 @@ const DEFAULT_COOLDOWNS: [Duration; 5] = [
 pub enum WorkloadClass {
     ExternalUser,
     Autonomous,
+    ControlPlane,
     AsyncCompletion,
     Memory,
 }
@@ -40,7 +41,18 @@ impl WorkloadClass {
     }
 
     fn is_background(self) -> bool {
-        matches!(self, Self::Autonomous | Self::AsyncCompletion)
+        matches!(
+            self,
+            Self::Autonomous | Self::ControlPlane | Self::AsyncCompletion
+        )
+    }
+
+    fn waits_for_memory_yield(self) -> bool {
+        matches!(self, Self::Autonomous | Self::ControlPlane)
+    }
+
+    fn can_probe_recovery(self) -> bool {
+        matches!(self, Self::ExternalUser | Self::Autonomous)
     }
 }
 
@@ -279,7 +291,7 @@ impl TrafficController {
                     });
                 }
                 if now >= ordinary_deadline
-                    && !(class == WorkloadClass::Autonomous
+                    && !(class.waits_for_memory_yield()
                         && state
                             .memory_yield
                             .as_ref()
@@ -296,7 +308,7 @@ impl TrafficController {
                 state
                     .memory_yield
                     .as_ref()
-                    .filter(|_| class == WorkloadClass::Autonomous)
+                    .filter(|_| class.waits_for_memory_yield())
                     .map(|yield_state| ordinary_deadline.max(yield_state.deadline))
                     .unwrap_or(ordinary_deadline)
             };
@@ -517,7 +529,7 @@ impl TrafficController {
             if status == StatusCode::TOO_MANY_REQUESTS {
                 state.apply_rate_limit("interactive", now, retry_after, &self.cooldowns);
             } else if state.circuit == CircuitState::ProbeInFlight {
-                if status.is_success() && class.is_external() {
+                if status.is_success() && class.can_probe_recovery() {
                     state.circuit = CircuitState::Recovery;
                     state.recovery_quiet_since = Some(now);
                 } else {
@@ -576,7 +588,7 @@ impl State {
         if class.is_background() && self.autonomous_in_flight >= 1 {
             return false;
         }
-        if class == WorkloadClass::Autonomous && self.memory_yield.is_some() {
+        if class.waits_for_memory_yield() && self.memory_yield.is_some() {
             return false;
         }
         if !class.is_external() && self.memory_head_can_use_slot() {
@@ -587,7 +599,9 @@ impl State {
                 self.shared_in_flight() < SHARED_MAX_CONCURRENT
                     && self.cooldown_until.is_none_or(|until| now >= until)
             }
-            CircuitState::HalfOpenReady => class.is_external() && self.shared_in_flight() == 0,
+            CircuitState::HalfOpenReady => {
+                class.can_probe_recovery() && self.shared_in_flight() == 0
+            }
             CircuitState::Recovery => self.shared_in_flight() < 1,
             CircuitState::Open | CircuitState::ProbeInFlight => false,
         }
@@ -997,7 +1011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_external_user_can_probe_and_success_enters_recovery() {
+    async fn autonomous_can_probe_after_cooldown_when_no_external_user_is_waiting() {
         let controller = fast_controller();
         controller
             .acquire(WorkloadClass::ExternalUser, fast_limits())
@@ -1019,12 +1033,12 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(half_open_memory_error.status, StatusCode::TOO_MANY_REQUESTS);
-        let background_error = controller
-            .acquire(WorkloadClass::Autonomous, fast_limits())
+        let control_plane_error = controller
+            .acquire(WorkloadClass::ControlPlane, fast_limits())
             .await
             .err()
             .unwrap();
-        assert_eq!(background_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(control_plane_error.status, StatusCode::SERVICE_UNAVAILABLE);
         let async_completion_error = controller
             .acquire(WorkloadClass::AsyncCompletion, fast_limits())
             .await
@@ -1039,7 +1053,7 @@ mod tests {
             CircuitState::HalfOpenReady
         );
         let probe = controller
-            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .acquire(WorkloadClass::Autonomous, fast_limits())
             .await
             .unwrap();
         probe.finish(StatusCode::OK, None);
@@ -1056,7 +1070,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cooldown_expiry_only_makes_the_external_probe_ready() {
+    async fn external_user_still_wins_the_half_open_probe_when_already_waiting() {
+        let controller = fast_controller();
+        controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .unwrap()
+            .finish(StatusCode::TOO_MANY_REQUESTS, None);
+        let limits = TrafficLimits {
+            interactive_queue_timeout: Duration::from_millis(250),
+            memory_queue_timeout: Duration::from_millis(250),
+        };
+
+        let background = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.acquire(WorkloadClass::Autonomous, limits).await })
+        };
+        tokio::task::yield_now().await;
+        let external = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                controller
+                    .acquire(WorkloadClass::ExternalUser, limits)
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        controller.changed.notify_waiters();
+        let probe = tokio::time::timeout(Duration::from_millis(50), external)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!background.is_finished());
+        assert_eq!(
+            controller.snapshot().shared_circuit_state,
+            CircuitState::ProbeInFlight
+        );
+
+        probe.finish(StatusCode::OK, None);
+        let background = tokio::time::timeout(Duration::from_millis(50), background)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        background.finish(StatusCode::OK, None);
+    }
+
+    #[tokio::test]
+    async fn autonomous_probe_that_is_throttled_reopens_with_the_next_cooldown_level() {
+        let controller = fast_controller();
+        controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .unwrap()
+            .finish(StatusCode::TOO_MANY_REQUESTS, None);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        controller
+            .acquire(WorkloadClass::Autonomous, fast_limits())
+            .await
+            .unwrap()
+            .finish(StatusCode::TOO_MANY_REQUESTS, None);
+        let reopened = controller.snapshot();
+        assert_eq!(reopened.shared_circuit_state, CircuitState::Open);
+        assert_eq!(reopened.shared_cooldown_level, 2);
+
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        assert_eq!(
+            controller.snapshot().shared_circuit_state,
+            CircuitState::HalfOpenReady
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_expiry_makes_one_recovery_probe_ready() {
         let controller = fast_controller();
         controller
             .acquire(WorkloadClass::ExternalUser, fast_limits())

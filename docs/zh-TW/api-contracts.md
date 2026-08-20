@@ -128,7 +128,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 ```
 
 - `OPEN` 到期只代表可以 probe，不會直接關閉。
-- 只有一筆 external-user request 可以 probe；背景 Hermes、Goal Judge 與 Memory 都不行。
+- external-user 永遠優先取得 probe；若 cooldown 到期且沒有 external-user 在等，允許一筆已被 Gateway 明確分類為 `Autonomous` 的 Hermes continuation 做唯一 probe。`/v1` control-plane（含 Goal Judge）、`AsyncCompletion` 與 Memory 仍不得 probe；probe 若再次 429 會依原 cooldown ladder 升級後重新 OPEN。
 - Probe 再被 throttle 會回 `OPEN` 並提高 cooldown。
 - Probe 成功才進 `RECOVERY`。
 - `RECOVERY` shared concurrency 仍是 1，Memory 仍不進 upstream。
