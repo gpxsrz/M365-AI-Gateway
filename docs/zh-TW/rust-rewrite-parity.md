@@ -2,9 +2,9 @@
 
 ## 30 秒看懂
 
-> AI Agent：先讀「這次抓到的偏差」。要查單一功能才讀對照表；要發布才讀最後的 gate。不要把保留的 Go 程式當成建置來源。
+> AI Agent：先讀「這次抓到的偏差」。要查單一功能才讀對照表；要發布才讀最後的 gate。Current source tree 已是 Rust-only。
 
-Rust 是唯一 release／container 建置來源。Go `f038c86e62c7390c442f30043715255576db4e19` 保留為唯讀比較基準，用來回答「原本真的怎麼做」，不能憑印象補流程。
+Rust 是唯一 release／container 建置來源。原 Go 基準不再保留在 current tree；需要回答「原本真的怎麼做」時，唯讀查 Git history 的固定歷史 commit `f038c86e62c7390c442f30043715255576db4e19`，不能憑印象補流程。
 
 目前已對到的核心原則：
 
@@ -51,7 +51,7 @@ Rust 是唯一 release／container 建置來源。Go `f038c86e62c7390c442f300437
 每個候選版本都要依序完成：
 
 1. Rust format、完整 tests、Clippy、release build、diff check。
-2. 若 parity 判斷依賴 Go，跑 Go verify／test／vet／build。
+2. 若 parity 判斷需要原 Go 行為，只從固定歷史 commit 唯讀查證，不恢復 Go 原碼到 current tree。
 3. Serena 與 Code Review Graph 檢查受影響路徑；graph 的零影響不能取代原碼搜尋。
 4. Commit 後，以 exact head 跑 GitHub CI 與 container build。
 5. 分別讀回 public ref、NAS、VM 與 release artifact。

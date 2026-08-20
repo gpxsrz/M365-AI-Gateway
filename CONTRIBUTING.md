@@ -40,7 +40,7 @@ git diff --check
 
 - 改到串流、並發、checkpoint 或生命週期時，完整測試至少再跑一次。
 - 改管理頁面時，實際檢查登入頁、主頁、診斷頁與 browser console。
-- Go source 只供遷移比較；只有改到它或用它做 parity gate 時，才跑 Go 的 verify/test/vet/build。
+- Current source tree 是 Rust-only。需要追原 Go 行為時，從 Git history 的固定歷史 commit 唯讀比較，不把 Go 原碼恢復到 current tree。
 
 ## 安全底線
 
@@ -90,7 +90,7 @@ git diff --check
 
 - Repeat the full test suite after streaming, concurrency, checkpoint, or lifecycle changes.
 - For management UI changes, inspect the login, main, and debug pages plus the browser console.
-- Go source is migration reference only. Run its verify/test/vet/build gate only when it changes or when a parity review explicitly depends on it.
+- The current source tree is Rust-only. When historical Go behavior is needed for parity review, inspect the pinned historical commit from Git without restoring Go source into the current tree.
 
 ## Security boundary
 

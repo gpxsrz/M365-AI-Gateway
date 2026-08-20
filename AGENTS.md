@@ -32,6 +32,6 @@
 
 Rust 變更至少執行 `cargo fmt --all --check`、`cargo test --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release` 與 `git diff --check`。串流、並發、checkpoint 或生命週期變更要重跑完整測試。
 
-只有改到保留的 Go 比較來源，或 parity review 明確依賴它時，才跑 Go verify/test/vet/build。
+目前 source tree 是 Rust-only。若 parity review 需要追原 Go 行為，只能從 Git history 的固定歷史 commit（例如 `f038c86e62c7390c442f30043715255576db4e19`）唯讀查證，不要把 Go 原碼恢復成 current build source。
 
 宣稱完成前，要讀回本輪涉及的 source、CI、runtime 與外部表面。只要仍有未審 WIP、stale process、未完成 gate 或 mixed-source runtime，就不能說「沒有尾巴」。

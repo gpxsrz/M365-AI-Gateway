@@ -2,9 +2,9 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: start with **Drift found during qualification**. Open the feature table only for one surface, and open the final gates only for a release. Never treat retained Go code as a build source.
+> AI agents: start with **Drift found during qualification**. Open the feature table only for one surface, and open the final gates only for a release. The current source tree is Rust-only.
 
-Rust is the only release and container build source. Go `f038c86e62c7390c442f30043715255576db4e19` remains a read-only comparison baseline for answering “what did the original actually do?” without filling gaps from memory.
+Rust is the only release and container build source. The original Go baseline is no longer kept in the current tree; when historical behavior matters, inspect the pinned Git-history commit `f038c86e62c7390c442f30043715255576db4e19` read-only instead of filling gaps from memory.
 
 Core parity rules now confirmed:
 
@@ -51,7 +51,7 @@ The corrected shared path is:
 Every candidate follows this order:
 
 1. Rust formatting, full tests, Clippy, release build, and diff check.
-2. When parity relies on Go, run Go verify, test, vet, and build.
+2. When parity needs original Go behavior, inspect only the pinned historical commit; do not restore Go source into the current tree.
 3. Review affected paths with Serena and Code Review Graph; zero graph impact never replaces source search.
 4. After commit, run exact-head GitHub CI and container build.
 5. Read back the public ref, NAS, VM, and release artifact separately.

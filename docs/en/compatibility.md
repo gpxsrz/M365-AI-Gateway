@@ -4,7 +4,7 @@
 
 > AI agents: start with the status table. Read the last section only to judge evidence strength; never turn one live pass into a permanent guarantee.
 
-Rust covers the public API and main execution paths of the retained Go gateway. One Microsoft sign-in, text chat, file/vision input, Code Interpreter files, and modern MCP all have real-path evidence.
+Rust covers the public API and main execution paths of the former Go gateway. One Microsoft sign-in, text chat, file/vision input, Code Interpreter files, and modern MCP all have real-path evidence.
 
 “Live pass” means one isolated check succeeded. Microsoft capabilities can vary by account and rollout, so every release must still bind an exact commit, CI run, binary, and runtime readback.
 
