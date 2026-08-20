@@ -56,6 +56,7 @@ Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 |---|---|
 | 一般聊天 | Private mode 要求不建立一般歷史，但不保證 Microsoft 零保留 |
 | 文件與圖片 | 可能使用 OneDrive／SharePoint 暫存，和聊天歷史是不同邊界 |
+| 登入權限 | 聊天與 Teams 檔案使用分開的更新憑證；Gateway 只在兩者帳號識別完全相同時綁在一起 |
 | Code Interpreter 檔案 | 先由 Gateway 以已登入狀態取回，再存入本機私有區域 |
 | 下載網址 | 對外只給短效 capability URL，不直接洩漏 Microsoft 暫時網址 |
 | Checkpoint | 只保存續接需要的摘要與識別，不保存完整私密內容 |

@@ -27,8 +27,29 @@ When the service reports that it is listening on `127.0.0.1:4141`, open `http://
 
 1. Sign in with the one-time password.
 2. Replace it when prompted, then sign in again with the new password.
-3. Start Microsoft sign-in from the management page and complete it in the browser.
+3. Select **Automatically Sign in to Microsoft Account** and finish sign-in in the controlled Chrome window.
 4. Create an API key. The raw key is shown once, so store it safely immediately.
+
+### Choose a Microsoft sign-in path
+
+Start with **Automatic Sign-in**. One click completes two steps in the same controlled Chrome window:
+
+1. Capture the Microsoft chat sign-in result.
+2. Capture the Teams file-access result. Files created by Code Interpreter need this step.
+
+The page may switch quickly. Keep the window open until the management page reports completion. The gateway receives only the one-time sign-in results; it does not store the full error page.
+
+On first use, you may still need to sign in once inside that window. It then keeps its own browser session.
+
+Your regular Chrome session is not copied into the controlled Chrome. If you are already signed in to regular Chrome, expand **Use compatibility fallback**:
+
+1. Select **Use Current Browser Session**.
+2. Microsoft may show “This isn't the right page.” The authorization result is still available.
+3. A trusted local AI agent can read the error page's `referrer` without displaying it and submit it directly to the local gateway.
+
+This fallback completes the main chat sign-in only. To download files created by Code Interpreter, complete **Automatic Sign-in** successfully at least once.
+
+Never paste the callback URL, authorization code, or complete error page into chat, logs, or documentation.
 
 ## Step 3: verify local access
 
@@ -60,7 +81,11 @@ First-use administrator bootstrap trusts real loopback only. A container bridge 
 | Sign-in returns 403 | The request has exactly one correct `Origin`, and proxy trust is configured correctly |
 | The one-time password no longer works | This is expected; use the persistent password you created |
 | The API returns 401 | `Authorization: Bearer ...` contains a valid API key |
-| Microsoft sign-in did not finish | Return to the management page for status; never publish callbacks, tokens, or full error bodies |
+| Automatic sign-in stops at a Microsoft sign-in field | First use requires a separate sign-in in the controlled Chrome; the regular Chrome session is not copied |
+| The page briefly switches to Teams after sign-in | This is the file-access step; keep the window open until the management page reports completion |
+| Teams file permission fails | Make sure the controlled Chrome uses the same Microsoft account, then restart sign-in from the management page |
+| Microsoft shows an error page | Return to the management page for status; automatic mode captures before the error page, while a trusted local agent may securely submit the `referrer` for the compatibility fallback |
+| Microsoft sign-in did not finish | Close any controlled Chrome window that is still waiting, then start again; never share callbacks, tokens, or full error bodies |
 
 ## Next page
 

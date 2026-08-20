@@ -2739,6 +2739,7 @@ mod tests {
             .upsert(TokenSet {
                 access_token: "access".to_owned(),
                 refresh_token: "refresh".to_owned(),
+                teams_refresh_token: String::new(),
                 id_token: String::new(),
                 token_type: "Bearer".to_owned(),
                 scope: DEFAULT_SCOPE.to_owned(),

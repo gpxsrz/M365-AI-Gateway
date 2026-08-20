@@ -26,7 +26,6 @@ const LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 const MAX_ENTRIES: usize = 1_024;
 const MAX_BYTES: u64 = 4 << 30;
 const MAX_FETCH_BYTES: u64 = 512 << 20;
-const ARTIFACT_SCOPE: &str = "https://ic3.teams.office.com/.default openid profile offline_access";
 const PROTECTED_STREAM_MARKERS: [&str; 5] = [
     "https://",
     "http://",
@@ -403,24 +402,31 @@ pub(crate) async fn materialize(
     let mut links = Vec::new();
     for artifact in &mut result.artifacts {
         let location = valid_upstream_location(&artifact.upstream_url)?;
+        let path_shape = upstream_path_shape(&location);
+        let mut expected_account_oid = None;
         let mut response = None;
         for _ in 0..2 {
-            let token = gateway
+            let (token, account_oid) = gateway
                 .tokens
-                .resource_access_token(ARTIFACT_SCOPE)
+                .teams_ic3_access_token()
                 .await
                 .map_err(|_| storage("artifact authorization unavailable"))?;
+            if expected_account_oid
+                .as_ref()
+                .is_some_and(|expected| expected != &account_oid)
+            {
+                return Err(storage("artifact authorization unavailable"));
+            }
+            expected_account_oid = Some(account_oid.clone());
+            let account_location = account_scoped_location(&location, &account_oid)
+                .ok_or_else(|| storage("artifact authorization unavailable"))?;
             if !valid_bearer_token(&token) {
                 return Err(storage("artifact authorization unavailable"));
             }
+            let token_class = crate::auth::teams_ic3_token_class(&token);
             let candidate = client
-                .get(location.clone())
-                .bearer_auth(token)
-                .header("ms-ic3-product", "Copilot")
-                .header(
-                    "x-ms-client-version",
-                    format!("M365-AI-Gateway/{}", env!("CARGO_PKG_VERSION")),
-                )
+                .get(account_location.clone())
+                .bearer_auth(&token)
                 .header(header::ACCEPT_ENCODING, "identity")
                 .send()
                 .await
@@ -429,6 +435,14 @@ pub(crate) async fn materialize(
                 continue;
             }
             if !candidate.status().is_success() {
+                tracing::warn!(
+                    http_status = candidate.status().as_u16(),
+                    path_shape,
+                    host_class = upstream_host_class(&location),
+                    token_class,
+                    has_query = location.query().is_some(),
+                    "Microsoft artifact download rejected"
+                );
                 return Err(storage("artifact upstream status rejected"));
             }
             response = Some(candidate);
@@ -552,8 +566,7 @@ fn valid_upstream_location(raw: &str) -> Result<url::Url, GatewayError> {
         || parts[0] != "v1"
         || parts[1] != "objects"
         || parts[2].is_empty()
-        || !matches!(parts[3], "content" | "views")
-        || parts[4] != "original"
+        || supported_upstream_path(&parts).is_none()
         || parts
             .iter()
             .any(|part| part.is_empty() || matches!(*part, "." | ".."))
@@ -564,6 +577,68 @@ fn valid_upstream_location(raw: &str) -> Result<url::Url, GatewayError> {
         return Err(storage("artifact upstream location is invalid"));
     }
     Ok(url)
+}
+
+fn supported_upstream_path(parts: &[&str]) -> Option<&'static str> {
+    if parts.len() >= 7 && parts[3] == "content" && parts[4] == "views" && parts[5] == "original" {
+        return Some("content_views_original");
+    }
+    if parts.len() >= 6 && parts[4] == "original" {
+        return match parts[3] {
+            "content" => Some("content_original"),
+            "views" => Some("views_original"),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn upstream_path_shape(location: &url::Url) -> &'static str {
+    location
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .and_then(|parts| supported_upstream_path(&parts))
+        .unwrap_or("unknown")
+}
+
+fn upstream_host_class(location: &url::Url) -> &'static str {
+    let hostname = location.host_str().unwrap_or_default();
+    let prefix = hostname
+        .strip_suffix(".asyncgw.teams.microsoft.com")
+        .unwrap_or_default();
+    match prefix {
+        "eu-prod" => "eu-prod",
+        "na-prod" => "na-prod",
+        "as-prod" => "as-prod",
+        "uk-prod" => "uk-prod",
+        "au-prod" => "au-prod",
+        "in-prod" => "in-prod",
+        "jp-prod" => "jp-prod",
+        "us-prod" => "us-prod",
+        _ => "other",
+    }
+}
+
+fn account_scoped_location(location: &url::Url, account_oid: &str) -> Option<url::Url> {
+    if !valid_account_oid(account_oid) || !location.path().starts_with("/v1/objects/") {
+        return None;
+    }
+    let rewritten =
+        location
+            .as_str()
+            .replacen("/v1/objects/", &format!("/v1/{account_oid}/objects/"), 1);
+    url::Url::parse(&rewritten).ok()
+}
+
+fn valid_account_oid(raw: &str) -> bool {
+    raw.len() == 36
+        && raw.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 pub(crate) fn release_stream_safe_prefix(buffer: &mut String) -> String {
@@ -821,12 +896,12 @@ mod tests {
 
     #[test]
     fn artifact_network_boundaries_fail_closed() {
-        assert!(
-            valid_upstream_location(
-                "https://us-prod.asyncgw.teams.microsoft.com/v1/objects/id/views/original/report.csv?sig=private"
-            )
-            .is_ok()
-        );
+        for location in [
+            "https://us-prod.asyncgw.teams.microsoft.com/v1/objects/id/views/original/report.csv?sig=private",
+            "https://us-prod.asyncgw.teams.microsoft.com/v1/objects/id/content/views/original/report.csv?sig=private",
+        ] {
+            assert!(valid_upstream_location(location).is_ok(), "{location}");
+        }
         for location in [
             "not a URL",
             " https://us.asyncgw.teams.microsoft.com/v1/objects/id/views/original/a.txt",
@@ -855,6 +930,37 @@ mod tests {
         ] {
             assert!(valid_public_origin(origin).is_err(), "{origin}");
         }
+    }
+
+    #[test]
+    fn artifact_download_adds_only_the_active_account_boundary() {
+        const ACCOUNT_OID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        let legacy = valid_upstream_location(
+            "https://us-prod.asyncgw.teams.microsoft.com/v1/objects/id/views/original/report.csv?sig=private",
+        )
+        .unwrap();
+        let account_scoped = account_scoped_location(&legacy, ACCOUNT_OID).unwrap();
+        assert_eq!(
+            account_scoped.path(),
+            "/v1/01234567-89ab-cdef-0123-456789abcdef/objects/id/views/original/report.csv"
+        );
+        assert_eq!(account_scoped.query(), Some("sig=private"));
+        assert!(account_scoped_location(&legacy, "not-an-oid").is_none());
+    }
+
+    #[test]
+    fn artifact_resource_token_classification_never_returns_claim_values() {
+        let claims = URL_SAFE_NO_PAD.encode(
+            br#"{"aud":"https://ic3.teams.office.com","appid":"5e3ce6c0-2b1f-4285-8d4b-75ee78787346","scp":"Teams.AccessAsUser.All"}"#,
+        );
+        assert_eq!(
+            crate::auth::teams_ic3_token_class(&format!("header.{claims}.signature")),
+            "ic3_teams_access"
+        );
+        assert_eq!(
+            crate::auth::teams_ic3_token_class("opaque-secret"),
+            "opaque"
+        );
     }
 
     #[test]

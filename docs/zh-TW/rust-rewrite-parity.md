@@ -2,9 +2,9 @@
 
 ## 30 秒看懂
 
-Rust 已完成 Go `f038c86e62c7390c442f30043715255576db4e19` 的離線契約搬移，也能以 release binary 在本機啟動。
+Rust 已完成 Go `f038c86e62c7390c442f30043715255576db4e19` 的離線契約搬移，也能以 release binary 在本機啟動。主要 OAuth、文字聊天、檔案／Vision 與官方 Python MCP client 已在隔離環境實測。
 
-這句話不包含：真實 Microsoft OAuth／ChatHub／檔案／圖片／artifact、第三方 MCP client、GitHub exact-head CI、container、NAS／VM 或 Production。那些要在固定 Rust commit 後分開驗收。
+目前仍不包含：圖片生成成功、Code Interpreter artifact 完整下載、GitHub exact-head CI、container、NAS／VM 或 Production。現在的 live 結果來自發布前候選版本，commit 後仍要以 exact head 重跑。
 
 | 問題 | 現在答案 |
 |---|---|
@@ -23,10 +23,12 @@ Rust 已完成 Go `f038c86e62c7390c442f30043715255576db4e19` 的離線契約搬�
 | Anthropic Messages | 本機 PASS | error、tool/image round trip、posthoc stream 與 ignored-parameter headers |
 | Hermes | 本機 PASS | provenance、execution ledger、completion guard、多輪 tools、排程 |
 | Hindsight | 本機 PASS | retain/recall/reflect、breaker、`MEMORY_YIELD`、webhook、barrier |
-| MCP modern + legacy | 本機 PASS | session/Origin、tool list/call、legacy SSE/message boundary |
-| Files / Vision | Offline seam PASS | magic/name/SSRF/quota/reuse/metadata；真實帳號待驗 |
-| Images | Offline seam PASS | 會走 ChatHub transport 並投影結果；真實生成待驗 |
-| Code Interpreter artifact | Offline seam PASS | 私有暫存、權限、path/network boundary、終點物化；真實 artifact 待驗 |
+| MCP modern | 候選 live PASS | 官方 Python SDK：initialize → list tools → `wp6_echo` → close |
+| MCP legacy | 本機 PASS | session/Origin、legacy SSE/message boundary |
+| Files / Vision | 候選 live PASS | 真實 file+image input；本機另驗 magic/name/SSRF/quota/reuse |
+| Images | 帳號能力未證明 | 真實請求回 `no_image_resource`；不可推定支援或 regression |
+| Code Interpreter artifact | 部分 live | 真實 metadata 已出現；私有暫存、雙重授權、account/path/network boundary 已實作，完整下載待重跑 |
+| 自動 Microsoft 登入 | 部分 live | 按鈕啟動與失敗後重試通過；主 OAuth 與 Teams PKCE 分別通過，同一受控視窗完整流程待驗 |
 | Checkpoint continuation | 本機 PASS | history prefix、rollback-safe clear、parent、tool ledger、restart persistence |
 | Caller tools | 本機 PASS | call identity、fail-closed limits、唯讀平行 allowlist、router/repair/final boundary |
 | Streaming | 本機 PASS | frame 去重、usage、單一 `[DONE]`、error SSE、artifact URL holdback |
@@ -39,13 +41,9 @@ Rust 已完成 Go `f038c86e62c7390c442f30043715255576db4e19` 的離線契約搬�
 
 ```text
 cargo fmt --all --check
-cargo test --locked --all-targets       # 123 passed, 0 failed
+cargo test --locked --all-targets       # 141 passed, 0 failed
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
-go mod verify
-go test ./...
-go vet ./...
-go build ./...
 git diff --check
 ```
 
@@ -58,8 +56,7 @@ Source 也經 Serena semantic review 與 Code Review Graph incremental review。
 1. Commit 並發布到 public `main`。
 2. GitHub exact-head CI 與 container build。
 3. NAS / VM exact commit 同步。
-4. 隔離 Microsoft 帳號的 OAuth、ChatHub、file、image、artifact live qualification。
-5. 真實 MCP client qualification。
-6. 完整 rollback 證據與 Production promotion/readback。
+4. 以發布後 exact commit 重跑 live；完成受控瀏覽器雙重登入、圖片能力判定與 artifact 完整下載。
+5. 完整 rollback 證據與 Production promotion/readback。
 
 每一項都要固定 commit、route、帳號／runtime scope，並遵守 secret 零輸出。後續若完成，必須更新本頁，不能讓舊的「尚未執行」留在 current docs。

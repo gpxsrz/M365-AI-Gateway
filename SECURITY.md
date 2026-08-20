@@ -16,6 +16,8 @@
 
 Gateway 會先用已登入狀態取得受保護檔案，再存到本機私有區域，最後提供短效下載能力。不要直接把 Microsoft 或瀏覽器的暫時網址交給呼叫端。
 
+聊天與 Teams 檔案權限使用不同的更新憑證。Gateway 只在帳號與租戶識別都完全相同時綁定；重新登入另一個帳號時，不得沿用舊的檔案權限。
+
 ## Private mode 的真正意思
 
 Private mode 會要求上游不要建立一般聊天記錄。這不等於零保留：文件或圖片仍可能經過 OneDrive／SharePoint 暫存，Microsoft 也可能依其服務政策處理資料。
@@ -47,6 +49,8 @@ Hermes、Hindsight 與一般呼叫可以共用同一帳號，但 Gateway 會限�
 - Full error bodies or packets when they may contain any of the above.
 
 The gateway fetches protected files with authenticated state, stores them in a private local area, and exposes a short-lived download capability. Do not return Microsoft or browser temporary URLs directly to callers.
+
+Chat and Teams file access use separate refresh credentials. The gateway binds them only when both account and tenant identities match exactly; signing in as another account must not reuse the old file permission.
 
 ## What Private mode means
 

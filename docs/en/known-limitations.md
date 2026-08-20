@@ -6,7 +6,7 @@ Know these three things first:
 
 1. Private Chat does not mean that Microsoft retains nothing.
 2. Large tool results may still be flattened or shortened upstream.
-3. Passing local tests does not qualify every Microsoft rollout, MCP client, or Production environment.
+3. One live pass does not qualify every Microsoft rollout, MCP client, or Production environment.
 
 The rest of this page lists current limits without replaying implementation history.
 
@@ -22,14 +22,15 @@ The rest of this page lists current limits without replaying implementation hist
 ## Privacy, files, and external clients
 
 7. **Private mode**: `disableMemory=1` prevents ordinary chat history. It does not promise zero Microsoft retention. Files, images, and artifacts have separate boundaries.
-8. **MCP**: server routes exist, but each third-party MCP client still needs separate interoperability qualification.
-9. **Web capabilities drift**: Microsoft's model selector and request capabilities may change during rollout. One evidence snapshot is not a permanent contract.
+8. **MCP**: modern HTTP passed with the official Python SDK. Other SDKs, legacy SSE clients, and versions still need separate qualification.
+9. **The controlled browser has separate sign-in state**: first automatic use may require another sign-in inside controlled Chrome. The regular-Chrome compatibility fallback completes main chat sign-in only; Code Interpreter files need the automatic Teams permission step.
+10. **Images and Web capabilities drift**: Microsoft's model selector, image resources, and request capabilities vary by account or rollout. One `no_image_resource` result or evidence snapshot is not a permanent contract.
 
 ## Hermes and Hindsight
 
-10. **Shared account throughput**: Hermes and Hindsight keep separate profiles and checkpoints, but still share real Microsoft-account capacity. Running Memory work is not preempted.
-11. **Bank mission**: until Hermes upstream #18774 is fixed, `bank_mission` / `bank_retain_mission` may not reach the live bank. Confirm through a Banks API readback.
-12. **Durable does not mean an old request saw new memory**: the Gateway can wait for `retain.completed` before admitting autonomous work, but cannot rewrite an HTTP body Hermes already built. Confirm fresh memory through a later normal recall/readback.
-13. **Goal Judge has a fixed 30-second caller timeout**: Hermes 0.20.4 `judge_goal()` explicitly uses `timeout=30s`, so a task-level auxiliary timeout cannot override it. If P2 waits too long behind Memory or `MEMORY_YIELD`, the Judge may fail safe and defer completion. Do not promote `/v1/chat/completions` to P0/P1 or bypass the shared scheduler to avoid this limit.
+11. **Shared account throughput**: Hermes and Hindsight keep separate profiles and checkpoints, but still share real Microsoft-account capacity. Running Memory work is not preempted.
+12. **Bank mission**: until Hermes upstream #18774 is fixed, `bank_mission` / `bank_retain_mission` may not reach the live bank. Confirm through a Banks API readback.
+13. **Durable does not mean an old request saw new memory**: the Gateway can wait for `retain.completed` before admitting autonomous work, but cannot rewrite an HTTP body Hermes already built. Confirm fresh memory through a later normal recall/readback.
+14. **Goal Judge has a fixed 30-second caller timeout**: Hermes 0.20.4 `judge_goal()` explicitly uses `timeout=30s`, so a task-level auxiliary timeout cannot override it. If P2 waits too long behind Memory or `MEMORY_YIELD`, the Judge may fail safe and defer completion. Do not promote `/v1/chat/completions` to P0/P1 or bypass the shared scheduler to avoid this limit.
 
 See [`compatibility.md`](compatibility.md) for current verification status.

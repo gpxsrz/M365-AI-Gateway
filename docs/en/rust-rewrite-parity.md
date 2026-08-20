@@ -2,9 +2,9 @@
 
 ## Understand it in 30 seconds
 
-Rust has completed the offline contract port from Go `f038c86e62c7390c442f30043715255576db4e19` and starts successfully as a local release binary.
+Rust has completed the offline contract port from Go `f038c86e62c7390c442f30043715255576db4e19` and starts successfully as a local release binary. Primary OAuth, text chat, file/vision input, and the official Python MCP client passed in an isolated environment.
 
-That statement excludes real Microsoft OAuth/ChatHub/files/images/artifacts, third-party MCP clients, GitHub exact-head CI, containers, NAS/VM, and Production. Those gates must run separately after pinning the Rust commit.
+The remaining exclusions are successful image generation, complete Code Interpreter artifact download, GitHub exact-head CI, containers, NAS/VM, and Production. Current live results are from a pre-publication candidate and must be rerun on the exact committed head.
 
 | Question | Current answer |
 |---|---|
@@ -23,10 +23,12 @@ That statement excludes real Microsoft OAuth/ChatHub/files/images/artifacts, thi
 | Anthropic Messages | Local PASS | errors, tool/image round trips, posthoc stream, ignored-parameter headers |
 | Hermes | Local PASS | provenance, execution ledger, completion guard, multi-round tools, scheduling |
 | Hindsight | Local PASS | retain/recall/reflect, breaker, `MEMORY_YIELD`, webhooks, barriers |
-| MCP modern + legacy | Local PASS | session/Origin, tool list/call, legacy SSE/message boundaries |
-| Files / vision | Offline seam PASS | magic/name/SSRF/quota/reuse/metadata; real account pending |
-| Images | Offline seam PASS | reaches ChatHub transport and projects results; real generation pending |
-| Code Interpreter artifacts | Offline seam PASS | private storage, authorization, path/network boundaries, terminal materialization; real artifacts pending |
+| MCP modern | Candidate live PASS | official Python SDK: initialize → list tools → `wp6_echo` → close |
+| MCP legacy | Local PASS | session/Origin and legacy SSE/message boundaries |
+| Files / vision | Candidate live PASS | real file-plus-image input; local magic/name/SSRF/quota/reuse checks also pass |
+| Images | Account capability unproven | a real request returned `no_image_resource`; do not infer support or regression |
+| Code Interpreter artifacts | Partial live | real metadata appeared; private storage, dual authorization, account/path/network boundaries are implemented; full download needs rerun |
+| Automatic Microsoft sign-in | Partial live | button launch and post-failure retry pass; primary OAuth and Teams PKCE passed separately; one combined controlled-window run remains |
 | Checkpoint continuation | Local PASS | history prefix, rollback-safe clear, parents, tool ledger, restart persistence |
 | Caller tools | Local PASS | call identity, fail-closed limits, read-only parallel allowlist, router/repair/final boundaries |
 | Streaming | Local PASS | frame dedupe, usage, single `[DONE]`, error SSE, artifact URL holdback |
@@ -39,13 +41,9 @@ That statement excludes real Microsoft OAuth/ChatHub/files/images/artifacts, thi
 
 ```text
 cargo fmt --all --check
-cargo test --locked --all-targets       # 123 passed, 0 failed
+cargo test --locked --all-targets       # 141 passed, 0 failed
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
-go mod verify
-go test ./...
-go vet ./...
-go build ./...
 git diff --check
 ```
 
@@ -58,8 +56,7 @@ Source also received Serena semantic review and incremental Code Review Graph re
 1. Commit and publish public `main`.
 2. GitHub exact-head CI and container build.
 3. NAS / VM exact-commit synchronization.
-4. Isolated Microsoft-account OAuth, ChatHub, file, image, and artifact live qualification.
-5. Real MCP-client qualification.
-6. Complete rollback evidence and Production promotion/readback.
+4. Rerun live checks on the published exact commit; complete combined controlled-browser authorization, image-capability determination, and full artifact download.
+5. Complete rollback evidence and Production promotion/readback.
 
 Every gate must pin commit, route, account/runtime scope, and produce zero secret output. Update this page when a gate completes; current documentation must not keep stale “not run” claims.

@@ -31,7 +31,8 @@
 - 一般文件先取得 Microsoft file identity / annotation，再做 ChatHub grounding。
 - 圖片使用另一條 transport，不能和文件 upload 混成一種流程。
 - Protected artifact 必須由 Gateway 用登入狀態抓回、放進私有暫存，再提供有權限的下載；上游私有 URL 不可先漏出。
-- Rust 已完成本機 transport/security tests；真實 Microsoft file/image/artifact 仍要 live qualification。
+- 發布前 Rust 候選版本已用真實帳號通過 file+Vision input。圖片生成回 `no_image_resource`，只能判定該次沒有 image resource。
+- 真實 Code Interpreter 回應已出現 artifact metadata。舊下載使用錯誤 client/scope；現在改成同一受控瀏覽器依序取得 Microsoft 聊天與 Teams 檔案授權，並只接受同帳號。完整 artifact bytes 尚未在新流程讀回。
 
 ### Tools、routing 與串流
 
@@ -39,6 +40,7 @@
 - Router repair 不再固定截 6000 字元；超過 UTF-16 budget 時停止，不猜內容。
 - Router、repair 與 final-answer phase 使用分開的 scratch conversation。
 - 內部 non-stream adapter 必須移除 `stream_options`；外層 SSE 仍保留一個 usage chunk 與一個 `[DONE]`。
+- 官方 Python MCP SDK 已對發布前候選版本完成 modern HTTP initialize、tool list、`wp6_echo` 與正常關閉。這只證明該 SDK／版本／route，不自動涵蓋所有 client。
 
 ### Hermes 與 Hindsight
 

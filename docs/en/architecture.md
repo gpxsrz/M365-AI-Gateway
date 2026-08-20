@@ -56,6 +56,7 @@ General `/v1/chat/completions` does not inherit the Hermes execution ledger and 
 |---|---|
 | Ordinary chat | Private mode requests no ordinary history, but does not promise zero Microsoft retention |
 | Documents and images | May use OneDrive or SharePoint staging, separate from chat history |
+| Sign-in permissions | Chat and Teams files use separate refresh credentials; the gateway binds them only when account and tenant identifiers match exactly |
 | Code Interpreter files | Fetched with authenticated state and materialized into private local storage |
 | Download URLs | Callers receive short-lived capability URLs, not protected Microsoft temporary URLs |
 | Checkpoints | Store only continuation summaries and identifiers, not complete private content |

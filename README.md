@@ -25,7 +25,7 @@ cargo run --locked --bin m365-native
 
 1. 用剛才的一次性密碼登入。
 2. 依畫面要求換成正式管理密碼。
-3. 完成 Microsoft 登入。
+3. 按「自動登入 Microsoft 帳號」，在同一個受控視窗完成聊天與 Teams 檔案授權。
 4. 建立 API key。
 
 不要把真實密碼、API key、token 或 cookie 貼進指令紀錄、Issue 或文件。
@@ -100,7 +100,7 @@ Then open `http://127.0.0.1:4141`:
 
 1. Sign in with the one-time password.
 2. Change it when prompted.
-3. Complete Microsoft sign-in.
+3. Select **Automatically Sign in to Microsoft Account** and complete chat plus Teams file permission in the same controlled window.
 4. Create an API key.
 
 Never put real passwords, API keys, tokens, or cookies in command logs, Issues, or documentation.

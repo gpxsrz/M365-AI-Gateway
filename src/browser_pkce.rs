@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    net::{Ipv4Addr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -16,11 +17,13 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Capture {
     pub code: String,
     pub state: String,
     pub error: String,
+    pub teams_code: String,
+    pub teams_verifier: String,
 }
 
 pub type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<Capture, String>> + Send + 'a>>;
@@ -69,8 +72,7 @@ pub async fn capture(
 ) -> Result<Capture, String> {
     validate_authorization_url(authorization_url)?;
     validate_redirect_uri(redirect_uri)?;
-    std::fs::create_dir_all(profile_dir).map_err(|error| error.to_string())?;
-    secure_directory(profile_dir)?;
+    prepare_profile(profile_dir)?;
     let executable = browser_executable()?;
     let mut child = Command::new(executable)
         .arg("--remote-debugging-port=0")
@@ -95,10 +97,9 @@ pub async fn capture(
             state,
         ),
     )
-    .await
-    .map_err(|_| "browser authorization timed out".to_owned())?;
+    .await;
     stop_browser(&mut child).await;
-    result
+    result.map_err(|_| "browser authorization timed out".to_owned())?
 }
 
 async fn capture_from_browser(
@@ -132,6 +133,38 @@ async fn capture_from_browser(
         ))
         .await
         .map_err(|error| format!("navigate browser: {error}"))?;
+    let mut capture = loop {
+        let Some(message) = socket.next().await else {
+            return Err("browser closed before OAuth callback".to_owned());
+        };
+        let message = message.map_err(|error| format!("read browser devtools event: {error}"))?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let candidate = event_url(&value);
+        if let Some(capture) = callback_capture(candidate, redirect_uri, state) {
+            break capture;
+        }
+    };
+    if !capture.error.is_empty() {
+        return Ok(capture);
+    }
+
+    let teams_state = crate::auth::verifier();
+    let teams_verifier = crate::auth::verifier();
+    let teams_url = crate::auth::teams_authorization_url(&teams_state, &teams_verifier)
+        .map_err(|_| "build Teams authorization URL".to_owned())?;
+    socket
+        .send(Message::Text(
+            json!({"id":4,"method":"Page.navigate","params":{"url":teams_url.as_str()}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .map_err(|error| format!("navigate browser for Teams authorization: {error}"))?;
     while let Some(message) = socket.next().await {
         let message = message.map_err(|error| format!("read browser devtools event: {error}"))?;
         let Message::Text(text) = message else {
@@ -140,18 +173,31 @@ async fn capture_from_browser(
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        let candidate = match value.get("method").and_then(Value::as_str) {
-            Some("Network.requestWillBeSent") => value.pointer("/params/request/url"),
-            Some("Page.frameRequestedNavigation") => value.pointer("/params/url"),
-            _ => None,
+        let Some(teams) = callback_capture(
+            event_url(&value),
+            crate::auth::TEAMS_REDIRECT_URI,
+            &teams_state,
+        ) else {
+            continue;
+        };
+        if !teams.error.is_empty() {
+            return Err("browser Teams authorization failed".to_owned());
         }
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-        if let Some(capture) = callback_capture(candidate, redirect_uri, state) {
-            return Ok(capture);
-        }
+        capture.teams_code = teams.code;
+        capture.teams_verifier = teams_verifier;
+        return Ok(capture);
     }
-    Err("browser closed before OAuth callback".to_owned())
+    Err("browser closed before Teams authorization callback".to_owned())
+}
+
+fn event_url(value: &Value) -> &str {
+    match value.get("method").and_then(Value::as_str) {
+        Some("Network.requestWillBeSent") => value.pointer("/params/request/url"),
+        Some("Page.frameRequestedNavigation") => value.pointer("/params/url"),
+        _ => None,
+    }
+    .and_then(Value::as_str)
+    .unwrap_or_default()
 }
 
 async fn wait_for_ack<S>(socket: &mut S, expected: i64) -> Result<(), String>
@@ -254,7 +300,9 @@ fn callback_capture(candidate: &str, redirect_uri: &str, expected_state: &str) -
     if candidate.scheme() != redirect.scheme()
         || candidate.host_str() != redirect.host_str()
         || candidate.port_or_known_default() != redirect.port_or_known_default()
-        || candidate.path() != redirect.path()
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || !callback_path_matches(candidate.path(), &redirect)
     {
         return None;
     }
@@ -280,7 +328,14 @@ fn callback_capture(candidate: &str, redirect_uri: &str, expected_state: &str) -
         code,
         state: state.to_owned(),
         error,
+        teams_code: String::new(),
+        teams_verifier: String::new(),
     })
+}
+
+fn callback_path_matches(candidate: &str, redirect: &Url) -> bool {
+    candidate == redirect.path()
+        || (redirect.as_str() == crate::auth::TEAMS_REDIRECT_URI && candidate == "/v2/")
 }
 
 fn validate_authorization_url(raw: &str) -> Result<(), String> {
@@ -308,6 +363,30 @@ fn validate_redirect_uri(raw: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn prepare_profile(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
+    secure_directory(path)?;
+    let marker = path.join("DevToolsActivePort");
+    if let Ok(raw) = std::fs::read_to_string(&marker)
+        && let Some(port) = raw
+            .lines()
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+        && TcpStream::connect_timeout(
+            &SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
+            Duration::from_millis(250),
+        )
+        .is_ok()
+    {
+        return Err("browser profile is already active".to_owned());
+    }
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("remove stale browser devtools marker".to_owned()),
+    }
 }
 
 fn browser_executable() -> Result<PathBuf, String> {
@@ -381,5 +460,64 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn teams_callback_accepts_the_canonical_trailing_slash_and_exact_state() {
+        let captured = callback_capture(
+            "https://teams.microsoft.com/v2/?code=secret&state=expected",
+            crate::auth::TEAMS_REDIRECT_URI,
+            "expected",
+        )
+        .unwrap();
+        assert_eq!(captured.code, "secret");
+        assert!(
+            callback_capture(
+                "https://teams.microsoft.com/v2/?code=secret&state=spoof",
+                crate::auth::TEAMS_REDIRECT_URI,
+                "expected",
+            )
+            .is_none()
+        );
+        assert!(
+            callback_capture(
+                "https://teams.microsoft.com/v2/extra?code=secret&state=expected",
+                crate::auth::TEAMS_REDIRECT_URI,
+                "expected",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn browser_profile_setup_removes_a_stale_devtools_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("DevToolsActivePort");
+        std::fs::write(&marker, "stale-port\nstale-socket\n").unwrap();
+
+        prepare_profile(root.path()).unwrap();
+
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn browser_profile_setup_preserves_a_live_devtools_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let marker = root.path().join("DevToolsActivePort");
+        std::fs::write(
+            &marker,
+            format!(
+                "{}\n/devtools/browser/live\n",
+                listener.local_addr().unwrap().port()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepare_profile(root.path()).unwrap_err(),
+            "browser profile is already active"
+        );
+        assert!(marker.exists());
     }
 }

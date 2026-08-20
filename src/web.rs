@@ -37,7 +37,7 @@ use crate::{
     checkpoint::{CheckpointStore, ClearThenError},
     config::Config,
     error::{GatewayError, openai_error},
-    oauth_flow::{AccountView, PkceError, PkceManager},
+    oauth_flow::{AccountView, PkceError, PkceManager, PkceStart},
     traffic::TrafficController,
 };
 
@@ -81,6 +81,9 @@ pub struct Gateway {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ApiKeyOwner(pub String);
+
+#[derive(Clone)]
+struct BrowserTeamsToken(TokenSet);
 
 impl Gateway {
     pub fn open(config: Config) -> Result<Self, GatewayError> {
@@ -222,6 +225,7 @@ impl Gateway {
                 "/api/auth/callback",
                 get(Self::auth_callback).post(Self::auth_callback),
             )
+            .route("/api/auth/browser/start", post(Self::auth_browser_start))
             .route("/api/auth/candidate/chat", post(Self::auth_candidate_chat))
             .route(
                 "/api/auth/browser/default/start",
@@ -895,16 +899,8 @@ impl Gateway {
     }
 
     async fn auth_browser_default_start(State(gateway): State<Arc<Self>>) -> Response {
-        if gateway
-            .browser_pkce_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return oauth_error(
-                StatusCode::CONFLICT,
-                "oauth_browser_session_active",
-                "已有瀏覽器授權工作階段正在進行",
-            );
+        if let Err(response) = claim_browser_session(&gateway) {
+            return *response;
         }
         let now = OffsetDateTime::now_utc();
         discard_abandoned_oauth(&gateway, now);
@@ -936,66 +932,11 @@ impl Gateway {
             now,
         ) {
             Ok(started) => {
-                let state = started.state.clone();
-                let authorization_url = started.url.clone();
-                let redirect_uri = started.redirect_uri.clone();
-                let profile_id = manifest.profile_id.clone();
-                let profile_dir = gateway
-                    .tokens
-                    .path()
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .join("browser-profile");
-                let background = Arc::clone(&gateway);
-                tokio::spawn(async move {
-                    let capture = background
-                        .browser_pkce
-                        .capture(
-                            authorization_url.to_string(),
-                            redirect_uri,
-                            state.clone(),
-                            profile_dir,
-                        )
-                        .await;
-                    match capture {
-                        Ok(capture) => {
-                            let body = serde_json::json!({
-                                "code": capture.code,
-                                "state": capture.state,
-                                "error": capture.error,
-                            });
-                            let request = Request::post("/api/auth/callback")
-                                .header(header::CONTENT_TYPE, "application/json")
-                                .body(Body::from(body.to_string()))
-                                .expect("internal OAuth callback request");
-                            let response =
-                                Self::auth_callback(State(Arc::clone(&background)), request).await;
-                            if !response.status().is_success() {
-                                background.oauth_profiles.discard(&profile_id);
-                            }
-                        }
-                        Err(error) => {
-                            let timeout = error.contains("timed out");
-                            background.pkce.fail_pending(
-                                &state,
-                                if timeout {
-                                    "oauth_browser_capture_timeout"
-                                } else {
-                                    "oauth_browser_capture_failed"
-                                },
-                                if timeout {
-                                    "瀏覽器授權等待逾時，請重新開始授權"
-                                } else {
-                                    "瀏覽器未能擷取 Microsoft 授權回呼，請重新開始授權"
-                                },
-                            );
-                            background.oauth_profiles.discard(&profile_id);
-                        }
-                    }
-                    background
-                        .browser_pkce_active
-                        .store(false, Ordering::Release);
-                });
+                launch_browser_capture(
+                    Arc::clone(&gateway),
+                    &started,
+                    Some(manifest.profile_id.clone()),
+                );
                 Json(serde_json::json!({
                     "status": "browser_pkce_started",
                     "state": started.state,
@@ -1010,6 +951,37 @@ impl Gateway {
                 pkce_error(error)
             }
         }
+    }
+
+    async fn auth_browser_start(State(gateway): State<Arc<Self>>) -> Response {
+        if gateway.tokens.config().redirect_uri != DEFAULT_REDIRECT_URI {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "oauth_browser_redirect_unsupported",
+                "自動登入只支援內建 Microsoft 回呼；請改用目前瀏覽器登入",
+            );
+        }
+        if let Err(response) = claim_browser_session(&gateway) {
+            return *response;
+        }
+        let started = match gateway
+            .pkce
+            .start(gateway.tokens.config().clone(), OffsetDateTime::now_utc())
+        {
+            Ok(started) => started,
+            Err(error) => {
+                gateway.browser_pkce_active.store(false, Ordering::Release);
+                return pkce_error(error);
+            }
+        };
+        launch_browser_capture(Arc::clone(&gateway), &started, None);
+        Json(serde_json::json!({
+            "status": "browser_pkce_started",
+            "state": started.state,
+            "oauthProfileKind": "active",
+            "staged": false,
+        }))
+        .into_response()
     }
 
     async fn auth_candidate_chat(State(gateway): State<Arc<Self>>, request: Request) -> Response {
@@ -1128,6 +1100,11 @@ impl Gateway {
 
     async fn auth_callback(State(gateway): State<Arc<Self>>, request: Request) -> Response {
         let method = request.method().clone();
+        let browser_teams_token = request
+            .extensions()
+            .get::<BrowserTeamsToken>()
+            .cloned()
+            .map(|token| token.0);
         let input = match parse_callback(&gateway.pkce, request).await {
             Ok(input) => input,
             Err(response) => return response,
@@ -1203,6 +1180,26 @@ impl Gateway {
                     "OAuth 授權碼交換失敗，請重新開始授權",
                 );
             }
+        };
+        let token = if let Some(teams_token) = browser_teams_token {
+            match token.bind_teams_refresh(teams_token) {
+                Ok(token) => token,
+                Err(_) => {
+                    gateway.pkce.failed(
+                        &input.state,
+                        "oauth_browser_teams_account_mismatch",
+                        "Teams 檔案授權與 Microsoft 帳號不一致，請重新開始授權",
+                    );
+                    discard_failed_oauth(&gateway, &claimed);
+                    return oauth_error(
+                        StatusCode::BAD_GATEWAY,
+                        "oauth_browser_teams_account_mismatch",
+                        "Teams 檔案授權與 Microsoft 帳號不一致，請重新開始授權",
+                    );
+                }
+            }
+        } else {
+            token
         };
         let account = match store_oauth_token(&gateway, token_store, token, !claimed.staged) {
             Ok(account) => account,
@@ -1856,6 +1853,121 @@ fn store_oauth_token(
     }
 }
 
+fn claim_browser_session(gateway: &Gateway) -> Result<(), Box<Response>> {
+    gateway
+        .browser_pkce_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| {
+            Box::new(oauth_error(
+                StatusCode::CONFLICT,
+                "oauth_browser_session_active",
+                "已有瀏覽器授權工作階段正在進行",
+            ))
+        })
+}
+
+fn launch_browser_capture(
+    gateway: Arc<Gateway>,
+    started: &PkceStart,
+    discard_profile: Option<String>,
+) {
+    let state = started.state.clone();
+    let authorization_url = started.url.clone();
+    let redirect_uri = started.redirect_uri.clone();
+    let profile_dir = gateway
+        .tokens
+        .path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("browser-profile");
+    tokio::spawn(async move {
+        let capture = gateway
+            .browser_pkce
+            .capture(authorization_url, redirect_uri, state.clone(), profile_dir)
+            .await;
+        match capture {
+            Ok(capture) => {
+                let teams_token = if capture.error.is_empty() {
+                    let exchanged = if let Some(profile_id) = discard_profile.as_deref() {
+                        match gateway.oauth_profiles.open_store(profile_id) {
+                            Ok((_, store)) => store
+                                .exchange_teams_code(&capture.teams_code, &capture.teams_verifier)
+                                .await
+                                .ok(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        gateway
+                            .tokens
+                            .exchange_teams_code(&capture.teams_code, &capture.teams_verifier)
+                            .await
+                            .ok()
+                    };
+                    let Some(token) = exchanged else {
+                        gateway.pkce.fail_pending(
+                            &state,
+                            "oauth_browser_teams_token_exchange_failed",
+                            "Teams 檔案授權交換失敗，請重新開始授權",
+                        );
+                        if let Some(profile_id) = discard_profile.as_deref() {
+                            gateway.oauth_profiles.discard(profile_id);
+                        }
+                        gateway.browser_pkce_active.store(false, Ordering::Release);
+                        return;
+                    };
+                    Some(token)
+                } else {
+                    None
+                };
+                let body = serde_json::json!({
+                    "code": capture.code,
+                    "state": capture.state,
+                    "error": capture.error,
+                });
+                let mut request = Request::post("/api/auth/callback")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("internal OAuth callback request");
+                if let Some(token) = teams_token {
+                    request.extensions_mut().insert(BrowserTeamsToken(token));
+                }
+                let response = Gateway::auth_callback(State(Arc::clone(&gateway)), request).await;
+                if !response.status().is_success()
+                    && let Some(profile_id) = discard_profile.as_deref()
+                {
+                    gateway.oauth_profiles.discard(profile_id);
+                }
+            }
+            Err(error) => {
+                let timeout = error.contains("timed out");
+                let teams = error.contains("Teams authorization");
+                gateway.pkce.fail_pending(
+                    &state,
+                    if teams {
+                        "oauth_browser_teams_authorization_failed"
+                    } else if timeout {
+                        "oauth_browser_capture_timeout"
+                    } else {
+                        "oauth_browser_capture_failed"
+                    },
+                    if teams {
+                        "瀏覽器未能完成 Teams 檔案授權，請重新開始授權"
+                    } else if timeout {
+                        "瀏覽器授權等待逾時，請重新開始授權"
+                    } else {
+                        "瀏覽器未能擷取 Microsoft 授權回呼，請重新開始授權"
+                    },
+                );
+                if let Some(profile_id) = discard_profile.as_deref() {
+                    gateway.oauth_profiles.discard(profile_id);
+                }
+            }
+        }
+        gateway.browser_pkce_active.store(false, Ordering::Release);
+    });
+}
+
 fn discard_abandoned_oauth(gateway: &Gateway, now: OffsetDateTime) {
     for profile_id in gateway.pkce.prune_discard_targets(now) {
         gateway.oauth_profiles.discard(&profile_id);
@@ -2097,6 +2209,7 @@ mod tests {
         crate::auth::TokenSet {
             access_token: format!("token-{id}"),
             refresh_token: format!("refresh-{id}"),
+            teams_refresh_token: String::new(),
             id_token: String::new(),
             token_type: "Bearer".to_owned(),
             scope: DEFAULT_SCOPE.to_owned(),
@@ -2110,6 +2223,10 @@ mod tests {
     }
 
     fn gateway() -> Arc<Gateway> {
+        gateway_with_redirect(DEFAULT_REDIRECT_URI)
+    }
+
+    fn gateway_with_redirect(redirect_uri: &str) -> Arc<Gateway> {
         let root = tempfile::tempdir().unwrap().keep();
         let admin_password = root.join("admin-password");
         std::fs::write(&admin_password, "correct-password\n").unwrap();
@@ -2117,7 +2234,7 @@ mod tests {
         let oauth = OAuthConfig {
             client_id: crate::auth::DEFAULT_CLIENT_ID.to_owned(),
             authority: crate::auth::DEFAULT_AUTHORITY.to_owned(),
-            redirect_uri: crate::auth::DEFAULT_REDIRECT_URI.to_owned(),
+            redirect_uri: redirect_uri.to_owned(),
             scope: crate::auth::DEFAULT_SCOPE.to_owned(),
             authorize_endpoint: format!("{}/oauth2/v2.0/authorize", crate::auth::DEFAULT_AUTHORITY),
             token_endpoint: format!("{}/oauth2/v2.0/token", crate::auth::DEFAULT_AUTHORITY),
@@ -2274,6 +2391,62 @@ mod tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn test_pkce_popup_opens_before_the_async_auth_request() {
+        let html = include_str!("../web/index.html");
+        let start = html.find("async function startPKCE()").unwrap();
+        let end = html[start..]
+            .find("async function submitCallback()")
+            .map(|offset| start + offset)
+            .unwrap();
+        let function = &html[start..end];
+        let popup = function.find("window.open(").unwrap();
+        let request = function.find("await api('/api/auth/start'").unwrap();
+
+        assert!(
+            popup < request,
+            "the popup must be created while the click still has browser user activation"
+        );
+        assert!(
+            function[request..].contains("win.location.replace(d.url)"),
+            "the authorization URL must be loaded after the API request succeeds"
+        );
+    }
+
+    #[test]
+    fn test_manual_pkce_fallback_explains_the_referrer_boundary() {
+        let html = include_str!("../web/index.html");
+
+        assert!(html.contains("已在目前 Chrome 登入？使用相容備援"));
+        assert!(html.contains("callback 仍在錯誤頁的 <code>referrer</code>"));
+        assert!(html.contains("不要把一次性網址貼到聊天、日誌或文件"));
+        assert!(html.contains("Already signed in to current Chrome? Use compatibility fallback"));
+        assert!(html.contains("$('manualCallbackFallback').open=true"));
+        assert!(!html.contains("請立刻按瀏覽器的「上一頁」"));
+    }
+
+    #[test]
+    fn test_primary_login_uses_the_managed_browser_active_route() {
+        let html = include_str!("../web/index.html");
+        let start = html.find("async function startBrowserLogin()").unwrap();
+        let end = html[start..]
+            .find("async function loadDeployments()")
+            .map(|offset| start + offset)
+            .unwrap();
+        let function = &html[start..end];
+
+        assert!(html.contains("onclick=\"startBrowserLogin()\""));
+        assert!(function.contains("await api('/api/auth/browser/start'"));
+        assert!(function.contains("st.status==='authenticated'&&!st.staged"));
+        assert!(html.contains(
+            "\"瀏覽器未能擷取 Microsoft 授權回呼，請重新開始授權\":\"The browser could not capture the Microsoft sign-in result. Start sign-in again.\""
+        ));
+        assert!(html.contains(
+            "\"自動登入只支援內建 Microsoft 回呼；請改用目前瀏覽器登入\":\"Automatic sign-in supports the built-in Microsoft callback only. Use the current browser instead.\""
+        ));
+        assert!(!html.contains("startBrowserCandidate"));
     }
 
     #[tokio::test]
@@ -2815,6 +2988,67 @@ mod tests {
                 .any(|record| record["path"] == "/api/version")
         );
         assert!(records.iter().all(|record| record.get("body").is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_managed_browser_login_targets_the_active_account() {
+        let gateway = gateway();
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::post("/api/auth/browser/start")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["staged"], false);
+        assert_eq!(value["oauthProfileKind"], "active");
+        assert!(gateway.tokens.first().is_none());
+
+        let state = value["state"].as_str().unwrap();
+        let mut status = gateway.pkce.status(state, OffsetDateTime::now_utc());
+        for _ in 0..10 {
+            if status.status != "pending" {
+                break;
+            }
+            tokio::task::yield_now().await;
+            status = gateway.pkce.status(state, OffsetDateTime::now_utc());
+        }
+        assert_eq!(status.status, "error");
+        assert_eq!(status.error_code, "oauth_browser_capture_failed");
+    }
+
+    #[tokio::test]
+    async fn test_managed_browser_login_rejects_an_unsupported_redirect_before_launch() {
+        let gateway = gateway_with_redirect("http://127.0.0.1:4143/api/auth/callback");
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::post("/api/auth/browser/start")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!gateway.browser_pkce_active.load(Ordering::Acquire));
     }
 
     #[tokio::test]

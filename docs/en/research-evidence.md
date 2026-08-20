@@ -31,7 +31,8 @@ Every PASS should bind source commit, tree, binary, settings, artifacts, and evi
 - Ordinary documents obtain Microsoft file identity / annotation before ChatHub grounding.
 - Images use a separate transport and must not be collapsed into document upload.
 - A protected artifact must be fetched with authenticated Gateway state, placed in private storage, and exposed through an authorized download. Its upstream private URL cannot be leaked first.
-- Rust has local transport/security coverage; real Microsoft file/image/artifact flows still require live qualification.
+- The pre-publication Rust candidate passed real file-plus-vision input. Image generation returned `no_image_resource`, which proves only that no image resource was available in that run.
+- A real Code Interpreter response produced artifact metadata. The old download used the wrong client/scope; the current flow obtains Microsoft chat and Teams file permission in sequence in one controlled browser and accepts only the same account. Full artifact bytes have not yet been read back through the new flow.
 
 ### Tools, routing, and streaming
 
@@ -39,6 +40,7 @@ Every PASS should bind source commit, tree, binary, settings, artifacts, and evi
 - Router repair no longer truncates at a fixed 6000 characters. It stops when the UTF-16 budget is exceeded and never guesses missing content.
 - Router, repair, and final-answer phases use separate scratch conversations.
 - An internal non-stream adapter must remove `stream_options`; outer SSE still ends with one usage chunk and one `[DONE]`.
+- The official Python MCP SDK completed modern HTTP initialize, tool listing, `wp6_echo`, and clean close against the pre-publication candidate. This evidence is specific to that SDK/version/route, not every client.
 
 ### Hermes and Hindsight
 
