@@ -145,15 +145,22 @@ pub(crate) fn build(messages: &[OpenAiMessage]) -> AgentLedger {
 }
 
 pub(crate) fn execution_ledger(prior: &AgentLedger, messages: &[OpenAiMessage]) -> AgentLedger {
-    let prior = if messages.iter().any(|message| message.role == "user") {
-        AgentLedger {
-            pending: prior.pending.clone(),
-            ..AgentLedger::default()
-        }
-    } else {
-        prior.clone()
+    let Some(last_user) = messages.iter().rposition(|message| message.role == "user") else {
+        return build_with_prior(messages, prior.clone());
     };
-    build_with_prior(messages, prior)
+
+    let pending = if last_user == 0 {
+        prior.pending.clone()
+    } else {
+        build_with_prior(&messages[..last_user], prior.clone()).pending
+    };
+    build_with_prior(
+        &messages[last_user..],
+        AgentLedger {
+            pending,
+            ..AgentLedger::default()
+        },
+    )
 }
 
 pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -> AgentLedger {
@@ -494,6 +501,41 @@ mod tests {
         validate_tool_conversation(&messages).unwrap();
         assert_eq!(build(&messages).pending.len(), 1);
         assert_eq!(build(active_messages(&messages)).tool_rounds, 0);
+
+        let ledger = execution_ledger(&AgentLedger::default(), &messages);
+        assert_eq!(ledger.pending.len(), 1);
+        let candidate = DetectedToolCall {
+            id: "retry".to_owned(),
+            kind: "function".to_owned(),
+            function: json!({"name":"deploy","arguments":"{}"}),
+        };
+        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate]);
+        assert!(calls.is_empty());
+        assert!(suppressed);
+    }
+
+    #[test]
+    fn completed_call_from_previous_user_turn_can_be_reissued() {
+        let messages = vec![
+            OpenAiMessage::text("user", "Read the current task."),
+            call("c1", "kanban_show", r#"{"task_id":"t_c3de88aa"}"#),
+            result("c1", "task state"),
+            OpenAiMessage::text("user", "Read the current task again."),
+        ];
+        let ledger = execution_ledger(&AgentLedger::default(), &messages);
+        let candidate = DetectedToolCall {
+            id: "c2".to_owned(),
+            kind: "function".to_owned(),
+            function: json!({
+                "name":"kanban_show",
+                "arguments":"{\"task_id\":\"t_c3de88aa\"}"
+            }),
+        };
+
+        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate]);
+
+        assert_eq!(calls.len(), 1);
+        assert!(!suppressed);
     }
 
     #[test]
