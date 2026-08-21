@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use crate::{protocol::OpenAiMessage, tool_calls::DetectedToolCall};
 
 pub(crate) const UNCONFIRMED_TOOL_OUTCOME: &str = "I cannot confirm completion because no matching tool results were returned. No external action has been verified.";
-pub(crate) const COMPLETED_TOOL_CALL_SUPPRESSED: &str = "The matching tool call was not reissued because its result is already present in the conversation.";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ToolEvidence {
@@ -86,6 +85,17 @@ impl AgentLedger {
             })
             .collect();
         (calls, suppressed)
+    }
+
+    pub(crate) fn router_context(&self) -> String {
+        let evidence = serde_json::json!({
+            "completed": self.completed,
+            "pending": self.pending,
+            "repeated_call": self.repeated_call,
+        });
+        format!(
+            "Use only this compact evidence. Completed calls are final evidence. Pending calls have unknown outcomes because no matching tool result was returned. Do not automatically issue the same name and arguments as any completed or pending call. Report pending outcomes as unconfirmed unless independent evidence resolves them.\nEVIDENCE_LEDGER: {evidence}"
+        )
     }
 }
 
@@ -274,14 +284,6 @@ pub(crate) fn completion_evidence_allows(answer: &str, ledger: &AgentLedger) -> 
     !claims_success
 }
 
-pub(crate) fn suppressed_known_call_response(ledger: &AgentLedger) -> &'static str {
-    if ledger.pending.is_empty() {
-        COMPLETED_TOOL_CALL_SUPPRESSED
-    } else {
-        UNCONFIRMED_TOOL_OUTCOME
-    }
-}
-
 fn tool_result_failed(explicit: bool, name: &str, result: &str) -> bool {
     if explicit {
         return true;
@@ -294,6 +296,31 @@ fn tool_result_failed(explicit: bool, name: &str, result: &str) -> bool {
         return exit_code != 0
             || object.get("error").is_some_and(|error| {
                 !error.is_null() && error.as_str().is_none_or(|s| !s.trim().is_empty())
+            });
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(result.trim()) {
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        if let Some(success) = object.get("success").and_then(Value::as_bool) {
+            return !success;
+        }
+        if let Some(ok) = object.get("ok").and_then(Value::as_bool) {
+            return !ok;
+        }
+        if object.get("error").is_some_and(|error| {
+            !error.is_null() && error.as_str().is_none_or(|text| !text.trim().is_empty())
+        }) {
+            return true;
+        }
+        return object
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status.trim().to_ascii_lowercase().as_str(),
+                    "error" | "failed" | "failure"
+                )
             });
     }
     let lower = result.to_ascii_lowercase();
@@ -453,6 +480,22 @@ mod tests {
             let mut output = result("c1", content);
             output.tool_result_is_error = explicit;
             let ledger = build(&[call("c1", "terminal", "{}"), output]);
+            assert_eq!(ledger.completed[0].failed, failed, "content={content}");
+        }
+    }
+
+    #[test]
+    fn structured_tool_success_ignores_null_error_fields() {
+        for (content, failed) in [
+            (
+                r#"{"success":true,"job":{"last_delivery_error":null,"last_fire_error":null}}"#,
+                false,
+            ),
+            (r#"{"ok":true,"error":null}"#, false),
+            (r#"{"success":false,"error":"update rejected"}"#, true),
+            (r#"{"ok":false,"error":"not found"}"#, true),
+        ] {
+            let ledger = build(&[call("c1", "cronjob", "{}"), result("c1", content)]);
             assert_eq!(ledger.completed[0].failed, failed, "content={content}");
         }
     }

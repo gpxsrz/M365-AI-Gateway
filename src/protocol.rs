@@ -680,6 +680,8 @@ async fn complete_chat(
     let tool_limit = request.tool_call_limit;
     let qualification_account = account.clone();
     let qualification_request = request.clone();
+    let fallback_account = account.clone();
+    let fallback_request = request.clone();
     let mut sink = |_: StreamEvent| Ok(());
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
@@ -739,12 +741,12 @@ async fn complete_chat(
                     "ChatHub returned an empty response",
                 );
             }
-            let projection = apply_agent_policy(
+            let mut policy = apply_agent_policy(
                 project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
                 &agent_ledger,
                 apply_agent_evidence_policy,
             );
-            if projection.overflowed {
+            if policy.projection.overflowed {
                 permit.finish(StatusCode::BAD_GATEWAY, None);
                 return openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -753,6 +755,79 @@ async fn complete_chat(
                     "model returned more tool calls than the safe request limit",
                 );
             }
+            if policy.completed_call_suppressed {
+                let answer_request =
+                    completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
+                let mut answer_sink = |_: StreamEvent| Ok(());
+                let answer = tokio::time::timeout(
+                    std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
+                    gateway.chat.chat(
+                        fallback_account.clone(),
+                        answer_request.clone(),
+                        &mut answer_sink,
+                    ),
+                )
+                .await;
+                let answer = match answer {
+                    Ok(Ok(answer)) => answer,
+                    Ok(Err(error)) => return chat_error(error, permit),
+                    Err(_) => {
+                        permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
+                        return openai_error(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "upstream_error",
+                            "upstream_timeout",
+                            "ChatHub final-answer fallback timed out",
+                        );
+                    }
+                };
+                result = match qualify_response_format(
+                    &gateway,
+                    fallback_account,
+                    answer_request,
+                    answer,
+                    response_format.as_ref(),
+                    memory_caller_evidence.as_deref(),
+                )
+                .await
+                {
+                    Ok(answer) => answer,
+                    Err(QualificationError::Format(message)) => {
+                        permit.finish(StatusCode::BAD_GATEWAY, None);
+                        return openai_error(
+                            StatusCode::BAD_GATEWAY,
+                            "upstream_error",
+                            "response_format_validation_failed",
+                            &message,
+                        );
+                    }
+                    Err(QualificationError::Chat(error)) => return chat_error(error, permit),
+                    Err(QualificationError::Timeout) => {
+                        permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
+                        return openai_error(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "upstream_error",
+                            "upstream_timeout",
+                            "ChatHub final-answer qualification timed out",
+                        );
+                    }
+                };
+                if result.text.trim().is_empty() {
+                    permit.finish(StatusCode::BAD_GATEWAY, None);
+                    return openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        "upstream_empty_response",
+                        "ChatHub final-answer fallback returned an empty response",
+                    );
+                }
+                policy = apply_agent_policy(
+                    project_tool_calls(&result.text, &[], &Value::String("none".to_owned()), 1),
+                    &agent_ledger,
+                    apply_agent_evidence_policy,
+                );
+            }
+            let projection = policy.projection;
             let artifacts = result
                 .artifacts
                 .iter()
@@ -858,6 +933,8 @@ async fn stream_chat(
         let tool_limit = request.tool_call_limit;
         let qualification_account = account.clone();
         let qualification_request = request.clone();
+        let fallback_account = account.clone();
+        let fallback_request = request.clone();
         let buffer_for_tools = !tools.is_empty()
             || response_format.is_some()
             || (apply_agent_evidence_policy
@@ -954,12 +1031,12 @@ async fn stream_chat(
                     let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
                     return;
                 }
-                let projection = apply_agent_policy(
+                let mut policy = apply_agent_policy(
                     project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
                     &agent_ledger,
                     apply_agent_evidence_policy,
                 );
-                if projection.overflowed {
+                if policy.projection.overflowed {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
                         &sender,
@@ -969,6 +1046,91 @@ async fn stream_chat(
                     let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
                     return;
                 }
+                if policy.completed_call_suppressed {
+                    let answer_request =
+                        completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
+                    let mut answer_sink = |_: StreamEvent| Ok(());
+                    let answer = tokio::time::timeout(
+                        std::time::Duration::from_secs(
+                            gateway.settings.current().chat_timeout_seconds,
+                        ),
+                        gateway.chat.chat(
+                            fallback_account.clone(),
+                            answer_request.clone(),
+                            &mut answer_sink,
+                        ),
+                    )
+                    .await;
+                    let answer = match answer {
+                        Ok(Ok(answer)) => answer,
+                        Ok(Err(error)) => {
+                            permit.finish(error_status(&error), retry_after(&error));
+                            send_sse_error(&sender, "upstream_error", &error.to_string());
+                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            return;
+                        }
+                        Err(_) => {
+                            permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
+                            send_sse_error(
+                                &sender,
+                                "upstream_timeout",
+                                "ChatHub final-answer fallback timed out",
+                            );
+                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            return;
+                        }
+                    };
+                    result = match qualify_response_format(
+                        &gateway,
+                        fallback_account,
+                        answer_request,
+                        answer,
+                        response_format.as_ref(),
+                        memory_caller_evidence.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(answer) => answer,
+                        Err(QualificationError::Format(message)) => {
+                            permit.finish(StatusCode::BAD_GATEWAY, None);
+                            send_sse_error(&sender, "response_format_validation_failed", &message);
+                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            return;
+                        }
+                        Err(QualificationError::Chat(error)) => {
+                            permit.finish(error_status(&error), retry_after(&error));
+                            send_sse_error(&sender, "upstream_error", &error.to_string());
+                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            return;
+                        }
+                        Err(QualificationError::Timeout) => {
+                            permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
+                            send_sse_error(
+                                &sender,
+                                "upstream_timeout",
+                                "ChatHub final-answer qualification timed out",
+                            );
+                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            return;
+                        }
+                    };
+                    if result.text.trim().is_empty() {
+                        permit.finish(StatusCode::BAD_GATEWAY, None);
+                        send_sse_error(
+                            &sender,
+                            "upstream_empty_response",
+                            "ChatHub final-answer fallback returned an empty response",
+                        );
+                        let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                        return;
+                    }
+                    policy = apply_agent_policy(
+                        project_tool_calls(&result.text, &[], &Value::String("none".to_owned()), 1),
+                        &agent_ledger,
+                        apply_agent_evidence_policy,
+                    );
+                }
+                let projection = policy.projection;
                 if !buffer_for_tools && !result.text.starts_with(&visible_text) {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
@@ -1199,25 +1361,64 @@ fn assistant_message(projection: &ToolProjection) -> Value {
     message
 }
 
+struct AgentPolicyOutcome {
+    projection: ToolProjection,
+    completed_call_suppressed: bool,
+}
+
 fn apply_agent_policy(
     mut projection: ToolProjection,
     ledger: &crate::agent_ledger::AgentLedger,
     enabled: bool,
-) -> ToolProjection {
+) -> AgentPolicyOutcome {
     if !enabled {
-        return projection;
+        return AgentPolicyOutcome {
+            projection,
+            completed_call_suppressed: false,
+        };
     }
     let (calls, suppressed) = ledger.filter_known_calls(projection.calls);
     projection.calls = calls;
+    let mut completed_call_suppressed = false;
     if projection.calls.is_empty() {
         if !crate::agent_ledger::completion_evidence_allows(&projection.content, ledger) {
             projection.content = crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME.to_owned();
         } else if suppressed && projection.content.trim().is_empty() {
-            projection.content =
-                crate::agent_ledger::suppressed_known_call_response(ledger).to_owned();
+            if ledger.pending.is_empty() {
+                completed_call_suppressed = true;
+            } else {
+                projection.content = crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME.to_owned();
+            }
         }
     }
-    projection
+    AgentPolicyOutcome {
+        projection,
+        completed_call_suppressed,
+    }
+}
+
+fn completed_tool_answer_request(
+    request: &ChatRequest,
+    result: &ChatResult,
+    ledger: &crate::agent_ledger::AgentLedger,
+) -> ChatRequest {
+    let mut answer = request.clone();
+    answer.text = format!(
+        "{}\n\n{}\n\nFINAL ANSWER RULE: A caller tool you selected has already completed with a matching result in the conversation above. Do not reissue any caller tool. Answer the user's latest request directly using the existing completed tool result. If that result is insufficient, state exactly what remains unconfirmed.",
+        request.text,
+        ledger.router_context(),
+    );
+    if !result.conversation_id.is_empty() {
+        answer.conversation_id = result.conversation_id.clone();
+    }
+    if !result.session_id.is_empty() {
+        answer.session_id = result.session_id.clone();
+    }
+    answer.started = false;
+    answer.tools.clear();
+    answer.tool_choice = Value::String("none".to_owned());
+    answer.tool_call_limit = 1;
+    answer
 }
 
 fn tool_round_limit_response(
@@ -2949,6 +3150,45 @@ mod tests {
         }
     }
 
+    struct DuplicateFallbackTransport {
+        results: Mutex<VecDeque<String>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl DuplicateFallbackTransport {
+        fn new(results: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().map(str::to_owned).collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ChatHubTransport for DuplicateFallbackTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(request);
+                let text = self
+                    .results
+                    .lock()
+                    .expect("duplicate fallback sequence poisoned")
+                    .pop_front()
+                    .expect("unexpected upstream request");
+                Ok(ChatResult {
+                    text,
+                    conversation_id: "conversation-1".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
     #[test]
     fn role_envelope_prevents_caller_text_from_creating_roles() {
         let prompt = flatten_messages(&[
@@ -3398,6 +3638,113 @@ mod tests {
                 "path={path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hermes_known_completed_duplicate_gets_no_tool_final_answer_pass() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```kanban_show\n{\"task_id\":\"t_c3de88aa\"}\n```",
+            "No. The task is still blocked and has no active worker.",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "model":"gpt-5.6-terra",
+                            "messages":[
+                                {"role":"user","content":"真的繼續了嗎？"},
+                                {"role":"assistant","content":null,"tool_calls":[
+                                    {"id":"c1","type":"function","function":{"name":"kanban_show","arguments":"{\"task_id\":\"t_c3de88aa\"}"}}
+                                ]},
+                                {"role":"tool","tool_call_id":"c1","content":"{\"status\":\"triage\",\"worker_pid\":null}"}
+                            ],
+                            "tools":[{"type":"function","function":{
+                                "name":"kanban_show",
+                                "description":"Read a Kanban task.",
+                                "parameters":{"type":"object","properties":{"task_id":{"type":"string"}}}
+                            }}],
+                            "tool_choice":"auto"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "No. The task is still blocked and has no active worker."
+        );
+        assert!(value["choices"][0]["message"].get("tool_calls").is_none());
+
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].tools.is_empty());
+        assert!(requests[1].tools.is_empty());
+        assert_eq!(requests[1].tool_choice, Value::String("none".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn hermes_streaming_duplicate_gets_no_tool_final_answer_pass() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```kanban_show\n{\"task_id\":\"t_c3de88aa\"}\n```",
+            "No. The task is still blocked and has no active worker.",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "model":"gpt-5.6-terra",
+                            "stream":true,
+                            "messages":[
+                                {"role":"user","content":"真的繼續了嗎？"},
+                                {"role":"assistant","content":null,"tool_calls":[
+                                    {"id":"c1","type":"function","function":{"name":"kanban_show","arguments":"{\"task_id\":\"t_c3de88aa\"}"}}
+                                ]},
+                                {"role":"tool","tool_call_id":"c1","content":"{\"status\":\"triage\",\"worker_pid\":null}"}
+                            ],
+                            "tools":[{"type":"function","function":{
+                                "name":"kanban_show",
+                                "description":"Read a Kanban task.",
+                                "parameters":{"type":"object","properties":{"task_id":{"type":"string"}}}
+                            }}],
+                            "tool_choice":"auto"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("No. The task is still blocked and has no active worker."));
+        assert!(!body.contains("matching tool call was not reissued"));
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].tools.is_empty());
+        assert!(requests[1].tools.is_empty());
+        assert_eq!(requests[1].tool_choice, Value::String("none".to_owned()));
     }
 
     #[tokio::test]
