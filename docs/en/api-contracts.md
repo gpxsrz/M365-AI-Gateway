@@ -128,7 +128,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 ```
 
 - `OPEN` expiry only makes a probe possible; it does not close the breaker.
-- External-user traffic always has probe priority. If cooldown expires with no external user waiting, one Hermes continuation already classified by the gateway as `Autonomous` may take the single probe. `/v1` control-plane traffic (including Goal Judge), `AsyncCompletion`, and Memory still cannot probe; another 429 reopens the circuit at the next cooldown level.
+- External-user traffic always has probe priority. If cooldown expires with no external user waiting, one Hermes continuation already classified by the gateway as `Autonomous` may take the single probe. Control-plane traffic (including Goal Judge, even when Hermes falls back from `/v1` to the main `/hermes/v1` provider), `AsyncCompletion`, and Memory still cannot probe; another 429 reopens the circuit at the next cooldown level.
 - A throttled probe returns to `OPEN` at a higher cooldown.
 - A successful probe enters `RECOVERY`.
 - `RECOVERY` keeps shared concurrency at 1 and still blocks Memory upstream.
