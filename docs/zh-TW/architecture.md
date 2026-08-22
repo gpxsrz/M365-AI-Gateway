@@ -16,6 +16,7 @@ Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 
 - 一個執行中的 Gateway 只服務一個 Microsoft 365 帳號。
 - 長期對話與記憶由呼叫端、Hermes 或 Hindsight 保存。Gateway 只留必要的短期續接資料。
+- Agent governance 的 authoritative lifecycle state 由 Agent Control Plane（ACP）持有；Hermes、Hindsight、Semantica 與其他 upstream core 都是 immutable upstream。治理 seam 與 canonical authority 見 [`agent-governance.md`](agent-governance.md)。
 - Gateway 是 Rust 程式。`m365-native` 舊名稱為了相容性保留，不代表產品仍使用舊品牌。
 - 這是社群專案，不是 Microsoft 官方產品。
 
@@ -70,6 +71,7 @@ Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 ## 需要更多細節時
 
 - 精確 request、stream 與錯誤：[`api-contracts.md`](api-contracts.md)
+- Agent lifecycle、blocker、completion、handoff 與 policy：[`agent-governance.md`](agent-governance.md)
 - Hermes / Hindsight：[`hermes-hindsight.md`](hermes-hindsight.md)
 - 設定：[`runtime-settings.md`](runtime-settings.md)
 - 安全與保留限制：[`../../SECURITY.md`](../../SECURITY.md)

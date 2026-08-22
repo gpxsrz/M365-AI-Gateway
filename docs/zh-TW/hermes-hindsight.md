@@ -8,7 +8,7 @@
 - Hindsight Memory 用 `/memory/v1`。
 - Goal Judge 等控制工作用 `/v1/chat/completions`，不要走 Hermes Agent route。
 - 同一 Microsoft 帳號同時最多跑 2 筆；使用者優先，Memory 第二，背景／控制工作第三。
-- Gateway 不修改 Hermes 或 Hindsight 核心程式碼。
+- Hermes、Hindsight、Semantica 與其他 upstream core 都是 immutable upstream。治理只能放在 ACP、versioned adapter、plugin / hook、gateway 或 sidecar；完整 lifecycle contract 見 [`agent-governance.md`](agent-governance.md)。
 
 若只是在接服務，先照下一節設定。排程、barrier 與 webhook 的精確規則放在後半。
 

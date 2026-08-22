@@ -16,6 +16,7 @@ It translates API shapes, keeps short-lived continuation state, protects files, 
 
 - One running gateway serves one Microsoft 365 account.
 - Durable conversations and memory belong to the caller, Hermes, or Hindsight. The gateway keeps only short-lived state needed to continue transport and tools.
+- Authoritative Agent governance lifecycle state belongs to the Agent Control Plane (ACP). Hermes, Hindsight, Semantica, and other upstream cores are immutable upstreams. See [`agent-governance.md`](agent-governance.md) for governance seams and canonical authority.
 - The gateway is a Rust program. The `m365-native` executable name remains for compatibility and does not imply the old product name.
 - This is a community project, not an official Microsoft product.
 
@@ -70,6 +71,7 @@ General `/v1/chat/completions` does not inherit the Hermes execution ledger and 
 ## Read deeper only when needed
 
 - Exact requests, streaming, and errors: [`api-contracts.md`](api-contracts.md)
+- Agent lifecycle, blockers, completion, handoff, and policy: [`agent-governance.md`](agent-governance.md)
 - Hermes / Hindsight: [`hermes-hindsight.md`](hermes-hindsight.md)
 - Settings: [`runtime-settings.md`](runtime-settings.md)
 - Security and retention limits: [`../../SECURITY.md`](../../SECURITY.md)

@@ -8,7 +8,7 @@
 - Hindsight Memory uses `/memory/v1`.
 - Goal Judge and similar control work use `/v1/chat/completions`, not the Hermes Agent route.
 - One Microsoft account runs at most two requests. Users come first, Memory second, and background/control work third.
-- The Gateway does not modify Hermes or Hindsight core code.
+- Hermes, Hindsight, Semantica, and other upstream cores are immutable upstreams. Governance may live only in ACP, a versioned adapter, plugin / hook, gateway, or sidecar. See [`agent-governance.md`](agent-governance.md) for the full lifecycle contract.
 
 If you only need to connect the services, use the next section. Exact scheduler, barrier, and webhook rules follow later.
 
