@@ -15,6 +15,7 @@ pub mod config;
 mod debug;
 mod deployments;
 pub mod error;
+pub mod governance;
 mod hindsight;
 mod images;
 mod mcp;
