@@ -413,6 +413,219 @@ pub struct FinishCompletionResult {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CapabilityStatus {
+    Supported,
+    Degraded,
+    Unsupported,
+    Incompatible,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CapabilityIntegrationSeam {
+    Adapter,
+    Plugin,
+    Hook,
+    Gateway,
+    Sidecar,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityProbeEvidence {
+    pub schema_version: u32,
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub upstream_id: String,
+    pub upstream_version: String,
+    pub requested_capability: String,
+    pub integration_seam: CapabilityIntegrationSeam,
+    pub surface_present: Option<bool>,
+    pub version_compatible: Option<bool>,
+    pub observed_field_families: Vec<String>,
+    pub observed_semantics: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+pub trait CapabilityProbeEvidenceVerifier {
+    /// Verify the referenced source evidence and its claimed semantics independently of the
+    /// caller-provided envelope. Syntax or subject identity checks alone are insufficient.
+    fn verifies(&self, evidence: &CapabilityProbeEvidence) -> bool;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityProbeRequest {
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub upstream_id: String,
+    pub upstream_version: String,
+    pub requested_capability: String,
+    pub integration_seam: CapabilityIntegrationSeam,
+    pub required_field_families: Vec<String>,
+    pub required_semantics: Vec<String>,
+    pub evidence: Option<CapabilityProbeEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityProbeResult {
+    pub schema_version: u32,
+    pub evidence_schema_version: Option<u32>,
+    pub status: CapabilityStatus,
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub upstream_id: String,
+    pub upstream_version: String,
+    pub requested_capability: String,
+    pub integration_seam: CapabilityIntegrationSeam,
+    pub surface_present: Option<bool>,
+    pub version_compatible: Option<bool>,
+    pub required_field_families: Vec<String>,
+    pub required_semantics: Vec<String>,
+    pub observed_field_families: Vec<String>,
+    pub observed_semantics: Vec<String>,
+    pub missing_field_families: Vec<String>,
+    pub missing_semantics: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+pub fn evaluate_capability_probe(
+    request: CapabilityProbeRequest,
+    verifier: &dyn CapabilityProbeEvidenceVerifier,
+) -> Result<CapabilityProbeResult, GovernanceError> {
+    validate_identity("adapter_id", &request.adapter_id)?;
+    validate_identity("adapter_version", &request.adapter_version)?;
+    validate_identity("upstream_id", &request.upstream_id)?;
+    validate_identity("upstream_version", &request.upstream_version)?;
+    validate_identity("requested_capability", &request.requested_capability)?;
+    for value in request
+        .required_field_families
+        .iter()
+        .chain(&request.required_semantics)
+    {
+        validate_identity("capability_semantic", value)?;
+    }
+    if let Some(evidence) = &request.evidence {
+        validate_identity("evidence_adapter_id", &evidence.adapter_id)?;
+        validate_identity("evidence_adapter_version", &evidence.adapter_version)?;
+        validate_identity("evidence_upstream_id", &evidence.upstream_id)?;
+        validate_identity("evidence_upstream_version", &evidence.upstream_version)?;
+        validate_identity(
+            "evidence_requested_capability",
+            &evidence.requested_capability,
+        )?;
+        for value in evidence
+            .observed_field_families
+            .iter()
+            .chain(&evidence.observed_semantics)
+        {
+            validate_identity("capability_semantic", value)?;
+        }
+        validate_evidence_refs(&evidence.evidence_refs)?;
+    }
+
+    let evidence_bound = request.evidence.as_ref().is_some_and(|evidence| {
+        evidence.schema_version == 1
+            && evidence.adapter_id == request.adapter_id
+            && evidence.adapter_version == request.adapter_version
+            && evidence.upstream_id == request.upstream_id
+            && evidence.upstream_version == request.upstream_version
+            && evidence.requested_capability == request.requested_capability
+            && evidence.integration_seam == request.integration_seam
+            && verifier.verifies(evidence)
+    });
+    let evidence = if evidence_bound {
+        request.evidence
+    } else {
+        None
+    };
+    let (
+        evidence_schema_version,
+        surface_present,
+        version_compatible,
+        observed_field_families,
+        observed_semantics,
+        evidence_refs,
+    ) = match evidence {
+        Some(evidence) => (
+            Some(evidence.schema_version),
+            evidence.surface_present,
+            evidence.version_compatible,
+            evidence.observed_field_families,
+            evidence.observed_semantics,
+            evidence.evidence_refs,
+        ),
+        None => (None, None, None, Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    let required_field_families = normalize_capability_values(request.required_field_families);
+    let required_semantics = normalize_capability_values(request.required_semantics);
+    let observed_field_families = normalize_capability_values(observed_field_families);
+    let observed_semantics = normalize_capability_values(observed_semantics);
+    let missing_field_families =
+        missing_capability_values(&required_field_families, &observed_field_families);
+    let missing_semantics = missing_capability_values(&required_semantics, &observed_semantics);
+    let semantic_contract_declared =
+        !required_field_families.is_empty() || !required_semantics.is_empty();
+    let coverage_complete = missing_field_families.is_empty() && missing_semantics.is_empty();
+    let status = if evidence_refs.is_empty() {
+        CapabilityStatus::Unknown
+    } else if version_compatible == Some(false) {
+        CapabilityStatus::Incompatible
+    } else if surface_present == Some(false) {
+        CapabilityStatus::Unsupported
+    } else if surface_present == Some(true) && version_compatible == Some(true) {
+        if !semantic_contract_declared {
+            CapabilityStatus::Unknown
+        } else if coverage_complete {
+            CapabilityStatus::Supported
+        } else {
+            CapabilityStatus::Degraded
+        }
+    } else {
+        CapabilityStatus::Unknown
+    };
+
+    Ok(CapabilityProbeResult {
+        schema_version: 1,
+        evidence_schema_version,
+        status,
+        adapter_id: request.adapter_id,
+        adapter_version: request.adapter_version,
+        upstream_id: request.upstream_id,
+        upstream_version: request.upstream_version,
+        requested_capability: request.requested_capability,
+        integration_seam: request.integration_seam,
+        surface_present,
+        version_compatible,
+        required_field_families,
+        required_semantics,
+        observed_field_families,
+        observed_semantics,
+        missing_field_families,
+        missing_semantics,
+        evidence_refs,
+    })
+}
+
+fn normalize_capability_values(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn missing_capability_values(required: &[String], observed: &[String]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|required| !observed.contains(required))
+        .cloned()
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RuntimeState {
     Unknown,
     Starting,
@@ -5214,5 +5427,290 @@ mod tests {
             waiting.waiting_on,
             ProjectionValue::Value(Some("tool:db".to_owned()))
         );
+    }
+
+    fn capability_probe_request() -> CapabilityProbeRequest {
+        CapabilityProbeRequest {
+            adapter_id: "hindsight-adapter".to_owned(),
+            adapter_version: "1.0.0".to_owned(),
+            upstream_id: "hindsight".to_owned(),
+            upstream_version: "0.9.1".to_owned(),
+            requested_capability: "memory.retain_durable".to_owned(),
+            integration_seam: CapabilityIntegrationSeam::Adapter,
+            required_field_families: vec!["operation_state".to_owned()],
+            required_semantics: vec!["durable_terminal".to_owned()],
+            evidence: None,
+        }
+    }
+
+    fn with_capability_evidence(
+        mut request: CapabilityProbeRequest,
+        surface_present: Option<bool>,
+        version_compatible: Option<bool>,
+        observed_field_families: &[&str],
+        observed_semantics: &[&str],
+        evidence_refs: &[&str],
+    ) -> CapabilityProbeRequest {
+        request.evidence = Some(CapabilityProbeEvidence {
+            schema_version: 1,
+            adapter_id: request.adapter_id.clone(),
+            adapter_version: request.adapter_version.clone(),
+            upstream_id: request.upstream_id.clone(),
+            upstream_version: request.upstream_version.clone(),
+            requested_capability: request.requested_capability.clone(),
+            integration_seam: request.integration_seam,
+            surface_present,
+            version_compatible,
+            observed_field_families: observed_field_families
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            observed_semantics: observed_semantics
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            evidence_refs: evidence_refs
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        });
+        request
+    }
+
+    #[derive(Default)]
+    struct TestCapabilityProbeEvidenceVerifier {
+        verified: Vec<CapabilityProbeEvidence>,
+    }
+
+    impl CapabilityProbeEvidenceVerifier for TestCapabilityProbeEvidenceVerifier {
+        fn verifies(&self, evidence: &CapabilityProbeEvidence) -> bool {
+            self.verified.contains(evidence)
+        }
+    }
+
+    fn evaluate_verified_capability_probe(
+        request: CapabilityProbeRequest,
+    ) -> Result<CapabilityProbeResult, GovernanceError> {
+        let verifier = TestCapabilityProbeEvidenceVerifier {
+            verified: request.evidence.iter().cloned().collect(),
+        };
+        evaluate_capability_probe(request, &verifier)
+    }
+
+    #[test]
+    fn capability_probe_unverified_semantic_assertion_is_unknown() {
+        let request = with_capability_evidence(
+            capability_probe_request(),
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &["evidence:caller-assertion"],
+        );
+        let result =
+            evaluate_capability_probe(request, &TestCapabilityProbeEvidenceVerifier::default())
+                .unwrap();
+
+        assert_eq!(result.status, CapabilityStatus::Unknown);
+        assert!(result.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn capability_probe_surface_presence_without_evidence_is_unknown() {
+        let request = with_capability_evidence(
+            capability_probe_request(),
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &[],
+        );
+        let result = evaluate_verified_capability_probe(request).unwrap();
+
+        assert_eq!(result.schema_version, 1);
+        assert_eq!(result.status, CapabilityStatus::Unknown);
+        assert_eq!(result.adapter_id, "hindsight-adapter");
+        assert_eq!(result.upstream_version, "0.9.1");
+        assert_eq!(result.requested_capability, "memory.retain_durable");
+    }
+
+    #[test]
+    fn capability_probe_empty_semantic_contract_is_unknown() {
+        let mut request = capability_probe_request();
+        request.required_field_families.clear();
+        request.required_semantics.clear();
+        let request = with_capability_evidence(
+            request,
+            Some(true),
+            Some(true),
+            &[],
+            &[],
+            &["evidence:surface-exists"],
+        );
+
+        assert_eq!(
+            evaluate_verified_capability_probe(request).unwrap().status,
+            CapabilityStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn capability_probe_full_evidenced_semantics_is_supported() {
+        let request = with_capability_evidence(
+            capability_probe_request(),
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &["evidence:hindsight-operation-terminal"],
+        );
+        let result = evaluate_verified_capability_probe(request).unwrap();
+
+        assert_eq!(result.evidence_schema_version, Some(1));
+        assert_eq!(result.status, CapabilityStatus::Supported);
+        assert!(result.missing_field_families.is_empty());
+        assert!(result.missing_semantics.is_empty());
+        assert_eq!(
+            result.evidence_refs,
+            vec!["evidence:hindsight-operation-terminal".to_owned()]
+        );
+    }
+
+    #[test]
+    fn capability_probe_incomplete_semantics_is_explicitly_degraded() {
+        let mut request = capability_probe_request();
+        request.required_field_families = vec![
+            "receipt_identity".to_owned(),
+            "operation_state".to_owned(),
+            "receipt_identity".to_owned(),
+        ];
+        request.required_semantics =
+            vec!["recall_visible".to_owned(), "durable_terminal".to_owned()];
+        let request = with_capability_evidence(
+            request,
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &["evidence:hindsight-partial-contract"],
+        );
+        let result = evaluate_verified_capability_probe(request).unwrap();
+
+        assert_eq!(result.status, CapabilityStatus::Degraded);
+        assert_eq!(
+            result.required_field_families,
+            vec!["operation_state".to_owned(), "receipt_identity".to_owned()]
+        );
+        assert_eq!(
+            result.missing_field_families,
+            vec!["receipt_identity".to_owned()]
+        );
+        assert_eq!(result.missing_semantics, vec!["recall_visible".to_owned()]);
+    }
+
+    #[test]
+    fn capability_probe_disappeared_surface_is_unsupported() {
+        let mut request = capability_probe_request();
+        request.adapter_id = "hermes-adapter".to_owned();
+        request.upstream_id = "hermes".to_owned();
+        request.upstream_version = "0.20.5".to_owned();
+        request.requested_capability = "handoff.checkpoint".to_owned();
+        request.integration_seam = CapabilityIntegrationSeam::Hook;
+        request.required_field_families = vec!["checkpoint_identity".to_owned()];
+        request.required_semantics = vec!["durable_handoff".to_owned()];
+        let request = with_capability_evidence(
+            request,
+            Some(false),
+            Some(true),
+            &[],
+            &[],
+            &["evidence:hermes-surface-probe"],
+        );
+        let result = evaluate_verified_capability_probe(request).unwrap();
+
+        assert_eq!(result.status, CapabilityStatus::Unsupported);
+        assert_eq!(
+            result.missing_field_families,
+            vec!["checkpoint_identity".to_owned()]
+        );
+        assert_eq!(result.missing_semantics, vec!["durable_handoff".to_owned()]);
+    }
+
+    #[test]
+    fn capability_probe_version_drift_is_incompatible_even_when_surface_exists() {
+        let mut request = capability_probe_request();
+        request.adapter_id = "semantica-adapter".to_owned();
+        request.upstream_id = "semantica".to_owned();
+        request.upstream_version = "0.7.0".to_owned();
+        request.requested_capability = "decision.query".to_owned();
+        request.required_field_families = vec!["decision_identity".to_owned()];
+        request.required_semantics = vec!["provenance_bound_query".to_owned()];
+        let request = with_capability_evidence(
+            request,
+            Some(true),
+            Some(false),
+            &["decision_identity"],
+            &["provenance_bound_query"],
+            &["evidence:semantica-version-drift"],
+        );
+        let result = evaluate_verified_capability_probe(request).unwrap();
+
+        assert_eq!(result.status, CapabilityStatus::Incompatible);
+        assert!(result.missing_field_families.is_empty());
+        assert!(result.missing_semantics.is_empty());
+    }
+
+    #[test]
+    fn capability_probe_mismatched_evidence_binding_is_unknown() {
+        let mut request = with_capability_evidence(
+            capability_probe_request(),
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &["evidence:unrelated-capability"],
+        );
+        request.evidence.as_mut().unwrap().requested_capability = "memory.delete".to_owned();
+        let result = evaluate_verified_capability_probe(request).unwrap();
+
+        assert_eq!(result.status, CapabilityStatus::Unknown);
+        assert_eq!(result.evidence_schema_version, None);
+        assert!(result.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn capability_probe_contract_rejects_undocumented_private_upstream_seams() {
+        for integration_seam in [
+            "UNDOCUMENTED_PRIVATE_DB",
+            "PRIVATE_FUNCTION",
+            "INTERNAL_CACHE",
+        ] {
+            let encoded = serde_json::json!({
+                "adapterId": "hermes-adapter",
+                "adapterVersion": "1.0.0",
+                "upstreamId": "hermes",
+                "upstreamVersion": "0.20.5",
+                "requestedCapability": "handoff.checkpoint",
+                "integrationSeam": integration_seam,
+                "requiredFieldFamilies": ["checkpoint_identity"],
+                "requiredSemantics": ["durable_handoff"],
+                "evidence": {
+                    "schemaVersion": 1,
+                    "adapterId": "hermes-adapter",
+                    "adapterVersion": "1.0.0",
+                    "upstreamId": "hermes",
+                    "upstreamVersion": "0.20.5",
+                    "requestedCapability": "handoff.checkpoint",
+                    "integrationSeam": integration_seam,
+                    "surfacePresent": true,
+                    "versionCompatible": true,
+                    "observedFieldFamilies": ["checkpoint_identity"],
+                    "observedSemantics": ["durable_handoff"],
+                    "evidenceRefs": ["evidence:private-upstream-state"]
+                }
+            });
+
+            assert!(serde_json::from_value::<CapabilityProbeRequest>(encoded).is_err());
+        }
     }
 }
