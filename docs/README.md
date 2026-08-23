@@ -19,7 +19,7 @@ Do not load every document at once. Choose one language and one topic. Obey the 
 |---|---|
 | 安裝、第一次登入、建立 API key | [`zh-TW/getting-started.md`](zh-TW/getting-started.md) |
 | 了解系統、入口與資料邊界 | [`zh-TW/architecture.md`](zh-TW/architecture.md) |
-| 設計或修改 Agent Control Plane、lifecycle、blocker、handoff、policy | [`zh-TW/agent-governance.md`](zh-TW/agent-governance.md) |
+| 整合 M365 與 ACP、檢查 adapter/projection governance contract | [`zh-TW/agent-governance.md`](zh-TW/agent-governance.md)；ACP core 請切到 standalone Agent-Control-Plane repo |
 | 設定 Hermes 或 Hindsight | [`zh-TW/hermes-hindsight.md`](zh-TW/hermes-hindsight.md) |
 | 部署、反向代理、回滾 | [`zh-TW/deployment.md`](zh-TW/deployment.md) |
 | 判斷功能是否真的驗證過 | [`zh-TW/compatibility.md`](zh-TW/compatibility.md) |
@@ -37,7 +37,7 @@ Do not load every document at once. Choose one language and one topic. Obey the 
 |---|---|
 | Install, first sign-in, create an API key | [`en/getting-started.md`](en/getting-started.md) |
 | Understand the system, endpoints, and data boundaries | [`en/architecture.md`](en/architecture.md) |
-| Design or change the Agent Control Plane, lifecycle, blockers, handoff, or policy | [`en/agent-governance.md`](en/agent-governance.md) |
+| Integrate M365 with ACP or inspect the adapter/projection governance contract | [`en/agent-governance.md`](en/agent-governance.md); change ACP core in the standalone Agent-Control-Plane repo |
 | Configure Hermes or Hindsight | [`en/hermes-hindsight.md`](en/hermes-hindsight.md) |
 | Deploy, proxy, and roll back | [`en/deployment.md`](en/deployment.md) |
 | Check whether behavior is verified | [`en/compatibility.md`](en/compatibility.md) |

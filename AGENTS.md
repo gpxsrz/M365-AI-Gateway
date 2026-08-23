@@ -6,12 +6,12 @@
 
 ## 不可變規則
 
-- 公開 `gpxsrz/M365-AI-Gateway` 的 `main` 是唯一開發權威。
+- 公開 `gpxsrz/M365-AI-Gateway` 的 `main` 是 M365 產品與 ACP/M365 adapter 的唯一開發權威；ACP core / lifecycle governance 的 source authority 是獨立 `gpxsrz/Agent-Control-Plane` 的 `main`，不得在本 repo 另建第二套 control-plane core。
 - `HEXUXIU/M365-Copilot2API` 只可唯讀比較，不得推送或建立 Issue。
 - 一個 Gateway 執行個體只對應一個 Microsoft 365 帳號。
 - Hermes、Hindsight、Semantica 與其他 external upstream core 一律視為 immutable upstream；不得為了相容或治理修改 upstream core。
-- Production governance 只能存在 ACP、versioned adapter、plugin / hook、gateway 或 sidecar。不得以私有 fork 當正式相依、monkey patch/runtime function replacement，或把 undocumented upstream DB/private function 當 ACP canonical authority。
-- Upstream capability 不足時，adapter 必須做 typed semantic probe（supported / degraded / unsupported / incompatible / unknown），再 fail closed 或回傳 typed degraded state；surface 存在不等於 capability 可用，也不得靜默放寬治理。Runtime/UI/context 都只能是帶 authority revision 與 provenance 的 projection。Agent lifecycle 的 canonical contract 見 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md)。
+- Production 的 canonical lifecycle governance 只能由 ACP 持有。Versioned adapter、plugin / hook、gateway 或 sidecar可以執行 integration enforcement、capability evidence與 projection，但不得持有另一份 Task/Run/Blocker/Completion/Policy/Memory/Handoff authority。不得以私有 fork 當正式相依、monkey patch/runtime function replacement，或把 undocumented upstream DB/private function 當 ACP canonical authority。
+- Upstream capability 不足時，adapter 必須做 typed semantic probe（supported / degraded / unsupported / incompatible / unknown），再 fail closed 或回傳 typed degraded state；surface 存在不等於 capability 可用，也不得靜默放寬治理。Runtime/UI/context 都只能是帶 authority revision 與 provenance 的 projection。本 repo 的 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md) 是 M365 integration contract mirror；ACP core/ADR/source 以 standalone Agent-Control-Plane repo 為準。
 - Private chat、文件暫存、圖片與 Code Interpreter 檔案是不同資料邊界。
 - 不得提交或輸出秘密、帳號／租戶識別、可重播資料、私有網址或產出檔案內容。
 

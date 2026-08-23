@@ -2,9 +2,9 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: read this page first when work involves Agent lifecycle, blockers, completion, handoff, context rotation, policy, or approval. This is the ACP canonical governance contract; the presence of this document does not mean every v1 behavior is already implemented or Production-qualified.
+> AI agents: read this page first when work involves M365 integration with Agent lifecycle, blockers, completion, handoff, context rotation, policy, or approval. This is the M365-side ACP integration-contract mirror, not ACP core source authority. ACP core, ADRs, and durable authority belong to the standalone `gpxsrz/Agent-Control-Plane` repository; this document also does not imply every v1 behavior is integrated or Production-qualified.
 
-The Agent Control Plane (ACP) is the only authoritative transition authority for Agent governance.
+The Agent Control Plane (ACP) is the only authoritative transition authority for Agent governance. M365 AI Gateway may act only as an adapter / transport-enforcement / projection surface; it must not create its own canonical Task/Run state or second durable governance store.
 
 Hermes, Hindsight, Semantica, and every other external upstream core are immutable upstreams. Agents, Managers, workers, dispatchers, LLMs, UIs, and Discord may propose intent or display projections. They may not independently make a Task or Run governance state authoritative as "resumed," "completed," or "handed off."
 

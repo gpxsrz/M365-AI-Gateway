@@ -2,9 +2,9 @@
 
 ## 30 秒看懂
 
-> AI Agent：如果任務涉及 Agent lifecycle、blocker、completion、handoff、context rotation、policy 或 approval，先讀本頁。這是 ACP 的 canonical governance contract；文件存在不代表所有 v1 行為已經實作或通過 Production 驗收。
+> AI Agent：如果任務涉及 M365 與 Agent lifecycle、blocker、completion、handoff、context rotation、policy 或 approval 的整合，先讀本頁。這是 M365 端的 ACP integration contract mirror，不是 ACP core 的 source authority。ACP core、ADR 與 durable authority 以獨立 `gpxsrz/Agent-Control-Plane` 為準；文件存在也不代表所有 v1 行為已經整合或通過 Production 驗收。
 
-Agent Control Plane（ACP）是 Agent 治理的唯一 authoritative transition authority。
+Agent Control Plane（ACP）是 Agent 治理的唯一 authoritative transition authority。M365 AI Gateway 只可作 adapter / transport enforcement / projection surface，不得建立自己的 Task/Run canonical state 或第二份 durable governance store。
 
 Hermes、Hindsight、Semantica 與其他外部 upstream core 一律視為 immutable upstream。Agent、Manager、worker、dispatcher、LLM、UI 與 Discord 都只能提出 intent 或顯示投影；不能自己把 Task / Run 的治理狀態改成「已解鎖」「已完成」或「已交接」。
 

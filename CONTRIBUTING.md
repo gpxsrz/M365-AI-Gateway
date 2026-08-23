@@ -16,8 +16,8 @@
 
 - 一個 Gateway 仍只對應一個 Microsoft 365 帳號。
 - Hermes、Hindsight、Semantica 與其他 external upstream core 都是 immutable upstream；相容與治理問題不得靠修改 upstream core 解決。
-- Production governance 只能落在 ACP、versioned adapter、plugin / hook、gateway 或 sidecar；不得使用私有 fork、monkey patch/runtime function replacement，或把 undocumented upstream DB/private function 當 canonical authority。
-- Adapter 必須做 typed semantic capability probe；surface 存在不等於 supported。能力缺失或不相容時 fail closed / typed degraded，runtime/UI/context projection 必須保留 authority revision / provenance，不得靜默放寬 policy、approval、blocker、completion 或 handoff gate。完整 contract 見 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md)。
+- Canonical lifecycle governance 只能由獨立 ACP 持有；versioned adapter、plugin / hook、gateway 或 sidecar只負責 integration enforcement、capability evidence與 projection，不得另存第二份 Task/Run authority。不得使用私有 fork、monkey patch/runtime function replacement，或把 undocumented upstream DB/private function 當 canonical authority。
+- Adapter 必須做 typed semantic capability probe；surface 存在不等於 supported。能力缺失或不相容時 fail closed / typed degraded，runtime/UI/context projection 必須保留 authority revision / provenance，不得靜默放寬 policy、approval、blocker、completion 或 handoff gate。本 repo 的 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md) 是 M365 integration contract mirror；ACP core 開發、ADR 與 durable authority 歸 `gpxsrz/Agent-Control-Plane`。
 - 所有工程工作預設遵循 Ponytail full：先刪不必要工作、優先重用既有 seam/helper、維持最小正確 diff，不因假想的未來需求增加 abstraction、依賴、設定或第二份 authority。
 - 不為「以後可能用到」增加抽象層、設定或依賴。
 - 非平凡修改先 trace execution path / callers / sibling paths / shared authority，再進 TDD；不要用一個很小的 failing test 取代結構分析。
@@ -32,7 +32,7 @@
 - 台灣繁中用白話、短句與台灣用語；英文內容要對稱。
 - 每頁先放「30 秒看懂」，再放操作步驟，最後才放精確查表。
 - 一頁只處理一個主題。AI Agent 應先讀 `docs/README.md`，不要一次載入全部文件。
-- Agent Governance 開發也遵守同一套分層揭露：core → router → 單一 topic → exact evidence → 必要時才進 history。完整開發讀取規則見 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md#12-agent-開發作業規則分層揭露與最小讀取)。
+- M365 的 ACP adapter / projection 開發也遵守同一套分層揭露；若工作會改變 ACP core lifecycle semantics，先切到 standalone Agent-Control-Plane repo，不得在 M365 repo 直接實作。M365 integration 讀取規則見 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md#12-agent-開發作業規則分層揭露與最小讀取)。
 - Current 文件只描述現在怎麼用；舊 Issue、舊 canary 與過去 Production 證據放 `docs/history/`。
 - Persistent structured `CURRENT` / handoff 的行數預算與 pruning policy 是執行環境治理，不是 M365 repo 的產品設定。Repo 可以定義專案 schema / evidence 語義，但不得把 host-local 的行數上限複製進 source、測試或 canonical 文件；有共用 handoff policy 時直接遵循它。
 - 不用大量縮寫或技術名詞堆砌。無法避免的名詞，第一次出現就用一句白話解釋。
@@ -75,8 +75,8 @@ git diff --check
 
 - One gateway still maps to one Microsoft 365 account.
 - Hermes, Hindsight, Semantica, and every other external upstream core are immutable upstreams. Compatibility and governance must not be implemented by patching upstream core.
-- Production governance may live only in ACP, a versioned adapter, plugin / hook, gateway, or sidecar. Do not use a private fork, monkey patch/runtime function replacement, or undocumented upstream DB/private function as canonical authority.
-- Adapters must use typed semantic capability probes; surface existence does not mean supported. Missing or incompatible capabilities fail closed / typed degraded, runtime/UI/context projections preserve authority revision / provenance, and policy, approval, blocker, completion, or handoff gates must not be silently weakened. See [`docs/en/agent-governance.md`](docs/en/agent-governance.md) for the canonical contract.
+- Canonical lifecycle governance belongs only to the standalone ACP. Versioned adapters, plugins / hooks, gateways, and sidecars may enforce integration rules, collect capability evidence, and expose projections, but they must not persist a second Task/Run authority. Do not use a private fork, monkey patch/runtime function replacement, or undocumented upstream DB/private function as canonical authority.
+- Adapters must use typed semantic capability probes; surface existence does not mean supported. Missing or incompatible capabilities fail closed / typed degraded, runtime/UI/context projections preserve authority revision / provenance, and policy, approval, blocker, completion, or handoff gates must not be silently weakened. [`docs/en/agent-governance.md`](docs/en/agent-governance.md) is the M365 integration-contract mirror; ACP core development, ADRs, and durable authority belong to `gpxsrz/Agent-Control-Plane`.
 - All engineering work defaults to Ponytail full: delete unnecessary work first, reuse existing seams/helpers, keep the smallest correct diff, and do not add abstractions, dependencies, settings, or a second authority for hypothetical future needs.
 - Do not add abstractions, settings, or dependencies for hypothetical future needs.
 - For non-trivial changes, trace the execution path, callers, sibling paths, and shared authority before TDD. A tiny failing test does not replace structural analysis.
@@ -91,7 +91,7 @@ git diff --check
 - Use plain, short Traditional Chinese with Taiwan wording. Keep the English page equivalent.
 - Start each page with a 30-second summary, then actions, then exact reference details.
 - Keep one topic per page. AI agents should route through `docs/README.md` instead of loading every document.
-- Agent Governance development follows the same disclosure chain: core → router → one topic → exact evidence → history only when required. See [`docs/en/agent-governance.md`](docs/en/agent-governance.md#12-agent-development-operating-rules-progressive-disclosure-and-minimum-reads).
+- M365 ACP-adapter / projection development follows the same disclosure chain. If work changes ACP core lifecycle semantics, switch to the standalone Agent-Control-Plane repository instead of implementing it here. See [`docs/en/agent-governance.md`](docs/en/agent-governance.md#12-agent-development-operating-rules-progressive-disclosure-and-minimum-reads) for the M365 integration reading path.
 - Current pages describe current behavior. Old Issues, canaries, and Production evidence belong under `docs/history/`.
 - Persistent structured `CURRENT` / handoff line budgets and pruning policy are execution-environment governance, not an M365 repository product setting. The repository may define project schema / evidence semantics, but must not copy a host-local line limit into source, tests, or canonical documentation; consume the shared handoff policy when one is available.
 - Avoid acronym and jargon stacks. Explain an unavoidable term in plain language when it first appears.
