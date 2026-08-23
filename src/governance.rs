@@ -35,6 +35,9 @@ pub enum TransitionKind {
     Resume,
     SupersedeBlocker,
     ForceResume,
+    IssueApprovalGrant,
+    ConsumeApprovalGrant,
+    RevokeApprovalGrant,
     BeginCompletion,
     Complete,
     Correct,
@@ -47,6 +50,364 @@ pub enum DecisionOutcome {
     Deny,
     Defer,
     RequireApproval,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicyLayer {
+    CompanyRequirements,
+    ProviderRequirements,
+    ServicePolicy,
+    ProfilePolicy,
+    TaskPolicy,
+    UserPreference,
+    AgentIntent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApprovalOutcome {
+    Allow,
+    Deny,
+    Timeout,
+    Abort,
+    RequireUserApproval,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicyEvaluatorStatus {
+    Resolved,
+    Timeout,
+    Aborted,
+    ParseFailure,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyRule {
+    pub layer: PolicyLayer,
+    pub policy_id: String,
+    pub exception_id: Option<String>,
+    pub requested_action: String,
+    pub target_scope: String,
+    pub outcome: ApprovalOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyEvaluationRequest {
+    pub requested_action: String,
+    pub target_scope: String,
+    pub policy_version: String,
+    pub evaluator_version: String,
+    pub evaluator_status: PolicyEvaluatorStatus,
+    pub evidence_refs: Vec<String>,
+    pub rules: Vec<PolicyRule>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyEvaluationResult {
+    pub outcome: ApprovalOutcome,
+    pub reason: String,
+    pub governing_policy_id: Option<String>,
+    pub governing_layer: Option<PolicyLayer>,
+    pub exception_id: Option<String>,
+    pub requested_action: String,
+    pub target_scope: String,
+    pub policy_version: String,
+    pub evaluator_version: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalGrant {
+    pub approval_id: String,
+    pub actor: String,
+    pub policy_layer: PolicyLayer,
+    pub policy_id: String,
+    pub exception_id: String,
+    pub permitted_action: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub target_scope: String,
+    pub authority_revision: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub issued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    pub max_uses: u32,
+    pub consumed_uses: u32,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub revoked_at: Option<OffsetDateTime>,
+    pub fencing_identity: String,
+    pub policy_version: String,
+    pub evaluator_version: String,
+    pub evidence_refs: Vec<String>,
+    pub issuance_decision_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalGrantConsumption {
+    pub consumption_id: String,
+    pub approval_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub actor: String,
+    pub permitted_action: String,
+    pub target_scope: String,
+    pub authority_revision: u64,
+    pub fencing_identity: String,
+    pub evidence_refs: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub consumed_at: OffsetDateTime,
+    pub decision_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssueApprovalGrantRequest {
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub approved_actor: String,
+    pub issued_by: String,
+    pub fencing_identity: String,
+    pub evaluation: PolicyEvaluationRequest,
+    pub expires_at: OffsetDateTime,
+    pub max_uses: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssueApprovalGrantResult {
+    pub decision: DecisionRecord,
+    pub grant: Option<ApprovalGrant>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsumeApprovalGrantRequest {
+    pub approval_id: String,
+    pub consumption_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub actor: String,
+    pub permitted_action: String,
+    pub target_scope: String,
+    pub fencing_identity: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsumeApprovalGrantResult {
+    pub decision: DecisionRecord,
+    pub grant: Option<ApprovalGrant>,
+    pub consumption: Option<ApprovalGrantConsumption>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevokeApprovalGrantRequest {
+    pub approval_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub actor: String,
+    pub fencing_identity: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevokeApprovalGrantResult {
+    pub decision: DecisionRecord,
+    pub grant: Option<ApprovalGrant>,
+}
+
+pub fn evaluate_policy(mut request: PolicyEvaluationRequest) -> PolicyEvaluationResult {
+    let evaluator_failure = match request.evaluator_status {
+        PolicyEvaluatorStatus::Resolved => None,
+        PolicyEvaluatorStatus::Timeout => Some((ApprovalOutcome::Timeout, "evaluator_timeout")),
+        PolicyEvaluatorStatus::Aborted => Some((ApprovalOutcome::Abort, "evaluator_aborted")),
+        PolicyEvaluatorStatus::ParseFailure => {
+            Some((ApprovalOutcome::Abort, "evaluator_parse_failure"))
+        }
+        PolicyEvaluatorStatus::Unavailable => {
+            Some((ApprovalOutcome::Abort, "evaluator_unavailable"))
+        }
+        PolicyEvaluatorStatus::Unknown => Some((ApprovalOutcome::Abort, "evaluator_unknown")),
+    };
+    if let Some((outcome, reason)) = evaluator_failure {
+        return PolicyEvaluationResult {
+            outcome,
+            reason: reason.to_owned(),
+            governing_policy_id: None,
+            governing_layer: None,
+            exception_id: None,
+            requested_action: request.requested_action,
+            target_scope: request.target_scope,
+            policy_version: request.policy_version,
+            evaluator_version: request.evaluator_version,
+            evidence_refs: request.evidence_refs,
+        };
+    }
+
+    if validate_policy_evaluation_request(&request).is_err() {
+        return PolicyEvaluationResult {
+            outcome: ApprovalOutcome::Abort,
+            reason: "invalid_policy_input".to_owned(),
+            governing_policy_id: None,
+            governing_layer: None,
+            exception_id: None,
+            requested_action: request.requested_action,
+            target_scope: request.target_scope,
+            policy_version: request.policy_version,
+            evaluator_version: request.evaluator_version,
+            evidence_refs: request.evidence_refs,
+        };
+    }
+    if request.evidence_refs.is_empty() {
+        return PolicyEvaluationResult {
+            outcome: ApprovalOutcome::Abort,
+            reason: "evidence_required".to_owned(),
+            governing_policy_id: None,
+            governing_layer: None,
+            exception_id: None,
+            requested_action: request.requested_action,
+            target_scope: request.target_scope,
+            policy_version: request.policy_version,
+            evaluator_version: request.evaluator_version,
+            evidence_refs: request.evidence_refs,
+        };
+    }
+    if request.rules.iter().any(|rule| {
+        rule.requested_action != request.requested_action
+            || rule.target_scope != request.target_scope
+    }) {
+        return PolicyEvaluationResult {
+            outcome: ApprovalOutcome::Abort,
+            reason: "policy_rule_binding_mismatch".to_owned(),
+            governing_policy_id: None,
+            governing_layer: None,
+            exception_id: None,
+            requested_action: request.requested_action,
+            target_scope: request.target_scope,
+            policy_version: request.policy_version,
+            evaluator_version: request.evaluator_version,
+            evidence_refs: request.evidence_refs,
+        };
+    }
+    if request.rules.iter().any(|rule| {
+        matches!(
+            rule.outcome,
+            ApprovalOutcome::Timeout | ApprovalOutcome::Abort
+        )
+    }) {
+        return PolicyEvaluationResult {
+            outcome: ApprovalOutcome::Abort,
+            reason: "invalid_policy_outcome".to_owned(),
+            governing_policy_id: None,
+            governing_layer: None,
+            exception_id: None,
+            requested_action: request.requested_action,
+            target_scope: request.target_scope,
+            policy_version: request.policy_version,
+            evaluator_version: request.evaluator_version,
+            evidence_refs: request.evidence_refs,
+        };
+    }
+    let mut observed_layers = std::collections::BTreeSet::new();
+    if request
+        .rules
+        .iter()
+        .any(|rule| !observed_layers.insert(rule.layer))
+    {
+        return PolicyEvaluationResult {
+            outcome: ApprovalOutcome::Abort,
+            reason: "duplicate_policy_layer".to_owned(),
+            governing_policy_id: None,
+            governing_layer: None,
+            exception_id: None,
+            requested_action: request.requested_action,
+            target_scope: request.target_scope,
+            policy_version: request.policy_version,
+            evaluator_version: request.evaluator_version,
+            evidence_refs: request.evidence_refs,
+        };
+    }
+
+    request.rules.sort_by_key(|rule| rule.layer);
+    let Some(mut governing) = request.rules.first().cloned() else {
+        return PolicyEvaluationResult {
+            outcome: ApprovalOutcome::Deny,
+            reason: "policy_required".to_owned(),
+            governing_policy_id: None,
+            governing_layer: None,
+            exception_id: None,
+            requested_action: request.requested_action,
+            target_scope: request.target_scope,
+            policy_version: request.policy_version,
+            evaluator_version: request.evaluator_version,
+            evidence_refs: request.evidence_refs,
+        };
+    };
+
+    for rule in request.rules.into_iter().skip(1) {
+        let strictness = |outcome| match outcome {
+            ApprovalOutcome::Allow => Some(0),
+            ApprovalOutcome::RequireUserApproval => Some(1),
+            ApprovalOutcome::Deny => Some(2),
+            ApprovalOutcome::Timeout | ApprovalOutcome::Abort => None,
+        };
+        let (Some(rule_strictness), Some(governing_strictness)) =
+            (strictness(rule.outcome), strictness(governing.outcome))
+        else {
+            return PolicyEvaluationResult {
+                outcome: ApprovalOutcome::Abort,
+                reason: "invalid_policy_outcome".to_owned(),
+                governing_policy_id: Some(governing.policy_id),
+                governing_layer: Some(governing.layer),
+                exception_id: governing.exception_id,
+                requested_action: request.requested_action,
+                target_scope: request.target_scope,
+                policy_version: request.policy_version,
+                evaluator_version: request.evaluator_version,
+                evidence_refs: request.evidence_refs,
+            };
+        };
+        if rule_strictness < governing_strictness {
+            return PolicyEvaluationResult {
+                outcome: ApprovalOutcome::Deny,
+                reason: "lower_layer_relaxation".to_owned(),
+                governing_policy_id: Some(governing.policy_id),
+                governing_layer: Some(governing.layer),
+                exception_id: governing.exception_id,
+                requested_action: request.requested_action,
+                target_scope: request.target_scope,
+                policy_version: request.policy_version,
+                evaluator_version: request.evaluator_version,
+                evidence_refs: request.evidence_refs,
+            };
+        }
+        if rule_strictness > governing_strictness {
+            governing = rule;
+        }
+    }
+
+    PolicyEvaluationResult {
+        outcome: governing.outcome,
+        reason: "policy_resolved".to_owned(),
+        governing_policy_id: Some(governing.policy_id),
+        governing_layer: Some(governing.layer),
+        exception_id: governing.exception_id,
+        requested_action: request.requested_action,
+        target_scope: request.target_scope,
+        policy_version: request.policy_version,
+        evaluator_version: request.evaluator_version,
+        evidence_refs: request.evidence_refs,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -854,6 +1215,10 @@ struct StateFile {
     completions: BTreeMap<String, CompletionBarrierRecord>,
     #[serde(default)]
     runtime_records: Vec<AgentRuntimeRecord>,
+    #[serde(default)]
+    approval_grants: BTreeMap<String, ApprovalGrant>,
+    #[serde(default)]
+    approval_consumptions: BTreeMap<String, ApprovalGrantConsumption>,
     decisions: Vec<DecisionRecord>,
     next_decision_seq: u64,
 }
@@ -866,6 +1231,8 @@ impl Default for StateFile {
             blockers: BTreeMap::new(),
             completions: BTreeMap::new(),
             runtime_records: Vec::new(),
+            approval_grants: BTreeMap::new(),
+            approval_consumptions: BTreeMap::new(),
             decisions: Vec::new(),
             next_decision_seq: 1,
         }
@@ -967,6 +1334,454 @@ impl GovernanceStore {
             .filter(|decision| decision.task_id == task_id)
             .cloned()
             .collect())
+    }
+
+    pub fn approval_grant(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalGrant>, GovernanceError> {
+        validate_identity("approval_id", approval_id)?;
+        let state = self.state.lock().expect("governance state poisoned");
+        Ok(state.approval_grants.get(approval_id).cloned())
+    }
+
+    pub fn approval_grant_consumptions(
+        &self,
+        approval_id: &str,
+    ) -> Result<Vec<ApprovalGrantConsumption>, GovernanceError> {
+        validate_identity("approval_id", approval_id)?;
+        let state = self.state.lock().expect("governance state poisoned");
+        Ok(state
+            .approval_consumptions
+            .values()
+            .filter(|consumption| consumption.approval_id == approval_id)
+            .cloned()
+            .collect())
+    }
+
+    pub fn issue_approval_grant(
+        &self,
+        request: IssueApprovalGrantRequest,
+    ) -> Result<IssueApprovalGrantResult, GovernanceError> {
+        validate_identity("task_id", &request.task_id)?;
+        validate_identity("run_id", &request.run_id)?;
+        validate_identity("approved_actor", &request.approved_actor)?;
+        validate_identity("issued_by", &request.issued_by)?;
+        validate_identity("fencing_identity", &request.fencing_identity)?;
+        validate_policy_evaluation_request(&request.evaluation)?;
+        if request.max_uses == 0 {
+            return Err(GovernanceError::InvalidIdentity("max_uses"));
+        }
+
+        let evaluation = evaluate_policy(request.evaluation);
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let authority_before = authority
+            .as_ref()
+            .map_or(0, |authority| authority.authority_revision);
+        let now = OffsetDateTime::now_utc();
+        let decision_id = next_decision_id(&mut state);
+        let mut authority_after = authority_before;
+        let mut performed_at = None;
+        let mut grant = None;
+        let (outcome, reason) = match authority.as_ref() {
+            None => (DecisionOutcome::Deny, "task_not_found"),
+            Some(authority) if authority.active_run_id != request.run_id => {
+                (DecisionOutcome::Deny, "run_not_found")
+            }
+            Some(authority)
+                if authority.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_authority")
+            }
+            Some(_) if evaluation.evidence_refs.is_empty() => {
+                (DecisionOutcome::Defer, "evidence_required")
+            }
+            Some(authority) if authority.lifecycle_state != LifecycleState::Running => {
+                (DecisionOutcome::Deny, "approval_not_available")
+            }
+            Some(authority)
+                if authority.owner_agent_id.as_deref() != Some(request.approved_actor.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "owner_mismatch")
+            }
+            Some(authority)
+                if authority.fencing_identity.as_deref()
+                    != Some(request.fencing_identity.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "fencing_mismatch")
+            }
+            Some(_) if request.expires_at <= now => (DecisionOutcome::Deny, "approval_expired"),
+            Some(_) if evaluation.outcome == ApprovalOutcome::Deny => {
+                (DecisionOutcome::Deny, evaluation.reason.as_str())
+            }
+            Some(_) if evaluation.outcome == ApprovalOutcome::RequireUserApproval => {
+                (DecisionOutcome::RequireApproval, evaluation.reason.as_str())
+            }
+            Some(_)
+                if matches!(
+                    evaluation.outcome,
+                    ApprovalOutcome::Timeout | ApprovalOutcome::Abort
+                ) =>
+            {
+                (DecisionOutcome::Defer, evaluation.reason.as_str())
+            }
+            Some(_)
+                if matches!(
+                    evaluation.governing_layer,
+                    Some(PolicyLayer::UserPreference | PolicyLayer::AgentIntent)
+                ) =>
+            {
+                (DecisionOutcome::Deny, "approval_authority_not_policy")
+            }
+            Some(_) if evaluation.exception_id.is_none() => {
+                (DecisionOutcome::Deny, "approval_exception_required")
+            }
+            Some(_) => {
+                let authority = state.tasks.get_mut(&request.task_id).unwrap();
+                authority.authority_revision = authority.authority_revision.saturating_add(1);
+                authority_after = authority.authority_revision;
+                performed_at = Some(now);
+                let approval = ApprovalGrant {
+                    approval_id: new_approval_id(),
+                    actor: request.approved_actor.clone(),
+                    policy_layer: evaluation.governing_layer.unwrap(),
+                    policy_id: evaluation.governing_policy_id.clone().unwrap(),
+                    exception_id: evaluation.exception_id.clone().unwrap(),
+                    permitted_action: evaluation.requested_action.clone(),
+                    task_id: request.task_id.clone(),
+                    run_id: request.run_id.clone(),
+                    target_scope: evaluation.target_scope.clone(),
+                    authority_revision: authority_after,
+                    issued_at: now,
+                    expires_at: request.expires_at,
+                    max_uses: request.max_uses,
+                    consumed_uses: 0,
+                    revoked_at: None,
+                    fencing_identity: request.fencing_identity.clone(),
+                    policy_version: evaluation.policy_version.clone(),
+                    evaluator_version: evaluation.evaluator_version.clone(),
+                    evidence_refs: evaluation.evidence_refs.clone(),
+                    issuance_decision_id: decision_id.clone(),
+                };
+                state
+                    .approval_grants
+                    .insert(approval.approval_id.clone(), approval.clone());
+                grant = Some(approval);
+                (DecisionOutcome::Allow, "approval_grant_issued")
+            }
+        };
+        let decision = DecisionRecord {
+            decision_id,
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.approved_actor,
+            requested_transition: TransitionKind::IssueApprovalGrant,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after,
+            policy_version: evaluation.policy_version,
+            evaluator_version: evaluation.evaluator_version,
+            evidence_refs: evaluation.evidence_refs,
+            actor: request.issued_by,
+            evaluated_at: now,
+            performed_at,
+            fencing_identity: Some(request.fencing_identity),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(IssueApprovalGrantResult { decision, grant })
+    }
+
+    pub fn consume_approval_grant(
+        &self,
+        request: ConsumeApprovalGrantRequest,
+    ) -> Result<ConsumeApprovalGrantResult, GovernanceError> {
+        self.consume_approval_grant_at(request, OffsetDateTime::now_utc())
+    }
+
+    fn consume_approval_grant_at(
+        &self,
+        request: ConsumeApprovalGrantRequest,
+        now: OffsetDateTime,
+    ) -> Result<ConsumeApprovalGrantResult, GovernanceError> {
+        validate_identity("approval_id", &request.approval_id)?;
+        validate_identity("consumption_id", &request.consumption_id)?;
+        validate_identity("task_id", &request.task_id)?;
+        validate_identity("run_id", &request.run_id)?;
+        validate_identity("actor", &request.actor)?;
+        validate_identity("permitted_action", &request.permitted_action)?;
+        validate_identity("target_scope", &request.target_scope)?;
+        validate_identity("fencing_identity", &request.fencing_identity)?;
+        validate_evidence_refs(&request.evidence_refs)?;
+
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let approval = state.approval_grants.get(&request.approval_id).cloned();
+        let authority_before = authority
+            .as_ref()
+            .map_or(0, |authority| authority.authority_revision);
+        let decision_id = next_decision_id(&mut state);
+        let mut authority_after = authority_before;
+        let mut performed_at = None;
+        let mut grant = approval.clone();
+        let mut consumption = None;
+        let (outcome, reason) = match (authority.as_ref(), approval.as_ref()) {
+            (None, _) => (DecisionOutcome::Deny, "task_not_found"),
+            (Some(authority), _) if authority.active_run_id != request.run_id => {
+                (DecisionOutcome::Deny, "run_not_found")
+            }
+            (Some(authority), _)
+                if authority.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_authority")
+            }
+            (Some(_), _) if request.evidence_refs.is_empty() => {
+                (DecisionOutcome::Defer, "evidence_required")
+            }
+            (Some(authority), _) if authority.lifecycle_state != LifecycleState::Running => {
+                (DecisionOutcome::Deny, "approval_not_available")
+            }
+            (Some(authority), _)
+                if authority.owner_agent_id.as_deref() != Some(request.actor.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "owner_mismatch")
+            }
+            (Some(authority), _)
+                if authority.fencing_identity.as_deref()
+                    != Some(request.fencing_identity.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "fencing_mismatch")
+            }
+            (Some(_), _)
+                if state
+                    .approval_consumptions
+                    .contains_key(&request.consumption_id) =>
+            {
+                (DecisionOutcome::Deny, "approval_replayed")
+            }
+            (Some(_), None) => (DecisionOutcome::Deny, "approval_not_found"),
+            (Some(_), Some(approval))
+                if approval.task_id != request.task_id || approval.run_id != request.run_id =>
+            {
+                (DecisionOutcome::Deny, "approval_task_scope_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.actor != request.actor => {
+                (DecisionOutcome::Deny, "approval_actor_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.permitted_action != request.permitted_action => {
+                (DecisionOutcome::Deny, "approval_action_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.target_scope != request.target_scope => {
+                (DecisionOutcome::Deny, "approval_scope_mismatch")
+            }
+            (Some(_), Some(approval))
+                if approval.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "approval_revision_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.fencing_identity != request.fencing_identity => {
+                (DecisionOutcome::Deny, "approval_fencing_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.revoked_at.is_some() => {
+                (DecisionOutcome::Deny, "approval_revoked")
+            }
+            (Some(_), Some(approval)) if approval.expires_at <= now => {
+                (DecisionOutcome::Deny, "approval_expired")
+            }
+            (Some(_), Some(approval)) if approval.consumed_uses >= approval.max_uses => {
+                (DecisionOutcome::Deny, "approval_exhausted")
+            }
+            (Some(_), Some(_)) => {
+                let authority = state.tasks.get_mut(&request.task_id).unwrap();
+                authority.authority_revision = authority.authority_revision.saturating_add(1);
+                authority_after = authority.authority_revision;
+                let approval = state.approval_grants.get_mut(&request.approval_id).unwrap();
+                approval.consumed_uses = approval.consumed_uses.saturating_add(1);
+                approval.authority_revision = authority_after;
+                grant = Some(approval.clone());
+                let consumed = ApprovalGrantConsumption {
+                    consumption_id: request.consumption_id.clone(),
+                    approval_id: request.approval_id.clone(),
+                    task_id: request.task_id.clone(),
+                    run_id: request.run_id.clone(),
+                    actor: request.actor.clone(),
+                    permitted_action: request.permitted_action.clone(),
+                    target_scope: request.target_scope.clone(),
+                    authority_revision: authority_after,
+                    fencing_identity: request.fencing_identity.clone(),
+                    evidence_refs: request.evidence_refs.clone(),
+                    consumed_at: now,
+                    decision_id: decision_id.clone(),
+                };
+                state
+                    .approval_consumptions
+                    .insert(consumed.consumption_id.clone(), consumed.clone());
+                consumption = Some(consumed);
+                performed_at = Some(now);
+                (DecisionOutcome::Allow, "approval_grant_consumed")
+            }
+        };
+        let decision = DecisionRecord {
+            decision_id,
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.actor.clone(),
+            requested_transition: TransitionKind::ConsumeApprovalGrant,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after,
+            policy_version: approval
+                .as_ref()
+                .map_or(BASE_POLICY_VERSION, |grant| grant.policy_version.as_str())
+                .to_owned(),
+            evaluator_version: approval
+                .as_ref()
+                .map_or(BASE_EVALUATOR_VERSION, |grant| {
+                    grant.evaluator_version.as_str()
+                })
+                .to_owned(),
+            evidence_refs: request.evidence_refs,
+            actor: request.actor,
+            evaluated_at: now,
+            performed_at,
+            fencing_identity: Some(request.fencing_identity),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(ConsumeApprovalGrantResult {
+            decision,
+            grant,
+            consumption,
+        })
+    }
+
+    pub fn revoke_approval_grant(
+        &self,
+        request: RevokeApprovalGrantRequest,
+    ) -> Result<RevokeApprovalGrantResult, GovernanceError> {
+        validate_identity("approval_id", &request.approval_id)?;
+        validate_identity("task_id", &request.task_id)?;
+        validate_identity("run_id", &request.run_id)?;
+        validate_identity("actor", &request.actor)?;
+        validate_identity("fencing_identity", &request.fencing_identity)?;
+        validate_evidence_refs(&request.evidence_refs)?;
+
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let approval = state.approval_grants.get(&request.approval_id).cloned();
+        let authority_before = authority
+            .as_ref()
+            .map_or(0, |authority| authority.authority_revision);
+        let now = OffsetDateTime::now_utc();
+        let mut authority_after = authority_before;
+        let mut performed_at = None;
+        let mut grant = approval.clone();
+        let (outcome, reason) = match (authority.as_ref(), approval.as_ref()) {
+            (None, _) => (DecisionOutcome::Deny, "task_not_found"),
+            (Some(authority), _) if authority.active_run_id != request.run_id => {
+                (DecisionOutcome::Deny, "run_not_found")
+            }
+            (Some(authority), _)
+                if authority.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_authority")
+            }
+            (Some(_), _) if request.evidence_refs.is_empty() => {
+                (DecisionOutcome::Defer, "evidence_required")
+            }
+            (Some(authority), _) if authority.lifecycle_state != LifecycleState::Running => {
+                (DecisionOutcome::Deny, "approval_not_available")
+            }
+            (Some(authority), _)
+                if authority.owner_agent_id.as_deref() != Some(request.actor.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "owner_mismatch")
+            }
+            (Some(authority), _)
+                if authority.fencing_identity.as_deref()
+                    != Some(request.fencing_identity.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "fencing_mismatch")
+            }
+            (Some(_), None) => (DecisionOutcome::Deny, "approval_not_found"),
+            (Some(_), Some(approval))
+                if approval.task_id != request.task_id || approval.run_id != request.run_id =>
+            {
+                (DecisionOutcome::Deny, "approval_task_scope_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.actor != request.actor => {
+                (DecisionOutcome::Deny, "approval_actor_mismatch")
+            }
+            (Some(_), Some(approval))
+                if approval.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "approval_revision_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.fencing_identity != request.fencing_identity => {
+                (DecisionOutcome::Deny, "approval_fencing_mismatch")
+            }
+            (Some(_), Some(approval)) if approval.revoked_at.is_some() => {
+                (DecisionOutcome::Deny, "approval_already_revoked")
+            }
+            (Some(_), Some(_)) => {
+                let authority = state.tasks.get_mut(&request.task_id).unwrap();
+                authority.authority_revision = authority.authority_revision.saturating_add(1);
+                authority_after = authority.authority_revision;
+                let approval = state.approval_grants.get_mut(&request.approval_id).unwrap();
+                approval.revoked_at = Some(now);
+                approval.authority_revision = authority_after;
+                grant = Some(approval.clone());
+                performed_at = Some(now);
+                (DecisionOutcome::Allow, "approval_grant_revoked")
+            }
+        };
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.actor.clone(),
+            requested_transition: TransitionKind::RevokeApprovalGrant,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after,
+            policy_version: approval
+                .as_ref()
+                .map_or(BASE_POLICY_VERSION, |grant| grant.policy_version.as_str())
+                .to_owned(),
+            evaluator_version: approval
+                .as_ref()
+                .map_or(BASE_EVALUATOR_VERSION, |grant| {
+                    grant.evaluator_version.as_str()
+                })
+                .to_owned(),
+            evidence_refs: request.evidence_refs,
+            actor: request.actor,
+            evaluated_at: now,
+            performed_at,
+            fencing_identity: Some(request.fencing_identity),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(RevokeApprovalGrantResult { decision, grant })
     }
 
     pub fn record_runtime_observation(
@@ -2262,6 +3077,25 @@ fn validate_evidence_refs(evidence_refs: &[String]) -> Result<(), GovernanceErro
     Ok(())
 }
 
+fn validate_policy_evaluation_request(
+    request: &PolicyEvaluationRequest,
+) -> Result<(), GovernanceError> {
+    validate_identity("requested_action", &request.requested_action)?;
+    validate_identity("target_scope", &request.target_scope)?;
+    validate_identity("policy_version", &request.policy_version)?;
+    validate_identity("evaluator_version", &request.evaluator_version)?;
+    validate_evidence_refs(&request.evidence_refs)?;
+    for rule in &request.rules {
+        validate_identity("policy_id", &rule.policy_id)?;
+        if let Some(exception_id) = &rule.exception_id {
+            validate_identity("exception_id", exception_id)?;
+        }
+        validate_identity("requested_action", &rule.requested_action)?;
+        validate_identity("target_scope", &rule.target_scope)?;
+    }
+    Ok(())
+}
+
 fn runtime_projection_value<T: Clone>(
     record: Option<&AgentRuntimeRecord>,
     authority_revision: u64,
@@ -2684,6 +3518,10 @@ fn new_blocker_id() -> String {
 
 fn new_completion_id() -> String {
     format!("completion-{:032x}", rand::random::<u128>())
+}
+
+fn new_approval_id() -> String {
+    format!("approval-{:032x}", rand::random::<u128>())
 }
 
 fn next_decision_id(state: &mut StateFile) -> String {
@@ -5711,6 +6549,845 @@ mod tests {
             });
 
             assert!(serde_json::from_value::<CapabilityProbeRequest>(encoded).is_err());
+        }
+    }
+
+    fn running_approval_task(store: &GovernanceStore, suffix: &str) -> (String, String, String) {
+        let task_id = format!("task-{suffix}");
+        let run_id = format!("run-{suffix}");
+        let agent_id = format!("agent-{suffix}");
+        store
+            .create_task(CreateTask {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                actor: "operator".to_owned(),
+                acceptance_contract_digest: format!("contract-{suffix}"),
+            })
+            .unwrap();
+        let claim = store
+            .transition(TransitionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 1,
+                requested_transition: TransitionKind::Claim,
+                agent_id: agent_id.clone(),
+                actor: "scheduler".to_owned(),
+                fencing_identity: None,
+                evidence_refs: vec!["evidence:claim".to_owned()],
+            })
+            .unwrap();
+        let fence = claim.fencing_identity.unwrap();
+        store
+            .transition(TransitionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 2,
+                requested_transition: TransitionKind::Start,
+                agent_id,
+                actor: "scheduler".to_owned(),
+                fencing_identity: Some(fence.clone()),
+                evidence_refs: vec!["evidence:start".to_owned()],
+            })
+            .unwrap();
+        (task_id, run_id, fence)
+    }
+
+    fn issue_test_approval(
+        store: &GovernanceStore,
+        suffix: &str,
+        task_id: &str,
+        run_id: &str,
+        fence: &str,
+        expires_at: OffsetDateTime,
+        max_uses: u32,
+    ) -> ApprovalGrant {
+        store
+            .issue_approval_grant(IssueApprovalGrantRequest {
+                task_id: task_id.to_owned(),
+                run_id: run_id.to_owned(),
+                expected_authority_revision: 3,
+                approved_actor: format!("agent-{suffix}"),
+                issued_by: "operator".to_owned(),
+                fencing_identity: fence.to_owned(),
+                evaluation: PolicyEvaluationRequest {
+                    requested_action: "deploy.production".to_owned(),
+                    target_scope: "gateway:production".to_owned(),
+                    policy_version: "policy-v1".to_owned(),
+                    evaluator_version: "evaluator-v1".to_owned(),
+                    evaluator_status: PolicyEvaluatorStatus::Resolved,
+                    evidence_refs: vec!["evidence:approved-exception".to_owned()],
+                    rules: vec![PolicyRule {
+                        layer: PolicyLayer::ServicePolicy,
+                        policy_id: "service-deploy".to_owned(),
+                        exception_id: Some("exception-emergency-deploy".to_owned()),
+                        requested_action: "deploy.production".to_owned(),
+                        target_scope: "gateway:production".to_owned(),
+                        outcome: ApprovalOutcome::Allow,
+                    }],
+                },
+                expires_at,
+                max_uses,
+            })
+            .unwrap()
+            .grant
+            .unwrap()
+    }
+
+    fn approval_consumption_request(
+        grant: &ApprovalGrant,
+        consumption_id: &str,
+        expected_authority_revision: u64,
+        actor: &str,
+        target_scope: &str,
+        fence: &str,
+    ) -> ConsumeApprovalGrantRequest {
+        ConsumeApprovalGrantRequest {
+            approval_id: grant.approval_id.clone(),
+            consumption_id: consumption_id.to_owned(),
+            task_id: grant.task_id.clone(),
+            run_id: grant.run_id.clone(),
+            expected_authority_revision,
+            actor: actor.to_owned(),
+            permitted_action: grant.permitted_action.clone(),
+            target_scope: target_scope.to_owned(),
+            fencing_identity: fence.to_owned(),
+            evidence_refs: vec![format!("evidence:{consumption_id}")],
+        }
+    }
+
+    fn consume_test_approval(
+        store: &GovernanceStore,
+        grant: &ApprovalGrant,
+        consumption_id: &str,
+        expected_authority_revision: u64,
+        actor: &str,
+        target_scope: &str,
+        fence: &str,
+    ) -> ConsumeApprovalGrantResult {
+        store
+            .consume_approval_grant(approval_consumption_request(
+                grant,
+                consumption_id,
+                expected_authority_revision,
+                actor,
+                target_scope,
+                fence,
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn policy_precedence_rejects_lower_layer_relaxation() {
+        let result = evaluate_policy(PolicyEvaluationRequest {
+            requested_action: "deploy.production".to_owned(),
+            target_scope: "gateway:production".to_owned(),
+            policy_version: "policy-v1".to_owned(),
+            evaluator_version: "evaluator-v1".to_owned(),
+            evaluator_status: PolicyEvaluatorStatus::Resolved,
+            evidence_refs: vec!["evidence:policy-v1".to_owned()],
+            rules: vec![
+                PolicyRule {
+                    layer: PolicyLayer::CompanyRequirements,
+                    policy_id: "company-production".to_owned(),
+                    exception_id: None,
+                    requested_action: "deploy.production".to_owned(),
+                    target_scope: "gateway:production".to_owned(),
+                    outcome: ApprovalOutcome::RequireUserApproval,
+                },
+                PolicyRule {
+                    layer: PolicyLayer::TaskPolicy,
+                    policy_id: "task-shortcut".to_owned(),
+                    exception_id: Some("exception-task-shortcut".to_owned()),
+                    requested_action: "deploy.production".to_owned(),
+                    target_scope: "gateway:production".to_owned(),
+                    outcome: ApprovalOutcome::Allow,
+                },
+            ],
+        });
+
+        assert_eq!(result.outcome, ApprovalOutcome::Deny);
+        assert_eq!(result.reason, "lower_layer_relaxation");
+        assert_eq!(
+            result.governing_policy_id.as_deref(),
+            Some("company-production")
+        );
+        assert_eq!(
+            result.governing_layer,
+            Some(PolicyLayer::CompanyRequirements)
+        );
+    }
+
+    #[test]
+    fn policy_precedence_allows_lower_layer_tightening() {
+        let result = evaluate_policy(PolicyEvaluationRequest {
+            requested_action: "tool.execute".to_owned(),
+            target_scope: "terminal:workspace".to_owned(),
+            policy_version: "policy-v1".to_owned(),
+            evaluator_version: "evaluator-v1".to_owned(),
+            evaluator_status: PolicyEvaluatorStatus::Resolved,
+            evidence_refs: vec!["evidence:policy-v1".to_owned()],
+            rules: vec![
+                PolicyRule {
+                    layer: PolicyLayer::ProviderRequirements,
+                    policy_id: "provider-tools".to_owned(),
+                    exception_id: None,
+                    requested_action: "tool.execute".to_owned(),
+                    target_scope: "terminal:workspace".to_owned(),
+                    outcome: ApprovalOutcome::RequireUserApproval,
+                },
+                PolicyRule {
+                    layer: PolicyLayer::CompanyRequirements,
+                    policy_id: "company-tools".to_owned(),
+                    exception_id: None,
+                    requested_action: "tool.execute".to_owned(),
+                    target_scope: "terminal:workspace".to_owned(),
+                    outcome: ApprovalOutcome::Allow,
+                },
+            ],
+        });
+
+        assert_eq!(result.outcome, ApprovalOutcome::RequireUserApproval);
+        assert_eq!(result.reason, "policy_resolved");
+        assert_eq!(
+            result.governing_policy_id.as_deref(),
+            Some("provider-tools")
+        );
+        assert_eq!(
+            result.governing_layer,
+            Some(PolicyLayer::ProviderRequirements)
+        );
+    }
+
+    #[test]
+    fn evaluator_failures_are_typed_and_never_allow() {
+        let base = PolicyEvaluationRequest {
+            requested_action: "artifact.publish".to_owned(),
+            target_scope: "repository:main".to_owned(),
+            policy_version: "policy-v1".to_owned(),
+            evaluator_version: "evaluator-v1".to_owned(),
+            evaluator_status: PolicyEvaluatorStatus::Resolved,
+            evidence_refs: vec!["evidence:policy-v1".to_owned()],
+            rules: vec![PolicyRule {
+                layer: PolicyLayer::CompanyRequirements,
+                policy_id: "company-publish".to_owned(),
+                exception_id: Some("exception-publish".to_owned()),
+                requested_action: "artifact.publish".to_owned(),
+                target_scope: "repository:main".to_owned(),
+                outcome: ApprovalOutcome::Allow,
+            }],
+        };
+
+        for (status, expected, reason) in [
+            (
+                PolicyEvaluatorStatus::Timeout,
+                ApprovalOutcome::Timeout,
+                "evaluator_timeout",
+            ),
+            (
+                PolicyEvaluatorStatus::Aborted,
+                ApprovalOutcome::Abort,
+                "evaluator_aborted",
+            ),
+            (
+                PolicyEvaluatorStatus::ParseFailure,
+                ApprovalOutcome::Abort,
+                "evaluator_parse_failure",
+            ),
+            (
+                PolicyEvaluatorStatus::Unavailable,
+                ApprovalOutcome::Abort,
+                "evaluator_unavailable",
+            ),
+            (
+                PolicyEvaluatorStatus::Unknown,
+                ApprovalOutcome::Abort,
+                "evaluator_unknown",
+            ),
+        ] {
+            let mut request = base.clone();
+            request.evaluator_status = status;
+            let result = evaluate_policy(request);
+
+            assert_eq!(result.outcome, expected);
+            assert_eq!(result.reason, reason);
+            assert_ne!(result.outcome, ApprovalOutcome::Allow);
+        }
+    }
+
+    #[test]
+    fn exceptional_allow_issues_and_consumes_a_durable_bound_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        store
+            .create_task(CreateTask {
+                task_id: "task-grant".to_owned(),
+                run_id: "run-grant".to_owned(),
+                actor: "operator".to_owned(),
+                acceptance_contract_digest: "contract-grant".to_owned(),
+            })
+            .unwrap();
+        let claim = store
+            .transition(TransitionRequest {
+                task_id: "task-grant".to_owned(),
+                run_id: "run-grant".to_owned(),
+                expected_authority_revision: 1,
+                requested_transition: TransitionKind::Claim,
+                agent_id: "agent-grant".to_owned(),
+                actor: "scheduler".to_owned(),
+                fencing_identity: None,
+                evidence_refs: vec!["evidence:claim".to_owned()],
+            })
+            .unwrap();
+        let fence = claim.fencing_identity.unwrap();
+        store
+            .transition(TransitionRequest {
+                task_id: "task-grant".to_owned(),
+                run_id: "run-grant".to_owned(),
+                expected_authority_revision: 2,
+                requested_transition: TransitionKind::Start,
+                agent_id: "agent-grant".to_owned(),
+                actor: "scheduler".to_owned(),
+                fencing_identity: Some(fence.clone()),
+                evidence_refs: vec!["evidence:start".to_owned()],
+            })
+            .unwrap();
+
+        let issued = store
+            .issue_approval_grant(IssueApprovalGrantRequest {
+                task_id: "task-grant".to_owned(),
+                run_id: "run-grant".to_owned(),
+                expected_authority_revision: 3,
+                approved_actor: "agent-grant".to_owned(),
+                issued_by: "operator".to_owned(),
+                fencing_identity: fence.clone(),
+                evaluation: PolicyEvaluationRequest {
+                    requested_action: "deploy.production".to_owned(),
+                    target_scope: "gateway:production".to_owned(),
+                    policy_version: "policy-v1".to_owned(),
+                    evaluator_version: "evaluator-v1".to_owned(),
+                    evaluator_status: PolicyEvaluatorStatus::Resolved,
+                    evidence_refs: vec!["evidence:approved-exception".to_owned()],
+                    rules: vec![PolicyRule {
+                        layer: PolicyLayer::ServicePolicy,
+                        policy_id: "service-deploy".to_owned(),
+                        exception_id: Some("exception-emergency-deploy".to_owned()),
+                        requested_action: "deploy.production".to_owned(),
+                        target_scope: "gateway:production".to_owned(),
+                        outcome: ApprovalOutcome::Allow,
+                    }],
+                },
+                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                max_uses: 1,
+            })
+            .unwrap();
+        assert_eq!(issued.decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(issued.decision.reason, "approval_grant_issued");
+        let grant = issued.grant.unwrap();
+        assert_eq!(grant.actor, "agent-grant");
+        assert_eq!(grant.policy_id, "service-deploy");
+        assert_eq!(grant.exception_id, "exception-emergency-deploy");
+        assert_eq!(grant.permitted_action, "deploy.production");
+        assert_eq!(grant.target_scope, "gateway:production");
+        assert_eq!(grant.authority_revision, 4);
+        assert_eq!(grant.max_uses, 1);
+        assert_eq!(grant.consumed_uses, 0);
+        assert!(grant.revoked_at.is_none());
+
+        drop(store);
+        let store = GovernanceStore::open(&path).unwrap();
+        assert_eq!(
+            store.approval_grant(&grant.approval_id).unwrap(),
+            Some(grant.clone())
+        );
+        let consumed = store
+            .consume_approval_grant(ConsumeApprovalGrantRequest {
+                approval_id: grant.approval_id.clone(),
+                consumption_id: "consume-grant-1".to_owned(),
+                task_id: "task-grant".to_owned(),
+                run_id: "run-grant".to_owned(),
+                expected_authority_revision: 4,
+                actor: "agent-grant".to_owned(),
+                permitted_action: "deploy.production".to_owned(),
+                target_scope: "gateway:production".to_owned(),
+                fencing_identity: fence.clone(),
+                evidence_refs: vec!["evidence:deployment-readback".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(consumed.decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(consumed.decision.reason, "approval_grant_consumed");
+        assert_eq!(consumed.grant.unwrap().consumed_uses, 1);
+        let consumption = consumed.consumption.unwrap();
+        assert_eq!(consumption.approval_id, grant.approval_id);
+        assert_eq!(consumption.consumption_id, "consume-grant-1");
+        assert_eq!(consumption.authority_revision, 5);
+        assert_eq!(
+            store
+                .authority("task-grant")
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            5
+        );
+
+        drop(store);
+        let reopened = GovernanceStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .approval_grant(&grant.approval_id)
+                .unwrap()
+                .unwrap()
+                .consumed_uses,
+            1
+        );
+        assert_eq!(
+            reopened
+                .approval_grant_consumptions(&grant.approval_id)
+                .unwrap(),
+            vec![consumption]
+        );
+        let ledger = reopened.decisions("task-grant").unwrap();
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|decision| {
+                    matches!(
+                        decision.requested_transition,
+                        TransitionKind::IssueApprovalGrant | TransitionKind::ConsumeApprovalGrant
+                    ) && decision.performed_at.is_some()
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn revoked_approval_grant_cannot_be_consumed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        let (task_id, run_id, fence) = running_approval_task(&store, "revoked");
+        let grant = issue_test_approval(
+            &store,
+            "revoked",
+            &task_id,
+            &run_id,
+            &fence,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            1,
+        );
+
+        let revoked = store
+            .revoke_approval_grant(RevokeApprovalGrantRequest {
+                approval_id: grant.approval_id.clone(),
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                actor: "agent-revoked".to_owned(),
+                fencing_identity: fence.clone(),
+                evidence_refs: vec!["evidence:revocation".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(revoked.decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(revoked.decision.reason, "approval_grant_revoked");
+        assert_eq!(revoked.grant.unwrap().authority_revision, 5);
+
+        let rejected = store
+            .consume_approval_grant(ConsumeApprovalGrantRequest {
+                approval_id: grant.approval_id,
+                consumption_id: "consume-revoked".to_owned(),
+                task_id,
+                run_id,
+                expected_authority_revision: 5,
+                actor: "agent-revoked".to_owned(),
+                permitted_action: "deploy.production".to_owned(),
+                target_scope: "gateway:production".to_owned(),
+                fencing_identity: fence,
+                evidence_refs: vec!["evidence:attempt".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(rejected.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(rejected.decision.reason, "approval_revoked");
+        assert!(rejected.decision.performed_at.is_none());
+        assert!(rejected.consumption.is_none());
+    }
+
+    #[test]
+    fn user_preference_cannot_issue_permanent_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (task_id, run_id, fence) = running_approval_task(&store, "preference");
+
+        let result = store
+            .issue_approval_grant(IssueApprovalGrantRequest {
+                task_id: task_id.clone(),
+                run_id,
+                expected_authority_revision: 3,
+                approved_actor: "agent-preference".to_owned(),
+                issued_by: "operator".to_owned(),
+                fencing_identity: fence,
+                evaluation: PolicyEvaluationRequest {
+                    requested_action: "deploy.production".to_owned(),
+                    target_scope: "gateway:production".to_owned(),
+                    policy_version: "policy-v1".to_owned(),
+                    evaluator_version: "evaluator-v1".to_owned(),
+                    evaluator_status: PolicyEvaluatorStatus::Resolved,
+                    evidence_refs: vec!["evidence:user-preference".to_owned()],
+                    rules: vec![PolicyRule {
+                        layer: PolicyLayer::UserPreference,
+                        policy_id: "user-default".to_owned(),
+                        exception_id: Some("preference-remember-me".to_owned()),
+                        requested_action: "deploy.production".to_owned(),
+                        target_scope: "gateway:production".to_owned(),
+                        outcome: ApprovalOutcome::Allow,
+                    }],
+                },
+                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                max_uses: 10,
+            })
+            .unwrap();
+
+        assert_eq!(result.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(result.decision.reason, "approval_authority_not_policy");
+        assert!(result.decision.performed_at.is_none());
+        assert!(result.grant.is_none());
+        assert_eq!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            3
+        );
+    }
+
+    #[test]
+    fn expanded_scope_and_fencing_mismatch_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (task_id, run_id, fence) = running_approval_task(&store, "binding");
+        let grant = issue_test_approval(
+            &store,
+            "binding",
+            &task_id,
+            &run_id,
+            &fence,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            1,
+        );
+
+        let expanded = consume_test_approval(
+            &store,
+            &grant,
+            "consume-expanded",
+            4,
+            "agent-binding",
+            "gateway:*",
+            &fence,
+        );
+        assert_eq!(expanded.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(expanded.decision.reason, "approval_scope_mismatch");
+        assert!(expanded.consumption.is_none());
+
+        let wrong_fence = consume_test_approval(
+            &store,
+            &grant,
+            "consume-wrong-fence",
+            4,
+            "agent-binding",
+            "gateway:production",
+            "fence-wrong",
+        );
+        assert_eq!(wrong_fence.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(wrong_fence.decision.reason, "fencing_mismatch");
+        assert!(wrong_fence.consumption.is_none());
+        assert_eq!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            4
+        );
+    }
+
+    #[test]
+    fn expired_and_exhausted_approval_grants_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (task_id, run_id, fence) = running_approval_task(&store, "expired");
+        let expiring = issue_test_approval(
+            &store,
+            "expired",
+            &task_id,
+            &run_id,
+            &fence,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            1,
+        );
+        let expired = store
+            .consume_approval_grant_at(
+                approval_consumption_request(
+                    &expiring,
+                    "consume-expired",
+                    4,
+                    "agent-expired",
+                    "gateway:production",
+                    &fence,
+                ),
+                expiring.expires_at,
+            )
+            .unwrap();
+        assert_eq!(expired.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(expired.decision.reason, "approval_expired");
+
+        let (task_id, run_id, fence) = running_approval_task(&store, "exhausted");
+        let single_use = issue_test_approval(
+            &store,
+            "exhausted",
+            &task_id,
+            &run_id,
+            &fence,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            1,
+        );
+        let consumed = consume_test_approval(
+            &store,
+            &single_use,
+            "consume-first",
+            4,
+            "agent-exhausted",
+            "gateway:production",
+            &fence,
+        );
+        assert_eq!(consumed.decision.outcome, DecisionOutcome::Allow);
+        let exhausted = consume_test_approval(
+            &store,
+            &single_use,
+            "consume-second",
+            5,
+            "agent-exhausted",
+            "gateway:production",
+            &fence,
+        );
+        assert_eq!(exhausted.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(exhausted.decision.reason, "approval_exhausted");
+        assert!(exhausted.consumption.is_none());
+    }
+
+    #[test]
+    fn approval_consumption_id_replay_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (task_id, run_id, fence) = running_approval_task(&store, "replay");
+        let grant = issue_test_approval(
+            &store,
+            "replay",
+            &task_id,
+            &run_id,
+            &fence,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            2,
+        );
+        let first = consume_test_approval(
+            &store,
+            &grant,
+            "consume-replay",
+            4,
+            "agent-replay",
+            "gateway:production",
+            &fence,
+        );
+        assert_eq!(first.decision.outcome, DecisionOutcome::Allow);
+        let replayed = consume_test_approval(
+            &store,
+            &grant,
+            "consume-replay",
+            5,
+            "agent-replay",
+            "gateway:production",
+            &fence,
+        );
+        assert_eq!(replayed.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(replayed.decision.reason, "approval_replayed");
+        assert!(replayed.consumption.is_none());
+        assert_eq!(
+            store
+                .approval_grant(&grant.approval_id)
+                .unwrap()
+                .unwrap()
+                .consumed_uses,
+            1
+        );
+    }
+
+    #[test]
+    fn approval_bound_to_an_older_authority_revision_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (task_id, run_id, fence) = running_approval_task(&store, "revision");
+        let grant = issue_test_approval(
+            &store,
+            "revision",
+            &task_id,
+            &run_id,
+            &fence,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            1,
+        );
+        let blocked = store
+            .block_task(BlockTaskRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                agent_id: "agent-revision".to_owned(),
+                actor: "agent-revision".to_owned(),
+                fencing_identity: fence,
+                blocker_kind: "dependency".to_owned(),
+                cause: StructuredCause {
+                    cause_id: "upstream-unavailable".to_owned(),
+                    schema_version: 1,
+                    fields: BTreeMap::from([("upstream".to_owned(), "memory".to_owned())]),
+                },
+                required_resume_evidence: vec![EvidenceRequirement {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "memory".to_owned(),
+                }],
+                evidence_baseline: vec![EvidenceObservation {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "memory".to_owned(),
+                    identity: "unavailable".to_owned(),
+                }],
+                evidence_refs: vec!["evidence:memory-unavailable".to_owned()],
+            })
+            .unwrap();
+        let blocker = blocked.blocker.unwrap();
+        let resumed = store
+            .resume_blocker(ResumeBlockerRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 5,
+                blocker_id: blocker.blocker_id,
+                expected_blocker_generation: blocker.generation,
+                actor: "scheduler".to_owned(),
+                evidence: vec![EvidenceObservation {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "memory".to_owned(),
+                    identity: "available".to_owned(),
+                }],
+                evidence_refs: vec!["evidence:memory-available".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(resumed.status, ResumeStatus::Resumed);
+        let claim = store
+            .transition(TransitionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 6,
+                requested_transition: TransitionKind::Claim,
+                agent_id: "agent-revision".to_owned(),
+                actor: "scheduler".to_owned(),
+                fencing_identity: None,
+                evidence_refs: vec!["evidence:reclaim".to_owned()],
+            })
+            .unwrap();
+        let new_fence = claim.fencing_identity.unwrap();
+        store
+            .transition(TransitionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 7,
+                requested_transition: TransitionKind::Start,
+                agent_id: "agent-revision".to_owned(),
+                actor: "scheduler".to_owned(),
+                fencing_identity: Some(new_fence.clone()),
+                evidence_refs: vec!["evidence:restart".to_owned()],
+            })
+            .unwrap();
+
+        let rejected = consume_test_approval(
+            &store,
+            &grant,
+            "consume-old-revision",
+            8,
+            "agent-revision",
+            "gateway:production",
+            &new_fence,
+        );
+        assert_eq!(rejected.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(rejected.decision.reason, "approval_revision_mismatch");
+        assert!(rejected.consumption.is_none());
+        assert_eq!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            8
+        );
+    }
+
+    #[test]
+    fn policy_rule_binding_mismatch_and_unresolved_rule_outcome_abort() {
+        let mut request = PolicyEvaluationRequest {
+            requested_action: "deploy.production".to_owned(),
+            target_scope: "gateway:production".to_owned(),
+            policy_version: "policy-v1".to_owned(),
+            evaluator_version: "evaluator-v1".to_owned(),
+            evaluator_status: PolicyEvaluatorStatus::Resolved,
+            evidence_refs: vec!["evidence:policy".to_owned()],
+            rules: vec![PolicyRule {
+                layer: PolicyLayer::CompanyRequirements,
+                policy_id: "company-deploy".to_owned(),
+                exception_id: None,
+                requested_action: "deploy.staging".to_owned(),
+                target_scope: "gateway:production".to_owned(),
+                outcome: ApprovalOutcome::Allow,
+            }],
+        };
+        let mismatched = evaluate_policy(request.clone());
+        assert_eq!(mismatched.outcome, ApprovalOutcome::Abort);
+        assert_eq!(mismatched.reason, "policy_rule_binding_mismatch");
+
+        request.rules[0].requested_action = request.requested_action.clone();
+        request.rules[0].outcome = ApprovalOutcome::Timeout;
+        let unresolved = evaluate_policy(request);
+        assert_eq!(unresolved.outcome, ApprovalOutcome::Abort);
+        assert_eq!(unresolved.reason, "invalid_policy_outcome");
+    }
+
+    #[test]
+    fn duplicate_rules_at_same_policy_layer_abort_regardless_of_order() {
+        let rule_a = PolicyRule {
+            layer: PolicyLayer::CompanyRequirements,
+            policy_id: "company-a".to_owned(),
+            exception_id: Some("exception-a".to_owned()),
+            requested_action: "deploy.production".to_owned(),
+            target_scope: "gateway:production".to_owned(),
+            outcome: ApprovalOutcome::Allow,
+        };
+        let rule_b = PolicyRule {
+            policy_id: "company-b".to_owned(),
+            exception_id: Some("exception-b".to_owned()),
+            ..rule_a.clone()
+        };
+        for rules in [
+            vec![rule_a.clone(), rule_b.clone()],
+            vec![rule_b.clone(), rule_a.clone()],
+        ] {
+            let result = evaluate_policy(PolicyEvaluationRequest {
+                requested_action: "deploy.production".to_owned(),
+                target_scope: "gateway:production".to_owned(),
+                policy_version: "policy-v1".to_owned(),
+                evaluator_version: "evaluator-v1".to_owned(),
+                evaluator_status: PolicyEvaluatorStatus::Resolved,
+                evidence_refs: vec!["evidence:duplicate-layer".to_owned()],
+                rules,
+            });
+            assert_eq!(result.outcome, ApprovalOutcome::Abort);
+            assert_eq!(result.reason, "duplicate_policy_layer");
+            assert!(result.governing_policy_id.is_none());
+            assert!(result.exception_id.is_none());
         }
     }
 }
