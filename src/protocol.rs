@@ -3094,6 +3094,10 @@ mod tests {
             artifacts: crate::artifact::Store::open(root.join("artifacts")).unwrap(),
             deployments: crate::deployments::Store::open(&root).unwrap(),
             debug: crate::debug::Store::default(),
+            governance: crate::governance::GovernanceStore::open(
+                root.join("agent-governance.json"),
+            )
+            .unwrap(),
         });
         (Gateway::router(gateway), raw_key)
     }

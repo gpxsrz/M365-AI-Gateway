@@ -411,6 +411,164 @@ pub struct FinishCompletionResult {
     pub barrier: Option<CompletionBarrierRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeState {
+    Unknown,
+    Starting,
+    Running,
+    Waiting,
+    Idle,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", content = "value", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProjectionValue<T> {
+    Value(T),
+    SourceAbsent,
+    SourceStale {
+        value: T,
+        observed_authority_revision: u64,
+    },
+    Redacted,
+    SchemaDowngrade,
+    ProjectionOmission,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeProjectionField {
+    RootAgentId,
+    ParentAgentId,
+    AgentId,
+    TaskId,
+    RunId,
+    Provider,
+    Profile,
+    Role,
+    RuntimeState,
+    LifecycleState,
+    LeaseGeneration,
+    WaitingOn,
+    LastActivity,
+    LastTransition,
+    AuthorityRevision,
+    Environment,
+    EvidenceClass,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProjectionAuthorityScope {
+    ObserveOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProjectionProvenance {
+    AcpCanonicalState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeRecord {
+    pub task_id: String,
+    pub run_id: String,
+    pub root_agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    pub agent_id: String,
+    pub provider: String,
+    pub profile: String,
+    pub role: String,
+    pub runtime_state: RuntimeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    pub observed_authority_revision: u64,
+    pub runtime_event_seq: u64,
+    pub environment: String,
+    pub evidence_class: String,
+    pub actor: String,
+    pub evidence_refs: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub observed_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeObservationRequest {
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub root_agent_id: String,
+    pub parent_agent_id: Option<String>,
+    pub agent_id: String,
+    pub provider: String,
+    pub profile: String,
+    pub role: String,
+    pub runtime_state: RuntimeState,
+    pub waiting_on: Option<String>,
+    pub environment: String,
+    pub evidence_class: String,
+    pub actor: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeObservationResult {
+    pub outcome: DecisionOutcome,
+    pub reason: String,
+    pub record: Option<AgentRuntimeRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeProjectionRequest {
+    pub task_id: String,
+    pub run_id: String,
+    pub agent_id: String,
+    pub consumer_schema_version: u32,
+    pub redacted_fields: Vec<RuntimeProjectionField>,
+    pub omitted_fields: Vec<RuntimeProjectionField>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProjectionMetadata {
+    pub schema_version: u32,
+    pub source_schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downgraded_from_schema_version: Option<u32>,
+    pub event_seq: u64,
+    pub emitter_identity: String,
+    pub provenance: ProjectionProvenance,
+    pub environment: ProjectionValue<String>,
+    pub evidence_class: ProjectionValue<String>,
+    pub projection_of_authority_revision: u64,
+    pub authority_scope: ProjectionAuthorityScope,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProjection {
+    pub metadata: RuntimeProjectionMetadata,
+    pub root_agent_id: ProjectionValue<String>,
+    pub parent_agent_id: ProjectionValue<Option<String>>,
+    pub agent_id: ProjectionValue<String>,
+    pub task_id: ProjectionValue<String>,
+    pub run_id: ProjectionValue<String>,
+    pub provider: ProjectionValue<String>,
+    pub profile: ProjectionValue<String>,
+    pub role: ProjectionValue<String>,
+    pub runtime_state: ProjectionValue<RuntimeState>,
+    pub lifecycle_state: ProjectionValue<LifecycleState>,
+    pub lease_generation: ProjectionValue<u64>,
+    pub waiting_on: ProjectionValue<Option<String>>,
+    pub last_activity: ProjectionValue<OffsetDateTime>,
+    pub last_transition: ProjectionValue<TransitionKind>,
+    pub authority_revision: ProjectionValue<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskAuthority {
@@ -481,6 +639,8 @@ struct StateFile {
     blockers: BTreeMap<String, BlockerRecord>,
     #[serde(default)]
     completions: BTreeMap<String, CompletionBarrierRecord>,
+    #[serde(default)]
+    runtime_records: Vec<AgentRuntimeRecord>,
     decisions: Vec<DecisionRecord>,
     next_decision_seq: u64,
 }
@@ -492,6 +652,7 @@ impl Default for StateFile {
             tasks: BTreeMap::new(),
             blockers: BTreeMap::new(),
             completions: BTreeMap::new(),
+            runtime_records: Vec::new(),
             decisions: Vec::new(),
             next_decision_seq: 1,
         }
@@ -593,6 +754,318 @@ impl GovernanceStore {
             .filter(|decision| decision.task_id == task_id)
             .cloned()
             .collect())
+    }
+
+    pub fn record_runtime_observation(
+        &self,
+        request: RuntimeObservationRequest,
+    ) -> Result<RuntimeObservationResult, GovernanceError> {
+        validate_identity("task_id", &request.task_id)?;
+        validate_identity("run_id", &request.run_id)?;
+        validate_identity("root_agent_id", &request.root_agent_id)?;
+        if let Some(parent_agent_id) = &request.parent_agent_id {
+            validate_identity("parent_agent_id", parent_agent_id)?;
+        }
+        validate_identity("agent_id", &request.agent_id)?;
+        validate_identity("provider", &request.provider)?;
+        validate_identity("profile", &request.profile)?;
+        validate_identity("role", &request.role)?;
+        if let Some(waiting_on) = &request.waiting_on {
+            validate_identity("waiting_on", waiting_on)?;
+        }
+        validate_identity("environment", &request.environment)?;
+        validate_identity("evidence_class", &request.evidence_class)?;
+        validate_identity("actor", &request.actor)?;
+        validate_evidence_refs(&request.evidence_refs)?;
+
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let mut record = None;
+        let (outcome, reason) = match authority.as_ref() {
+            None => (DecisionOutcome::Deny, "task_not_found"),
+            Some(authority) if authority.active_run_id != request.run_id => {
+                (DecisionOutcome::Deny, "run_not_found")
+            }
+            Some(authority)
+                if authority.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_authority")
+            }
+            Some(_) if request.evidence_refs.is_empty() => {
+                (DecisionOutcome::Defer, "evidence_required")
+            }
+            Some(_)
+                if request.runtime_state == RuntimeState::Waiting
+                    && request.waiting_on.is_none() =>
+            {
+                (DecisionOutcome::Deny, "waiting_reason_required")
+            }
+            Some(_)
+                if request.runtime_state != RuntimeState::Waiting
+                    && request.waiting_on.is_some() =>
+            {
+                (DecisionOutcome::Deny, "waiting_reason_not_allowed")
+            }
+            Some(_) => {
+                let now = OffsetDateTime::now_utc();
+                let existing = state.runtime_records.iter().position(|candidate| {
+                    candidate.task_id == request.task_id
+                        && candidate.run_id == request.run_id
+                        && candidate.agent_id == request.agent_id
+                });
+                match existing {
+                    Some(index) => {
+                        let candidate = &state.runtime_records[index];
+                        if candidate.root_agent_id != request.root_agent_id
+                            || candidate.parent_agent_id != request.parent_agent_id
+                            || candidate.provider != request.provider
+                            || candidate.profile != request.profile
+                            || candidate.role != request.role
+                        {
+                            (DecisionOutcome::Deny, "runtime_identity_mismatch")
+                        } else {
+                            let candidate = &mut state.runtime_records[index];
+                            candidate.runtime_state = request.runtime_state;
+                            candidate.waiting_on = request.waiting_on.clone();
+                            candidate.observed_authority_revision =
+                                request.expected_authority_revision;
+                            candidate.runtime_event_seq =
+                                candidate.runtime_event_seq.saturating_add(1);
+                            candidate.environment = request.environment.clone();
+                            candidate.evidence_class = request.evidence_class.clone();
+                            candidate.actor = request.actor.clone();
+                            candidate.evidence_refs = request.evidence_refs.clone();
+                            candidate.observed_at = now;
+                            record = Some(candidate.clone());
+                            (DecisionOutcome::Allow, "runtime_observed")
+                        }
+                    }
+                    None => {
+                        let created = AgentRuntimeRecord {
+                            task_id: request.task_id.clone(),
+                            run_id: request.run_id.clone(),
+                            root_agent_id: request.root_agent_id.clone(),
+                            parent_agent_id: request.parent_agent_id.clone(),
+                            agent_id: request.agent_id.clone(),
+                            provider: request.provider.clone(),
+                            profile: request.profile.clone(),
+                            role: request.role.clone(),
+                            runtime_state: request.runtime_state,
+                            waiting_on: request.waiting_on.clone(),
+                            observed_authority_revision: request.expected_authority_revision,
+                            runtime_event_seq: 1,
+                            environment: request.environment.clone(),
+                            evidence_class: request.evidence_class.clone(),
+                            actor: request.actor.clone(),
+                            evidence_refs: request.evidence_refs.clone(),
+                            observed_at: now,
+                        };
+                        state.runtime_records.push(created.clone());
+                        record = Some(created);
+                        (DecisionOutcome::Allow, "runtime_observed")
+                    }
+                }
+            }
+        };
+        if outcome == DecisionOutcome::Allow
+            && let Err(error) = save(&self.path, &state)
+        {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(RuntimeObservationResult {
+            outcome,
+            reason: reason.to_owned(),
+            record,
+        })
+    }
+
+    pub fn runtime_projection(
+        &self,
+        request: RuntimeProjectionRequest,
+    ) -> Result<Option<RuntimeProjection>, GovernanceError> {
+        validate_identity("task_id", &request.task_id)?;
+        validate_identity("run_id", &request.run_id)?;
+        validate_identity("agent_id", &request.agent_id)?;
+        if request.consumer_schema_version > 1 {
+            return Err(GovernanceError::InvalidIdentity("consumer_schema_version"));
+        }
+
+        let state = self.state.lock().expect("governance state poisoned");
+        let Some(authority) = state.tasks.get(&request.task_id) else {
+            return Ok(None);
+        };
+        if authority.active_run_id != request.run_id {
+            return Ok(None);
+        }
+        let record = state.runtime_records.iter().find(|record| {
+            record.task_id == request.task_id
+                && record.run_id == request.run_id
+                && record.agent_id == request.agent_id
+        });
+        let task_decisions = state
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision.task_id == request.task_id && decision.run_id == request.run_id
+            })
+            .collect::<Vec<_>>();
+        let lease_generation = task_decisions
+            .iter()
+            .filter(|decision| {
+                decision.requested_transition == TransitionKind::Claim
+                    && decision.performed_at.is_some()
+            })
+            .count() as u64;
+        let last_transition = task_decisions.iter().rev().find_map(|decision| {
+            (decision.performed_at.is_some()
+                && decision.authority_after > decision.authority_before)
+                .then_some(decision.requested_transition)
+        });
+        let last_decision_activity = task_decisions
+            .iter()
+            .map(|decision| decision.evaluated_at)
+            .max();
+        let last_activity = match (
+            last_decision_activity,
+            record.map(|record| record.observed_at),
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        let runtime_event_seq = state
+            .runtime_records
+            .iter()
+            .filter(|record| record.task_id == request.task_id && record.run_id == request.run_id)
+            .fold(0_u64, |total, record| {
+                total.saturating_add(record.runtime_event_seq)
+            });
+        let event_seq = (task_decisions.len() as u64).saturating_add(runtime_event_seq);
+
+        let schema_version = request.consumer_schema_version;
+        Ok(Some(RuntimeProjection {
+            metadata: RuntimeProjectionMetadata {
+                schema_version,
+                source_schema_version: 1,
+                downgraded_from_schema_version: (schema_version < 1).then_some(1),
+                event_seq,
+                emitter_identity: "m365-ai-gateway/acp-governance".to_owned(),
+                provenance: ProjectionProvenance::AcpCanonicalState,
+                environment: reduce_runtime_projection_value(
+                    &request,
+                    RuntimeProjectionField::Environment,
+                    runtime_projection_value(record, authority.authority_revision, |record| {
+                        record.environment.clone()
+                    }),
+                ),
+                evidence_class: reduce_runtime_projection_value(
+                    &request,
+                    RuntimeProjectionField::EvidenceClass,
+                    runtime_projection_value(record, authority.authority_revision, |record| {
+                        record.evidence_class.clone()
+                    }),
+                ),
+                projection_of_authority_revision: authority.authority_revision,
+                authority_scope: ProjectionAuthorityScope::ObserveOnly,
+            },
+            root_agent_id: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::RootAgentId,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.root_agent_id.clone()
+                }),
+            ),
+            parent_agent_id: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::ParentAgentId,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.parent_agent_id.clone()
+                }),
+            ),
+            agent_id: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::AgentId,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.agent_id.clone()
+                }),
+            ),
+            task_id: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::TaskId,
+                ProjectionValue::Value(authority.task_id.clone()),
+            ),
+            run_id: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::RunId,
+                ProjectionValue::Value(authority.active_run_id.clone()),
+            ),
+            provider: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::Provider,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.provider.clone()
+                }),
+            ),
+            profile: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::Profile,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.profile.clone()
+                }),
+            ),
+            role: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::Role,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.role.clone()
+                }),
+            ),
+            runtime_state: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::RuntimeState,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.runtime_state
+                }),
+            ),
+            lifecycle_state: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::LifecycleState,
+                ProjectionValue::Value(authority.lifecycle_state),
+            ),
+            lease_generation: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::LeaseGeneration,
+                ProjectionValue::Value(lease_generation),
+            ),
+            waiting_on: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::WaitingOn,
+                runtime_projection_value(record, authority.authority_revision, |record| {
+                    record.waiting_on.clone()
+                }),
+            ),
+            last_activity: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::LastActivity,
+                last_activity
+                    .map(ProjectionValue::Value)
+                    .unwrap_or(ProjectionValue::SourceAbsent),
+            ),
+            last_transition: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::LastTransition,
+                last_transition
+                    .map(ProjectionValue::Value)
+                    .unwrap_or(ProjectionValue::SourceAbsent),
+            ),
+            authority_revision: reduce_runtime_projection_value(
+                &request,
+                RuntimeProjectionField::AuthorityRevision,
+                ProjectionValue::Value(authority.authority_revision),
+            ),
+        }))
     }
 
     pub fn blocker(&self, task_id: &str) -> Result<Option<BlockerRecord>, GovernanceError> {
@@ -1574,6 +2047,58 @@ fn validate_evidence_refs(evidence_refs: &[String]) -> Result<(), GovernanceErro
         validate_identity("evidence_ref", evidence_ref)?;
     }
     Ok(())
+}
+
+fn runtime_projection_value<T: Clone>(
+    record: Option<&AgentRuntimeRecord>,
+    authority_revision: u64,
+    project: impl FnOnce(&AgentRuntimeRecord) -> T,
+) -> ProjectionValue<T> {
+    let Some(record) = record else {
+        return ProjectionValue::SourceAbsent;
+    };
+    let value = project(record);
+    if record.observed_authority_revision == authority_revision {
+        ProjectionValue::Value(value)
+    } else {
+        ProjectionValue::SourceStale {
+            value,
+            observed_authority_revision: record.observed_authority_revision,
+        }
+    }
+}
+
+fn reduce_runtime_projection_value<T>(
+    request: &RuntimeProjectionRequest,
+    field: RuntimeProjectionField,
+    value: ProjectionValue<T>,
+) -> ProjectionValue<T> {
+    if request.redacted_fields.contains(&field) {
+        return ProjectionValue::Redacted;
+    }
+    if request.omitted_fields.contains(&field) {
+        return ProjectionValue::ProjectionOmission;
+    }
+    if !runtime_projection_field_supported(request.consumer_schema_version, field) {
+        return ProjectionValue::SchemaDowngrade;
+    }
+    value
+}
+
+fn runtime_projection_field_supported(schema_version: u32, field: RuntimeProjectionField) -> bool {
+    match schema_version {
+        0 => matches!(
+            field,
+            RuntimeProjectionField::AgentId
+                | RuntimeProjectionField::TaskId
+                | RuntimeProjectionField::RunId
+                | RuntimeProjectionField::RuntimeState
+                | RuntimeProjectionField::LifecycleState
+                | RuntimeProjectionField::AuthorityRevision
+        ),
+        1 => true,
+        _ => false,
+    }
 }
 
 fn validate_completion_contract(contract: &CompletionContract) -> Result<(), GovernanceError> {
@@ -4182,6 +4707,512 @@ mod tests {
                 .unwrap()
                 .lifecycle_state,
             LifecycleState::Completed
+        );
+    }
+
+    #[test]
+    fn runtime_projection_keeps_runtime_liveness_distinct_from_lifecycle_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        store
+            .create_task(CreateTask {
+                task_id: "task-projection".to_owned(),
+                run_id: "run-projection".to_owned(),
+                actor: "scheduler".to_owned(),
+                acceptance_contract_digest: "contract:projection:v1".to_owned(),
+            })
+            .unwrap();
+        let claim = store
+            .transition(TransitionRequest {
+                task_id: "task-projection".to_owned(),
+                run_id: "run-projection".to_owned(),
+                expected_authority_revision: 1,
+                requested_transition: TransitionKind::Claim,
+                agent_id: "worker-a".to_owned(),
+                actor: "dispatcher-a".to_owned(),
+                fencing_identity: None,
+                evidence_refs: vec!["evidence:worker-ready".to_owned()],
+            })
+            .unwrap();
+        let fence = claim.fencing_identity.clone().unwrap();
+        store
+            .transition(TransitionRequest {
+                task_id: "task-projection".to_owned(),
+                run_id: "run-projection".to_owned(),
+                expected_authority_revision: 2,
+                requested_transition: TransitionKind::Start,
+                agent_id: "worker-a".to_owned(),
+                actor: "dispatcher-a".to_owned(),
+                fencing_identity: Some(fence.clone()),
+                evidence_refs: vec!["evidence:owner-ready".to_owned()],
+            })
+            .unwrap();
+
+        let observed = store
+            .record_runtime_observation(RuntimeObservationRequest {
+                task_id: "task-projection".to_owned(),
+                run_id: "run-projection".to_owned(),
+                expected_authority_revision: 3,
+                root_agent_id: "root-a".to_owned(),
+                parent_agent_id: None,
+                agent_id: "worker-a".to_owned(),
+                provider: "m365".to_owned(),
+                profile: "default".to_owned(),
+                role: "worker".to_owned(),
+                runtime_state: RuntimeState::Running,
+                waiting_on: None,
+                environment: "test".to_owned(),
+                evidence_class: "direct-runtime".to_owned(),
+                actor: "runtime-adapter".to_owned(),
+                evidence_refs: vec!["runtime:worker-a-live".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(observed.outcome, DecisionOutcome::Allow);
+        assert_eq!(observed.reason, "runtime_observed");
+        assert_eq!(observed.record.as_ref().unwrap().runtime_event_seq, 1);
+
+        let request = RuntimeProjectionRequest {
+            task_id: "task-projection".to_owned(),
+            run_id: "run-projection".to_owned(),
+            agent_id: "worker-a".to_owned(),
+            consumer_schema_version: 1,
+            redacted_fields: Vec::new(),
+            omitted_fields: Vec::new(),
+        };
+        let running = store.runtime_projection(request.clone()).unwrap().unwrap();
+        assert_eq!(
+            running.runtime_state,
+            ProjectionValue::Value(RuntimeState::Running)
+        );
+        assert_eq!(
+            running.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Running)
+        );
+        assert_eq!(running.lease_generation, ProjectionValue::Value(1));
+        assert_eq!(running.authority_revision, ProjectionValue::Value(3));
+        assert_eq!(
+            running.root_agent_id,
+            ProjectionValue::Value("root-a".to_owned())
+        );
+        assert_eq!(running.parent_agent_id, ProjectionValue::Value(None));
+        assert_eq!(
+            running.agent_id,
+            ProjectionValue::Value("worker-a".to_owned())
+        );
+        assert_eq!(running.provider, ProjectionValue::Value("m365".to_owned()));
+        assert_eq!(
+            running.profile,
+            ProjectionValue::Value("default".to_owned())
+        );
+        assert_eq!(running.role, ProjectionValue::Value("worker".to_owned()));
+        assert_eq!(running.waiting_on, ProjectionValue::Value(None));
+        assert_eq!(
+            running.last_transition,
+            ProjectionValue::Value(TransitionKind::Start)
+        );
+        assert_eq!(running.metadata.schema_version, 1);
+        assert_eq!(running.metadata.source_schema_version, 1);
+        assert_eq!(running.metadata.projection_of_authority_revision, 3);
+        assert_eq!(
+            running.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+        assert_eq!(
+            running.metadata.emitter_identity,
+            "m365-ai-gateway/acp-governance"
+        );
+        assert_eq!(
+            running.metadata.provenance,
+            ProjectionProvenance::AcpCanonicalState
+        );
+        assert_eq!(
+            running.metadata.environment,
+            ProjectionValue::Value("test".to_owned())
+        );
+        assert_eq!(
+            running.metadata.evidence_class,
+            ProjectionValue::Value("direct-runtime".to_owned())
+        );
+        assert!(running.metadata.event_seq >= 4);
+
+        store
+            .block_task(BlockTaskRequest {
+                task_id: "task-projection".to_owned(),
+                run_id: "run-projection".to_owned(),
+                expected_authority_revision: 3,
+                agent_id: "worker-a".to_owned(),
+                actor: "worker-a".to_owned(),
+                fencing_identity: fence,
+                blocker_kind: "dependency".to_owned(),
+                cause: StructuredCause {
+                    cause_id: "db-unavailable".to_owned(),
+                    schema_version: 1,
+                    fields: BTreeMap::from([("status".to_owned(), "down".to_owned())]),
+                },
+                required_resume_evidence: vec![EvidenceRequirement {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "db-primary".to_owned(),
+                }],
+                evidence_baseline: vec![EvidenceObservation {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "db-primary".to_owned(),
+                    identity: "down".to_owned(),
+                }],
+                evidence_refs: vec!["evidence:db-down".to_owned()],
+            })
+            .unwrap();
+
+        let blocked = store.runtime_projection(request).unwrap().unwrap();
+        assert_eq!(
+            blocked.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Blocked)
+        );
+        assert_eq!(
+            blocked.runtime_state,
+            ProjectionValue::SourceStale {
+                value: RuntimeState::Running,
+                observed_authority_revision: 3,
+            }
+        );
+        assert_eq!(blocked.authority_revision, ProjectionValue::Value(4));
+        assert_eq!(blocked.metadata.projection_of_authority_revision, 4);
+        assert_eq!(
+            blocked.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+    }
+
+    #[test]
+    fn runtime_projection_reductions_and_schema_downgrade_are_explicit_and_observe_only() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        store
+            .create_task(CreateTask {
+                task_id: "task-projection-reduction".to_owned(),
+                run_id: "run-projection-reduction".to_owned(),
+                actor: "scheduler".to_owned(),
+                acceptance_contract_digest: "contract:projection-reduction:v1".to_owned(),
+            })
+            .unwrap();
+        store
+            .record_runtime_observation(RuntimeObservationRequest {
+                task_id: "task-projection-reduction".to_owned(),
+                run_id: "run-projection-reduction".to_owned(),
+                expected_authority_revision: 1,
+                root_agent_id: "root-a".to_owned(),
+                parent_agent_id: None,
+                agent_id: "worker-a".to_owned(),
+                provider: "m365".to_owned(),
+                profile: "default".to_owned(),
+                role: "worker".to_owned(),
+                runtime_state: RuntimeState::Idle,
+                waiting_on: None,
+                environment: "test".to_owned(),
+                evidence_class: "direct-runtime".to_owned(),
+                actor: "runtime-adapter".to_owned(),
+                evidence_refs: vec!["runtime:worker-a-idle".to_owned()],
+            })
+            .unwrap();
+
+        let reduced = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: "task-projection-reduction".to_owned(),
+                run_id: "run-projection-reduction".to_owned(),
+                agent_id: "worker-a".to_owned(),
+                consumer_schema_version: 1,
+                redacted_fields: vec![RuntimeProjectionField::Provider],
+                omitted_fields: vec![RuntimeProjectionField::Role],
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(reduced.provider, ProjectionValue::Redacted);
+        assert_eq!(reduced.role, ProjectionValue::ProjectionOmission);
+        assert_eq!(reduced.parent_agent_id, ProjectionValue::Value(None));
+        assert_eq!(reduced.waiting_on, ProjectionValue::Value(None));
+        assert_eq!(
+            reduced.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+
+        let absent = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: "task-projection-reduction".to_owned(),
+                run_id: "run-projection-reduction".to_owned(),
+                agent_id: "unknown-agent".to_owned(),
+                consumer_schema_version: 1,
+                redacted_fields: Vec::new(),
+                omitted_fields: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(absent.agent_id, ProjectionValue::SourceAbsent);
+        assert_eq!(absent.parent_agent_id, ProjectionValue::SourceAbsent);
+        assert_eq!(absent.runtime_state, ProjectionValue::SourceAbsent);
+        assert_eq!(
+            absent.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Ready)
+        );
+        assert_eq!(
+            absent.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+
+        let legacy = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: "task-projection-reduction".to_owned(),
+                run_id: "run-projection-reduction".to_owned(),
+                agent_id: "worker-a".to_owned(),
+                consumer_schema_version: 0,
+                redacted_fields: Vec::new(),
+                omitted_fields: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.metadata.schema_version, 0);
+        assert_eq!(legacy.metadata.source_schema_version, 1);
+        assert_eq!(legacy.metadata.downgraded_from_schema_version, Some(1));
+        assert_eq!(
+            legacy.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+        assert_eq!(
+            legacy.task_id,
+            ProjectionValue::Value("task-projection-reduction".to_owned())
+        );
+        assert_eq!(
+            legacy.run_id,
+            ProjectionValue::Value("run-projection-reduction".to_owned())
+        );
+        assert_eq!(
+            legacy.agent_id,
+            ProjectionValue::Value("worker-a".to_owned())
+        );
+        assert_eq!(
+            legacy.runtime_state,
+            ProjectionValue::Value(RuntimeState::Idle)
+        );
+        assert_eq!(
+            legacy.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Ready)
+        );
+        assert_eq!(legacy.authority_revision, ProjectionValue::Value(1));
+        assert_eq!(legacy.root_agent_id, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.parent_agent_id, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.provider, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.profile, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.role, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.lease_generation, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.waiting_on, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.last_activity, ProjectionValue::SchemaDowngrade);
+        assert_eq!(legacy.last_transition, ProjectionValue::SchemaDowngrade);
+        assert_eq!(
+            legacy.metadata.environment,
+            ProjectionValue::SchemaDowngrade
+        );
+        assert_eq!(
+            legacy.metadata.evidence_class,
+            ProjectionValue::SchemaDowngrade
+        );
+
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert!(serialized.contains("SCHEMA_DOWNGRADE"));
+        assert!(!serialized.contains("ALLOW"));
+    }
+
+    #[test]
+    fn runtime_projection_sequence_advances_on_runtime_activity_and_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        store
+            .create_task(CreateTask {
+                task_id: "task-projection-seq".to_owned(),
+                run_id: "run-projection-seq".to_owned(),
+                actor: "scheduler".to_owned(),
+                acceptance_contract_digest: "contract:projection-seq:v1".to_owned(),
+            })
+            .unwrap();
+        let observe =
+            |runtime_state: RuntimeState, waiting_on: Option<&str>| RuntimeObservationRequest {
+                task_id: "task-projection-seq".to_owned(),
+                run_id: "run-projection-seq".to_owned(),
+                expected_authority_revision: 1,
+                root_agent_id: "root-a".to_owned(),
+                parent_agent_id: Some("manager-a".to_owned()),
+                agent_id: "worker-a".to_owned(),
+                provider: "m365".to_owned(),
+                profile: "default".to_owned(),
+                role: "worker".to_owned(),
+                runtime_state,
+                waiting_on: waiting_on.map(str::to_owned),
+                environment: "test".to_owned(),
+                evidence_class: "direct-runtime".to_owned(),
+                actor: "runtime-adapter".to_owned(),
+                evidence_refs: vec!["runtime:worker-a".to_owned()],
+            };
+        let projection_request = RuntimeProjectionRequest {
+            task_id: "task-projection-seq".to_owned(),
+            run_id: "run-projection-seq".to_owned(),
+            agent_id: "worker-a".to_owned(),
+            consumer_schema_version: 1,
+            redacted_fields: Vec::new(),
+            omitted_fields: Vec::new(),
+        };
+
+        store
+            .record_runtime_observation(observe(RuntimeState::Running, None))
+            .unwrap();
+        let first = store
+            .runtime_projection(projection_request.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.metadata.projection_of_authority_revision, 1);
+        assert_eq!(
+            first.runtime_state,
+            ProjectionValue::Value(RuntimeState::Running)
+        );
+        assert_eq!(first.waiting_on, ProjectionValue::Value(None));
+
+        store
+            .record_runtime_observation(observe(RuntimeState::Waiting, Some("tool:database")))
+            .unwrap();
+        let waiting = store
+            .runtime_projection(projection_request.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(waiting.metadata.projection_of_authority_revision, 1);
+        assert!(waiting.metadata.event_seq > first.metadata.event_seq);
+        assert_eq!(
+            waiting.runtime_state,
+            ProjectionValue::Value(RuntimeState::Waiting)
+        );
+        assert_eq!(
+            waiting.waiting_on,
+            ProjectionValue::Value(Some("tool:database".to_owned()))
+        );
+        assert_eq!(
+            waiting.parent_agent_id,
+            ProjectionValue::Value(Some("manager-a".to_owned()))
+        );
+        drop(store);
+
+        let reopened = GovernanceStore::open(&path).unwrap();
+        let after_restart = reopened
+            .runtime_projection(projection_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_restart, waiting);
+    }
+
+    #[test]
+    fn runtime_observation_fails_closed_on_stale_authority_identity_rewrite_and_waiting_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        store
+            .create_task(CreateTask {
+                task_id: "task-runtime-guard".to_owned(),
+                run_id: "run-runtime-guard".to_owned(),
+                actor: "scheduler".to_owned(),
+                acceptance_contract_digest: "contract:runtime-guard:v1".to_owned(),
+            })
+            .unwrap();
+        let base = |revision: u64, runtime_state: RuntimeState, waiting_on: Option<&str>| {
+            RuntimeObservationRequest {
+                task_id: "task-runtime-guard".to_owned(),
+                run_id: "run-runtime-guard".to_owned(),
+                expected_authority_revision: revision,
+                root_agent_id: "root-a".to_owned(),
+                parent_agent_id: Some("manager-a".to_owned()),
+                agent_id: "worker-a".to_owned(),
+                provider: "m365".to_owned(),
+                profile: "default".to_owned(),
+                role: "worker".to_owned(),
+                runtime_state,
+                waiting_on: waiting_on.map(str::to_owned),
+                environment: "test".to_owned(),
+                evidence_class: "direct-runtime".to_owned(),
+                actor: "runtime-adapter".to_owned(),
+                evidence_refs: vec!["runtime:worker-a".to_owned()],
+            }
+        };
+        store
+            .record_runtime_observation(base(1, RuntimeState::Running, None))
+            .unwrap();
+        let projection_request = RuntimeProjectionRequest {
+            task_id: "task-runtime-guard".to_owned(),
+            run_id: "run-runtime-guard".to_owned(),
+            agent_id: "worker-a".to_owned(),
+            consumer_schema_version: 1,
+            redacted_fields: Vec::new(),
+            omitted_fields: Vec::new(),
+        };
+        let initial = store
+            .runtime_projection(projection_request.clone())
+            .unwrap()
+            .unwrap();
+
+        let stale = store
+            .record_runtime_observation(base(0, RuntimeState::Stopped, None))
+            .unwrap();
+        assert_eq!(stale.outcome, DecisionOutcome::Defer);
+        assert_eq!(stale.reason, "stale_authority");
+        assert_eq!(
+            store
+                .runtime_projection(projection_request.clone())
+                .unwrap()
+                .unwrap(),
+            initial
+        );
+
+        let mut rewritten = base(1, RuntimeState::Running, None);
+        rewritten.parent_agent_id = Some("other-manager".to_owned());
+        let identity_rewrite = store.record_runtime_observation(rewritten).unwrap();
+        assert_eq!(identity_rewrite.outcome, DecisionOutcome::Deny);
+        assert_eq!(identity_rewrite.reason, "runtime_identity_mismatch");
+        assert_eq!(
+            store
+                .runtime_projection(projection_request.clone())
+                .unwrap()
+                .unwrap(),
+            initial
+        );
+
+        let waiting_without_reason = store
+            .record_runtime_observation(base(1, RuntimeState::Waiting, None))
+            .unwrap();
+        assert_eq!(waiting_without_reason.outcome, DecisionOutcome::Deny);
+        assert_eq!(waiting_without_reason.reason, "waiting_reason_required");
+
+        let running_with_wait = store
+            .record_runtime_observation(base(1, RuntimeState::Running, Some("tool:db")))
+            .unwrap();
+        assert_eq!(running_with_wait.outcome, DecisionOutcome::Deny);
+        assert_eq!(running_with_wait.reason, "waiting_reason_not_allowed");
+        assert_eq!(
+            store
+                .runtime_projection(projection_request.clone())
+                .unwrap()
+                .unwrap(),
+            initial
+        );
+
+        let valid_wait = store
+            .record_runtime_observation(base(1, RuntimeState::Waiting, Some("tool:db")))
+            .unwrap();
+        assert_eq!(valid_wait.outcome, DecisionOutcome::Allow);
+        assert_eq!(valid_wait.record.as_ref().unwrap().runtime_event_seq, 2);
+        let waiting = store
+            .runtime_projection(projection_request)
+            .unwrap()
+            .unwrap();
+        assert!(waiting.metadata.event_seq > initial.metadata.event_seq);
+        assert_eq!(
+            waiting.runtime_state,
+            ProjectionValue::Value(RuntimeState::Waiting)
+        );
+        assert_eq!(
+            waiting.waiting_on,
+            ProjectionValue::Value(Some("tool:db".to_owned()))
         );
     }
 }

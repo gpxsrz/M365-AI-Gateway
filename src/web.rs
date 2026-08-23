@@ -77,6 +77,7 @@ pub struct Gateway {
     pub(crate) artifacts: crate::artifact::Store,
     pub(crate) deployments: crate::deployments::Store,
     pub(crate) debug: crate::debug::Store,
+    pub(crate) governance: crate::governance::GovernanceStore,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +101,9 @@ impl Gateway {
         let artifacts = crate::artifact::Store::open(config.data_dir.join("artifacts"))?;
         let deployments = crate::deployments::Store::open(&config.data_dir)?;
         let settings = crate::runtime_settings::Store::open(&config.data_dir, &config)?;
+        let governance =
+            crate::governance::GovernanceStore::open(config.data_dir.join("agent-governance.json"))
+                .map_err(|error| GatewayError::Storage(error.to_string()))?;
         Ok(Self {
             started_at: Instant::now(),
             admin,
@@ -123,6 +127,7 @@ impl Gateway {
             artifacts,
             deployments,
             debug: crate::debug::Store::default(),
+            governance,
         })
     }
 
@@ -172,6 +177,10 @@ impl Gateway {
             )
             .route("/api/admin/debug/export", post(crate::debug::export))
             .route("/api/admin/traffic", get(Self::admin_traffic))
+            .route(
+                "/api/admin/governance/runtime",
+                get(Self::admin_governance_runtime),
+            )
             .route("/api/health", get(Self::health))
             .route("/api/version", get(Self::version))
             .route("/api/update", get(Self::update))
@@ -532,6 +541,38 @@ impl Gateway {
             "compatibilityTraffic": gateway.traffic.snapshot(),
         }))
         .into_response()
+    }
+
+    async fn admin_governance_runtime(
+        State(gateway): State<Arc<Self>>,
+        Query(query): Query<GovernanceRuntimeQuery>,
+    ) -> Response {
+        let request = crate::governance::RuntimeProjectionRequest {
+            task_id: query.task_id,
+            run_id: query.run_id,
+            agent_id: query.agent_id,
+            consumer_schema_version: query.schema_version,
+            redacted_fields: Vec::new(),
+            omitted_fields: Vec::new(),
+        };
+        match gateway.governance.runtime_projection(request) {
+            Ok(Some(projection)) => Json(projection).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "governance_projection_not_found"})),
+            )
+                .into_response(),
+            Err(crate::governance::GovernanceError::InvalidIdentity(_)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_governance_projection_request"})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "governance_projection_unavailable"})),
+            )
+                .into_response(),
+        }
     }
 
     async fn admin_settings(State(gateway): State<Arc<Self>>, request: Request) -> Response {
@@ -1337,6 +1378,15 @@ struct CreateKeyResponse {
 struct RecoveryRequest {
     #[serde(default)]
     action: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GovernanceRuntimeQuery {
+    task_id: String,
+    run_id: String,
+    agent_id: String,
+    schema_version: u32,
 }
 
 #[derive(Default, Deserialize)]
@@ -2195,6 +2245,10 @@ mod tests {
             artifacts: crate::artifact::Store::open(root.join("artifacts")).unwrap(),
             deployments: crate::deployments::Store::open(&root).unwrap(),
             debug: crate::debug::Store::default(),
+            governance: crate::governance::GovernanceStore::open(
+                root.join("agent-governance.json"),
+            )
+            .unwrap(),
         })
     }
 
@@ -2276,6 +2330,98 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "recovery_not_ready");
+    }
+
+    #[tokio::test]
+    async fn test_admin_governance_runtime_exposes_acp_projection_for_observers() {
+        use crate::governance::{CreateTask, RuntimeObservationRequest, RuntimeState};
+
+        let gateway = gateway();
+        gateway
+            .governance
+            .create_task(CreateTask {
+                task_id: "task-observer".to_owned(),
+                run_id: "run-observer".to_owned(),
+                actor: "scheduler".to_owned(),
+                acceptance_contract_digest: "contract:observer:v1".to_owned(),
+            })
+            .unwrap();
+        gateway
+            .governance
+            .record_runtime_observation(RuntimeObservationRequest {
+                task_id: "task-observer".to_owned(),
+                run_id: "run-observer".to_owned(),
+                expected_authority_revision: 1,
+                root_agent_id: "root-a".to_owned(),
+                parent_agent_id: Some("manager-a".to_owned()),
+                agent_id: "worker-a".to_owned(),
+                provider: "m365".to_owned(),
+                profile: "default".to_owned(),
+                role: "worker".to_owned(),
+                runtime_state: RuntimeState::Waiting,
+                waiting_on: Some("tool:database".to_owned()),
+                environment: "test".to_owned(),
+                evidence_class: "direct-runtime".to_owned(),
+                actor: "runtime-adapter".to_owned(),
+                evidence_refs: vec!["runtime:worker-a-waiting".to_owned()],
+            })
+            .unwrap();
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let app = Gateway::router(gateway);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/admin/governance/runtime?taskId=task-observer&runId=run-observer&agentId=worker-a&schemaVersion=1",
+                )
+                .header(header::HOST, "127.0.0.1")
+                .header(
+                    header::COOKIE,
+                    format!("{ADMIN_COOKIE}={}", login.token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["metadata"]["schemaVersion"], 1);
+        assert_eq!(value["metadata"]["authorityScope"], "OBSERVE_ONLY");
+        assert_eq!(value["metadata"]["projectionOfAuthorityRevision"], 1);
+        assert_eq!(value["runtimeState"]["status"], "VALUE");
+        assert_eq!(value["runtimeState"]["value"], "WAITING");
+        assert_eq!(value["lifecycleState"]["status"], "VALUE");
+        assert_eq!(value["lifecycleState"]["value"], "READY");
+        assert_eq!(value["waitingOn"]["value"], "tool:database");
+
+        let legacy = app
+            .oneshot(
+                Request::get(
+                    "/api/admin/governance/runtime?taskId=task-observer&runId=run-observer&agentId=worker-a&schemaVersion=0",
+                )
+                .header(header::HOST, "127.0.0.1")
+                .header(
+                    header::COOKIE,
+                    format!("{ADMIN_COOKIE}={}", login.token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK);
+        let body = to_bytes(legacy.into_body(), 64 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["metadata"]["schemaVersion"], 0);
+        assert_eq!(value["metadata"]["authorityScope"], "OBSERVE_ONLY");
+        assert_eq!(value["rootAgentId"]["status"], "SCHEMA_DOWNGRADE");
+        assert_eq!(value["runtimeState"]["value"], "WAITING");
     }
 
     #[tokio::test]
