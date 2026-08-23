@@ -20,6 +20,9 @@ pub enum LifecycleState {
     Ready,
     Claimed,
     Running,
+    Suspending,
+    Suspended,
+    Resuming,
     Blocked,
     Completing,
     Completed,
@@ -39,6 +42,10 @@ pub enum TransitionKind {
     ConsumeApprovalGrant,
     RevokeApprovalGrant,
     RotateContext,
+    BeginHandoff,
+    SuspendHandoff,
+    AcquireHandoff,
+    ResumeHandoff,
     BeginCompletion,
     Complete,
     Correct,
@@ -1047,6 +1054,10 @@ pub struct ContextCheckpoint {
     pub retain_request_id: String,
     pub retain_operation_id: String,
     pub capability_status: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_capability: Option<CapabilityProbeResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydrate_capability: Option<CapabilityProbeResult>,
     pub phase: ContextLifecyclePhase,
     pub phase_trace: Vec<ContextLifecyclePhase>,
     pub memory_evidence_refs: Vec<String>,
@@ -1080,6 +1091,135 @@ pub struct ContextRotationRequest {
 pub struct ContextRotationResult {
     pub decision: DecisionRecord,
     pub checkpoint: Option<ContextCheckpoint>,
+    pub hydration: Option<MemoryHydrateResult>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HandoffCheckpointState {
+    Suspending,
+    Suspended,
+    Resuming,
+    Resumed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffCheckpoint {
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub lineage_id: String,
+    pub root_agent_id: String,
+    pub parent_agent_id: String,
+    pub old_owner_agent_id: String,
+    pub replacement_agent_id: String,
+    pub acceptance_contract_digest: String,
+    pub memory_durability_required: bool,
+    pub source_authority_revision: u64,
+    pub suspending_authority_revision: u64,
+    pub suspended_authority_revision: Option<u64>,
+    pub resuming_authority_revision: Option<u64>,
+    pub resumed_authority_revision: Option<u64>,
+    pub old_ownership_generation: u64,
+    pub new_ownership_generation: Option<u64>,
+    pub old_fencing_identity: String,
+    pub new_fencing_identity: Option<String>,
+    pub active_blocker_id: Option<String>,
+    pub blocker_evidence_baseline: Vec<EvidenceObservation>,
+    pub pending_consequential_mutation_ids: Vec<String>,
+    pub mutation_receipts: Vec<MutationReceipt>,
+    pub context_checkpoint_id: String,
+    pub memory_checkpoint_id: Option<String>,
+    pub handoff_capability: CapabilityProbeResult,
+    pub evidence_refs: Vec<String>,
+    pub state: HandoffCheckpointState,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub released_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub resumed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeginHandoffRequest {
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub lineage_id: String,
+    pub root_agent_id: String,
+    pub parent_agent_id: String,
+    pub old_owner_agent_id: String,
+    pub replacement_agent_id: String,
+    pub actor: String,
+    pub fencing_identity: String,
+    pub contract: CompletionContract,
+    pub handoff_capability: CapabilityProbeResult,
+    pub blocker_evidence_baseline: Vec<EvidenceObservation>,
+    pub pending_consequential_mutation_ids: Vec<String>,
+    pub mutation_receipts: Vec<MutationReceipt>,
+    pub context_checkpoint_id: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffTransitionResult {
+    pub decision: DecisionRecord,
+    pub checkpoint: Option<HandoffCheckpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuspendHandoffRequest {
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub checkpoint_id: String,
+    pub old_owner_agent_id: String,
+    pub actor: String,
+    pub fencing_identity: String,
+    pub handoff_capability: CapabilityProbeResult,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcquireHandoffRequest {
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub checkpoint_id: String,
+    pub replacement_agent_id: String,
+    pub actor: String,
+    pub handoff_capability: CapabilityProbeResult,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcquireHandoffResult {
+    pub decision: DecisionRecord,
+    pub checkpoint: Option<HandoffCheckpoint>,
+    pub fencing_identity: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeHandoffRequest {
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub checkpoint_id: String,
+    pub replacement_agent_id: String,
+    pub actor: String,
+    pub fencing_identity: String,
+    pub new_context_id: String,
+    pub memory_query: String,
+    pub handoff_capability: CapabilityProbeResult,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeHandoffResult {
+    pub decision: DecisionRecord,
+    pub checkpoint: Option<HandoffCheckpoint>,
     pub hydration: Option<MemoryHydrateResult>,
 }
 
@@ -1530,6 +1670,8 @@ pub struct TaskAuthority {
     pub active_blocker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_completion_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_handoff_checkpoint_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1591,6 +1733,8 @@ struct StateFile {
     approval_consumptions: BTreeMap<String, ApprovalGrantConsumption>,
     #[serde(default)]
     context_checkpoints: BTreeMap<String, ContextCheckpoint>,
+    #[serde(default)]
+    handoff_checkpoints: BTreeMap<String, HandoffCheckpoint>,
     decisions: Vec<DecisionRecord>,
     next_decision_seq: u64,
 }
@@ -1606,6 +1750,7 @@ impl Default for StateFile {
             approval_grants: BTreeMap::new(),
             approval_consumptions: BTreeMap::new(),
             context_checkpoints: BTreeMap::new(),
+            handoff_checkpoints: BTreeMap::new(),
             decisions: Vec::new(),
             next_decision_seq: 1,
         }
@@ -1661,6 +1806,7 @@ impl GovernanceStore {
             fencing_identity: None,
             active_blocker_id: None,
             active_completion_id: None,
+            active_handoff_checkpoint_id: None,
         };
         let decision_id = next_decision_id(&mut state);
         state
@@ -1716,6 +1862,15 @@ impl GovernanceStore {
         validate_identity("checkpoint_id", checkpoint_id)?;
         let state = self.state.lock().expect("governance state poisoned");
         Ok(state.context_checkpoints.get(checkpoint_id).cloned())
+    }
+
+    pub fn handoff_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<HandoffCheckpoint>, GovernanceError> {
+        validate_identity("checkpoint_id", checkpoint_id)?;
+        let state = self.state.lock().expect("governance state poisoned");
+        Ok(state.handoff_checkpoints.get(checkpoint_id).cloned())
     }
 
     pub fn rotate_context(
@@ -1809,6 +1964,8 @@ impl GovernanceStore {
             retain_request_id: request.retain_request_id.clone(),
             retain_operation_id: retained.operation_id.clone().unwrap(),
             capability_status: retained.capability_status,
+            retain_capability: Some(retain_probe.capability.clone()),
+            hydrate_capability: Some(hydrate_probe.capability.clone()),
             phase: ContextLifecyclePhase::ContextCheckpoint,
             phase_trace: vec![
                 ContextLifecyclePhase::PreCompact,
@@ -1984,6 +2141,785 @@ impl GovernanceStore {
         Ok(ContextRotationResult {
             decision,
             checkpoint: None,
+            hydration: None,
+        })
+    }
+
+    pub fn begin_handoff(
+        &self,
+        request: BeginHandoffRequest,
+    ) -> Result<HandoffTransitionResult, GovernanceError> {
+        validate_begin_handoff_request(&request)?;
+        let contract_digest = request.contract.digest();
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let authority_before = authority
+            .as_ref()
+            .map_or(0, |authority| authority.authority_revision);
+        let now = OffsetDateTime::now_utc();
+        let capability_failure = handoff_capability_failure(&request.handoff_capability);
+        let mutation_failure = handoff_mutation_failure(
+            &request.mutation_receipts,
+            request.expected_authority_revision,
+            &request.fencing_identity,
+        );
+        let referenced_context_checkpoint = state
+            .context_checkpoints
+            .get(&request.context_checkpoint_id)
+            .cloned();
+        let context_checkpoint = handoff_context_checkpoint(
+            &state,
+            &request.context_checkpoint_id,
+            (&request.task_id, &request.run_id),
+            &request.lineage_id,
+            request.expected_authority_revision,
+            (&request.old_owner_agent_id, &request.fencing_identity),
+            &contract_digest,
+        )
+        .cloned();
+        let memory_checkpoint = request
+            .contract
+            .memory_durability_required
+            .then(|| {
+                verified_memory_checkpoint(
+                    &state,
+                    Some(&request.context_checkpoint_id),
+                    (&request.task_id, &request.run_id),
+                    request.expected_authority_revision,
+                    (&request.old_owner_agent_id, &request.fencing_identity),
+                    &contract_digest,
+                )
+                .cloned()
+            })
+            .flatten();
+        let blocker_baseline_matches = authority.as_ref().is_some_and(|authority| match authority
+            .active_blocker_id
+            .as_deref()
+        {
+            Some(blocker_id) => state.blockers.get(blocker_id).is_some_and(|blocker| {
+                blocker.evidence_baseline == request.blocker_evidence_baseline
+            }),
+            None => request.blocker_evidence_baseline.is_empty(),
+        });
+        let mut authority_after = authority_before;
+        let mut performed_at = None;
+        let mut checkpoint = None;
+        let (outcome, reason) = match authority.as_ref() {
+            None => (DecisionOutcome::Deny, "task_not_found"),
+            Some(authority) if authority.active_run_id != request.run_id => {
+                (DecisionOutcome::Deny, "run_not_found")
+            }
+            Some(authority)
+                if authority.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_authority")
+            }
+            Some(_) if request.evidence_refs.is_empty() => {
+                (DecisionOutcome::Defer, "evidence_required")
+            }
+            Some(authority) if authority.lifecycle_state != LifecycleState::Running => {
+                (DecisionOutcome::Deny, "handoff_not_available")
+            }
+            Some(authority)
+                if authority.owner_agent_id.as_deref()
+                    != Some(request.old_owner_agent_id.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "owner_mismatch")
+            }
+            Some(authority)
+                if authority.fencing_identity.as_deref()
+                    != Some(request.fencing_identity.as_str()) =>
+            {
+                (DecisionOutcome::Deny, "fencing_mismatch")
+            }
+            Some(authority) if authority.acceptance_contract_digest != contract_digest => {
+                (DecisionOutcome::Deny, "acceptance_contract_mismatch")
+            }
+            Some(authority) if authority.active_handoff_checkpoint_id.is_some() => {
+                (DecisionOutcome::Deny, "handoff_already_active")
+            }
+            Some(_) if !blocker_baseline_matches => {
+                (DecisionOutcome::Defer, "blocker_evidence_baseline_mismatch")
+            }
+            Some(_) if capability_failure.is_some() => capability_failure.unwrap(),
+            Some(_) if mutation_failure.is_some() => mutation_failure.unwrap(),
+            Some(_) if referenced_context_checkpoint.is_none() => {
+                (DecisionOutcome::Defer, "context_checkpoint_required")
+            }
+            Some(_) if context_checkpoint.is_none() => {
+                (DecisionOutcome::Deny, "context_checkpoint_binding_mismatch")
+            }
+            Some(_)
+                if request.contract.memory_durability_required && memory_checkpoint.is_none() =>
+            {
+                (DecisionOutcome::Defer, "memory_checkpoint_required")
+            }
+            Some(authority) => {
+                let checkpoint_id = new_handoff_checkpoint_id();
+                let old_ownership_generation =
+                    lease_generation(&state, &request.task_id, &request.run_id);
+                let mut evidence_refs = request.evidence_refs.clone();
+                evidence_refs.extend(request.handoff_capability.evidence_refs.clone());
+                let context_checkpoint = context_checkpoint.as_ref().unwrap();
+                evidence_refs.extend(context_checkpoint.memory_evidence_refs.clone());
+                evidence_refs.extend(context_checkpoint.selected_evidence_refs.clone());
+                evidence_refs.sort();
+                evidence_refs.dedup();
+                let active_blocker_id = authority.active_blocker_id.clone();
+                let authority = state.tasks.get_mut(&request.task_id).unwrap();
+                authority.lifecycle_state = LifecycleState::Suspending;
+                authority.authority_revision = authority.authority_revision.saturating_add(1);
+                authority.active_handoff_checkpoint_id = Some(checkpoint_id.clone());
+                authority_after = authority.authority_revision;
+                performed_at = Some(now);
+                let created = HandoffCheckpoint {
+                    checkpoint_id: checkpoint_id.clone(),
+                    task_id: request.task_id.clone(),
+                    run_id: request.run_id.clone(),
+                    lineage_id: request.lineage_id.clone(),
+                    root_agent_id: request.root_agent_id.clone(),
+                    parent_agent_id: request.parent_agent_id.clone(),
+                    old_owner_agent_id: request.old_owner_agent_id.clone(),
+                    replacement_agent_id: request.replacement_agent_id.clone(),
+                    acceptance_contract_digest: contract_digest.clone(),
+                    memory_durability_required: request.contract.memory_durability_required,
+                    source_authority_revision: request.expected_authority_revision,
+                    suspending_authority_revision: authority_after,
+                    suspended_authority_revision: None,
+                    resuming_authority_revision: None,
+                    resumed_authority_revision: None,
+                    old_ownership_generation,
+                    new_ownership_generation: None,
+                    old_fencing_identity: request.fencing_identity.clone(),
+                    new_fencing_identity: None,
+                    active_blocker_id,
+                    blocker_evidence_baseline: request.blocker_evidence_baseline.clone(),
+                    pending_consequential_mutation_ids: request
+                        .pending_consequential_mutation_ids
+                        .clone(),
+                    mutation_receipts: request.mutation_receipts.clone(),
+                    context_checkpoint_id: request.context_checkpoint_id.clone(),
+                    memory_checkpoint_id: request
+                        .contract
+                        .memory_durability_required
+                        .then(|| request.context_checkpoint_id.clone()),
+                    handoff_capability: request.handoff_capability.clone(),
+                    evidence_refs,
+                    state: HandoffCheckpointState::Suspending,
+                    created_at: now,
+                    released_at: None,
+                    resumed_at: None,
+                };
+                state
+                    .handoff_checkpoints
+                    .insert(checkpoint_id, created.clone());
+                checkpoint = Some(created);
+                (DecisionOutcome::Allow, "handoff_suspending")
+            }
+        };
+        let mut evidence_refs = request.evidence_refs;
+        evidence_refs.extend(request.handoff_capability.evidence_refs);
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.old_owner_agent_id,
+            requested_transition: TransitionKind::BeginHandoff,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after,
+            policy_version: BASE_POLICY_VERSION.to_owned(),
+            evaluator_version: BASE_EVALUATOR_VERSION.to_owned(),
+            evidence_refs,
+            actor: request.actor,
+            evaluated_at: now,
+            performed_at,
+            fencing_identity: Some(request.fencing_identity),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(HandoffTransitionResult {
+            decision,
+            checkpoint,
+        })
+    }
+
+    pub fn suspend_handoff(
+        &self,
+        request: SuspendHandoffRequest,
+    ) -> Result<HandoffTransitionResult, GovernanceError> {
+        validate_suspend_handoff_request(&request)?;
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let checkpoint = state
+            .handoff_checkpoints
+            .get(&request.checkpoint_id)
+            .cloned();
+        let authority_before = authority
+            .as_ref()
+            .map_or(0, |authority| authority.authority_revision);
+        let capability_failure = handoff_capability_failure(&request.handoff_capability);
+        let context_checkpoint_verified = checkpoint.as_ref().is_some_and(|checkpoint| {
+            handoff_context_checkpoint(
+                &state,
+                &checkpoint.context_checkpoint_id,
+                (&request.task_id, &request.run_id),
+                &checkpoint.lineage_id,
+                checkpoint.source_authority_revision,
+                (
+                    &checkpoint.old_owner_agent_id,
+                    &checkpoint.old_fencing_identity,
+                ),
+                &checkpoint.acceptance_contract_digest,
+            )
+            .is_some()
+        });
+        let memory_checkpoint_verified = checkpoint.as_ref().is_some_and(|checkpoint| {
+            !checkpoint.memory_durability_required
+                || checkpoint
+                    .memory_checkpoint_id
+                    .as_deref()
+                    .is_some_and(|checkpoint_id| {
+                        verified_memory_checkpoint(
+                            &state,
+                            Some(checkpoint_id),
+                            (&request.task_id, &request.run_id),
+                            checkpoint.source_authority_revision,
+                            (
+                                &checkpoint.old_owner_agent_id,
+                                &checkpoint.old_fencing_identity,
+                            ),
+                            &checkpoint.acceptance_contract_digest,
+                        )
+                        .is_some()
+                    })
+        });
+        let now = OffsetDateTime::now_utc();
+        let mut authority_after = authority_before;
+        let mut performed_at = None;
+        let mut resulting_checkpoint = checkpoint.clone();
+        let (outcome, reason) = match (authority.as_ref(), checkpoint.as_ref()) {
+            (None, _) => (DecisionOutcome::Deny, "task_not_found"),
+            (Some(authority), _) if authority.active_run_id != request.run_id => {
+                (DecisionOutcome::Deny, "run_not_found")
+            }
+            (Some(authority), _)
+                if authority.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_authority")
+            }
+            (Some(_), _) if request.evidence_refs.is_empty() => {
+                (DecisionOutcome::Defer, "evidence_required")
+            }
+            (Some(authority), _) if authority.lifecycle_state != LifecycleState::Suspending => {
+                (DecisionOutcome::Deny, "suspend_not_available")
+            }
+            (Some(authority), _)
+                if authority.active_handoff_checkpoint_id.as_deref()
+                    != Some(request.checkpoint_id.as_str()) =>
+            {
+                (DecisionOutcome::Defer, "stale_handoff_checkpoint")
+            }
+            (_, None) => (DecisionOutcome::Defer, "stale_handoff_checkpoint"),
+            (_, Some(checkpoint))
+                if checkpoint.task_id != request.task_id || checkpoint.run_id != request.run_id =>
+            {
+                (DecisionOutcome::Deny, "handoff_scope_mismatch")
+            }
+            (_, Some(checkpoint))
+                if checkpoint.state != HandoffCheckpointState::Suspending
+                    || checkpoint.suspending_authority_revision
+                        != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_handoff_checkpoint")
+            }
+            (_, Some(_)) if capability_failure.is_some() => capability_failure.unwrap(),
+            (_, Some(checkpoint))
+                if !same_capability_source(
+                    &checkpoint.handoff_capability,
+                    &request.handoff_capability,
+                ) =>
+            {
+                (DecisionOutcome::Deny, "handoff_capability_binding_mismatch")
+            }
+            (Some(authority), Some(checkpoint))
+                if authority.acceptance_contract_digest
+                    != checkpoint.acceptance_contract_digest =>
+            {
+                (DecisionOutcome::Deny, "acceptance_contract_mismatch")
+            }
+            (Some(authority), Some(checkpoint))
+                if authority.owner_agent_id.as_deref()
+                    != Some(request.old_owner_agent_id.as_str())
+                    || checkpoint.old_owner_agent_id != request.old_owner_agent_id =>
+            {
+                (DecisionOutcome::Deny, "owner_mismatch")
+            }
+            (Some(authority), Some(checkpoint))
+                if authority.fencing_identity.as_deref()
+                    != Some(request.fencing_identity.as_str())
+                    || checkpoint.old_fencing_identity != request.fencing_identity =>
+            {
+                (DecisionOutcome::Deny, "fencing_mismatch")
+            }
+            (_, Some(checkpoint))
+                if handoff_capability_failure(&checkpoint.handoff_capability).is_some() =>
+            {
+                handoff_capability_failure(&checkpoint.handoff_capability).unwrap()
+            }
+            _ if !context_checkpoint_verified => {
+                (DecisionOutcome::Deny, "context_checkpoint_binding_mismatch")
+            }
+            _ if !memory_checkpoint_verified => {
+                (DecisionOutcome::Defer, "memory_checkpoint_required")
+            }
+            _ => {
+                let authority = state.tasks.get_mut(&request.task_id).unwrap();
+                authority.lifecycle_state = LifecycleState::Suspended;
+                authority.authority_revision = authority.authority_revision.saturating_add(1);
+                authority.owner_agent_id = None;
+                authority.fencing_identity = None;
+                authority_after = authority.authority_revision;
+                let checkpoint = state
+                    .handoff_checkpoints
+                    .get_mut(&request.checkpoint_id)
+                    .unwrap();
+                checkpoint.state = HandoffCheckpointState::Suspended;
+                checkpoint.suspended_authority_revision = Some(authority_after);
+                checkpoint.released_at = Some(now);
+                resulting_checkpoint = Some(checkpoint.clone());
+                performed_at = Some(now);
+                (DecisionOutcome::Allow, "handoff_suspended")
+            }
+        };
+        let mut evidence_refs = request.evidence_refs;
+        evidence_refs.extend(request.handoff_capability.evidence_refs);
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.old_owner_agent_id,
+            requested_transition: TransitionKind::SuspendHandoff,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after,
+            policy_version: BASE_POLICY_VERSION.to_owned(),
+            evaluator_version: BASE_EVALUATOR_VERSION.to_owned(),
+            evidence_refs,
+            actor: request.actor,
+            evaluated_at: now,
+            performed_at,
+            fencing_identity: Some(request.fencing_identity),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(HandoffTransitionResult {
+            decision,
+            checkpoint: resulting_checkpoint,
+        })
+    }
+
+    pub fn acquire_handoff(
+        &self,
+        request: AcquireHandoffRequest,
+    ) -> Result<AcquireHandoffResult, GovernanceError> {
+        validate_acquire_handoff_request(&request)?;
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let checkpoint = state
+            .handoff_checkpoints
+            .get(&request.checkpoint_id)
+            .cloned();
+        let authority_before = authority
+            .as_ref()
+            .map_or(0, |authority| authority.authority_revision);
+        let current_lease_generation = lease_generation(&state, &request.task_id, &request.run_id);
+        let capability_failure = handoff_capability_failure(&request.handoff_capability);
+        let context_checkpoint_verified = checkpoint.as_ref().is_some_and(|checkpoint| {
+            handoff_context_checkpoint(
+                &state,
+                &checkpoint.context_checkpoint_id,
+                (&request.task_id, &request.run_id),
+                &checkpoint.lineage_id,
+                checkpoint.source_authority_revision,
+                (
+                    &checkpoint.old_owner_agent_id,
+                    &checkpoint.old_fencing_identity,
+                ),
+                &checkpoint.acceptance_contract_digest,
+            )
+            .is_some()
+        });
+        let memory_checkpoint_verified = checkpoint.as_ref().is_some_and(|checkpoint| {
+            !checkpoint.memory_durability_required
+                || checkpoint
+                    .memory_checkpoint_id
+                    .as_deref()
+                    .is_some_and(|checkpoint_id| {
+                        verified_memory_checkpoint(
+                            &state,
+                            Some(checkpoint_id),
+                            (&request.task_id, &request.run_id),
+                            checkpoint.source_authority_revision,
+                            (
+                                &checkpoint.old_owner_agent_id,
+                                &checkpoint.old_fencing_identity,
+                            ),
+                            &checkpoint.acceptance_contract_digest,
+                        )
+                        .is_some()
+                    })
+        });
+        let now = OffsetDateTime::now_utc();
+        let mut authority_after = authority_before;
+        let mut performed_at = None;
+        let mut resulting_checkpoint = checkpoint.clone();
+        let mut resulting_fence = None;
+        let (outcome, reason) = match (authority.as_ref(), checkpoint.as_ref()) {
+            (None, _) => (DecisionOutcome::Deny, "task_not_found"),
+            (Some(authority), _) if authority.active_run_id != request.run_id => {
+                (DecisionOutcome::Deny, "run_not_found")
+            }
+            (Some(authority), _)
+                if authority.authority_revision != request.expected_authority_revision =>
+            {
+                (DecisionOutcome::Defer, "stale_authority")
+            }
+            (Some(_), _) if request.evidence_refs.is_empty() => {
+                (DecisionOutcome::Defer, "evidence_required")
+            }
+            (Some(authority), _) if authority.lifecycle_state != LifecycleState::Suspended => {
+                (DecisionOutcome::Deny, "acquire_handoff_not_available")
+            }
+            (Some(authority), _)
+                if authority.owner_agent_id.is_some() || authority.fencing_identity.is_some() =>
+            {
+                (DecisionOutcome::Deny, "old_lease_not_released")
+            }
+            (Some(authority), _)
+                if authority.active_handoff_checkpoint_id.as_deref()
+                    != Some(request.checkpoint_id.as_str()) =>
+            {
+                (DecisionOutcome::Defer, "stale_handoff_checkpoint")
+            }
+            (_, None) => (DecisionOutcome::Defer, "stale_handoff_checkpoint"),
+            (_, Some(checkpoint))
+                if checkpoint.task_id != request.task_id || checkpoint.run_id != request.run_id =>
+            {
+                (DecisionOutcome::Deny, "handoff_scope_mismatch")
+            }
+            (_, Some(checkpoint))
+                if checkpoint.state != HandoffCheckpointState::Suspended
+                    || checkpoint.suspended_authority_revision
+                        != Some(request.expected_authority_revision)
+                    || checkpoint.released_at.is_none() =>
+            {
+                (DecisionOutcome::Defer, "stale_handoff_checkpoint")
+            }
+            (Some(authority), Some(checkpoint))
+                if authority.acceptance_contract_digest
+                    != checkpoint.acceptance_contract_digest =>
+            {
+                (DecisionOutcome::Deny, "acceptance_contract_mismatch")
+            }
+            (_, Some(checkpoint))
+                if checkpoint.replacement_agent_id != request.replacement_agent_id =>
+            {
+                (DecisionOutcome::Deny, "replacement_mismatch")
+            }
+            (_, Some(checkpoint))
+                if checkpoint.old_ownership_generation != current_lease_generation =>
+            {
+                (DecisionOutcome::Defer, "lease_generation_mismatch")
+            }
+            (_, Some(_)) if capability_failure.is_some() => capability_failure.unwrap(),
+            (_, Some(checkpoint))
+                if !same_capability_source(
+                    &checkpoint.handoff_capability,
+                    &request.handoff_capability,
+                ) =>
+            {
+                (DecisionOutcome::Deny, "handoff_capability_binding_mismatch")
+            }
+            (_, Some(checkpoint))
+                if handoff_capability_failure(&checkpoint.handoff_capability).is_some() =>
+            {
+                handoff_capability_failure(&checkpoint.handoff_capability).unwrap()
+            }
+            _ if !context_checkpoint_verified => {
+                (DecisionOutcome::Deny, "context_checkpoint_binding_mismatch")
+            }
+            _ if !memory_checkpoint_verified => {
+                (DecisionOutcome::Defer, "memory_checkpoint_required")
+            }
+            _ => {
+                let fence = new_fencing_identity();
+                let authority = state.tasks.get_mut(&request.task_id).unwrap();
+                authority.lifecycle_state = LifecycleState::Resuming;
+                authority.authority_revision = authority.authority_revision.saturating_add(1);
+                authority.owner_agent_id = Some(request.replacement_agent_id.clone());
+                authority.fencing_identity = Some(fence.clone());
+                authority_after = authority.authority_revision;
+                let checkpoint = state
+                    .handoff_checkpoints
+                    .get_mut(&request.checkpoint_id)
+                    .unwrap();
+                checkpoint.state = HandoffCheckpointState::Resuming;
+                checkpoint.resuming_authority_revision = Some(authority_after);
+                checkpoint.new_ownership_generation =
+                    Some(current_lease_generation.saturating_add(1));
+                checkpoint.new_fencing_identity = Some(fence.clone());
+                resulting_checkpoint = Some(checkpoint.clone());
+                resulting_fence = Some(fence);
+                performed_at = Some(now);
+                (DecisionOutcome::Allow, "handoff_acquired")
+            }
+        };
+        let mut evidence_refs = request.evidence_refs;
+        evidence_refs.extend(request.handoff_capability.evidence_refs);
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.replacement_agent_id,
+            requested_transition: TransitionKind::AcquireHandoff,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after,
+            policy_version: BASE_POLICY_VERSION.to_owned(),
+            evaluator_version: BASE_EVALUATOR_VERSION.to_owned(),
+            evidence_refs,
+            actor: request.actor,
+            evaluated_at: now,
+            performed_at,
+            fencing_identity: resulting_fence.clone(),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(AcquireHandoffResult {
+            decision,
+            checkpoint: resulting_checkpoint,
+            fencing_identity: resulting_fence,
+        })
+    }
+
+    pub fn resume_handoff(
+        &self,
+        request: ResumeHandoffRequest,
+        port: &dyn MemoryPort,
+    ) -> Result<ResumeHandoffResult, GovernanceError> {
+        validate_resume_handoff_request(&request)?;
+        let (authority, checkpoint, context_checkpoint) = {
+            let state = self.state.lock().expect("governance state poisoned");
+            if let Some((outcome, reason)) = resume_handoff_state_failure(&state, &request) {
+                drop(state);
+                return self.record_resume_handoff_rejection(&request, outcome, reason, Vec::new());
+            }
+            let authority = state.tasks.get(&request.task_id).cloned().unwrap();
+            let checkpoint = state
+                .handoff_checkpoints
+                .get(&request.checkpoint_id)
+                .cloned()
+                .unwrap();
+            let context_checkpoint = state
+                .context_checkpoints
+                .get(&checkpoint.context_checkpoint_id)
+                .cloned()
+                .unwrap();
+            (authority, checkpoint, context_checkpoint)
+        };
+
+        let hydrate_probe = port.probe("memory.hydrate");
+        validate_memory_port_probe(&hydrate_probe)?;
+        if let Some((outcome, reason)) = memory_probe_failure(&hydrate_probe, "memory.hydrate") {
+            return self.record_resume_handoff_rejection(
+                &request,
+                outcome,
+                reason,
+                hydrate_probe.evidence_refs,
+            );
+        }
+        let expected_hydrate_capability = context_checkpoint.hydrate_capability.as_ref().unwrap();
+        if !same_capability_source(expected_hydrate_capability, &hydrate_probe.capability) {
+            let mut evidence_refs = hydrate_probe.evidence_refs;
+            evidence_refs.extend(hydrate_probe.capability.evidence_refs);
+            evidence_refs.extend(expected_hydrate_capability.evidence_refs.clone());
+            return self.record_resume_handoff_rejection(
+                &request,
+                DecisionOutcome::Deny,
+                "memory_provider_binding_mismatch",
+                evidence_refs,
+            );
+        }
+
+        let hydrate_request = MemoryHydrateRequest {
+            hydrate_request_id: format!("handoff-hydrate-{}", checkpoint.checkpoint_id),
+            checkpoint_id: context_checkpoint.checkpoint_id,
+            task_id: request.task_id.clone(),
+            run_id: request.run_id.clone(),
+            lineage_id: checkpoint.lineage_id,
+            authority_summary: authority_summary(&authority),
+            new_context_id: request.new_context_id.clone(),
+            memory_query: request.memory_query.clone(),
+            selected_evidence_refs: context_checkpoint.selected_evidence_refs,
+        };
+        let hydration = port.hydrate(&hydrate_request);
+        let (hydration_valid, hydrate_failure) = match validate_memory_hydrate_result(&hydration) {
+            Ok(()) => (true, memory_hydrate_failure(&hydrate_request, &hydration)),
+            Err(_) => (
+                false,
+                Some((DecisionOutcome::Deny, "memory_hydrate_invalid")),
+            ),
+        };
+        let completed_at = OffsetDateTime::now_utc();
+
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority_before = state
+            .tasks
+            .get(&request.task_id)
+            .map_or(0, |authority| authority.authority_revision);
+        let failure = resume_handoff_state_failure(&state, &request).or(hydrate_failure);
+        let mut authority_after = authority_before;
+        let mut performed_at = None;
+        let mut resulting_checkpoint = state
+            .handoff_checkpoints
+            .get(&request.checkpoint_id)
+            .cloned();
+        let (outcome, reason) = match failure {
+            Some((outcome, reason)) => (outcome, reason),
+            None => {
+                let authority = state.tasks.get_mut(&request.task_id).unwrap();
+                authority.lifecycle_state = LifecycleState::Running;
+                authority.authority_revision = authority.authority_revision.saturating_add(1);
+                authority.active_handoff_checkpoint_id = None;
+                authority_after = authority.authority_revision;
+                let checkpoint = state
+                    .handoff_checkpoints
+                    .get_mut(&request.checkpoint_id)
+                    .unwrap();
+                checkpoint.state = HandoffCheckpointState::Resumed;
+                checkpoint.resumed_authority_revision = Some(authority_after);
+                checkpoint.resumed_at = Some(completed_at);
+                resulting_checkpoint = Some(checkpoint.clone());
+                performed_at = Some(completed_at);
+                (DecisionOutcome::Allow, "handoff_resumed")
+            }
+        };
+        let mut evidence_refs = request.evidence_refs;
+        evidence_refs.extend(request.handoff_capability.evidence_refs);
+        evidence_refs.extend(hydrate_probe.evidence_refs);
+        evidence_refs.extend(hydrate_probe.capability.evidence_refs);
+        if hydration_valid {
+            evidence_refs.extend(hydration.evidence_refs.clone());
+        }
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.replacement_agent_id,
+            requested_transition: TransitionKind::ResumeHandoff,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after,
+            policy_version: BASE_POLICY_VERSION.to_owned(),
+            evaluator_version: BASE_EVALUATOR_VERSION.to_owned(),
+            evidence_refs,
+            actor: request.actor,
+            evaluated_at: completed_at,
+            performed_at,
+            fencing_identity: Some(request.fencing_identity),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(ResumeHandoffResult {
+            decision,
+            checkpoint: resulting_checkpoint,
+            hydration: (outcome == DecisionOutcome::Allow).then_some(hydration),
+        })
+    }
+
+    fn record_resume_handoff_rejection(
+        &self,
+        request: &ResumeHandoffRequest,
+        outcome: DecisionOutcome,
+        reason: &str,
+        mut evidence_refs: Vec<String>,
+    ) -> Result<ResumeHandoffResult, GovernanceError> {
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority_before = state
+            .tasks
+            .get(&request.task_id)
+            .map_or(0, |authority| authority.authority_revision);
+        let (outcome, reason) =
+            resume_handoff_state_failure(&state, request).unwrap_or((outcome, reason));
+        evidence_refs.extend(request.evidence_refs.clone());
+        evidence_refs.extend(request.handoff_capability.evidence_refs.clone());
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id.clone(),
+            run_id: request.run_id.clone(),
+            agent_id: request.replacement_agent_id.clone(),
+            requested_transition: TransitionKind::ResumeHandoff,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after: authority_before,
+            policy_version: BASE_POLICY_VERSION.to_owned(),
+            evaluator_version: BASE_EVALUATOR_VERSION.to_owned(),
+            evidence_refs,
+            actor: request.actor.clone(),
+            evaluated_at: OffsetDateTime::now_utc(),
+            performed_at: None,
+            fencing_identity: Some(request.fencing_identity.clone()),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        let checkpoint = state
+            .handoff_checkpoints
+            .get(&request.checkpoint_id)
+            .cloned();
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(ResumeHandoffResult {
+            decision,
+            checkpoint,
             hydration: None,
         })
     }
@@ -2591,13 +3527,7 @@ impl GovernanceStore {
                 decision.task_id == request.task_id && decision.run_id == request.run_id
             })
             .collect::<Vec<_>>();
-        let lease_generation = task_decisions
-            .iter()
-            .filter(|decision| {
-                decision.requested_transition == TransitionKind::Claim
-                    && decision.performed_at.is_some()
-            })
-            .count() as u64;
+        let lease_generation = lease_generation(&state, &request.task_id, &request.run_id);
         let last_transition = task_decisions.iter().rev().find_map(|decision| {
             (decision.performed_at.is_some()
                 && decision.authority_after > decision.authority_before)
@@ -2722,9 +3652,14 @@ impl GovernanceStore {
             waiting_on: reduce_runtime_projection_value(
                 &request,
                 RuntimeProjectionField::WaitingOn,
-                runtime_projection_value(record, authority.authority_revision, |record| {
-                    record.waiting_on.clone()
-                }),
+                handoff_waiting_on(authority.lifecycle_state).map_or_else(
+                    || {
+                        runtime_projection_value(record, authority.authority_revision, |record| {
+                            record.waiting_on.clone()
+                        })
+                    },
+                    |waiting_on| ProjectionValue::Value(Some(waiting_on.to_owned())),
+                ),
             ),
             last_activity: reduce_runtime_projection_value(
                 &request,
@@ -3820,16 +4755,124 @@ fn validate_context_rotation_request(
     Ok(())
 }
 
-fn validate_memory_port_probe(probe: &MemoryPortProbe) -> Result<(), GovernanceError> {
-    validate_identity("adapter_id", &probe.capability.adapter_id)?;
-    validate_identity("adapter_version", &probe.capability.adapter_version)?;
-    validate_identity("upstream_id", &probe.capability.upstream_id)?;
-    validate_identity("upstream_version", &probe.capability.upstream_version)?;
-    validate_identity(
-        "requested_capability",
-        &probe.capability.requested_capability,
+fn validate_begin_handoff_request(request: &BeginHandoffRequest) -> Result<(), GovernanceError> {
+    validate_identity("task_id", &request.task_id)?;
+    validate_identity("run_id", &request.run_id)?;
+    validate_identity("lineage_id", &request.lineage_id)?;
+    validate_identity("root_agent_id", &request.root_agent_id)?;
+    validate_identity("parent_agent_id", &request.parent_agent_id)?;
+    validate_identity("old_owner_agent_id", &request.old_owner_agent_id)?;
+    validate_identity("replacement_agent_id", &request.replacement_agent_id)?;
+    validate_identity("actor", &request.actor)?;
+    validate_identity("fencing_identity", &request.fencing_identity)?;
+    validate_identity("context_checkpoint_id", &request.context_checkpoint_id)?;
+    validate_completion_contract(&request.contract)?;
+    validate_capability_probe_result(&request.handoff_capability)?;
+    validate_evidence_observations(&request.blocker_evidence_baseline)?;
+    validate_handoff_mutations(
+        &request.pending_consequential_mutation_ids,
+        &request.mutation_receipts,
     )?;
-    validate_evidence_refs(&probe.capability.evidence_refs)?;
+    validate_evidence_refs(&request.evidence_refs)?;
+    if request.old_owner_agent_id == request.replacement_agent_id {
+        return Err(GovernanceError::InvalidIdentity("replacement_agent_id"));
+    }
+    Ok(())
+}
+
+fn validate_suspend_handoff_request(
+    request: &SuspendHandoffRequest,
+) -> Result<(), GovernanceError> {
+    validate_identity("task_id", &request.task_id)?;
+    validate_identity("run_id", &request.run_id)?;
+    validate_identity("checkpoint_id", &request.checkpoint_id)?;
+    validate_identity("old_owner_agent_id", &request.old_owner_agent_id)?;
+    validate_identity("actor", &request.actor)?;
+    validate_identity("fencing_identity", &request.fencing_identity)?;
+    validate_capability_probe_result(&request.handoff_capability)?;
+    validate_evidence_refs(&request.evidence_refs)
+}
+
+fn validate_acquire_handoff_request(
+    request: &AcquireHandoffRequest,
+) -> Result<(), GovernanceError> {
+    validate_identity("task_id", &request.task_id)?;
+    validate_identity("run_id", &request.run_id)?;
+    validate_identity("checkpoint_id", &request.checkpoint_id)?;
+    validate_identity("replacement_agent_id", &request.replacement_agent_id)?;
+    validate_identity("actor", &request.actor)?;
+    validate_capability_probe_result(&request.handoff_capability)?;
+    validate_evidence_refs(&request.evidence_refs)
+}
+
+fn validate_resume_handoff_request(request: &ResumeHandoffRequest) -> Result<(), GovernanceError> {
+    validate_identity("task_id", &request.task_id)?;
+    validate_identity("run_id", &request.run_id)?;
+    validate_identity("checkpoint_id", &request.checkpoint_id)?;
+    validate_identity("replacement_agent_id", &request.replacement_agent_id)?;
+    validate_identity("actor", &request.actor)?;
+    validate_identity("fencing_identity", &request.fencing_identity)?;
+    validate_identity("new_context_id", &request.new_context_id)?;
+    validate_identity("memory_query", &request.memory_query)?;
+    validate_capability_probe_result(&request.handoff_capability)?;
+    validate_evidence_refs(&request.evidence_refs)
+}
+
+fn validate_handoff_mutations(
+    pending_mutation_ids: &[String],
+    receipts: &[MutationReceipt],
+) -> Result<(), GovernanceError> {
+    let mut pending = std::collections::BTreeSet::new();
+    for mutation_id in pending_mutation_ids {
+        validate_identity("pending_mutation_id", mutation_id)?;
+        if !pending.insert(mutation_id.trim().to_owned()) {
+            return Err(GovernanceError::InvalidIdentity("pending_mutation_id"));
+        }
+    }
+    let mut mutation_ids = std::collections::BTreeSet::new();
+    let mut receipt_ids = std::collections::BTreeSet::new();
+    for receipt in receipts {
+        validate_identity("mutation_id", &receipt.mutation_id)?;
+        validate_identity("mutation_receipt_id", &receipt.receipt_id)?;
+        validate_identity("mutation_receipt_fence", &receipt.fencing_identity)?;
+        if !mutation_ids.insert(receipt.mutation_id.trim().to_owned())
+            || !receipt_ids.insert(receipt.receipt_id.trim().to_owned())
+        {
+            return Err(GovernanceError::InvalidIdentity("mutation_receipt_id"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capability_probe_result(
+    capability: &CapabilityProbeResult,
+) -> Result<(), GovernanceError> {
+    validate_identity("adapter_id", &capability.adapter_id)?;
+    validate_identity("adapter_version", &capability.adapter_version)?;
+    validate_identity("upstream_id", &capability.upstream_id)?;
+    validate_identity("upstream_version", &capability.upstream_version)?;
+    validate_identity("requested_capability", &capability.requested_capability)?;
+    for family in capability
+        .required_field_families
+        .iter()
+        .chain(&capability.observed_field_families)
+        .chain(&capability.missing_field_families)
+    {
+        validate_identity("capability_field_family", family)?;
+    }
+    for semantic in capability
+        .required_semantics
+        .iter()
+        .chain(&capability.observed_semantics)
+        .chain(&capability.missing_semantics)
+    {
+        validate_identity("capability_semantic", semantic)?;
+    }
+    validate_evidence_refs(&capability.evidence_refs)
+}
+
+fn validate_memory_port_probe(probe: &MemoryPortProbe) -> Result<(), GovernanceError> {
+    validate_capability_probe_result(&probe.capability)?;
     validate_evidence_refs(&probe.evidence_refs)
 }
 
@@ -3942,6 +4985,214 @@ fn same_memory_provider(left: &CapabilityProbeResult, right: &CapabilityProbeRes
         && left.integration_seam == right.integration_seam
 }
 
+fn handoff_capability_failure(
+    capability: &CapabilityProbeResult,
+) -> Option<(DecisionOutcome, &'static str)> {
+    if capability.requested_capability != "handoff.checkpoint" {
+        return Some((DecisionOutcome::Deny, "handoff_capability_mismatch"));
+    }
+    let status_failure = match capability.status {
+        CapabilityStatus::Supported => None,
+        CapabilityStatus::Degraded => Some((DecisionOutcome::Defer, "handoff_capability_degraded")),
+        CapabilityStatus::Unsupported => {
+            Some((DecisionOutcome::Defer, "handoff_capability_unsupported"))
+        }
+        CapabilityStatus::Incompatible => {
+            Some((DecisionOutcome::Defer, "handoff_capability_incompatible"))
+        }
+        CapabilityStatus::Unknown => Some((DecisionOutcome::Defer, "handoff_capability_unknown")),
+    };
+    if status_failure.is_some() {
+        return status_failure;
+    }
+    if capability.evidence_refs.is_empty() {
+        return Some((
+            DecisionOutcome::Defer,
+            "handoff_capability_evidence_required",
+        ));
+    }
+    if capability.schema_version != 1
+        || capability.evidence_schema_version != Some(1)
+        || capability.surface_present != Some(true)
+        || capability.version_compatible != Some(true)
+        || capability.required_field_families.is_empty()
+        || capability.required_semantics.is_empty()
+        || !capability.missing_field_families.is_empty()
+        || !capability.missing_semantics.is_empty()
+        || capability
+            .required_field_families
+            .iter()
+            .any(|required| !capability.observed_field_families.contains(required))
+        || capability
+            .required_semantics
+            .iter()
+            .any(|required| !capability.observed_semantics.contains(required))
+    {
+        return Some((DecisionOutcome::Defer, "handoff_capability_unknown"));
+    }
+    None
+}
+
+fn same_capability_source(left: &CapabilityProbeResult, right: &CapabilityProbeResult) -> bool {
+    left.adapter_id == right.adapter_id
+        && left.adapter_version == right.adapter_version
+        && left.upstream_id == right.upstream_id
+        && left.upstream_version == right.upstream_version
+        && left.integration_seam == right.integration_seam
+        && left.requested_capability == right.requested_capability
+        && normalized_capability_requirements(&left.required_field_families)
+            == normalized_capability_requirements(&right.required_field_families)
+        && normalized_capability_requirements(&left.required_semantics)
+            == normalized_capability_requirements(&right.required_semantics)
+}
+
+fn normalized_capability_requirements(values: &[String]) -> std::collections::BTreeSet<&str> {
+    values.iter().map(|value| value.trim()).collect()
+}
+
+fn handoff_mutation_failure(
+    receipts: &[MutationReceipt],
+    expected_authority_revision: u64,
+    expected_fencing_identity: &str,
+) -> Option<(DecisionOutcome, &'static str)> {
+    receipts
+        .iter()
+        .any(|receipt| {
+            receipt.authority_revision != expected_authority_revision
+                || receipt.fencing_identity != expected_fencing_identity
+        })
+        .then_some((DecisionOutcome::Defer, "stale_mutation_receipt"))
+}
+
+fn resume_handoff_state_failure<'a>(
+    state: &StateFile,
+    request: &ResumeHandoffRequest,
+) -> Option<(DecisionOutcome, &'a str)> {
+    let authority = state.tasks.get(&request.task_id);
+    let checkpoint = state.handoff_checkpoints.get(&request.checkpoint_id);
+    match (authority, checkpoint) {
+        (None, _) => Some((DecisionOutcome::Deny, "task_not_found")),
+        (Some(authority), _) if authority.active_run_id != request.run_id => {
+            Some((DecisionOutcome::Deny, "run_not_found"))
+        }
+        (Some(authority), _)
+            if authority.authority_revision != request.expected_authority_revision =>
+        {
+            Some((DecisionOutcome::Defer, "stale_authority"))
+        }
+        (Some(_), _) if request.evidence_refs.is_empty() => {
+            Some((DecisionOutcome::Defer, "evidence_required"))
+        }
+        (Some(authority), _) if authority.lifecycle_state != LifecycleState::Resuming => {
+            Some((DecisionOutcome::Deny, "resume_handoff_not_available"))
+        }
+        (Some(authority), _)
+            if authority.active_handoff_checkpoint_id.as_deref()
+                != Some(request.checkpoint_id.as_str()) =>
+        {
+            Some((DecisionOutcome::Defer, "stale_handoff_checkpoint"))
+        }
+        (_, None) => Some((DecisionOutcome::Defer, "stale_handoff_checkpoint")),
+        (_, Some(checkpoint))
+            if checkpoint.task_id != request.task_id || checkpoint.run_id != request.run_id =>
+        {
+            Some((DecisionOutcome::Deny, "handoff_scope_mismatch"))
+        }
+        (_, Some(checkpoint))
+            if checkpoint.state != HandoffCheckpointState::Resuming
+                || checkpoint.resuming_authority_revision
+                    != Some(request.expected_authority_revision) =>
+        {
+            Some((DecisionOutcome::Defer, "stale_handoff_checkpoint"))
+        }
+        (Some(authority), Some(checkpoint))
+            if authority.acceptance_contract_digest != checkpoint.acceptance_contract_digest =>
+        {
+            Some((DecisionOutcome::Deny, "acceptance_contract_mismatch"))
+        }
+        (Some(authority), Some(checkpoint))
+            if authority.owner_agent_id.as_deref()
+                != Some(request.replacement_agent_id.as_str())
+                || checkpoint.replacement_agent_id != request.replacement_agent_id =>
+        {
+            Some((DecisionOutcome::Deny, "replacement_mismatch"))
+        }
+        (Some(authority), Some(checkpoint))
+            if authority.fencing_identity.as_deref() != Some(request.fencing_identity.as_str())
+                || checkpoint.new_fencing_identity.as_deref()
+                    != Some(request.fencing_identity.as_str()) =>
+        {
+            Some((DecisionOutcome::Deny, "fencing_mismatch"))
+        }
+        (_, Some(_)) if handoff_capability_failure(&request.handoff_capability).is_some() => {
+            handoff_capability_failure(&request.handoff_capability)
+        }
+        (_, Some(checkpoint))
+            if !same_capability_source(
+                &checkpoint.handoff_capability,
+                &request.handoff_capability,
+            ) =>
+        {
+            Some((DecisionOutcome::Deny, "handoff_capability_binding_mismatch"))
+        }
+        (_, Some(checkpoint))
+            if handoff_capability_failure(&checkpoint.handoff_capability).is_some() =>
+        {
+            handoff_capability_failure(&checkpoint.handoff_capability)
+        }
+        (_, Some(checkpoint))
+            if handoff_context_checkpoint(
+                state,
+                &checkpoint.context_checkpoint_id,
+                (&request.task_id, &request.run_id),
+                &checkpoint.lineage_id,
+                checkpoint.source_authority_revision,
+                (
+                    &checkpoint.old_owner_agent_id,
+                    &checkpoint.old_fencing_identity,
+                ),
+                &checkpoint.acceptance_contract_digest,
+            )
+            .is_none() =>
+        {
+            Some((DecisionOutcome::Deny, "context_checkpoint_binding_mismatch"))
+        }
+        (_, Some(checkpoint))
+            if checkpoint.memory_durability_required
+                && (checkpoint.memory_checkpoint_id.as_deref()
+                    != Some(checkpoint.context_checkpoint_id.as_str())
+                    || verified_memory_checkpoint(
+                        state,
+                        checkpoint.memory_checkpoint_id.as_deref(),
+                        (&request.task_id, &request.run_id),
+                        checkpoint.source_authority_revision,
+                        (
+                            &checkpoint.old_owner_agent_id,
+                            &checkpoint.old_fencing_identity,
+                        ),
+                        &checkpoint.acceptance_contract_digest,
+                    )
+                    .is_none()) =>
+        {
+            Some((DecisionOutcome::Defer, "memory_checkpoint_required"))
+        }
+        (_, Some(checkpoint))
+            if state
+                .context_checkpoints
+                .get(&checkpoint.context_checkpoint_id)
+                .and_then(|context_checkpoint| context_checkpoint.hydrate_capability.as_ref())
+                .is_none_or(|capability| {
+                    capability.requested_capability != "memory.hydrate"
+                        || capability.status != CapabilityStatus::Supported
+                        || capability.evidence_refs.is_empty()
+                }) =>
+        {
+            Some((DecisionOutcome::Defer, "memory_provider_binding_required"))
+        }
+        _ => None,
+    }
+}
+
 fn memory_capability_reason(status: CapabilityStatus) -> &'static str {
     match status {
         CapabilityStatus::Supported => "memory_capability_supported",
@@ -3990,6 +5241,31 @@ fn memory_hydrate_failure<'a>(
         return Some((DecisionOutcome::Deny, "memory_hydrate_layer_forbidden"));
     }
     None
+}
+
+fn lease_generation(state: &StateFile, task_id: &str, run_id: &str) -> u64 {
+    state
+        .decisions
+        .iter()
+        .filter(|decision| {
+            decision.task_id == task_id
+                && decision.run_id == run_id
+                && matches!(
+                    decision.requested_transition,
+                    TransitionKind::Claim | TransitionKind::AcquireHandoff
+                )
+                && decision.performed_at.is_some()
+        })
+        .count() as u64
+}
+
+fn handoff_waiting_on(lifecycle_state: LifecycleState) -> Option<&'static str> {
+    match lifecycle_state {
+        LifecycleState::Suspending => Some("handoff:suspending"),
+        LifecycleState::Suspended => Some("handoff:suspended"),
+        LifecycleState::Resuming => Some("handoff:resuming"),
+        _ => None,
+    }
 }
 
 fn runtime_projection_value<T: Clone>(
@@ -4279,6 +5555,35 @@ fn completion_gate_failure(
     None
 }
 
+fn handoff_context_checkpoint<'a>(
+    state: &'a StateFile,
+    checkpoint_id: &str,
+    scope: (&str, &str),
+    lineage_id: &str,
+    authority_revision: u64,
+    ownership: (&str, &str),
+    acceptance_contract_digest: &str,
+) -> Option<&'a ContextCheckpoint> {
+    let (task_id, run_id) = scope;
+    let (owner_agent_id, fencing_identity) = ownership;
+    state
+        .context_checkpoints
+        .get(checkpoint_id)
+        .filter(|checkpoint| {
+            checkpoint.task_id == task_id
+                && checkpoint.run_id == run_id
+                && checkpoint.lineage_id == lineage_id
+                && checkpoint.authority_summary.task_id == task_id
+                && checkpoint.authority_summary.run_id == run_id
+                && checkpoint.authority_summary.lifecycle_state == LifecycleState::Running
+                && checkpoint.authority_summary.authority_revision == authority_revision
+                && checkpoint.authority_summary.owner_agent_id == owner_agent_id
+                && checkpoint.authority_summary.fencing_identity == fencing_identity
+                && checkpoint.authority_summary.acceptance_contract_digest
+                    == acceptance_contract_digest
+        })
+}
+
 fn verified_memory_checkpoint<'a>(
     state: &'a StateFile,
     checkpoint_id: Option<&str>,
@@ -4305,6 +5610,27 @@ fn verified_memory_checkpoint<'a>(
                 && checkpoint.authority_summary.acceptance_contract_digest
                     == acceptance_contract_digest
                 && checkpoint.capability_status == CapabilityStatus::Supported
+                && checkpoint
+                    .retain_capability
+                    .as_ref()
+                    .is_some_and(|capability| {
+                        capability.requested_capability == "memory.retain_durable"
+                            && capability.status == CapabilityStatus::Supported
+                            && !capability.evidence_refs.is_empty()
+                    })
+                && checkpoint
+                    .hydrate_capability
+                    .as_ref()
+                    .is_some_and(|capability| {
+                        capability.requested_capability == "memory.hydrate"
+                            && capability.status == CapabilityStatus::Supported
+                            && !capability.evidence_refs.is_empty()
+                    })
+                && checkpoint
+                    .retain_capability
+                    .as_ref()
+                    .zip(checkpoint.hydrate_capability.as_ref())
+                    .is_some_and(|(retain, hydrate)| same_memory_provider(retain, hydrate))
                 && checkpoint.phase == ContextLifecyclePhase::PostCompactVerify
                 && checkpoint.verified_at.is_some()
                 && !checkpoint.memory_evidence_refs.is_empty()
@@ -4460,6 +5786,10 @@ fn new_approval_id() -> String {
 
 fn new_context_checkpoint_id() -> String {
     format!("context-{:032x}", rand::random::<u128>())
+}
+
+fn new_handoff_checkpoint_id() -> String {
+    format!("handoff-{:032x}", rand::random::<u128>())
 }
 
 fn next_decision_id(state: &mut StateFile) -> String {
@@ -9231,6 +10561,1196 @@ mod tests {
                 .unwrap()
                 .authority_revision,
             3
+        );
+    }
+
+    fn handoff_capability() -> CapabilityProbeResult {
+        let mut request = capability_probe_request();
+        request.adapter_id = "hermes-adapter".to_owned();
+        request.upstream_id = "hermes".to_owned();
+        request.upstream_version = "0.20.5".to_owned();
+        request.requested_capability = "handoff.checkpoint".to_owned();
+        request.integration_seam = CapabilityIntegrationSeam::Hook;
+        request.required_field_families = vec!["checkpoint_identity".to_owned()];
+        request.required_semantics =
+            vec!["durable_handoff".to_owned(), "fenced_release".to_owned()];
+        evaluate_verified_capability_probe(with_capability_evidence(
+            request,
+            Some(true),
+            Some(true),
+            &["checkpoint_identity"],
+            &["durable_handoff", "fenced_release"],
+            &["evidence:hermes-handoff-capability"],
+        ))
+        .unwrap()
+    }
+
+    fn weakened_handoff_capability() -> CapabilityProbeResult {
+        let mut capability = handoff_capability();
+        capability
+            .required_semantics
+            .retain(|semantic| semantic != "fenced_release");
+        capability
+    }
+
+    fn prepared_handoff(
+        store: &GovernanceStore,
+        suffix: &str,
+    ) -> (
+        CompletionContract,
+        String,
+        String,
+        String,
+        ContextCheckpoint,
+        TestMemoryPort,
+    ) {
+        let contract = CompletionContract {
+            required_mutation_ids: Vec::new(),
+            required_artifacts: Vec::new(),
+            approval_required: false,
+            memory_durability_required: true,
+        };
+        let (task_id, run_id, fence) = running_task(store, suffix, contract.digest());
+        let lineage_id = format!("lineage-{suffix}");
+        let retain_request_id = format!("retain-{suffix}");
+        let port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            &lineage_id,
+            &fence,
+            &retain_request_id,
+            "sha256:precompact-memory",
+        );
+        let checkpoint = store
+            .rotate_context(
+                context_rotation_request(
+                    suffix,
+                    &task_id,
+                    &run_id,
+                    &fence,
+                    &lineage_id,
+                    &retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        (contract, task_id, run_id, fence, checkpoint, port)
+    }
+
+    fn prepared_begin_handoff_request(
+        suffix: &str,
+        contract: CompletionContract,
+        task_id: &str,
+        run_id: &str,
+        fence: &str,
+        context_checkpoint_id: &str,
+    ) -> BeginHandoffRequest {
+        BeginHandoffRequest {
+            task_id: task_id.to_owned(),
+            run_id: run_id.to_owned(),
+            expected_authority_revision: 3,
+            lineage_id: format!("lineage-{suffix}"),
+            root_agent_id: "agent-root".to_owned(),
+            parent_agent_id: "agent-parent".to_owned(),
+            old_owner_agent_id: format!("agent-{suffix}"),
+            replacement_agent_id: format!("replacement-{suffix}"),
+            actor: format!("agent-{suffix}"),
+            fencing_identity: fence.to_owned(),
+            contract,
+            handoff_capability: handoff_capability(),
+            blocker_evidence_baseline: Vec::new(),
+            pending_consequential_mutation_ids: Vec::new(),
+            mutation_receipts: Vec::new(),
+            context_checkpoint_id: context_checkpoint_id.to_owned(),
+            evidence_refs: vec!["evidence:handoff-requested".to_owned()],
+        }
+    }
+
+    #[test]
+    fn handoff_lifecycle_is_durable_fenced_and_never_completes_the_task() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        let contract = CompletionContract {
+            required_mutation_ids: vec!["mutation-before-handoff".to_owned()],
+            required_artifacts: Vec::new(),
+            approval_required: false,
+            memory_durability_required: true,
+        };
+        let contract_digest = contract.digest();
+        let (task_id, run_id, old_fence) = running_task(&store, "handoff", contract_digest.clone());
+        let lineage_id = "lineage-handoff";
+        let retain_request_id = "retain-handoff";
+        let port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            lineage_id,
+            &old_fence,
+            retain_request_id,
+            "sha256:precompact-memory",
+        );
+        let context = store
+            .rotate_context(
+                context_rotation_request(
+                    "handoff",
+                    &task_id,
+                    &run_id,
+                    &old_fence,
+                    lineage_id,
+                    retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap()
+            .checkpoint
+            .unwrap();
+
+        let beginning = store
+            .begin_handoff(BeginHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 3,
+                lineage_id: lineage_id.to_owned(),
+                root_agent_id: "agent-root".to_owned(),
+                parent_agent_id: "agent-parent".to_owned(),
+                old_owner_agent_id: "agent-handoff".to_owned(),
+                replacement_agent_id: "agent-replacement".to_owned(),
+                actor: "agent-handoff".to_owned(),
+                fencing_identity: old_fence.clone(),
+                contract,
+                handoff_capability: handoff_capability(),
+                blocker_evidence_baseline: Vec::new(),
+                pending_consequential_mutation_ids: vec!["mutation-pending".to_owned()],
+                mutation_receipts: vec![MutationReceipt {
+                    mutation_id: "mutation-before-handoff".to_owned(),
+                    receipt_id: "receipt-before-handoff".to_owned(),
+                    authority_revision: 3,
+                    fencing_identity: old_fence.clone(),
+                    durability: MutationDurability::Durable,
+                }],
+                context_checkpoint_id: context.checkpoint_id.clone(),
+                evidence_refs: vec!["evidence:handoff-requested".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(beginning.decision.outcome, DecisionOutcome::Allow);
+        let checkpoint = beginning.checkpoint.unwrap();
+        assert_eq!(checkpoint.state, HandoffCheckpointState::Suspending);
+        assert_eq!(checkpoint.old_ownership_generation, 1);
+        assert_eq!(checkpoint.source_authority_revision, 3);
+        assert_eq!(checkpoint.suspending_authority_revision, 4);
+        let suspending = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(suspending.lifecycle_state, LifecycleState::Suspending);
+        assert_eq!(suspending.owner_agent_id.as_deref(), Some("agent-handoff"));
+        assert_eq!(
+            suspending.fencing_identity.as_deref(),
+            Some(old_fence.as_str())
+        );
+        assert_eq!(suspending.acceptance_contract_digest, contract_digest);
+        let projection = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                agent_id: "agent-handoff".to_owned(),
+                consumer_schema_version: 1,
+                redacted_fields: Vec::new(),
+                omitted_fields: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Suspending)
+        );
+        assert_eq!(projection.lease_generation, ProjectionValue::Value(1));
+        assert_eq!(
+            projection.waiting_on,
+            ProjectionValue::Value(Some("handoff:suspending".to_owned()))
+        );
+
+        let suspended = store
+            .suspend_handoff(SuspendHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                old_owner_agent_id: "agent-handoff".to_owned(),
+                actor: "agent-handoff".to_owned(),
+                fencing_identity: old_fence.clone(),
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:state-and-ledger-flushed".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(suspended.decision.outcome, DecisionOutcome::Allow);
+        let checkpoint = suspended.checkpoint.unwrap();
+        assert_eq!(checkpoint.state, HandoffCheckpointState::Suspended);
+        assert_eq!(checkpoint.suspended_authority_revision, Some(5));
+        assert!(checkpoint.released_at.is_some());
+        let authority = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(authority.lifecycle_state, LifecycleState::Suspended);
+        assert!(authority.owner_agent_id.is_none());
+        assert!(authority.fencing_identity.is_none());
+        let projection = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                agent_id: "agent-handoff".to_owned(),
+                consumer_schema_version: 1,
+                redacted_fields: Vec::new(),
+                omitted_fields: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Suspended)
+        );
+        assert_eq!(projection.lease_generation, ProjectionValue::Value(1));
+        assert_eq!(
+            projection.waiting_on,
+            ProjectionValue::Value(Some("handoff:suspended".to_owned()))
+        );
+        drop(store);
+
+        let store = GovernanceStore::open(&path).unwrap();
+        let durable_checkpoint = store
+            .handoff_checkpoint(&checkpoint.checkpoint_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_checkpoint, checkpoint);
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Suspended
+        );
+
+        let acquired = store
+            .acquire_handoff(AcquireHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 5,
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                replacement_agent_id: "agent-replacement".to_owned(),
+                actor: "scheduler".to_owned(),
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:replacement-ready".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(acquired.decision.outcome, DecisionOutcome::Allow);
+        let new_fence = acquired.fencing_identity.unwrap();
+        assert_ne!(new_fence, old_fence);
+        let checkpoint = acquired.checkpoint.unwrap();
+        assert_eq!(checkpoint.state, HandoffCheckpointState::Resuming);
+        assert_eq!(checkpoint.resuming_authority_revision, Some(6));
+        assert_eq!(checkpoint.new_ownership_generation, Some(2));
+        assert_eq!(
+            checkpoint.new_fencing_identity.as_deref(),
+            Some(new_fence.as_str())
+        );
+        assert_eq!(checkpoint.lineage_id, lineage_id);
+        assert_eq!(checkpoint.root_agent_id, "agent-root");
+        assert_eq!(checkpoint.parent_agent_id, "agent-parent");
+        assert_eq!(
+            checkpoint.pending_consequential_mutation_ids,
+            vec!["mutation-pending".to_owned()]
+        );
+        assert_eq!(checkpoint.mutation_receipts.len(), 1);
+        assert_eq!(
+            checkpoint.memory_checkpoint_id.as_deref(),
+            Some(context.checkpoint_id.as_str())
+        );
+
+        let projection = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                agent_id: "agent-replacement".to_owned(),
+                consumer_schema_version: 1,
+                redacted_fields: Vec::new(),
+                omitted_fields: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Resuming)
+        );
+        assert_eq!(projection.lease_generation, ProjectionValue::Value(2));
+        assert_eq!(
+            projection.waiting_on,
+            ProjectionValue::Value(Some("handoff:resuming".to_owned()))
+        );
+
+        let resumed = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    task_id: task_id.clone(),
+                    run_id: run_id.clone(),
+                    expected_authority_revision: 6,
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    replacement_agent_id: "agent-replacement".to_owned(),
+                    actor: "agent-replacement".to_owned(),
+                    fencing_identity: new_fence.clone(),
+                    new_context_id: "context-resumed-handoff".to_owned(),
+                    memory_query: "resume the exact handoff".to_owned(),
+                    handoff_capability: handoff_capability(),
+                    evidence_refs: vec!["evidence:typed-hydrate-requested".to_owned()],
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(resumed.decision.outcome, DecisionOutcome::Allow);
+        assert!(resumed.hydration.is_some());
+        assert_eq!(
+            resumed.checkpoint.unwrap().state,
+            HandoffCheckpointState::Resumed
+        );
+        let authority = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(authority.lifecycle_state, LifecycleState::Running);
+        assert_eq!(authority.authority_revision, 7);
+        assert_eq!(
+            authority.owner_agent_id.as_deref(),
+            Some("agent-replacement")
+        );
+        assert_eq!(
+            authority.fencing_identity.as_deref(),
+            Some(new_fence.as_str())
+        );
+        assert_eq!(authority.acceptance_contract_digest, contract_digest);
+        assert!(authority.active_handoff_checkpoint_id.is_none());
+        assert!(authority.active_completion_id.is_none());
+        drop(store);
+
+        let reopened = GovernanceStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .handoff_checkpoint(&checkpoint.checkpoint_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffCheckpointState::Resumed
+        );
+        assert_eq!(
+            reopened
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            LifecycleState::Running
+        );
+    }
+
+    #[test]
+    fn handoff_capability_loss_is_typed_and_never_weakens_the_requirement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (contract, task_id, run_id, fence, context, _) =
+            prepared_handoff(&store, "handoff-capability");
+
+        for (status, reason) in [
+            (CapabilityStatus::Degraded, "handoff_capability_degraded"),
+            (
+                CapabilityStatus::Unsupported,
+                "handoff_capability_unsupported",
+            ),
+            (
+                CapabilityStatus::Incompatible,
+                "handoff_capability_incompatible",
+            ),
+            (CapabilityStatus::Unknown, "handoff_capability_unknown"),
+        ] {
+            let mut request = prepared_begin_handoff_request(
+                "handoff-capability",
+                contract.clone(),
+                &task_id,
+                &run_id,
+                &fence,
+                &context.checkpoint_id,
+            );
+            request.handoff_capability.status = status;
+            let result = store.begin_handoff(request).unwrap();
+
+            assert_eq!(result.decision.outcome, DecisionOutcome::Defer);
+            assert_eq!(result.decision.reason, reason);
+            assert!(result.decision.performed_at.is_none());
+            assert!(result.checkpoint.is_none());
+            let authority = store.authority(&task_id).unwrap().unwrap();
+            assert_eq!(authority.lifecycle_state, LifecycleState::Running);
+            assert_eq!(authority.authority_revision, 3);
+            assert!(authority.active_handoff_checkpoint_id.is_none());
+        }
+    }
+
+    #[test]
+    fn capability_loss_at_each_handoff_stage_fails_closed_and_is_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (contract, task_id, run_id, old_fence, context, mut port) =
+            prepared_handoff(&store, "handoff-stage-capability");
+        let checkpoint = store
+            .begin_handoff(prepared_begin_handoff_request(
+                "handoff-stage-capability",
+                contract,
+                &task_id,
+                &run_id,
+                &old_fence,
+                &context.checkpoint_id,
+            ))
+            .unwrap()
+            .checkpoint
+            .unwrap();
+
+        let mut suspend_capability = handoff_capability();
+        suspend_capability.status = CapabilityStatus::Incompatible;
+        let suspend_request = SuspendHandoffRequest {
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            expected_authority_revision: 4,
+            checkpoint_id: checkpoint.checkpoint_id,
+            old_owner_agent_id: "agent-handoff-stage-capability".to_owned(),
+            actor: "agent-handoff-stage-capability".to_owned(),
+            fencing_identity: old_fence.clone(),
+            handoff_capability: suspend_capability,
+            evidence_refs: vec!["evidence:suspend-probe".to_owned()],
+        };
+        let weakened_suspend = store
+            .suspend_handoff(SuspendHandoffRequest {
+                handoff_capability: weakened_handoff_capability(),
+                ..suspend_request.clone()
+            })
+            .unwrap();
+        assert_eq!(weakened_suspend.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            weakened_suspend.decision.reason,
+            "handoff_capability_binding_mismatch"
+        );
+        let failed_suspend = store.suspend_handoff(suspend_request.clone()).unwrap();
+        assert_eq!(failed_suspend.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(
+            failed_suspend.decision.reason,
+            "handoff_capability_incompatible"
+        );
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Suspending
+        );
+        let checkpoint = store
+            .suspend_handoff(SuspendHandoffRequest {
+                handoff_capability: handoff_capability(),
+                ..suspend_request
+            })
+            .unwrap()
+            .checkpoint
+            .unwrap();
+
+        let mut acquire_capability = handoff_capability();
+        acquire_capability.status = CapabilityStatus::Unknown;
+        let acquire_request = AcquireHandoffRequest {
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            expected_authority_revision: 5,
+            checkpoint_id: checkpoint.checkpoint_id,
+            replacement_agent_id: "replacement-handoff-stage-capability".to_owned(),
+            actor: "scheduler".to_owned(),
+            handoff_capability: acquire_capability,
+            evidence_refs: vec!["evidence:acquire-probe".to_owned()],
+        };
+        let weakened_acquire = store
+            .acquire_handoff(AcquireHandoffRequest {
+                handoff_capability: weakened_handoff_capability(),
+                ..acquire_request.clone()
+            })
+            .unwrap();
+        assert_eq!(weakened_acquire.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            weakened_acquire.decision.reason,
+            "handoff_capability_binding_mismatch"
+        );
+        let failed_acquire = store.acquire_handoff(acquire_request.clone()).unwrap();
+        assert_eq!(failed_acquire.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(failed_acquire.decision.reason, "handoff_capability_unknown");
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Suspended
+        );
+        let acquired = store
+            .acquire_handoff(AcquireHandoffRequest {
+                handoff_capability: handoff_capability(),
+                ..acquire_request
+            })
+            .unwrap();
+        let checkpoint = acquired.checkpoint.unwrap();
+        let new_fence = acquired.fencing_identity.unwrap();
+
+        let hydrate_observed = std::sync::Arc::new(Mutex::new(None));
+        port.hydrate_observed_at = Some(hydrate_observed.clone());
+        let mut resume_capability = handoff_capability();
+        resume_capability.status = CapabilityStatus::Degraded;
+        let resume_request = ResumeHandoffRequest {
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            expected_authority_revision: 6,
+            checkpoint_id: checkpoint.checkpoint_id,
+            replacement_agent_id: "replacement-handoff-stage-capability".to_owned(),
+            actor: "replacement-handoff-stage-capability".to_owned(),
+            fencing_identity: new_fence,
+            new_context_id: "context-stage-capability".to_owned(),
+            memory_query: "resume".to_owned(),
+            handoff_capability: resume_capability,
+            evidence_refs: vec!["evidence:resume-probe".to_owned()],
+        };
+        let weakened_resume = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    handoff_capability: weakened_handoff_capability(),
+                    ..resume_request.clone()
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(weakened_resume.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            weakened_resume.decision.reason,
+            "handoff_capability_binding_mismatch"
+        );
+        assert!(weakened_resume.hydration.is_none());
+        let failed_resume = store.resume_handoff(resume_request.clone(), &port).unwrap();
+        assert_eq!(failed_resume.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(failed_resume.decision.reason, "handoff_capability_degraded");
+        assert!(failed_resume.hydration.is_none());
+        assert!(hydrate_observed.lock().unwrap().is_none());
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Resuming
+        );
+
+        let resumed = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    handoff_capability: handoff_capability(),
+                    ..resume_request
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(resumed.decision.outcome, DecisionOutcome::Allow);
+        assert!(resumed.hydration.is_some());
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Running
+        );
+    }
+
+    #[test]
+    fn handoff_requires_a_verified_memory_checkpoint_before_suspending() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        let (contract, task_id, run_id, fence, context, _) =
+            prepared_handoff(&store, "handoff-no-memory");
+        {
+            let mut state = store.state.lock().unwrap();
+            let context = state
+                .context_checkpoints
+                .get_mut(&context.checkpoint_id)
+                .unwrap();
+            context.capability_status = CapabilityStatus::Unknown;
+            context.memory_evidence_refs.clear();
+            context.verified_at = None;
+            save(&path, &state).unwrap();
+        }
+        let result = store
+            .begin_handoff(prepared_begin_handoff_request(
+                "handoff-no-memory",
+                contract,
+                &task_id,
+                &run_id,
+                &fence,
+                &context.checkpoint_id,
+            ))
+            .unwrap();
+
+        assert_eq!(result.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(result.decision.reason, "memory_checkpoint_required");
+        assert!(result.checkpoint.is_none());
+        let authority = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(authority.lifecycle_state, LifecycleState::Running);
+        assert_eq!(authority.authority_revision, 3);
+        assert_eq!(
+            authority.owner_agent_id.as_deref(),
+            Some("agent-handoff-no-memory")
+        );
+        assert_eq!(authority.fencing_identity.as_deref(), Some(fence.as_str()));
+    }
+
+    #[test]
+    fn handoff_rejects_a_context_checkpoint_from_another_lineage() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (contract, task_id, run_id, fence, context, _) =
+            prepared_handoff(&store, "handoff-lineage");
+        let mut request = prepared_begin_handoff_request(
+            "handoff-lineage",
+            contract,
+            &task_id,
+            &run_id,
+            &fence,
+            &context.checkpoint_id,
+        );
+        request.lineage_id = "lineage-other".to_owned();
+
+        let result = store.begin_handoff(request).unwrap();
+        assert_eq!(result.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            result.decision.reason,
+            "context_checkpoint_binding_mismatch"
+        );
+        assert!(result.checkpoint.is_none());
+        let authority = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(authority.lifecycle_state, LifecycleState::Running);
+        assert_eq!(authority.authority_revision, 3);
+    }
+
+    #[test]
+    fn policy_without_memory_durability_can_handoff_from_a_bound_context_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        let contract = CompletionContract {
+            required_mutation_ids: Vec::new(),
+            required_artifacts: Vec::new(),
+            approval_required: false,
+            memory_durability_required: false,
+        };
+        let suffix = "handoff-memory-optional";
+        let (task_id, run_id, old_fence) = running_task(&store, suffix, contract.digest());
+        let lineage_id = format!("lineage-{suffix}");
+        let retain_request_id = format!("retain-{suffix}");
+        let port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            &lineage_id,
+            &old_fence,
+            &retain_request_id,
+            "sha256:precompact-memory",
+        );
+        let context = store
+            .rotate_context(
+                context_rotation_request(
+                    suffix,
+                    &task_id,
+                    &run_id,
+                    &old_fence,
+                    &lineage_id,
+                    &retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        {
+            let mut state = store.state.lock().unwrap();
+            let context = state
+                .context_checkpoints
+                .get_mut(&context.checkpoint_id)
+                .unwrap();
+            context.capability_status = CapabilityStatus::Unknown;
+            context.phase = ContextLifecyclePhase::ContextCheckpoint;
+            context.memory_evidence_refs.clear();
+            context.verified_at = None;
+            save(&path, &state).unwrap();
+        }
+
+        let checkpoint = store
+            .begin_handoff(prepared_begin_handoff_request(
+                suffix,
+                contract,
+                &task_id,
+                &run_id,
+                &old_fence,
+                &context.checkpoint_id,
+            ))
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        assert!(!checkpoint.memory_durability_required);
+        assert!(checkpoint.memory_checkpoint_id.is_none());
+        let checkpoint = store
+            .suspend_handoff(SuspendHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                checkpoint_id: checkpoint.checkpoint_id,
+                old_owner_agent_id: format!("agent-{suffix}"),
+                actor: format!("agent-{suffix}"),
+                fencing_identity: old_fence,
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:flushed".to_owned()],
+            })
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let acquired = store
+            .acquire_handoff(AcquireHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 5,
+                checkpoint_id: checkpoint.checkpoint_id,
+                replacement_agent_id: format!("replacement-{suffix}"),
+                actor: "scheduler".to_owned(),
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:replacement-ready".to_owned()],
+            })
+            .unwrap();
+        let checkpoint = acquired.checkpoint.unwrap();
+        let new_fence = acquired.fencing_identity.unwrap();
+        let resumed = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    task_id: task_id.clone(),
+                    run_id,
+                    expected_authority_revision: 6,
+                    checkpoint_id: checkpoint.checkpoint_id,
+                    replacement_agent_id: format!("replacement-{suffix}"),
+                    actor: format!("replacement-{suffix}"),
+                    fencing_identity: new_fence,
+                    new_context_id: "context-memory-optional-resumed".to_owned(),
+                    memory_query: "resume".to_owned(),
+                    handoff_capability: handoff_capability(),
+                    evidence_refs: vec!["evidence:typed-hydrate".to_owned()],
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(resumed.decision.outcome, DecisionOutcome::Allow);
+        assert!(resumed.hydration.is_some());
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Running
+        );
+    }
+
+    #[test]
+    fn simultaneous_handoff_acquisition_has_one_generation_and_one_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (contract, task_id, run_id, old_fence, context, _) =
+            prepared_handoff(&store, "handoff-race");
+        let checkpoint = store
+            .begin_handoff(prepared_begin_handoff_request(
+                "handoff-race",
+                contract,
+                &task_id,
+                &run_id,
+                &old_fence,
+                &context.checkpoint_id,
+            ))
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let checkpoint = store
+            .suspend_handoff(SuspendHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                checkpoint_id: checkpoint.checkpoint_id,
+                old_owner_agent_id: "agent-handoff-race".to_owned(),
+                actor: "agent-handoff-race".to_owned(),
+                fencing_identity: old_fence,
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:flushed".to_owned()],
+            })
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let store = std::sync::Arc::new(store);
+        let request = AcquireHandoffRequest {
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            expected_authority_revision: 5,
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            replacement_agent_id: "replacement-handoff-race".to_owned(),
+            actor: "scheduler".to_owned(),
+            handoff_capability: handoff_capability(),
+            evidence_refs: vec!["evidence:replacement-ready".to_owned()],
+        };
+        let first_store = store.clone();
+        let first_request = request.clone();
+        let first = std::thread::spawn(move || first_store.acquire_handoff(first_request).unwrap());
+        let second_store = store.clone();
+        let second = std::thread::spawn(move || second_store.acquire_handoff(request).unwrap());
+        let results = [first.join().unwrap(), second.join().unwrap()];
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.decision.outcome == DecisionOutcome::Allow)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.decision.outcome == DecisionOutcome::Defer)
+                .count(),
+            1
+        );
+        let winner = results
+            .iter()
+            .find(|result| result.decision.outcome == DecisionOutcome::Allow)
+            .unwrap();
+        let winner_fence = winner.fencing_identity.as_deref().unwrap();
+        let authority = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(authority.lifecycle_state, LifecycleState::Resuming);
+        assert_eq!(authority.authority_revision, 6);
+        assert_eq!(
+            authority.owner_agent_id.as_deref(),
+            Some("replacement-handoff-race")
+        );
+        assert_eq!(authority.fencing_identity.as_deref(), Some(winner_fence));
+        assert_eq!(
+            winner.checkpoint.as_ref().unwrap().new_ownership_generation,
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .decisions(&task_id)
+                .unwrap()
+                .iter()
+                .filter(|decision| {
+                    decision.requested_transition == TransitionKind::AcquireHandoff
+                        && decision.performed_at.is_some()
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn resuming_rejects_old_lease_and_work_until_typed_hydrate_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (contract, task_id, run_id, old_fence, context, mut port) =
+            prepared_handoff(&store, "handoff-guard");
+        let checkpoint = store
+            .begin_handoff(prepared_begin_handoff_request(
+                "handoff-guard",
+                contract,
+                &task_id,
+                &run_id,
+                &old_fence,
+                &context.checkpoint_id,
+            ))
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let checkpoint = store
+            .suspend_handoff(SuspendHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                checkpoint_id: checkpoint.checkpoint_id,
+                old_owner_agent_id: "agent-handoff-guard".to_owned(),
+                actor: "agent-handoff-guard".to_owned(),
+                fencing_identity: old_fence.clone(),
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:flushed".to_owned()],
+            })
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let acquired = store
+            .acquire_handoff(AcquireHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 5,
+                checkpoint_id: checkpoint.checkpoint_id,
+                replacement_agent_id: "replacement-handoff-guard".to_owned(),
+                actor: "scheduler".to_owned(),
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:replacement-ready".to_owned()],
+            })
+            .unwrap();
+        let checkpoint = acquired.checkpoint.unwrap();
+        let new_fence = acquired.fencing_identity.unwrap();
+        let hydrate_observed = std::sync::Arc::new(Mutex::new(None));
+        port.hydrate_observed_at = Some(hydrate_observed.clone());
+
+        let stale_owner = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    task_id: task_id.clone(),
+                    run_id: run_id.clone(),
+                    expected_authority_revision: 6,
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    replacement_agent_id: "replacement-handoff-guard".to_owned(),
+                    actor: "agent-handoff-guard".to_owned(),
+                    fencing_identity: old_fence,
+                    new_context_id: "context-resumed-guard".to_owned(),
+                    memory_query: "resume".to_owned(),
+                    handoff_capability: handoff_capability(),
+                    evidence_refs: vec!["evidence:old-owner-attempt".to_owned()],
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(stale_owner.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(stale_owner.decision.reason, "fencing_mismatch");
+        assert!(stale_owner.hydration.is_none());
+        assert!(hydrate_observed.lock().unwrap().is_none());
+
+        port.hydrate_probe.capability.adapter_id = "other-memory-adapter".to_owned();
+        let provider_mismatch = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    task_id: task_id.clone(),
+                    run_id: run_id.clone(),
+                    expected_authority_revision: 6,
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    replacement_agent_id: "replacement-handoff-guard".to_owned(),
+                    actor: "replacement-handoff-guard".to_owned(),
+                    fencing_identity: new_fence.clone(),
+                    new_context_id: "context-resumed-guard".to_owned(),
+                    memory_query: "resume".to_owned(),
+                    handoff_capability: handoff_capability(),
+                    evidence_refs: vec!["evidence:provider-mismatch".to_owned()],
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(provider_mismatch.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            provider_mismatch.decision.reason,
+            "memory_provider_binding_mismatch"
+        );
+        assert!(provider_mismatch.hydration.is_none());
+        assert!(hydrate_observed.lock().unwrap().is_none());
+        port.hydrate_probe.capability.adapter_id = "hindsight-adapter".to_owned();
+
+        let blocked = store
+            .block_task(BlockTaskRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 6,
+                agent_id: "replacement-handoff-guard".to_owned(),
+                actor: "replacement-handoff-guard".to_owned(),
+                fencing_identity: new_fence.clone(),
+                blocker_kind: "dependency".to_owned(),
+                cause: StructuredCause {
+                    cause_id: "work-before-running".to_owned(),
+                    schema_version: 1,
+                    fields: BTreeMap::from([("service".to_owned(), "db".to_owned())]),
+                },
+                required_resume_evidence: vec![EvidenceRequirement {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "db".to_owned(),
+                }],
+                evidence_baseline: vec![EvidenceObservation {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "db".to_owned(),
+                    identity: "down".to_owned(),
+                }],
+                evidence_refs: vec!["evidence:work-attempt".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(blocked.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(blocked.decision.reason, "block_not_available");
+        assert_eq!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            6
+        );
+
+        port.hydrate_layer = ContextLayer::KanbanDurableHistory;
+        let invalid_hydrate = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    task_id: task_id.clone(),
+                    run_id: run_id.clone(),
+                    expected_authority_revision: 6,
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    replacement_agent_id: "replacement-handoff-guard".to_owned(),
+                    actor: "replacement-handoff-guard".to_owned(),
+                    fencing_identity: new_fence.clone(),
+                    new_context_id: "context-resumed-guard".to_owned(),
+                    memory_query: "resume".to_owned(),
+                    handoff_capability: handoff_capability(),
+                    evidence_refs: vec!["evidence:typed-hydrate".to_owned()],
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(invalid_hydrate.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            invalid_hydrate.decision.reason,
+            "memory_hydrate_layer_forbidden"
+        );
+        assert!(invalid_hydrate.hydration.is_none());
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Resuming
+        );
+        assert_eq!(
+            store
+                .handoff_checkpoint(&checkpoint.checkpoint_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffCheckpointState::Resuming
+        );
+
+        port.hydrate_layer = ContextLayer::LongTermMemory;
+        let resumed = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    task_id: task_id.clone(),
+                    run_id,
+                    expected_authority_revision: 6,
+                    checkpoint_id: checkpoint.checkpoint_id,
+                    replacement_agent_id: "replacement-handoff-guard".to_owned(),
+                    actor: "replacement-handoff-guard".to_owned(),
+                    fencing_identity: new_fence,
+                    new_context_id: "context-resumed-guard".to_owned(),
+                    memory_query: "resume".to_owned(),
+                    handoff_capability: handoff_capability(),
+                    evidence_refs: vec!["evidence:typed-hydrate-retry".to_owned()],
+                },
+                &port,
+            )
+            .unwrap();
+        assert_eq!(resumed.decision.outcome, DecisionOutcome::Allow);
+        assert!(resumed.hydration.is_some());
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Running
+        );
+    }
+
+    #[test]
+    fn authority_drift_during_hydrate_returns_no_stale_handoff_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let (contract, task_id, run_id, old_fence, context, port) =
+            prepared_handoff(&store, "handoff-hydrate-race");
+        let checkpoint = store
+            .begin_handoff(prepared_begin_handoff_request(
+                "handoff-hydrate-race",
+                contract,
+                &task_id,
+                &run_id,
+                &old_fence,
+                &context.checkpoint_id,
+            ))
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let checkpoint = store
+            .suspend_handoff(SuspendHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                checkpoint_id: checkpoint.checkpoint_id,
+                old_owner_agent_id: "agent-handoff-hydrate-race".to_owned(),
+                actor: "agent-handoff-hydrate-race".to_owned(),
+                fencing_identity: old_fence,
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:flushed".to_owned()],
+            })
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let acquired = store
+            .acquire_handoff(AcquireHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 5,
+                checkpoint_id: checkpoint.checkpoint_id,
+                replacement_agent_id: "replacement-handoff-hydrate-race".to_owned(),
+                actor: "scheduler".to_owned(),
+                handoff_capability: handoff_capability(),
+                evidence_refs: vec!["evidence:replacement-ready".to_owned()],
+            })
+            .unwrap();
+        let checkpoint = acquired.checkpoint.unwrap();
+        let new_fence = acquired.fencing_identity.unwrap();
+        let hydrate_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let hydrate_release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let blocking_port = BlockingMemoryPort {
+            inner: port,
+            hydrate_entered: hydrate_entered.clone(),
+            hydrate_release: hydrate_release.clone(),
+        };
+        let store = std::sync::Arc::new(store);
+        let resume_store = store.clone();
+        let resume_task_id = task_id.clone();
+        let resume_run_id = run_id.clone();
+        let resume_checkpoint_id = checkpoint.checkpoint_id.clone();
+        let resume_fence = new_fence.clone();
+        let resume = std::thread::spawn(move || {
+            resume_store
+                .resume_handoff(
+                    ResumeHandoffRequest {
+                        task_id: resume_task_id,
+                        run_id: resume_run_id,
+                        expected_authority_revision: 6,
+                        checkpoint_id: resume_checkpoint_id,
+                        replacement_agent_id: "replacement-handoff-hydrate-race".to_owned(),
+                        actor: "replacement-handoff-hydrate-race".to_owned(),
+                        fencing_identity: resume_fence,
+                        new_context_id: "context-resumed-race".to_owned(),
+                        memory_query: "resume".to_owned(),
+                        handoff_capability: handoff_capability(),
+                        evidence_refs: vec!["evidence:hydrate-race".to_owned()],
+                    },
+                    &blocking_port,
+                )
+                .unwrap()
+        });
+        hydrate_entered.wait();
+        let correction = store
+            .correct_decision(CorrectionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 6,
+                supersedes_decision_id: acquired.decision.decision_id,
+                actor: "operator".to_owned(),
+                reason: "authority_changed_during_hydrate".to_owned(),
+                evidence_refs: vec!["evidence:authority-correction".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(correction.outcome, DecisionOutcome::Allow);
+        hydrate_release.wait();
+        let resumed = resume.join().unwrap();
+
+        assert_eq!(resumed.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(resumed.decision.reason, "stale_authority");
+        assert!(resumed.decision.performed_at.is_none());
+        assert!(resumed.hydration.is_none());
+        let authority = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(authority.lifecycle_state, LifecycleState::Resuming);
+        assert_eq!(authority.authority_revision, 7);
+        assert_eq!(
+            authority.owner_agent_id.as_deref(),
+            Some("replacement-handoff-hydrate-race")
+        );
+        assert_eq!(
+            authority.fencing_identity.as_deref(),
+            Some(new_fence.as_str())
+        );
+        assert_eq!(
+            store
+                .handoff_checkpoint(&checkpoint.checkpoint_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffCheckpointState::Resuming
         );
     }
 }
