@@ -562,6 +562,8 @@ A structural analyzer, MCP, adapter, hook, watchdog, or reviewer showing enabled
 
 A previous Agent handoff, chat memory, summary, CURRENT projection, or task note can reduce rediscovery cost, but cannot replace consequential preflight. Before mutation, resume, claim, completion, publication, or handoff, fresh-read canonical authority revision and the target surface actually depended on or mutated, then reconcile expected-old, lease, owner, artifact, blocker, and evidence identity.
 
+The **schema / evidence semantics** of a persistent structured `CURRENT` may be project-specific, but its **capacity, line budget, and pruning policy** belong to shared handoff governance in the execution environment, not to ACP / Gateway product behavior. This repository must not hard-code a host-local line limit; when the host provides a shared structured-CURRENT policy, project helpers consume that policy directly. Raising the shared limit also does not make stale history current evidence: information that no longer affects the current objective still belongs in Issues, repository docs, history/archive, followed by controlled cache pruning.
+
 If another actor changed shared state, re-evaluate instead of blindly replaying the old handoff plan. "No other active Agent is visible now" describes only the observation time and does not prove that no actor modified shared state earlier.
 
 ### Checkpoint consequential gates immediately

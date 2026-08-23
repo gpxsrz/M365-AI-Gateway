@@ -31,6 +31,7 @@
 - 一頁只處理一個主題。AI Agent 應先讀 `docs/README.md`，不要一次載入全部文件。
 - Agent Governance 開發也遵守同一套分層揭露：core → router → 單一 topic → exact evidence → 必要時才進 history。完整開發讀取規則見 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md#12-agent-開發作業規則分層揭露與最小讀取)。
 - Current 文件只描述現在怎麼用；舊 Issue、舊 canary 與過去 Production 證據放 `docs/history/`。
+- Persistent structured `CURRENT` / handoff 的行數預算與 pruning policy 是執行環境治理，不是 M365 repo 的產品設定。Repo 可以定義專案 schema / evidence 語義，但不得把 host-local 的行數上限複製進 source、測試或 canonical 文件；有共用 handoff policy 時直接遵循它。
 - 不用大量縮寫或技術名詞堆砌。無法避免的名詞，第一次出現就用一句白話解釋。
 
 ## 提交前檢查
@@ -86,6 +87,7 @@ git diff --check
 - Keep one topic per page. AI agents should route through `docs/README.md` instead of loading every document.
 - Agent Governance development follows the same disclosure chain: core → router → one topic → exact evidence → history only when required. See [`docs/en/agent-governance.md`](docs/en/agent-governance.md#12-agent-development-operating-rules-progressive-disclosure-and-minimum-reads).
 - Current pages describe current behavior. Old Issues, canaries, and Production evidence belong under `docs/history/`.
+- Persistent structured `CURRENT` / handoff line budgets and pruning policy are execution-environment governance, not an M365 repository product setting. The repository may define project schema / evidence semantics, but must not copy a host-local line limit into source, tests, or canonical documentation; consume the shared handoff policy when one is available.
 - Avoid acronym and jargon stacks. Explain an unavoidable term in plain language when it first appears.
 
 ## Checks before commit

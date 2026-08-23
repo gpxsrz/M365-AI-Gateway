@@ -562,6 +562,8 @@ core invariant
 
 上一個 Agent 的 handoff、聊天記憶、摘要、CURRENT projection 或 task note 可以降低重新搜尋成本，但不能跳過 consequential preflight。在 mutation、resume、claim、completion、publication 或 handoff 前，fresh-read canonical authority revision 與本次真的依賴／修改的 target surface，再對帳 expected-old、lease、owner、artifact、blocker 與 evidence identity。
 
+Persistent structured `CURRENT` 的 **schema / evidence 語義**可以是專案專用，但它的 **容量、行數預算與 pruning policy** 屬於執行環境的共用 handoff governance，不是 ACP / Gateway 產品行為。本 repo 不 hard-code 任何 host-local 行數上限；若 host 提供共用 structured-CURRENT policy，專案 helper 應直接消費該 policy。共用上限放寬也不代表可以把 stale history 永久留在 CURRENT：不再影響 current objective 的 evidence 仍應移到 Issue、repo docs、history/archive，再受控 prune cache。
+
 發現 shared state 已被其他 actor 改變時，重新評估，不照舊 handoff 重做一次。「現在看不到其他 active Agent」只能描述查詢當下，不能證明之前沒有別的 actor 動過共享狀態。
 
 ### Consequential gate 完成就 checkpoint

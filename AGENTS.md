@@ -34,6 +34,7 @@
 3. Current 文件用白話、短句、先摘要後細節；AI Agent 不要一次載入整棵文件樹。
 4. `docs/history/` 只用於舊 regression、決策或證據追溯。
 5. GitHub、NAS、VM、OAuth 與 Production 私人操作使用本機 `m365-ops` skill。
+6. Persistent structured `CURRENT` / handoff 的容量與 pruning policy 屬於執行環境的共用 handoff governance；本 repo 只定義專案語義與 authority，不 hard-code 任何 host-local 行數上限。若執行環境提供共用 policy，專案 helper 必須消費它，不得複製一份專案專用數字。
 
 ## 驗證與收尾
 
