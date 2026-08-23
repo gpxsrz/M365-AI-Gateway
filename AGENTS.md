@@ -18,8 +18,11 @@
 ## 工程規則
 
 - 每個實質不同的開發作業單元開始前，先經 Gabriel Skill Router 依任務目的挑選最小且適合的 Skill，再動手。`open_workspace` 當下列出的 Skills 只是目前 scope 的 discovery snapshot，不是完整能力清單；若沒有直接匹配但任務明顯需要專用能力，必須依 Router 的 dynamic resolution 規則尋找 exact hidden / plugin Skill，不能因第一次清單未列出就宣稱不存在。診斷、設計、實作、review、部署、QA、cleanup 等作業類別改變時要重新 route / 選 Skill，不能慣性沿用上一階段。
+- 所有工程工作預設採 **Ponytail full**：先刪除不必要工作、優先重用既有 seam/helper、做最小正確 diff，不因未來可能需求新增 speculative abstraction、依賴、設定或第二份 authority。
 - 先追完整執行路徑，再做最小的共同根因修正。
 - TDD 不能取代 trace；先確認 callers、sibling paths、shared state 與 authority boundary，再開始實作。
+- 非平凡程式／runtime 行為變更在進 TDD 或 implementation 前，結構 trace 預設必須同時使用 **code-review-graph** 與 **Serena**：先把 code-review-graph 刷新／確認到 exact current HEAD，並執行對目標 seam 有意義的 current-source 結構查詢；再取得 Serena terminal health PASS，並用 symbol/reference（必要時 declaration/implementation）查詢核對實際 callers 與 shared authority。單純顯示 enabled、built-at HEAD、`0 impacted`、空 graph 或 health green 都不能單獨當成 blast-radius 證據。
+- 若 code-review-graph 或 Serena 在當前 route 不可用、stale、空結果、索引不完整或 deterministic failure，必須把限制記入本輪 evidence，改用 direct source / LSP / Git 等可驗證方式補齊相同的 execution-path trace；前提未變時不得原樣重試，也不得在 callers、sibling paths、shared state、authority boundary 尚未能被證明前進入 TDD。
 - 不新增沒有實際需求的抽象層、設定、依賴或相容層。
 - 非單純文字變更要有最小可執行 regression test。
 - Adapter 若改變 stream / non-stream 等協定形狀，要同步清理只屬於原模式的欄位，並測完整續接路徑。

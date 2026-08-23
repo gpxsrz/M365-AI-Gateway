@@ -18,8 +18,11 @@
 - Hermes、Hindsight、Semantica 與其他 external upstream core 都是 immutable upstream；相容與治理問題不得靠修改 upstream core 解決。
 - Production governance 只能落在 ACP、versioned adapter、plugin / hook、gateway 或 sidecar；不得使用私有 fork、monkey patch/runtime function replacement，或把 undocumented upstream DB/private function 當 canonical authority。
 - Adapter 必須做 typed semantic capability probe；surface 存在不等於 supported。能力缺失或不相容時 fail closed / typed degraded，runtime/UI/context projection 必須保留 authority revision / provenance，不得靜默放寬 policy、approval、blocker、completion 或 handoff gate。完整 contract 見 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md)。
+- 所有工程工作預設遵循 Ponytail full：先刪不必要工作、優先重用既有 seam/helper、維持最小正確 diff，不因假想的未來需求增加 abstraction、依賴、設定或第二份 authority。
 - 不為「以後可能用到」增加抽象層、設定或依賴。
 - 非平凡修改先 trace execution path / callers / sibling paths / shared authority，再進 TDD；不要用一個很小的 failing test 取代結構分析。
+- 非平凡程式／runtime 行為修改在 TDD / implementation 前，預設同時用 code-review-graph 與 Serena 做 current-source trace：code-review-graph 必須先確認 exact current HEAD 並跑有意義的結構 query；Serena 必須取得 terminal health PASS，再用 symbol/reference（必要時 declaration/implementation）核對 callers 與 authority seam。enabled、built-at HEAD、`0 impacted`、空 graph 或單純 health green 都不能單獨證明 blast radius。
+- 若其中一個工具在當前 route unavailable、stale、索引不完整或 deterministic failure，記錄限制並用 direct source / LSP / Git 補完同等 trace；前提未改變時不原樣重試，也不得在 execution path / shared authority 尚未能被證明前開始 TDD。
 - timeout、502 或 observer 無輸出不證明 worker 已停止；重派前先讀回原 Run/process/lease。Deterministic failure 在前提未改變時不原樣重試。
 - 改到串流、工具續接、checkpoint、並發或生命週期時，要測完整路徑，不只測輸入格式。
 - 新增或修改 Rust 行為時，至少留一個能實際執行的 regression test。
@@ -74,8 +77,11 @@ git diff --check
 - Hermes, Hindsight, Semantica, and every other external upstream core are immutable upstreams. Compatibility and governance must not be implemented by patching upstream core.
 - Production governance may live only in ACP, a versioned adapter, plugin / hook, gateway, or sidecar. Do not use a private fork, monkey patch/runtime function replacement, or undocumented upstream DB/private function as canonical authority.
 - Adapters must use typed semantic capability probes; surface existence does not mean supported. Missing or incompatible capabilities fail closed / typed degraded, runtime/UI/context projections preserve authority revision / provenance, and policy, approval, blocker, completion, or handoff gates must not be silently weakened. See [`docs/en/agent-governance.md`](docs/en/agent-governance.md) for the canonical contract.
+- All engineering work defaults to Ponytail full: delete unnecessary work first, reuse existing seams/helpers, keep the smallest correct diff, and do not add abstractions, dependencies, settings, or a second authority for hypothetical future needs.
 - Do not add abstractions, settings, or dependencies for hypothetical future needs.
 - For non-trivial changes, trace the execution path, callers, sibling paths, and shared authority before TDD. A tiny failing test does not replace structural analysis.
+- Before TDD / implementation for a non-trivial code or runtime-behavior change, use both code-review-graph and Serena for current-source tracing by default: code-review-graph must be refreshed/verified against exact current HEAD and run a meaningful structural query for the target seam; Serena must reach terminal health PASS and then use symbol/reference (plus declaration/implementation where needed) queries to verify callers and the authority seam. Enabled status, built-at HEAD, `0 impacted`, an empty graph, or health green alone is not blast-radius proof.
+- If either tool is unavailable on the current route, stale, incompletely indexed, or deterministically failing, record the limitation and complete the equivalent trace with direct source / LSP / Git evidence. Do not retry unchanged prerequisites, and do not enter TDD until the execution path and shared authority can still be demonstrated.
 - A timeout, 502, or quiet observer does not prove a worker stopped; reread the original Run/process/lease before retrying. Do not repeat deterministic failures unchanged while their prerequisites are unchanged.
 - Changes to streaming, tool continuation, checkpoints, concurrency, or lifecycle must test the full path, not only request validation.
 - Every non-trivial Rust behavior change needs at least one runnable regression test.
