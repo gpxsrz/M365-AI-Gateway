@@ -38,6 +38,7 @@ pub enum TransitionKind {
     IssueApprovalGrant,
     ConsumeApprovalGrant,
     RevokeApprovalGrant,
+    RotateContext,
     BeginCompletion,
     Complete,
     Correct,
@@ -655,9 +656,14 @@ pub enum ApprovalState {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MemoryDurabilityState {
     NotRequired,
+    Accepted,
     Durable,
     Queued,
+    Claimed,
     Processing,
+    Degraded,
+    Unsupported,
+    Unknown,
     Failed,
     Timeout,
 }
@@ -741,6 +747,8 @@ pub struct CompletionBarrierRecord {
     pub began_at_authority_revision: u64,
     pub owner_agent_id: String,
     pub fencing_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_checkpoint_id: Option<String>,
     pub state: CompletionBarrierState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_authority_revision: Option<u64>,
@@ -850,6 +858,368 @@ pub struct CapabilityProbeResult {
     pub missing_field_families: Vec<String>,
     pub missing_semantics: Vec<String>,
     pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRetainRequest {
+    pub retain_request_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub lineage_id: String,
+    pub authority_revision: u64,
+    pub content_digest: String,
+    pub fencing_identity: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryDurabilityEvidence {
+    pub schema_version: u32,
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub upstream_id: String,
+    pub upstream_version: String,
+    pub retain_request_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub lineage_id: String,
+    pub authority_revision: u64,
+    pub content_digest: String,
+    pub fencing_identity: String,
+    pub operation_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub durable_at: OffsetDateTime,
+    pub evidence_refs: Vec<String>,
+}
+
+pub trait MemoryDurabilityEvidenceVerifier {
+    /// Verify provider-defined terminal durability independently of the adapter envelope.
+    fn verifies(&self, evidence: &MemoryDurabilityEvidence) -> bool;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRetainResult {
+    pub retain_request_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub lineage_id: String,
+    pub authority_revision: u64,
+    pub content_digest: String,
+    pub fencing_identity: String,
+    pub operation_id: String,
+    pub durability: MemoryDurabilityState,
+    pub evidence: Option<MemoryDurabilityEvidence>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRetainEvaluation {
+    pub capability_status: CapabilityStatus,
+    pub durability: MemoryDurabilityState,
+    pub is_durable: bool,
+    pub reason: String,
+    pub operation_id: Option<String>,
+    pub provider_evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MemoryPortHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryPortProbe {
+    pub capability: CapabilityProbeResult,
+    pub health: MemoryPortHealth,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ContextLayer {
+    KanbanDurableHistory,
+    LongTermMemory,
+    LiveModelContext,
+    AcpAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MemoryHydrateStatus {
+    Hydrated,
+    Degraded,
+    Unsupported,
+    Failed,
+    Timeout,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthoritySummary {
+    pub task_id: String,
+    pub run_id: String,
+    pub lifecycle_state: LifecycleState,
+    pub authority_revision: u64,
+    pub acceptance_contract_digest: String,
+    pub owner_agent_id: String,
+    pub fencing_identity: String,
+    pub active_blocker_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHydrateRequest {
+    pub hydrate_request_id: String,
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub lineage_id: String,
+    pub authority_summary: AuthoritySummary,
+    pub new_context_id: String,
+    pub memory_query: String,
+    pub selected_evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HydratedContextItem {
+    pub memory_id: String,
+    pub layer: ContextLayer,
+    pub content: String,
+    pub evidence_ref: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHydrateResult {
+    pub hydrate_request_id: String,
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub lineage_id: String,
+    pub authority_revision: u64,
+    pub new_context_id: String,
+    pub status: MemoryHydrateStatus,
+    pub items: Vec<HydratedContextItem>,
+    pub evidence_refs: Vec<String>,
+}
+
+pub trait MemoryPort {
+    fn probe(&self, requested_capability: &str) -> MemoryPortProbe;
+    fn retain(&self, request: &MemoryRetainRequest) -> MemoryRetainResult;
+    fn hydrate(&self, request: &MemoryHydrateRequest) -> MemoryHydrateResult;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ContextLifecyclePhase {
+    PreCompact,
+    RetainDurable,
+    ContextCheckpoint,
+    NewContext,
+    TypedHydrate,
+    PostCompactVerify,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpoint {
+    pub checkpoint_id: String,
+    pub rotation_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub lineage_id: String,
+    pub authority_summary: AuthoritySummary,
+    pub kanban_history_ref: String,
+    pub old_context_id: String,
+    pub new_context_id: String,
+    pub retain_request_id: String,
+    pub retain_operation_id: String,
+    pub capability_status: CapabilityStatus,
+    pub phase: ContextLifecyclePhase,
+    pub phase_trace: Vec<ContextLifecyclePhase>,
+    pub memory_evidence_refs: Vec<String>,
+    pub selected_evidence_refs: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub verified_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextRotationRequest {
+    pub rotation_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub expected_authority_revision: u64,
+    pub agent_id: String,
+    pub actor: String,
+    pub fencing_identity: String,
+    pub lineage_id: String,
+    pub kanban_history_ref: String,
+    pub old_context_id: String,
+    pub new_context_id: String,
+    pub retain_request_id: String,
+    pub memory_content_digest: String,
+    pub memory_query: String,
+    pub selected_evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextRotationResult {
+    pub decision: DecisionRecord,
+    pub checkpoint: Option<ContextCheckpoint>,
+    pub hydration: Option<MemoryHydrateResult>,
+}
+
+pub fn evaluate_memory_retain(
+    capability: &CapabilityProbeResult,
+    request: &MemoryRetainRequest,
+    result: MemoryRetainResult,
+    verifier: &dyn MemoryDurabilityEvidenceVerifier,
+) -> Result<MemoryRetainEvaluation, GovernanceError> {
+    validate_memory_retain_request(request)?;
+    validate_identity("retain_request_id", &result.retain_request_id)?;
+    validate_identity("task_id", &result.task_id)?;
+    validate_identity("run_id", &result.run_id)?;
+    validate_identity("lineage_id", &result.lineage_id)?;
+    validate_identity("operation_id", &result.operation_id)?;
+    validate_evidence_refs(&result.evidence_refs)?;
+
+    let capability_failure = match capability.status {
+        CapabilityStatus::Supported => None,
+        CapabilityStatus::Degraded => Some((
+            MemoryDurabilityState::Degraded,
+            "memory_capability_degraded",
+        )),
+        CapabilityStatus::Unsupported => Some((
+            MemoryDurabilityState::Unsupported,
+            "memory_capability_unsupported",
+        )),
+        CapabilityStatus::Incompatible => Some((
+            MemoryDurabilityState::Unsupported,
+            "memory_capability_incompatible",
+        )),
+        CapabilityStatus::Unknown => {
+            Some((MemoryDurabilityState::Unknown, "memory_capability_unknown"))
+        }
+    };
+    if let Some((durability, reason)) = capability_failure {
+        return Ok(MemoryRetainEvaluation {
+            capability_status: capability.status,
+            durability,
+            is_durable: false,
+            reason: reason.to_owned(),
+            operation_id: Some(result.operation_id),
+            provider_evidence_refs: Vec::new(),
+        });
+    }
+    if capability.requested_capability != "memory.retain_durable" {
+        return Ok(memory_retain_failure(
+            capability.status,
+            MemoryDurabilityState::Failed,
+            "memory_capability_mismatch",
+            Some(result.operation_id),
+        ));
+    }
+    if result.retain_request_id != request.retain_request_id
+        || result.task_id != request.task_id
+        || result.run_id != request.run_id
+        || result.lineage_id != request.lineage_id
+        || result.authority_revision != request.authority_revision
+        || result.content_digest != request.content_digest
+        || result.fencing_identity != request.fencing_identity
+    {
+        return Ok(memory_retain_failure(
+            capability.status,
+            MemoryDurabilityState::Failed,
+            "memory_retain_binding_mismatch",
+            Some(result.operation_id),
+        ));
+    }
+    if result.durability != MemoryDurabilityState::Durable {
+        return Ok(memory_retain_failure(
+            capability.status,
+            result.durability,
+            "memory_not_durable",
+            Some(result.operation_id),
+        ));
+    }
+    let Some(evidence) = result.evidence else {
+        return Ok(memory_retain_failure(
+            capability.status,
+            MemoryDurabilityState::Failed,
+            "memory_durability_evidence_required",
+            Some(result.operation_id),
+        ));
+    };
+    validate_memory_durability_evidence(&evidence)?;
+    let evidence_bound = evidence.schema_version == 1
+        && evidence.adapter_id == capability.adapter_id
+        && evidence.adapter_version == capability.adapter_version
+        && evidence.upstream_id == capability.upstream_id
+        && evidence.upstream_version == capability.upstream_version
+        && evidence.retain_request_id == request.retain_request_id
+        && evidence.task_id == request.task_id
+        && evidence.run_id == request.run_id
+        && evidence.lineage_id == request.lineage_id
+        && evidence.authority_revision == request.authority_revision
+        && evidence.content_digest == request.content_digest
+        && evidence.fencing_identity == request.fencing_identity
+        && evidence.operation_id == result.operation_id
+        && verifier.verifies(&evidence);
+    if !evidence_bound {
+        return Ok(memory_retain_failure(
+            capability.status,
+            MemoryDurabilityState::Failed,
+            "memory_durability_evidence_rejected",
+            Some(result.operation_id),
+        ));
+    }
+    if evidence.evidence_refs.is_empty() {
+        return Ok(memory_retain_failure(
+            capability.status,
+            MemoryDurabilityState::Failed,
+            "memory_durability_evidence_required",
+            Some(result.operation_id),
+        ));
+    }
+
+    Ok(MemoryRetainEvaluation {
+        capability_status: capability.status,
+        durability: MemoryDurabilityState::Durable,
+        is_durable: true,
+        reason: "memory_durable".to_owned(),
+        operation_id: Some(result.operation_id),
+        provider_evidence_refs: evidence.evidence_refs,
+    })
+}
+
+fn memory_retain_failure(
+    capability_status: CapabilityStatus,
+    durability: MemoryDurabilityState,
+    reason: &str,
+    operation_id: Option<String>,
+) -> MemoryRetainEvaluation {
+    MemoryRetainEvaluation {
+        capability_status,
+        durability,
+        is_durable: false,
+        reason: reason.to_owned(),
+        operation_id,
+        provider_evidence_refs: Vec::new(),
+    }
 }
 
 pub fn evaluate_capability_probe(
@@ -1219,6 +1589,8 @@ struct StateFile {
     approval_grants: BTreeMap<String, ApprovalGrant>,
     #[serde(default)]
     approval_consumptions: BTreeMap<String, ApprovalGrantConsumption>,
+    #[serde(default)]
+    context_checkpoints: BTreeMap<String, ContextCheckpoint>,
     decisions: Vec<DecisionRecord>,
     next_decision_seq: u64,
 }
@@ -1233,6 +1605,7 @@ impl Default for StateFile {
             runtime_records: Vec::new(),
             approval_grants: BTreeMap::new(),
             approval_consumptions: BTreeMap::new(),
+            context_checkpoints: BTreeMap::new(),
             decisions: Vec::new(),
             next_decision_seq: 1,
         }
@@ -1334,6 +1707,285 @@ impl GovernanceStore {
             .filter(|decision| decision.task_id == task_id)
             .cloned()
             .collect())
+    }
+
+    pub fn context_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<ContextCheckpoint>, GovernanceError> {
+        validate_identity("checkpoint_id", checkpoint_id)?;
+        let state = self.state.lock().expect("governance state poisoned");
+        Ok(state.context_checkpoints.get(checkpoint_id).cloned())
+    }
+
+    pub fn rotate_context(
+        &self,
+        request: ContextRotationRequest,
+        port: &dyn MemoryPort,
+        verifier: &dyn MemoryDurabilityEvidenceVerifier,
+    ) -> Result<ContextRotationResult, GovernanceError> {
+        validate_context_rotation_request(&request)?;
+        let authority = {
+            let state = self.state.lock().expect("governance state poisoned");
+            state.tasks.get(&request.task_id).cloned()
+        };
+        if let Some((outcome, reason)) = context_rotation_authority_failure(
+            authority.as_ref(),
+            &request,
+            request.expected_authority_revision,
+        ) {
+            return self.record_context_rotation_rejection(&request, outcome, reason, Vec::new());
+        }
+
+        let retain_probe = port.probe("memory.retain_durable");
+        validate_memory_port_probe(&retain_probe)?;
+        if let Some((outcome, reason)) =
+            memory_probe_failure(&retain_probe, "memory.retain_durable")
+        {
+            return self.record_context_rotation_rejection(
+                &request,
+                outcome,
+                reason,
+                retain_probe.evidence_refs,
+            );
+        }
+        let hydrate_probe = port.probe("memory.hydrate");
+        validate_memory_port_probe(&hydrate_probe)?;
+        if let Some((outcome, reason)) = memory_probe_failure(&hydrate_probe, "memory.hydrate") {
+            return self.record_context_rotation_rejection(
+                &request,
+                outcome,
+                reason,
+                hydrate_probe.evidence_refs,
+            );
+        }
+        if !same_memory_provider(&retain_probe.capability, &hydrate_probe.capability) {
+            return self.record_context_rotation_rejection(
+                &request,
+                DecisionOutcome::Deny,
+                "memory_provider_binding_mismatch",
+                hydrate_probe.evidence_refs,
+            );
+        }
+
+        let retain_request = MemoryRetainRequest {
+            retain_request_id: request.retain_request_id.clone(),
+            task_id: request.task_id.clone(),
+            run_id: request.run_id.clone(),
+            lineage_id: request.lineage_id.clone(),
+            authority_revision: request.expected_authority_revision,
+            content_digest: request.memory_content_digest.clone(),
+            fencing_identity: request.fencing_identity.clone(),
+            evidence_refs: request.selected_evidence_refs.clone(),
+        };
+        let retained = evaluate_memory_retain(
+            &retain_probe.capability,
+            &retain_request,
+            port.retain(&retain_request),
+            verifier,
+        )?;
+        if !retained.is_durable {
+            return self.record_context_rotation_rejection(
+                &request,
+                DecisionOutcome::Defer,
+                &retained.reason,
+                retain_probe.evidence_refs,
+            );
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let checkpoint_id = new_context_checkpoint_id();
+        let authority_summary = authority_summary(authority.as_ref().unwrap());
+        let checkpoint = ContextCheckpoint {
+            checkpoint_id: checkpoint_id.clone(),
+            rotation_id: request.rotation_id.clone(),
+            task_id: request.task_id.clone(),
+            run_id: request.run_id.clone(),
+            lineage_id: request.lineage_id.clone(),
+            authority_summary: authority_summary.clone(),
+            kanban_history_ref: request.kanban_history_ref.clone(),
+            old_context_id: request.old_context_id.clone(),
+            new_context_id: request.new_context_id.clone(),
+            retain_request_id: request.retain_request_id.clone(),
+            retain_operation_id: retained.operation_id.clone().unwrap(),
+            capability_status: retained.capability_status,
+            phase: ContextLifecyclePhase::ContextCheckpoint,
+            phase_trace: vec![
+                ContextLifecyclePhase::PreCompact,
+                ContextLifecyclePhase::RetainDurable,
+                ContextLifecyclePhase::ContextCheckpoint,
+            ],
+            memory_evidence_refs: retained.provider_evidence_refs.clone(),
+            selected_evidence_refs: request.selected_evidence_refs.clone(),
+            created_at: now,
+            verified_at: None,
+        };
+        {
+            let mut state = self.state.lock().expect("governance state poisoned");
+            let snapshot = state.clone();
+            let current = state.tasks.get(&request.task_id);
+            if let Some((outcome, reason)) = context_rotation_authority_failure(
+                current,
+                &request,
+                request.expected_authority_revision,
+            ) {
+                drop(state);
+                return self.record_context_rotation_rejection(
+                    &request,
+                    outcome,
+                    reason,
+                    retained.provider_evidence_refs,
+                );
+            }
+            state
+                .context_checkpoints
+                .insert(checkpoint_id.clone(), checkpoint);
+            if let Err(error) = save(&self.path, &state) {
+                *state = snapshot;
+                return Err(error);
+            }
+        }
+
+        let hydrate_request = MemoryHydrateRequest {
+            hydrate_request_id: format!("hydrate-{}", request.rotation_id),
+            checkpoint_id: checkpoint_id.clone(),
+            task_id: request.task_id.clone(),
+            run_id: request.run_id.clone(),
+            lineage_id: request.lineage_id.clone(),
+            authority_summary,
+            new_context_id: request.new_context_id.clone(),
+            memory_query: request.memory_query.clone(),
+            selected_evidence_refs: request.selected_evidence_refs.clone(),
+        };
+        let hydration = port.hydrate(&hydrate_request);
+        let (hydration_valid, hydrate_failure) = match validate_memory_hydrate_result(&hydration) {
+            Ok(()) => (true, memory_hydrate_failure(&hydrate_request, &hydration)),
+            Err(_) => (
+                false,
+                Some((DecisionOutcome::Deny, "memory_hydrate_invalid")),
+            ),
+        };
+        let completed_at = OffsetDateTime::now_utc();
+
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority = state.tasks.get(&request.task_id).cloned();
+        let authority_before = authority
+            .as_ref()
+            .map_or(0, |authority| authority.authority_revision);
+        let authority_failure = context_rotation_authority_failure(
+            authority.as_ref(),
+            &request,
+            request.expected_authority_revision,
+        );
+        let failure = authority_failure.or(hydrate_failure);
+        let (outcome, reason, performed_at) = match failure {
+            Some((outcome, reason)) => (outcome, reason, None),
+            None => (
+                DecisionOutcome::Allow,
+                "context_rotated",
+                Some(completed_at),
+            ),
+        };
+        let checkpoint = state.context_checkpoints.get_mut(&checkpoint_id).unwrap();
+        if outcome == DecisionOutcome::Allow {
+            checkpoint.phase = ContextLifecyclePhase::PostCompactVerify;
+            checkpoint.phase_trace.extend([
+                ContextLifecyclePhase::NewContext,
+                ContextLifecyclePhase::TypedHydrate,
+                ContextLifecyclePhase::PostCompactVerify,
+            ]);
+            checkpoint.verified_at = Some(completed_at);
+        } else {
+            checkpoint.phase = ContextLifecyclePhase::Failed;
+            checkpoint.phase_trace.push(ContextLifecyclePhase::Failed);
+        }
+        let checkpoint = checkpoint.clone();
+        let mut evidence_refs = request.selected_evidence_refs.clone();
+        evidence_refs.extend(retain_probe.evidence_refs);
+        evidence_refs.extend(hydrate_probe.evidence_refs);
+        evidence_refs.extend(retained.provider_evidence_refs);
+        if hydration_valid {
+            evidence_refs.extend(hydration.evidence_refs.clone());
+        }
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id,
+            run_id: request.run_id,
+            agent_id: request.agent_id,
+            requested_transition: TransitionKind::RotateContext,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after: authority_before,
+            policy_version: BASE_POLICY_VERSION.to_owned(),
+            evaluator_version: BASE_EVALUATOR_VERSION.to_owned(),
+            evidence_refs,
+            actor: request.actor,
+            evaluated_at: completed_at,
+            performed_at,
+            fencing_identity: Some(request.fencing_identity),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(ContextRotationResult {
+            decision,
+            checkpoint: Some(checkpoint),
+            hydration: (outcome == DecisionOutcome::Allow).then_some(hydration),
+        })
+    }
+
+    fn record_context_rotation_rejection(
+        &self,
+        request: &ContextRotationRequest,
+        outcome: DecisionOutcome,
+        reason: &str,
+        mut evidence_refs: Vec<String>,
+    ) -> Result<ContextRotationResult, GovernanceError> {
+        let mut state = self.state.lock().expect("governance state poisoned");
+        let snapshot = state.clone();
+        let authority_before = state
+            .tasks
+            .get(&request.task_id)
+            .map_or(0, |authority| authority.authority_revision);
+        evidence_refs.extend(request.selected_evidence_refs.clone());
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let decision = DecisionRecord {
+            decision_id: next_decision_id(&mut state),
+            task_id: request.task_id.clone(),
+            run_id: request.run_id.clone(),
+            agent_id: request.agent_id.clone(),
+            requested_transition: TransitionKind::RotateContext,
+            outcome,
+            reason: reason.to_owned(),
+            authority_before,
+            authority_after: authority_before,
+            policy_version: BASE_POLICY_VERSION.to_owned(),
+            evaluator_version: BASE_EVALUATOR_VERSION.to_owned(),
+            evidence_refs,
+            actor: request.actor.clone(),
+            evaluated_at: OffsetDateTime::now_utc(),
+            performed_at: None,
+            fencing_identity: Some(request.fencing_identity.clone()),
+            supersedes_decision_id: None,
+        };
+        state.decisions.push(decision.clone());
+        if let Err(error) = save(&self.path, &state) {
+            *state = snapshot;
+            return Err(error);
+        }
+        Ok(ContextRotationResult {
+            decision,
+            checkpoint: None,
+            hydration: None,
+        })
     }
 
     pub fn approval_grant(
@@ -2159,6 +2811,15 @@ impl GovernanceStore {
             .map_or(0, |authority| authority.authority_revision);
         let now = OffsetDateTime::now_utc();
         let contract_digest = request.contract.digest();
+        let memory_checkpoint_id = verified_memory_checkpoint(
+            &state,
+            None,
+            (&request.task_id, &request.run_id),
+            request.expected_authority_revision,
+            (&request.agent_id, &request.fencing_identity),
+            &contract_digest,
+        )
+        .map(|checkpoint| checkpoint.checkpoint_id.clone());
         let completion_gate_failure = completion_gate_failure(
             &request.contract,
             &request.observation,
@@ -2166,6 +2827,7 @@ impl GovernanceStore {
             request.expected_authority_revision,
             request.expected_authority_revision,
             &request.fencing_identity,
+            !request.contract.memory_durability_required || memory_checkpoint_id.is_some(),
         );
         let mut authority_after = authority_before;
         let mut performed_at = None;
@@ -2230,6 +2892,7 @@ impl GovernanceStore {
                     began_at_authority_revision: authority_after,
                     owner_agent_id: request.agent_id.clone(),
                     fencing_identity: request.fencing_identity.clone(),
+                    memory_checkpoint_id,
                     state: CompletionBarrierState::Active,
                     completed_at_authority_revision: None,
                 };
@@ -2291,6 +2954,16 @@ impl GovernanceStore {
         let mutation_receipts_digest =
             completion_required_receipts_digest(&request.contract, &request.observation);
         let completion_gate_failure = barrier.as_ref().and_then(|barrier| {
+            let memory_durability_verified = !request.contract.memory_durability_required
+                || verified_memory_checkpoint(
+                    &state,
+                    barrier.memory_checkpoint_id.as_deref(),
+                    (&request.task_id, &request.run_id),
+                    barrier.evidence_authority_revision,
+                    (&request.agent_id, &request.fencing_identity),
+                    &contract_digest,
+                )
+                .is_some();
             completion_gate_failure(
                 &request.contract,
                 &request.observation,
@@ -2298,6 +2971,7 @@ impl GovernanceStore {
                 barrier.evidence_authority_revision,
                 request.expected_authority_revision,
                 &request.fencing_identity,
+                memory_durability_verified,
             )
         });
         let mut authority_after = authority_before;
@@ -3096,6 +3770,228 @@ fn validate_policy_evaluation_request(
     Ok(())
 }
 
+fn validate_memory_retain_request(request: &MemoryRetainRequest) -> Result<(), GovernanceError> {
+    validate_identity("retain_request_id", &request.retain_request_id)?;
+    validate_identity("task_id", &request.task_id)?;
+    validate_identity("run_id", &request.run_id)?;
+    validate_identity("lineage_id", &request.lineage_id)?;
+    validate_identity("content_digest", &request.content_digest)?;
+    validate_identity("fencing_identity", &request.fencing_identity)?;
+    validate_evidence_refs(&request.evidence_refs)
+}
+
+fn validate_memory_durability_evidence(
+    evidence: &MemoryDurabilityEvidence,
+) -> Result<(), GovernanceError> {
+    validate_identity("adapter_id", &evidence.adapter_id)?;
+    validate_identity("adapter_version", &evidence.adapter_version)?;
+    validate_identity("upstream_id", &evidence.upstream_id)?;
+    validate_identity("upstream_version", &evidence.upstream_version)?;
+    validate_identity("retain_request_id", &evidence.retain_request_id)?;
+    validate_identity("task_id", &evidence.task_id)?;
+    validate_identity("run_id", &evidence.run_id)?;
+    validate_identity("lineage_id", &evidence.lineage_id)?;
+    validate_identity("content_digest", &evidence.content_digest)?;
+    validate_identity("fencing_identity", &evidence.fencing_identity)?;
+    validate_identity("operation_id", &evidence.operation_id)?;
+    validate_evidence_refs(&evidence.evidence_refs)
+}
+
+fn validate_context_rotation_request(
+    request: &ContextRotationRequest,
+) -> Result<(), GovernanceError> {
+    validate_identity("rotation_id", &request.rotation_id)?;
+    validate_identity("task_id", &request.task_id)?;
+    validate_identity("run_id", &request.run_id)?;
+    validate_identity("agent_id", &request.agent_id)?;
+    validate_identity("actor", &request.actor)?;
+    validate_identity("fencing_identity", &request.fencing_identity)?;
+    validate_identity("lineage_id", &request.lineage_id)?;
+    validate_identity("kanban_history_ref", &request.kanban_history_ref)?;
+    validate_identity("old_context_id", &request.old_context_id)?;
+    validate_identity("new_context_id", &request.new_context_id)?;
+    validate_identity("retain_request_id", &request.retain_request_id)?;
+    validate_identity("memory_content_digest", &request.memory_content_digest)?;
+    validate_identity("memory_query", &request.memory_query)?;
+    validate_evidence_refs(&request.selected_evidence_refs)?;
+    if request.old_context_id == request.new_context_id {
+        return Err(GovernanceError::InvalidIdentity("new_context_id"));
+    }
+    Ok(())
+}
+
+fn validate_memory_port_probe(probe: &MemoryPortProbe) -> Result<(), GovernanceError> {
+    validate_identity("adapter_id", &probe.capability.adapter_id)?;
+    validate_identity("adapter_version", &probe.capability.adapter_version)?;
+    validate_identity("upstream_id", &probe.capability.upstream_id)?;
+    validate_identity("upstream_version", &probe.capability.upstream_version)?;
+    validate_identity(
+        "requested_capability",
+        &probe.capability.requested_capability,
+    )?;
+    validate_evidence_refs(&probe.capability.evidence_refs)?;
+    validate_evidence_refs(&probe.evidence_refs)
+}
+
+fn validate_memory_hydrate_result(result: &MemoryHydrateResult) -> Result<(), GovernanceError> {
+    validate_identity("hydrate_request_id", &result.hydrate_request_id)?;
+    validate_identity("checkpoint_id", &result.checkpoint_id)?;
+    validate_identity("task_id", &result.task_id)?;
+    validate_identity("run_id", &result.run_id)?;
+    validate_identity("lineage_id", &result.lineage_id)?;
+    validate_identity("new_context_id", &result.new_context_id)?;
+    validate_evidence_refs(&result.evidence_refs)?;
+    for item in &result.items {
+        validate_identity("memory_id", &item.memory_id)?;
+        validate_identity("memory_evidence_ref", &item.evidence_ref)?;
+        if item.content.trim().is_empty() {
+            return Err(GovernanceError::InvalidIdentity("memory_content"));
+        }
+    }
+    Ok(())
+}
+
+fn authority_summary(authority: &TaskAuthority) -> AuthoritySummary {
+    AuthoritySummary {
+        task_id: authority.task_id.clone(),
+        run_id: authority.active_run_id.clone(),
+        lifecycle_state: authority.lifecycle_state,
+        authority_revision: authority.authority_revision,
+        acceptance_contract_digest: authority.acceptance_contract_digest.clone(),
+        owner_agent_id: authority.owner_agent_id.clone().unwrap_or_default(),
+        fencing_identity: authority.fencing_identity.clone().unwrap_or_default(),
+        active_blocker_id: authority.active_blocker_id.clone(),
+    }
+}
+
+fn context_rotation_authority_failure<'a>(
+    authority: Option<&TaskAuthority>,
+    request: &ContextRotationRequest,
+    expected_authority_revision: u64,
+) -> Option<(DecisionOutcome, &'a str)> {
+    match authority {
+        None => Some((DecisionOutcome::Deny, "task_not_found")),
+        Some(authority) if authority.active_run_id != request.run_id => {
+            Some((DecisionOutcome::Deny, "run_not_found"))
+        }
+        Some(authority) if authority.authority_revision != expected_authority_revision => {
+            Some((DecisionOutcome::Defer, "stale_authority"))
+        }
+        Some(_) if request.selected_evidence_refs.is_empty() => {
+            Some((DecisionOutcome::Defer, "evidence_required"))
+        }
+        Some(authority) if authority.lifecycle_state != LifecycleState::Running => {
+            Some((DecisionOutcome::Deny, "context_rotation_not_available"))
+        }
+        Some(authority)
+            if authority.owner_agent_id.as_deref() != Some(request.agent_id.as_str()) =>
+        {
+            Some((DecisionOutcome::Deny, "owner_mismatch"))
+        }
+        Some(authority)
+            if authority.fencing_identity.as_deref() != Some(request.fencing_identity.as_str()) =>
+        {
+            Some((DecisionOutcome::Deny, "fencing_mismatch"))
+        }
+        Some(_) => None,
+    }
+}
+
+fn memory_health_reason(health: MemoryPortHealth) -> &'static str {
+    match health {
+        MemoryPortHealth::Healthy => "memory_healthy",
+        MemoryPortHealth::Degraded => "memory_health_degraded",
+        MemoryPortHealth::Unavailable => "memory_health_unavailable",
+        MemoryPortHealth::Unknown => "memory_health_unknown",
+    }
+}
+
+fn memory_probe_failure(
+    probe: &MemoryPortProbe,
+    expected_capability: &str,
+) -> Option<(DecisionOutcome, &'static str)> {
+    if probe.health != MemoryPortHealth::Healthy {
+        return Some((DecisionOutcome::Defer, memory_health_reason(probe.health)));
+    }
+    if probe.evidence_refs.is_empty() {
+        return Some((DecisionOutcome::Defer, "memory_health_evidence_required"));
+    }
+    if probe.capability.status != CapabilityStatus::Supported {
+        return Some((
+            DecisionOutcome::Defer,
+            memory_capability_reason(probe.capability.status),
+        ));
+    }
+    if probe.capability.evidence_refs.is_empty() {
+        return Some((
+            DecisionOutcome::Defer,
+            "memory_capability_evidence_required",
+        ));
+    }
+    if probe.capability.requested_capability != expected_capability {
+        return Some((DecisionOutcome::Deny, "memory_capability_mismatch"));
+    }
+    None
+}
+
+fn same_memory_provider(left: &CapabilityProbeResult, right: &CapabilityProbeResult) -> bool {
+    left.adapter_id == right.adapter_id
+        && left.adapter_version == right.adapter_version
+        && left.upstream_id == right.upstream_id
+        && left.upstream_version == right.upstream_version
+        && left.integration_seam == right.integration_seam
+}
+
+fn memory_capability_reason(status: CapabilityStatus) -> &'static str {
+    match status {
+        CapabilityStatus::Supported => "memory_capability_supported",
+        CapabilityStatus::Degraded => "memory_capability_degraded",
+        CapabilityStatus::Unsupported => "memory_capability_unsupported",
+        CapabilityStatus::Incompatible => "memory_capability_incompatible",
+        CapabilityStatus::Unknown => "memory_capability_unknown",
+    }
+}
+
+fn memory_hydrate_failure<'a>(
+    request: &MemoryHydrateRequest,
+    result: &MemoryHydrateResult,
+) -> Option<(DecisionOutcome, &'a str)> {
+    if result.hydrate_request_id != request.hydrate_request_id
+        || result.checkpoint_id != request.checkpoint_id
+        || result.task_id != request.task_id
+        || result.run_id != request.run_id
+        || result.lineage_id != request.lineage_id
+        || result.authority_revision != request.authority_summary.authority_revision
+        || result.new_context_id != request.new_context_id
+    {
+        return Some((DecisionOutcome::Deny, "memory_hydrate_binding_mismatch"));
+    }
+    let status_failure = match result.status {
+        MemoryHydrateStatus::Hydrated => None,
+        MemoryHydrateStatus::Degraded => Some((DecisionOutcome::Defer, "memory_hydrate_degraded")),
+        MemoryHydrateStatus::Unsupported => {
+            Some((DecisionOutcome::Defer, "memory_hydrate_unsupported"))
+        }
+        MemoryHydrateStatus::Failed => Some((DecisionOutcome::Defer, "memory_hydrate_failed")),
+        MemoryHydrateStatus::Timeout => Some((DecisionOutcome::Defer, "memory_hydrate_timeout")),
+        MemoryHydrateStatus::Unknown => Some((DecisionOutcome::Defer, "memory_hydrate_unknown")),
+    };
+    if status_failure.is_some() {
+        return status_failure;
+    }
+    if result.evidence_refs.is_empty() {
+        return Some((DecisionOutcome::Defer, "memory_hydrate_evidence_required"));
+    }
+    if result
+        .items
+        .iter()
+        .any(|item| item.layer != ContextLayer::LongTermMemory)
+    {
+        return Some((DecisionOutcome::Deny, "memory_hydrate_layer_forbidden"));
+    }
+    None
+}
+
 fn runtime_projection_value<T: Clone>(
     record: Option<&AgentRuntimeRecord>,
     authority_revision: u64,
@@ -3333,6 +4229,7 @@ fn completion_gate_failure(
     expected_receipt_authority_revision: u64,
     expected_artifact_authority_revision: u64,
     expected_fencing_identity: &str,
+    memory_durability_verified: bool,
 ) -> Option<(DecisionOutcome, &'static str)> {
     if observation.observed_authority_revision != expected_observation_authority_revision {
         return Some((DecisionOutcome::Defer, "stale_completion_observation"));
@@ -3360,6 +4257,9 @@ fn completion_gate_failure(
     {
         return Some((DecisionOutcome::Defer, "memory_not_durable"));
     }
+    if contract.memory_durability_required && !memory_durability_verified {
+        return Some((DecisionOutcome::Defer, "memory_checkpoint_required"));
+    }
     if let Some(reason) = completion_mutation_receipt_failure(
         contract,
         observation,
@@ -3377,6 +4277,40 @@ fn completion_gate_failure(
         return Some((DecisionOutcome::Defer, reason));
     }
     None
+}
+
+fn verified_memory_checkpoint<'a>(
+    state: &'a StateFile,
+    checkpoint_id: Option<&str>,
+    scope: (&str, &str),
+    authority_revision: u64,
+    ownership: (&str, &str),
+    acceptance_contract_digest: &str,
+) -> Option<&'a ContextCheckpoint> {
+    let (task_id, run_id) = scope;
+    let (owner_agent_id, fencing_identity) = ownership;
+    state
+        .context_checkpoints
+        .values()
+        .filter(|checkpoint| {
+            checkpoint_id.is_none_or(|id| checkpoint.checkpoint_id == id)
+                && checkpoint.task_id == task_id
+                && checkpoint.run_id == run_id
+                && checkpoint.authority_summary.task_id == task_id
+                && checkpoint.authority_summary.run_id == run_id
+                && checkpoint.authority_summary.lifecycle_state == LifecycleState::Running
+                && checkpoint.authority_summary.authority_revision == authority_revision
+                && checkpoint.authority_summary.owner_agent_id == owner_agent_id
+                && checkpoint.authority_summary.fencing_identity == fencing_identity
+                && checkpoint.authority_summary.acceptance_contract_digest
+                    == acceptance_contract_digest
+                && checkpoint.capability_status == CapabilityStatus::Supported
+                && checkpoint.phase == ContextLifecyclePhase::PostCompactVerify
+                && checkpoint.verified_at.is_some()
+                && !checkpoint.memory_evidence_refs.is_empty()
+                && !checkpoint.selected_evidence_refs.is_empty()
+        })
+        .max_by_key(|checkpoint| checkpoint.created_at)
 }
 
 fn completion_required_receipts_digest(
@@ -3522,6 +4456,10 @@ fn new_completion_id() -> String {
 
 fn new_approval_id() -> String {
     format!("approval-{:032x}", rand::random::<u128>())
+}
+
+fn new_context_checkpoint_id() -> String {
+    format!("context-{:032x}", rand::random::<u128>())
 }
 
 fn next_decision_id(state: &mut StateFile) -> String {
@@ -5611,6 +6549,81 @@ mod tests {
     }
 
     #[test]
+    fn completion_requires_verified_memory_checkpoint_not_caller_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let suffix = "memory-completion";
+        let contract = CompletionContract {
+            required_mutation_ids: Vec::new(),
+            required_artifacts: Vec::new(),
+            approval_required: false,
+            memory_durability_required: true,
+        };
+        let (task_id, run_id, fence) = running_task(&store, suffix, contract.digest());
+        let request = || BeginCompletionRequest {
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            expected_authority_revision: 3,
+            agent_id: format!("agent-{suffix}"),
+            actor: format!("agent-{suffix}"),
+            fencing_identity: fence.clone(),
+            source: CompletionIntentSource::AgentIntent,
+            contract: contract.clone(),
+            observation: CompletionObservation {
+                observed_authority_revision: 3,
+                fencing_identity: fence.clone(),
+                acceptance_satisfied: true,
+                active_child_ids: Vec::new(),
+                pending_consequential_mutation_ids: Vec::new(),
+                mutation_receipts: Vec::new(),
+                artifact_verifications: Vec::new(),
+                policy_state: CompletionGateState::Allow,
+                approval_state: ApprovalState::NotRequired,
+                memory_state: MemoryDurabilityState::Durable,
+            },
+            evidence_refs: vec!["evidence:completion".to_owned()],
+        };
+
+        let unverified = store.begin_completion(request()).unwrap();
+        assert_eq!(unverified.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(unverified.decision.reason, "memory_checkpoint_required");
+        assert!(unverified.barrier.is_none());
+
+        let lineage_id = format!("lineage-{suffix}");
+        let retain_request_id = format!("retain-{suffix}");
+        let port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            &lineage_id,
+            &fence,
+            &retain_request_id,
+            "sha256:precompact-memory",
+        );
+        let rotated = store
+            .rotate_context(
+                context_rotation_request(
+                    suffix,
+                    &task_id,
+                    &run_id,
+                    &fence,
+                    &lineage_id,
+                    &retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap();
+        let checkpoint_id = rotated.checkpoint.unwrap().checkpoint_id;
+
+        let verified = store.begin_completion(request()).unwrap();
+        assert_eq!(verified.decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(
+            verified.barrier.unwrap().memory_checkpoint_id,
+            Some(checkpoint_id)
+        );
+    }
+
+    #[test]
     fn finish_completion_revalidates_fresh_state_and_artifact_after_barrier() {
         let root = tempfile::tempdir().unwrap();
         let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
@@ -5656,6 +6669,32 @@ mod tests {
                 evidence_refs: vec!["evidence:owner-ready".to_owned()],
             })
             .unwrap();
+        let lineage_id = "lineage-finish-recheck";
+        let retain_request_id = "retain-finish-recheck";
+        let memory_port = verified_test_memory_port(
+            "task-finish-recheck",
+            "run-finish-recheck",
+            lineage_id,
+            &fence,
+            retain_request_id,
+            "sha256:precompact-memory",
+        );
+        let rotated = store
+            .rotate_context(
+                context_rotation_request_for_agent(
+                    "finish-recheck",
+                    "task-finish-recheck",
+                    "run-finish-recheck",
+                    &fence,
+                    lineage_id,
+                    retain_request_id,
+                    "worker-a",
+                ),
+                &memory_port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap();
+        assert_eq!(rotated.decision.outcome, DecisionOutcome::Allow);
         let receipt = MutationReceipt {
             mutation_id: "deploy".to_owned(),
             receipt_id: "receipt-deploy".to_owned(),
@@ -6326,6 +7365,220 @@ mod tests {
         }
     }
 
+    struct RejectMemoryEvidence;
+
+    impl MemoryDurabilityEvidenceVerifier for RejectMemoryEvidence {
+        fn verifies(&self, _evidence: &MemoryDurabilityEvidence) -> bool {
+            false
+        }
+    }
+
+    struct AcceptMemoryEvidence;
+
+    impl MemoryDurabilityEvidenceVerifier for AcceptMemoryEvidence {
+        fn verifies(&self, _evidence: &MemoryDurabilityEvidence) -> bool {
+            true
+        }
+    }
+
+    struct TestMemoryPort {
+        retain_probe: MemoryPortProbe,
+        hydrate_probe: MemoryPortProbe,
+        retain: MemoryRetainResult,
+        hydrate_status: MemoryHydrateStatus,
+        hydrate_layer: ContextLayer,
+        hydrate_authority_revision: Option<u64>,
+        hydrate_content: String,
+        hydrate_observed_at: Option<std::sync::Arc<Mutex<Option<OffsetDateTime>>>>,
+    }
+
+    impl MemoryPort for TestMemoryPort {
+        fn probe(&self, requested_capability: &str) -> MemoryPortProbe {
+            match requested_capability {
+                "memory.retain_durable" => self.retain_probe.clone(),
+                "memory.hydrate" => self.hydrate_probe.clone(),
+                _ => panic!("unexpected capability probe: {requested_capability}"),
+            }
+        }
+
+        fn retain(&self, _request: &MemoryRetainRequest) -> MemoryRetainResult {
+            self.retain.clone()
+        }
+
+        fn hydrate(&self, request: &MemoryHydrateRequest) -> MemoryHydrateResult {
+            if let Some(observed_at) = &self.hydrate_observed_at {
+                *observed_at.lock().unwrap() = Some(OffsetDateTime::now_utc());
+            }
+            MemoryHydrateResult {
+                hydrate_request_id: request.hydrate_request_id.clone(),
+                checkpoint_id: request.checkpoint_id.clone(),
+                task_id: request.task_id.clone(),
+                run_id: request.run_id.clone(),
+                lineage_id: request.lineage_id.clone(),
+                authority_revision: self
+                    .hydrate_authority_revision
+                    .unwrap_or(request.authority_summary.authority_revision),
+                new_context_id: request.new_context_id.clone(),
+                status: self.hydrate_status,
+                items: vec![HydratedContextItem {
+                    memory_id: "memory-observation-1".to_owned(),
+                    layer: self.hydrate_layer,
+                    content: self.hydrate_content.clone(),
+                    evidence_ref: "evidence:memory-observation-1".to_owned(),
+                }],
+                evidence_refs: vec!["evidence:hindsight-recall-1".to_owned()],
+            }
+        }
+    }
+
+    struct BlockingMemoryPort {
+        inner: TestMemoryPort,
+        hydrate_entered: std::sync::Arc<std::sync::Barrier>,
+        hydrate_release: std::sync::Arc<std::sync::Barrier>,
+    }
+
+    impl MemoryPort for BlockingMemoryPort {
+        fn probe(&self, requested_capability: &str) -> MemoryPortProbe {
+            self.inner.probe(requested_capability)
+        }
+
+        fn retain(&self, request: &MemoryRetainRequest) -> MemoryRetainResult {
+            self.inner.retain(request)
+        }
+
+        fn hydrate(&self, request: &MemoryHydrateRequest) -> MemoryHydrateResult {
+            self.hydrate_entered.wait();
+            self.hydrate_release.wait();
+            self.inner.hydrate(request)
+        }
+    }
+
+    fn verified_test_memory_port(
+        task_id: &str,
+        run_id: &str,
+        lineage_id: &str,
+        fence: &str,
+        retain_request_id: &str,
+        content_digest: &str,
+    ) -> TestMemoryPort {
+        let capability = evaluate_verified_capability_probe(with_capability_evidence(
+            capability_probe_request(),
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &["evidence:hindsight-capability"],
+        ))
+        .unwrap();
+        let mut hydrate_request = capability_probe_request();
+        hydrate_request.requested_capability = "memory.hydrate".to_owned();
+        hydrate_request.required_field_families = vec!["context_identity".to_owned()];
+        hydrate_request.required_semantics = vec!["typed_hydrate".to_owned()];
+        let hydrate_capability = evaluate_verified_capability_probe(with_capability_evidence(
+            hydrate_request,
+            Some(true),
+            Some(true),
+            &["context_identity"],
+            &["typed_hydrate"],
+            &["evidence:hindsight-hydrate-capability"],
+        ))
+        .unwrap();
+        let operation_id = format!("hindsight-operation-{retain_request_id}");
+        TestMemoryPort {
+            retain_probe: MemoryPortProbe {
+                capability: capability.clone(),
+                health: MemoryPortHealth::Healthy,
+                evidence_refs: vec!["evidence:hindsight-health".to_owned()],
+            },
+            hydrate_probe: MemoryPortProbe {
+                capability: hydrate_capability,
+                health: MemoryPortHealth::Healthy,
+                evidence_refs: vec!["evidence:hindsight-hydrate-health".to_owned()],
+            },
+            retain: MemoryRetainResult {
+                retain_request_id: retain_request_id.to_owned(),
+                task_id: task_id.to_owned(),
+                run_id: run_id.to_owned(),
+                lineage_id: lineage_id.to_owned(),
+                authority_revision: 3,
+                content_digest: content_digest.to_owned(),
+                fencing_identity: fence.to_owned(),
+                operation_id: operation_id.clone(),
+                durability: MemoryDurabilityState::Durable,
+                evidence: Some(MemoryDurabilityEvidence {
+                    schema_version: 1,
+                    adapter_id: capability.adapter_id,
+                    adapter_version: capability.adapter_version,
+                    upstream_id: capability.upstream_id,
+                    upstream_version: capability.upstream_version,
+                    retain_request_id: retain_request_id.to_owned(),
+                    task_id: task_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    lineage_id: lineage_id.to_owned(),
+                    authority_revision: 3,
+                    content_digest: content_digest.to_owned(),
+                    fencing_identity: fence.to_owned(),
+                    operation_id,
+                    durable_at: OffsetDateTime::now_utc(),
+                    evidence_refs: vec!["evidence:hmac-retain-completed".to_owned()],
+                }),
+                evidence_refs: vec!["provider:retain-completed".to_owned()],
+            },
+            hydrate_status: MemoryHydrateStatus::Hydrated,
+            hydrate_layer: ContextLayer::LongTermMemory,
+            hydrate_authority_revision: None,
+            hydrate_content: "selected durable memory".to_owned(),
+            hydrate_observed_at: None,
+        }
+    }
+
+    fn context_rotation_request(
+        suffix: &str,
+        task_id: &str,
+        run_id: &str,
+        fence: &str,
+        lineage_id: &str,
+        retain_request_id: &str,
+    ) -> ContextRotationRequest {
+        context_rotation_request_for_agent(
+            suffix,
+            task_id,
+            run_id,
+            fence,
+            lineage_id,
+            retain_request_id,
+            &format!("agent-{suffix}"),
+        )
+    }
+
+    fn context_rotation_request_for_agent(
+        suffix: &str,
+        task_id: &str,
+        run_id: &str,
+        fence: &str,
+        lineage_id: &str,
+        retain_request_id: &str,
+        agent_id: &str,
+    ) -> ContextRotationRequest {
+        ContextRotationRequest {
+            rotation_id: format!("rotation-{suffix}"),
+            task_id: task_id.to_owned(),
+            run_id: run_id.to_owned(),
+            expected_authority_revision: 3,
+            agent_id: agent_id.to_owned(),
+            actor: agent_id.to_owned(),
+            fencing_identity: fence.to_owned(),
+            lineage_id: lineage_id.to_owned(),
+            kanban_history_ref: format!("kanban:task-{suffix}"),
+            old_context_id: format!("context-old-{suffix}"),
+            new_context_id: format!("context-new-{suffix}"),
+            retain_request_id: retain_request_id.to_owned(),
+            memory_content_digest: "sha256:precompact-memory".to_owned(),
+            memory_query: "current run requirements".to_owned(),
+            selected_evidence_refs: vec!["evidence:current-run".to_owned()],
+        }
+    }
+
     fn evaluate_verified_capability_probe(
         request: CapabilityProbeRequest,
     ) -> Result<CapabilityProbeResult, GovernanceError> {
@@ -6552,7 +7805,11 @@ mod tests {
         }
     }
 
-    fn running_approval_task(store: &GovernanceStore, suffix: &str) -> (String, String, String) {
+    fn running_task(
+        store: &GovernanceStore,
+        suffix: &str,
+        acceptance_contract_digest: String,
+    ) -> (String, String, String) {
         let task_id = format!("task-{suffix}");
         let run_id = format!("run-{suffix}");
         let agent_id = format!("agent-{suffix}");
@@ -6561,7 +7818,7 @@ mod tests {
                 task_id: task_id.clone(),
                 run_id: run_id.clone(),
                 actor: "operator".to_owned(),
-                acceptance_contract_digest: format!("contract-{suffix}"),
+                acceptance_contract_digest,
             })
             .unwrap();
         let claim = store
@@ -6590,6 +7847,10 @@ mod tests {
             })
             .unwrap();
         (task_id, run_id, fence)
+    }
+
+    fn running_approval_task(store: &GovernanceStore, suffix: &str) -> (String, String, String) {
+        running_task(store, suffix, format!("contract-{suffix}"))
     }
 
     fn issue_test_approval(
@@ -7389,5 +8650,587 @@ mod tests {
             assert!(result.governing_policy_id.is_none());
             assert!(result.exception_id.is_none());
         }
+    }
+
+    #[test]
+    fn memory_transport_acceptance_is_never_durable_without_provider_evidence() {
+        let capability = evaluate_verified_capability_probe(with_capability_evidence(
+            capability_probe_request(),
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &["evidence:memory-port-capability"],
+        ))
+        .unwrap();
+        let request = MemoryRetainRequest {
+            retain_request_id: "retain-1".to_owned(),
+            task_id: "task-memory".to_owned(),
+            run_id: "run-memory".to_owned(),
+            lineage_id: "lineage-memory".to_owned(),
+            authority_revision: 3,
+            content_digest: "sha256:memory-input".to_owned(),
+            fencing_identity: "fence-memory".to_owned(),
+            evidence_refs: vec!["evidence:pre-compact".to_owned()],
+        };
+
+        for durability in [
+            MemoryDurabilityState::Accepted,
+            MemoryDurabilityState::Queued,
+            MemoryDurabilityState::Claimed,
+            MemoryDurabilityState::Processing,
+        ] {
+            let evaluated = evaluate_memory_retain(
+                &capability,
+                &request,
+                MemoryRetainResult {
+                    retain_request_id: request.retain_request_id.clone(),
+                    task_id: request.task_id.clone(),
+                    run_id: request.run_id.clone(),
+                    lineage_id: request.lineage_id.clone(),
+                    authority_revision: request.authority_revision,
+                    content_digest: request.content_digest.clone(),
+                    fencing_identity: request.fencing_identity.clone(),
+                    operation_id: "hindsight-operation-1".to_owned(),
+                    durability,
+                    evidence: None,
+                    evidence_refs: vec!["provider:http-200".to_owned()],
+                },
+                &RejectMemoryEvidence,
+            )
+            .unwrap();
+            assert_eq!(evaluated.durability, durability);
+            assert!(!evaluated.is_durable);
+            assert_eq!(evaluated.reason, "memory_not_durable");
+            assert!(evaluated.provider_evidence_refs.is_empty());
+        }
+    }
+
+    #[test]
+    fn verified_memory_durability_preserves_typed_capability_loss() {
+        let capability = evaluate_verified_capability_probe(with_capability_evidence(
+            capability_probe_request(),
+            Some(true),
+            Some(true),
+            &["operation_state"],
+            &["durable_terminal"],
+            &["evidence:memory-port-capability"],
+        ))
+        .unwrap();
+        let request = MemoryRetainRequest {
+            retain_request_id: "retain-verified".to_owned(),
+            task_id: "task-memory".to_owned(),
+            run_id: "run-memory".to_owned(),
+            lineage_id: "lineage-memory".to_owned(),
+            authority_revision: 3,
+            content_digest: "sha256:memory-input".to_owned(),
+            fencing_identity: "fence-memory".to_owned(),
+            evidence_refs: vec!["evidence:pre-compact".to_owned()],
+        };
+        let result = MemoryRetainResult {
+            retain_request_id: request.retain_request_id.clone(),
+            task_id: request.task_id.clone(),
+            run_id: request.run_id.clone(),
+            lineage_id: request.lineage_id.clone(),
+            authority_revision: request.authority_revision,
+            content_digest: request.content_digest.clone(),
+            fencing_identity: request.fencing_identity.clone(),
+            operation_id: "hindsight-operation-verified".to_owned(),
+            durability: MemoryDurabilityState::Durable,
+            evidence: Some(MemoryDurabilityEvidence {
+                schema_version: 1,
+                adapter_id: capability.adapter_id.clone(),
+                adapter_version: capability.adapter_version.clone(),
+                upstream_id: capability.upstream_id.clone(),
+                upstream_version: capability.upstream_version.clone(),
+                retain_request_id: request.retain_request_id.clone(),
+                task_id: request.task_id.clone(),
+                run_id: request.run_id.clone(),
+                lineage_id: request.lineage_id.clone(),
+                authority_revision: request.authority_revision,
+                content_digest: request.content_digest.clone(),
+                fencing_identity: request.fencing_identity.clone(),
+                operation_id: "hindsight-operation-verified".to_owned(),
+                durable_at: OffsetDateTime::now_utc(),
+                evidence_refs: vec!["evidence:hmac-retain-completed".to_owned()],
+            }),
+            evidence_refs: vec!["provider:retain-completed".to_owned()],
+        };
+        let durable =
+            evaluate_memory_retain(&capability, &request, result.clone(), &AcceptMemoryEvidence)
+                .unwrap();
+        assert!(durable.is_durable);
+        assert_eq!(durable.durability, MemoryDurabilityState::Durable);
+        assert_eq!(
+            durable.provider_evidence_refs,
+            vec!["evidence:hmac-retain-completed".to_owned()]
+        );
+
+        let mut empty_evidence = result.clone();
+        empty_evidence
+            .evidence
+            .as_mut()
+            .unwrap()
+            .evidence_refs
+            .clear();
+        let rejected =
+            evaluate_memory_retain(&capability, &request, empty_evidence, &AcceptMemoryEvidence)
+                .unwrap();
+        assert!(!rejected.is_durable);
+        assert_eq!(rejected.durability, MemoryDurabilityState::Failed);
+        assert_eq!(rejected.reason, "memory_durability_evidence_required");
+        assert!(rejected.provider_evidence_refs.is_empty());
+
+        for (status, expected_durability, reason) in [
+            (
+                CapabilityStatus::Degraded,
+                MemoryDurabilityState::Degraded,
+                "memory_capability_degraded",
+            ),
+            (
+                CapabilityStatus::Unsupported,
+                MemoryDurabilityState::Unsupported,
+                "memory_capability_unsupported",
+            ),
+            (
+                CapabilityStatus::Incompatible,
+                MemoryDurabilityState::Unsupported,
+                "memory_capability_incompatible",
+            ),
+            (
+                CapabilityStatus::Unknown,
+                MemoryDurabilityState::Unknown,
+                "memory_capability_unknown",
+            ),
+        ] {
+            let mut unavailable = capability.clone();
+            unavailable.status = status;
+            let evaluated = evaluate_memory_retain(
+                &unavailable,
+                &request,
+                result.clone(),
+                &AcceptMemoryEvidence,
+            )
+            .unwrap();
+            assert_eq!(evaluated.capability_status, status);
+            assert_eq!(evaluated.durability, expected_durability);
+            assert_eq!(evaluated.reason, reason);
+            assert!(!evaluated.is_durable);
+            assert!(evaluated.provider_evidence_refs.is_empty());
+        }
+    }
+
+    #[test]
+    fn context_rotation_persists_checkpoint_and_preserves_authority_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        let (task_id, run_id, fence) = running_approval_task(&store, "context");
+        let retain_request_id = "retain-context-1".to_owned();
+        let lineage_id = "lineage-context-1".to_owned();
+        let hydrate_observed_at = std::sync::Arc::new(Mutex::new(None));
+        let mut port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            &lineage_id,
+            &fence,
+            &retain_request_id,
+            "sha256:precompact-memory",
+        );
+        port.hydrate_observed_at = Some(hydrate_observed_at.clone());
+
+        let rotated = store
+            .rotate_context(
+                context_rotation_request(
+                    "context",
+                    &task_id,
+                    &run_id,
+                    &fence,
+                    &lineage_id,
+                    &retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap();
+
+        assert_eq!(rotated.decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(rotated.decision.reason, "context_rotated");
+        assert_eq!(rotated.decision.authority_before, 3);
+        assert_eq!(rotated.decision.authority_after, 3);
+        let checkpoint = rotated.checkpoint.unwrap();
+        assert_eq!(
+            checkpoint.phase_trace,
+            vec![
+                ContextLifecyclePhase::PreCompact,
+                ContextLifecyclePhase::RetainDurable,
+                ContextLifecyclePhase::ContextCheckpoint,
+                ContextLifecyclePhase::NewContext,
+                ContextLifecyclePhase::TypedHydrate,
+                ContextLifecyclePhase::PostCompactVerify,
+            ]
+        );
+        assert_eq!(checkpoint.phase, ContextLifecyclePhase::PostCompactVerify);
+        assert_eq!(checkpoint.authority_summary.task_id, task_id);
+        assert_eq!(checkpoint.authority_summary.run_id, run_id);
+        assert_eq!(checkpoint.authority_summary.authority_revision, 3);
+        assert_eq!(checkpoint.authority_summary.fencing_identity, fence);
+        assert_eq!(checkpoint.kanban_history_ref, "kanban:task-context");
+        assert!(checkpoint.verified_at.is_some());
+        assert!(checkpoint.verified_at.unwrap() >= hydrate_observed_at.lock().unwrap().unwrap());
+        let hydration = rotated.hydration.unwrap();
+        assert_eq!(hydration.status, MemoryHydrateStatus::Hydrated);
+        assert!(
+            hydration
+                .items
+                .iter()
+                .all(|item| item.layer == ContextLayer::LongTermMemory)
+        );
+        assert_eq!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            3
+        );
+
+        drop(store);
+        let reopened = GovernanceStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .context_checkpoint(&checkpoint.checkpoint_id)
+                .unwrap(),
+            Some(checkpoint)
+        );
+    }
+
+    #[test]
+    fn context_rotation_requires_exact_hydrate_capability_from_same_provider() {
+        for (index, status, reason) in [
+            (0, CapabilityStatus::Degraded, "memory_capability_degraded"),
+            (
+                1,
+                CapabilityStatus::Unsupported,
+                "memory_capability_unsupported",
+            ),
+            (
+                2,
+                CapabilityStatus::Incompatible,
+                "memory_capability_incompatible",
+            ),
+            (3, CapabilityStatus::Unknown, "memory_capability_unknown"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+            let suffix = format!("hydrate-capability-{index}");
+            let (task_id, run_id, fence) = running_approval_task(&store, &suffix);
+            let lineage_id = format!("lineage-{suffix}");
+            let retain_request_id = format!("retain-{suffix}");
+            let mut port = verified_test_memory_port(
+                &task_id,
+                &run_id,
+                &lineage_id,
+                &fence,
+                &retain_request_id,
+                "sha256:precompact-memory",
+            );
+            port.hydrate_probe.capability.status = status;
+
+            let rotated = store
+                .rotate_context(
+                    context_rotation_request(
+                        &suffix,
+                        &task_id,
+                        &run_id,
+                        &fence,
+                        &lineage_id,
+                        &retain_request_id,
+                    ),
+                    &port,
+                    &AcceptMemoryEvidence,
+                )
+                .unwrap();
+
+            assert_eq!(rotated.decision.outcome, DecisionOutcome::Defer);
+            assert_eq!(rotated.decision.reason, reason);
+            assert!(rotated.checkpoint.is_none());
+            assert!(rotated.hydration.is_none());
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let suffix = "hydrate-provider-mismatch";
+        let (task_id, run_id, fence) = running_approval_task(&store, suffix);
+        let lineage_id = format!("lineage-{suffix}");
+        let retain_request_id = format!("retain-{suffix}");
+        let mut port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            &lineage_id,
+            &fence,
+            &retain_request_id,
+            "sha256:precompact-memory",
+        );
+        port.hydrate_probe.capability.adapter_version = "2.0.0".to_owned();
+        let rotated = store
+            .rotate_context(
+                context_rotation_request(
+                    suffix,
+                    &task_id,
+                    &run_id,
+                    &fence,
+                    &lineage_id,
+                    &retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap();
+        assert_eq!(rotated.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(rotated.decision.reason, "memory_provider_binding_mismatch");
+        assert!(rotated.checkpoint.is_none());
+        assert!(rotated.hydration.is_none());
+    }
+
+    #[test]
+    fn malformed_hydrate_marks_durable_checkpoint_failed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        let suffix = "hydrate-invalid";
+        let (task_id, run_id, fence) = running_approval_task(&store, suffix);
+        let lineage_id = format!("lineage-{suffix}");
+        let retain_request_id = format!("retain-{suffix}");
+        let mut port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            &lineage_id,
+            &fence,
+            &retain_request_id,
+            "sha256:precompact-memory",
+        );
+        port.hydrate_content.clear();
+
+        let rotated = store
+            .rotate_context(
+                context_rotation_request(
+                    suffix,
+                    &task_id,
+                    &run_id,
+                    &fence,
+                    &lineage_id,
+                    &retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap();
+
+        assert_eq!(rotated.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(rotated.decision.reason, "memory_hydrate_invalid");
+        assert!(rotated.hydration.is_none());
+        let checkpoint = rotated.checkpoint.unwrap();
+        assert_eq!(checkpoint.phase, ContextLifecyclePhase::Failed);
+        assert!(checkpoint.verified_at.is_none());
+        assert_eq!(
+            store.decisions(&task_id).unwrap().last(),
+            Some(&rotated.decision)
+        );
+        drop(store);
+        assert_eq!(
+            GovernanceStore::open(&path)
+                .unwrap()
+                .context_checkpoint(&checkpoint.checkpoint_id)
+                .unwrap(),
+            Some(checkpoint)
+        );
+    }
+
+    #[test]
+    fn authority_change_during_hydrate_never_returns_memory_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            GovernanceStore::open(root.path().join("agent-governance.json")).unwrap(),
+        );
+        let suffix = "hydrate-authority-race";
+        let contract = CompletionContract {
+            required_mutation_ids: Vec::new(),
+            required_artifacts: Vec::new(),
+            approval_required: false,
+            memory_durability_required: false,
+        };
+        let (task_id, run_id, fence) = running_task(&store, suffix, contract.digest());
+        let lineage_id = format!("lineage-{suffix}");
+        let retain_request_id = format!("retain-{suffix}");
+        let hydrate_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let hydrate_release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let port = BlockingMemoryPort {
+            inner: verified_test_memory_port(
+                &task_id,
+                &run_id,
+                &lineage_id,
+                &fence,
+                &retain_request_id,
+                "sha256:precompact-memory",
+            ),
+            hydrate_entered: hydrate_entered.clone(),
+            hydrate_release: hydrate_release.clone(),
+        };
+        let rotation_request = context_rotation_request(
+            suffix,
+            &task_id,
+            &run_id,
+            &fence,
+            &lineage_id,
+            &retain_request_id,
+        );
+        let rotating_store = store.clone();
+        let rotating = std::thread::spawn(move || {
+            rotating_store
+                .rotate_context(rotation_request, &port, &AcceptMemoryEvidence)
+                .unwrap()
+        });
+        hydrate_entered.wait();
+
+        let begun = store
+            .begin_completion(BeginCompletionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 3,
+                agent_id: format!("agent-{suffix}"),
+                actor: format!("agent-{suffix}"),
+                fencing_identity: fence.clone(),
+                source: CompletionIntentSource::AgentIntent,
+                contract,
+                observation: CompletionObservation {
+                    observed_authority_revision: 3,
+                    fencing_identity: fence,
+                    acceptance_satisfied: true,
+                    active_child_ids: Vec::new(),
+                    pending_consequential_mutation_ids: Vec::new(),
+                    mutation_receipts: Vec::new(),
+                    artifact_verifications: Vec::new(),
+                    policy_state: CompletionGateState::Allow,
+                    approval_state: ApprovalState::NotRequired,
+                    memory_state: MemoryDurabilityState::NotRequired,
+                },
+                evidence_refs: vec!["evidence:completion".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(begun.decision.outcome, DecisionOutcome::Allow);
+        hydrate_release.wait();
+
+        let rotated = rotating.join().unwrap();
+        assert_eq!(rotated.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(rotated.decision.reason, "stale_authority");
+        assert!(rotated.hydration.is_none());
+        assert_eq!(
+            rotated.checkpoint.unwrap().phase,
+            ContextLifecyclePhase::Failed
+        );
+    }
+
+    #[test]
+    fn hydrate_cannot_reconstruct_kanban_or_acp_authority() {
+        for (index, layer) in [
+            ContextLayer::KanbanDurableHistory,
+            ContextLayer::LiveModelContext,
+            ContextLayer::AcpAuthority,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = tempfile::tempdir().unwrap();
+            let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+            let suffix = format!("forbidden-hydrate-{index}");
+            let (task_id, run_id, fence) = running_approval_task(&store, &suffix);
+            let lineage_id = format!("lineage-{suffix}");
+            let retain_request_id = format!("retain-{suffix}");
+            let mut port = verified_test_memory_port(
+                &task_id,
+                &run_id,
+                &lineage_id,
+                &fence,
+                &retain_request_id,
+                "sha256:precompact-memory",
+            );
+            port.hydrate_layer = layer;
+
+            let rotated = store
+                .rotate_context(
+                    context_rotation_request(
+                        &suffix,
+                        &task_id,
+                        &run_id,
+                        &fence,
+                        &lineage_id,
+                        &retain_request_id,
+                    ),
+                    &port,
+                    &AcceptMemoryEvidence,
+                )
+                .unwrap();
+
+            assert_eq!(rotated.decision.outcome, DecisionOutcome::Deny);
+            assert_eq!(rotated.decision.reason, "memory_hydrate_layer_forbidden");
+            let checkpoint = rotated.checkpoint.unwrap();
+            assert_eq!(checkpoint.phase, ContextLifecyclePhase::Failed);
+            assert!(checkpoint.verified_at.is_none());
+            assert_eq!(
+                store
+                    .authority(&task_id)
+                    .unwrap()
+                    .unwrap()
+                    .authority_revision,
+                3
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = GovernanceStore::open(root.path().join("agent-governance.json")).unwrap();
+        let suffix = "hydrate-authority-mismatch";
+        let (task_id, run_id, fence) = running_approval_task(&store, suffix);
+        let lineage_id = format!("lineage-{suffix}");
+        let retain_request_id = format!("retain-{suffix}");
+        let mut port = verified_test_memory_port(
+            &task_id,
+            &run_id,
+            &lineage_id,
+            &fence,
+            &retain_request_id,
+            "sha256:precompact-memory",
+        );
+        port.hydrate_authority_revision = Some(99);
+
+        let rotated = store
+            .rotate_context(
+                context_rotation_request(
+                    suffix,
+                    &task_id,
+                    &run_id,
+                    &fence,
+                    &lineage_id,
+                    &retain_request_id,
+                ),
+                &port,
+                &AcceptMemoryEvidence,
+            )
+            .unwrap();
+
+        assert_eq!(rotated.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(rotated.decision.reason, "memory_hydrate_binding_mismatch");
+        assert_eq!(
+            rotated.checkpoint.unwrap().phase,
+            ContextLifecyclePhase::Failed
+        );
+        assert_eq!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            3
+        );
     }
 }
