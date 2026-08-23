@@ -1132,6 +1132,10 @@ pub struct HandoffCheckpoint {
     pub context_checkpoint_id: String,
     pub memory_checkpoint_id: Option<String>,
     pub handoff_capability: CapabilityProbeResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_handoff_acceptance: Option<CompletionObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_evidence_digest: Option<String>,
     pub evidence_refs: Vec<String>,
     pub state: HandoffCheckpointState,
     #[serde(with = "time::serde::rfc3339")]
@@ -1160,6 +1164,7 @@ pub struct BeginHandoffRequest {
     pub pending_consequential_mutation_ids: Vec<String>,
     pub mutation_receipts: Vec<MutationReceipt>,
     pub context_checkpoint_id: String,
+    pub pre_handoff_acceptance: Option<CompletionObservation>,
     pub evidence_refs: Vec<String>,
 }
 
@@ -2193,6 +2198,10 @@ impl GovernanceStore {
                 .cloned()
             })
             .flatten();
+        let acceptance_failure = handoff_acceptance_failure(
+            &request,
+            !request.contract.memory_durability_required || memory_checkpoint.is_some(),
+        );
         let blocker_baseline_matches = authority.as_ref().is_some_and(|authority| match authority
             .active_blocker_id
             .as_deref()
@@ -2255,6 +2264,7 @@ impl GovernanceStore {
             {
                 (DecisionOutcome::Defer, "memory_checkpoint_required")
             }
+            Some(_) if acceptance_failure.is_some() => acceptance_failure.unwrap(),
             Some(authority) => {
                 let checkpoint_id = new_handoff_checkpoint_id();
                 let old_ownership_generation =
@@ -2305,6 +2315,11 @@ impl GovernanceStore {
                         .memory_durability_required
                         .then(|| request.context_checkpoint_id.clone()),
                     handoff_capability: request.handoff_capability.clone(),
+                    pre_handoff_acceptance: request.pre_handoff_acceptance.clone(),
+                    acceptance_evidence_digest: request
+                        .pre_handoff_acceptance
+                        .as_ref()
+                        .map(completion_observation_digest),
                     evidence_refs,
                     state: HandoffCheckpointState::Suspending,
                     created_at: now,
@@ -4773,6 +4788,9 @@ fn validate_begin_handoff_request(request: &BeginHandoffRequest) -> Result<(), G
         &request.pending_consequential_mutation_ids,
         &request.mutation_receipts,
     )?;
+    if let Some(observation) = &request.pre_handoff_acceptance {
+        validate_completion_observation(observation)?;
+    }
     validate_evidence_refs(&request.evidence_refs)?;
     if request.old_owner_agent_id == request.replacement_agent_id {
         return Err(GovernanceError::InvalidIdentity("replacement_agent_id"));
@@ -5062,6 +5080,37 @@ fn handoff_mutation_failure(
                 || receipt.fencing_identity != expected_fencing_identity
         })
         .then_some((DecisionOutcome::Defer, "stale_mutation_receipt"))
+}
+
+fn handoff_acceptance_failure(
+    request: &BeginHandoffRequest,
+    memory_durability_verified: bool,
+) -> Option<(DecisionOutcome, &'static str)> {
+    let observation = request.pre_handoff_acceptance.as_ref()?;
+    if observation.pending_consequential_mutation_ids != request.pending_consequential_mutation_ids
+        || completion_required_receipts_digest(&request.contract, observation)
+            != completion_required_receipts_digest(
+                &request.contract,
+                &CompletionObservation {
+                    mutation_receipts: request.mutation_receipts.clone(),
+                    ..observation.clone()
+                },
+            )
+    {
+        return Some((
+            DecisionOutcome::Defer,
+            "handoff_acceptance_binding_mismatch",
+        ));
+    }
+    completion_gate_failure(
+        &request.contract,
+        observation,
+        request.expected_authority_revision,
+        request.expected_authority_revision,
+        request.expected_authority_revision,
+        &request.fencing_identity,
+        memory_durability_verified,
+    )
 }
 
 fn resume_handoff_state_failure<'a>(
@@ -8695,6 +8744,20 @@ mod tests {
         }
     }
 
+    struct Sha256CapabilityProbeEvidenceVerifier {
+        verified: &'static [&'static str],
+    }
+
+    impl CapabilityProbeEvidenceVerifier for Sha256CapabilityProbeEvidenceVerifier {
+        fn verifies(&self, evidence: &CapabilityProbeEvidence) -> bool {
+            let digest = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(evidence).unwrap())
+            );
+            self.verified.contains(&digest.as_str())
+        }
+    }
+
     struct RejectMemoryEvidence;
 
     impl MemoryDurabilityEvidenceVerifier for RejectMemoryEvidence {
@@ -8708,6 +8771,14 @@ mod tests {
     impl MemoryDurabilityEvidenceVerifier for AcceptMemoryEvidence {
         fn verifies(&self, _evidence: &MemoryDurabilityEvidence) -> bool {
             true
+        }
+    }
+
+    struct ExactMemoryEvidence(MemoryDurabilityEvidence);
+
+    impl MemoryDurabilityEvidenceVerifier for ExactMemoryEvidence {
+        fn verifies(&self, evidence: &MemoryDurabilityEvidence) -> bool {
+            evidence == &self.0
         }
     }
 
@@ -10665,6 +10736,7 @@ mod tests {
             pending_consequential_mutation_ids: Vec::new(),
             mutation_receipts: Vec::new(),
             context_checkpoint_id: context_checkpoint_id.to_owned(),
+            pre_handoff_acceptance: None,
             evidence_refs: vec!["evidence:handoff-requested".to_owned()],
         }
     }
@@ -10733,6 +10805,7 @@ mod tests {
                     durability: MutationDurability::Durable,
                 }],
                 context_checkpoint_id: context.checkpoint_id.clone(),
+                pre_handoff_acceptance: None,
                 evidence_refs: vec!["evidence:handoff-requested".to_owned()],
             })
             .unwrap();
@@ -11752,5 +11825,1503 @@ mod tests {
                 .state,
             HandoffCheckpointState::Resuming
         );
+    }
+
+    #[test]
+    fn governance_v1_structural_lifecycle_is_reconstructable_end_to_end() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent-governance.json");
+        let store = GovernanceStore::open(&path).unwrap();
+        let contract = CompletionContract {
+            required_mutation_ids: vec!["publish".to_owned()],
+            required_artifacts: vec![ArtifactRequirement {
+                artifact_id: "release-manifest".to_owned(),
+                after_mutation_id: "publish".to_owned(),
+            }],
+            approval_required: true,
+            memory_durability_required: true,
+        };
+        let contract_digest = contract.digest();
+        let (task_id, run_id, first_fence) =
+            running_task(&store, "structural-e2e", contract_digest.clone());
+        let first_owner = "agent-structural-e2e";
+        let replacement = "replacement-structural-e2e";
+        let lineage_id = "lineage-structural-e2e";
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StructuralArtifactFixture {
+            artifact_id: String,
+            content: String,
+            sha256: String,
+        }
+
+        #[derive(Debug, Deserialize, Eq, PartialEq)]
+        #[serde(rename_all = "camelCase")]
+        struct StructuralHarnessFixture {
+            harness_id: String,
+            source_commit: String,
+            source_tree: String,
+        }
+
+        #[derive(Debug, Deserialize, Eq, PartialEq)]
+        #[serde(rename_all = "camelCase")]
+        struct StructuralUpstreamFixture {
+            upstream_id: String,
+            repository: String,
+            release_tag: String,
+            source_commit: String,
+            source_tree: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StructuralAcceptanceFixture {
+            schema_version: u32,
+            config_id: String,
+            harness: StructuralHarnessFixture,
+            upstreams: Vec<StructuralUpstreamFixture>,
+            artifact: StructuralArtifactFixture,
+            capability_probes: Vec<CapabilityProbeRequest>,
+        }
+
+        let fixture_bytes =
+            include_bytes!("../tests/fixtures/governance-v1-structural-acceptance.json");
+        let fixture_sha256 = format!("{:x}", Sha256::digest(fixture_bytes));
+        assert_eq!(
+            fixture_sha256,
+            "02c40f9e3b3d50567379f18dff55fe6b9f99c0726d75460d06f08c4f8858d97d"
+        );
+        let fixture: StructuralAcceptanceFixture = serde_json::from_slice(fixture_bytes).unwrap();
+        assert_eq!(fixture.schema_version, 1);
+        assert_eq!(
+            fixture.harness,
+            StructuralHarnessFixture {
+                harness_id: "m365-ai-gateway/acp-governance-structural-e2e".to_owned(),
+                source_commit: "5102b93d93e601bf497e47e59c01351772ded0ec".to_owned(),
+                source_tree: "5024bf83b1ce0401156a7bee2c0dc7b591d10d79".to_owned(),
+            }
+        );
+        assert_eq!(
+            fixture.upstreams,
+            vec![
+                StructuralUpstreamFixture {
+                    upstream_id: "hindsight".to_owned(),
+                    repository: "vectorize-io/hindsight".to_owned(),
+                    release_tag: "v0.9.1".to_owned(),
+                    source_commit: "e5b49eb6729512bd9b103058daa93f701da25644".to_owned(),
+                    source_tree: "b3939ba8b3d054f87a6118dada5dfa723aa0bdbc".to_owned(),
+                },
+                StructuralUpstreamFixture {
+                    upstream_id: "hermes".to_owned(),
+                    repository: "NousResearch/hermes-agent".to_owned(),
+                    release_tag: "v2026.8.19".to_owned(),
+                    source_commit: "fcbd1076a93841fa88855acce810e342a5b78101".to_owned(),
+                    source_tree: "cc9f987a403a1d02b8b17cc527a57b54402e864b".to_owned(),
+                },
+                StructuralUpstreamFixture {
+                    upstream_id: "semantica".to_owned(),
+                    repository: "semantica-agi/semantica".to_owned(),
+                    release_tag: "v0.6.5".to_owned(),
+                    source_commit: "5b319560fb0b8403644b70bc592864418cdcc740".to_owned(),
+                    source_tree: "2bff91d9a345897dfc0e570d67363af46dedaf5b".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fixture.artifact.content.as_bytes())),
+            fixture.artifact.sha256
+        );
+        let fixture_verifier = Sha256CapabilityProbeEvidenceVerifier {
+            verified: &[
+                "398a3c4fabdca5c56a3e1b8220a697b91881fa3eb2708332daaec015832879c1",
+                "e8b2a05974607ff97acec8c43882ab542acc91fb63a18cc5c5c5b46b31c0c77e",
+                "cea71638b483b198a5337ca3ff68242a0bd427e1733a8811da8f2fea8f587127",
+                "dfb149d4ac9c6082c7feff33e67a89f773e16d63a2bca52f1c93488c01286614",
+                "083c53a6d94d51a2dfccf48e55fbb0ff57715eb1448b72cfd4285cbd5a4b9d49",
+            ],
+        };
+        let mut tampered_capability_evidence =
+            fixture.capability_probes[0].evidence.clone().unwrap();
+        tampered_capability_evidence.upstream_version = "private-fork".to_owned();
+        assert!(!fixture_verifier.verifies(&tampered_capability_evidence));
+        let capabilities = fixture
+            .capability_probes
+            .iter()
+            .cloned()
+            .map(|request| evaluate_capability_probe(request, &fixture_verifier).unwrap())
+            .collect::<Vec<_>>();
+        let capability =
+            |upstream_id: &str, requested_capability: &str, status: CapabilityStatus| {
+                capabilities
+                    .iter()
+                    .find(|capability| {
+                        capability.upstream_id == upstream_id
+                            && capability.requested_capability == requested_capability
+                            && capability.status == status
+                    })
+                    .cloned()
+                    .unwrap()
+            };
+        let hindsight_retain_capability = capability(
+            "hindsight",
+            "memory.retain_durable",
+            CapabilityStatus::Supported,
+        );
+        let hindsight_hydrate_capability =
+            capability("hindsight", "memory.hydrate", CapabilityStatus::Supported);
+        let stock_handoff_capability =
+            capability("hermes", "handoff.checkpoint", CapabilityStatus::Supported);
+        let unavailable_handoff_capability = capability(
+            "hermes",
+            "handoff.checkpoint",
+            CapabilityStatus::Unsupported,
+        );
+        let semantica_capability =
+            capability("semantica", "decision.query", CapabilityStatus::Supported);
+        for (result, adapter, upstream, version, seam) in [
+            (
+                &hindsight_retain_capability,
+                "hindsight-adapter",
+                "hindsight",
+                "0.9.1",
+                CapabilityIntegrationSeam::Adapter,
+            ),
+            (
+                &hindsight_hydrate_capability,
+                "hindsight-adapter",
+                "hindsight",
+                "0.9.1",
+                CapabilityIntegrationSeam::Adapter,
+            ),
+            (
+                &stock_handoff_capability,
+                "hermes-adapter",
+                "hermes",
+                "0.20.5",
+                CapabilityIntegrationSeam::Hook,
+            ),
+            (
+                &semantica_capability,
+                "semantica-adapter",
+                "semantica",
+                "0.6.5",
+                CapabilityIntegrationSeam::Sidecar,
+            ),
+        ] {
+            assert_eq!(result.adapter_id, adapter);
+            assert_eq!(result.adapter_version, "1.0.0");
+            assert_eq!(result.upstream_id, upstream);
+            assert_eq!(result.upstream_version, version);
+            assert_eq!(result.integration_seam, seam);
+            assert!(!result.evidence_refs.is_empty());
+        }
+
+        let memory_evidence_at = |authority_revision: u64, fence: &str, retain_request_id: &str| {
+            MemoryDurabilityEvidence {
+                schema_version: 1,
+                adapter_id: "hindsight-adapter".to_owned(),
+                adapter_version: "1.0.0".to_owned(),
+                upstream_id: "hindsight".to_owned(),
+                upstream_version: "0.9.1".to_owned(),
+                retain_request_id: retain_request_id.to_owned(),
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                lineage_id: lineage_id.to_owned(),
+                authority_revision,
+                content_digest: "sha256:precompact-memory".to_owned(),
+                fencing_identity: fence.to_owned(),
+                operation_id: format!("hindsight-operation-{retain_request_id}"),
+                durable_at: OffsetDateTime::from_unix_timestamp(1_725_000_000).unwrap(),
+                evidence_refs: vec![
+                    "evidence:hmac-retain-completed".to_owned(),
+                    "source:vectorize-io/hindsight@e5b49eb6729512bd9b103058daa93f701da25644"
+                        .to_owned(),
+                ],
+            }
+        };
+        let memory_port_at =
+            |authority_revision: u64, owner: &str, fence: &str, retain_request_id: &str| {
+                let mut port = verified_test_memory_port(
+                    &task_id,
+                    &run_id,
+                    lineage_id,
+                    fence,
+                    retain_request_id,
+                    "sha256:precompact-memory",
+                );
+                port.retain.authority_revision = authority_revision;
+                port.retain.evidence = Some(memory_evidence_at(
+                    authority_revision,
+                    fence,
+                    retain_request_id,
+                ));
+                port.retain_probe.capability = hindsight_retain_capability.clone();
+                port.hydrate_probe.capability = hindsight_hydrate_capability.clone();
+                let mut request = context_rotation_request_for_agent(
+                    retain_request_id,
+                    &task_id,
+                    &run_id,
+                    fence,
+                    lineage_id,
+                    retain_request_id,
+                    owner,
+                );
+                request.expected_authority_revision = authority_revision;
+                let expected_evidence =
+                    memory_evidence_at(authority_revision, fence, retain_request_id);
+                (port, request, expected_evidence)
+            };
+
+        let observed_child = store
+            .record_runtime_observation(RuntimeObservationRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 3,
+                root_agent_id: "agent-root".to_owned(),
+                parent_agent_id: Some("agent-parent".to_owned()),
+                agent_id: first_owner.to_owned(),
+                provider: "m365".to_owned(),
+                profile: "default".to_owned(),
+                role: "child".to_owned(),
+                runtime_state: RuntimeState::Running,
+                waiting_on: None,
+                environment: "structural-test".to_owned(),
+                evidence_class: "versioned-adapter".to_owned(),
+                actor: "runtime-adapter".to_owned(),
+                evidence_refs: vec!["runtime:child-running".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(observed_child.outcome, DecisionOutcome::Allow);
+        let first_receipt = MutationReceipt {
+            mutation_id: "publish".to_owned(),
+            receipt_id: "receipt-first-generation".to_owned(),
+            authority_revision: 3,
+            fencing_identity: first_fence.clone(),
+            durability: MutationDurability::Durable,
+        };
+
+        let (initial_port, initial_rotation, initial_expected_evidence) =
+            memory_port_at(3, first_owner, &first_fence, "retain-e2e-initial");
+        let initial_memory_evidence = ExactMemoryEvidence(initial_expected_evidence.clone());
+        let initial_retain_request = MemoryRetainRequest {
+            retain_request_id: "retain-e2e-initial".to_owned(),
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            lineage_id: lineage_id.to_owned(),
+            authority_revision: 3,
+            content_digest: "sha256:precompact-memory".to_owned(),
+            fencing_identity: first_fence.clone(),
+            evidence_refs: vec!["evidence:selected-memory".to_owned()],
+        };
+        let mut tampered_retain = initial_port.retain.clone();
+        tampered_retain.evidence.as_mut().unwrap().operation_id =
+            "hindsight-operation-tampered".to_owned();
+        let rejected_memory = evaluate_memory_retain(
+            &hindsight_retain_capability,
+            &initial_retain_request,
+            tampered_retain,
+            &initial_memory_evidence,
+        )
+        .unwrap();
+        assert!(!rejected_memory.is_durable);
+        assert_eq!(
+            rejected_memory.reason,
+            "memory_durability_evidence_rejected"
+        );
+        let initial_context = store
+            .rotate_context(initial_rotation, &initial_port, &initial_memory_evidence)
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        assert_eq!(
+            initial_context.phase,
+            ContextLifecyclePhase::PostCompactVerify
+        );
+        assert_eq!(initial_context.authority_summary.authority_revision, 3);
+        assert_eq!(
+            initial_context
+                .retain_capability
+                .as_ref()
+                .unwrap()
+                .upstream_version,
+            "0.9.1"
+        );
+
+        let blocked = store
+            .block_task(BlockTaskRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 3,
+                agent_id: first_owner.to_owned(),
+                actor: first_owner.to_owned(),
+                fencing_identity: first_fence.clone(),
+                blocker_kind: "dependency".to_owned(),
+                cause: StructuredCause {
+                    cause_id: "stock-upstream-unavailable".to_owned(),
+                    schema_version: 1,
+                    fields: BTreeMap::from([("upstream".to_owned(), "semantica".to_owned())]),
+                },
+                required_resume_evidence: vec![EvidenceRequirement {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "semantica".to_owned(),
+                }],
+                evidence_baseline: vec![EvidenceObservation {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "semantica".to_owned(),
+                    identity: "unavailable".to_owned(),
+                }],
+                evidence_refs: semantica_capability.evidence_refs.clone(),
+            })
+            .unwrap();
+        let blocker = blocked.blocker.unwrap();
+        assert_eq!(blocked.decision.authority_after, 4);
+        assert!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .owner_agent_id
+                .is_none()
+        );
+
+        let projection_request = |schema_version| RuntimeProjectionRequest {
+            task_id: task_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: first_owner.to_owned(),
+            consumer_schema_version: schema_version,
+            redacted_fields: Vec::new(),
+            omitted_fields: Vec::new(),
+        };
+        let blocked_projection = store
+            .runtime_projection(projection_request(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            blocked_projection.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Blocked)
+        );
+        assert_eq!(
+            blocked_projection.authority_revision,
+            ProjectionValue::Value(4)
+        );
+        assert_eq!(
+            blocked_projection.metadata.projection_of_authority_revision,
+            4
+        );
+        assert_eq!(
+            blocked_projection.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+        let legacy_projection = store
+            .runtime_projection(projection_request(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            legacy_projection.metadata.downgraded_from_schema_version,
+            Some(1)
+        );
+        assert_eq!(
+            legacy_projection.root_agent_id,
+            ProjectionValue::SchemaDowngrade
+        );
+        assert_eq!(
+            legacy_projection.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Blocked)
+        );
+        assert_eq!(
+            legacy_projection.authority_revision,
+            ProjectionValue::Value(4)
+        );
+        assert_eq!(
+            legacy_projection.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+
+        let unchanged = store
+            .resume_blocker(ResumeBlockerRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                blocker_id: blocker.blocker_id.clone(),
+                expected_blocker_generation: blocker.generation,
+                actor: "scheduler".to_owned(),
+                evidence: vec![
+                    EvidenceObservation {
+                        kind: EvidenceKind::ElapsedTime,
+                        subject: "semantica".to_owned(),
+                        identity: "300s".to_owned(),
+                    },
+                    EvidenceObservation {
+                        kind: EvidenceKind::Heartbeat,
+                        subject: first_owner.to_owned(),
+                        identity: "heartbeat-new".to_owned(),
+                    },
+                    EvidenceObservation {
+                        kind: EvidenceKind::EventSequence,
+                        subject: task_id.clone(),
+                        identity: "event-new".to_owned(),
+                    },
+                    EvidenceObservation {
+                        kind: EvidenceKind::ArtifactVerification,
+                        subject: "unrelated-artifact".to_owned(),
+                        identity: "sha256:unrelated".to_owned(),
+                    },
+                    EvidenceObservation {
+                        kind: EvidenceKind::DependencyState,
+                        subject: "semantica".to_owned(),
+                        identity: "unavailable".to_owned(),
+                    },
+                ],
+                evidence_refs: vec!["evidence:same-cause-recheck".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(unchanged.status, ResumeStatus::BlockerUnchanged);
+        assert_eq!(unchanged.decision.reason, "BLOCKER_UNCHANGED");
+        assert_eq!(unchanged.decision.authority_after, 4);
+
+        let resumed = store
+            .resume_blocker(ResumeBlockerRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 4,
+                blocker_id: blocker.blocker_id.clone(),
+                expected_blocker_generation: blocker.generation,
+                actor: "scheduler".to_owned(),
+                evidence: vec![EvidenceObservation {
+                    kind: EvidenceKind::DependencyState,
+                    subject: "semantica".to_owned(),
+                    identity: "available".to_owned(),
+                }],
+                evidence_refs: vec!["evidence:semantica-recovered".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(resumed.status, ResumeStatus::Resumed);
+        assert_eq!(resumed.decision.authority_after, 5);
+        let ready = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(ready.active_run_id, run_id);
+        assert_eq!(ready.acceptance_contract_digest, contract_digest);
+
+        let reclaimed = store
+            .transition(TransitionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 5,
+                requested_transition: TransitionKind::Claim,
+                agent_id: first_owner.to_owned(),
+                actor: "scheduler".to_owned(),
+                fencing_identity: None,
+                evidence_refs: vec!["evidence:reclaim".to_owned()],
+            })
+            .unwrap();
+        let second_fence = reclaimed.fencing_identity.unwrap();
+        assert_ne!(second_fence, first_fence);
+        store
+            .transition(TransitionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 6,
+                requested_transition: TransitionKind::Start,
+                agent_id: first_owner.to_owned(),
+                actor: "scheduler".to_owned(),
+                fencing_identity: Some(second_fence.clone()),
+                evidence_refs: vec!["evidence:restart-same-run".to_owned()],
+            })
+            .unwrap();
+
+        let premature = store
+            .begin_completion(BeginCompletionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 7,
+                agent_id: first_owner.to_owned(),
+                actor: first_owner.to_owned(),
+                fencing_identity: second_fence.clone(),
+                source: CompletionIntentSource::ModelFinal,
+                contract: contract.clone(),
+                observation: CompletionObservation {
+                    observed_authority_revision: 7,
+                    fencing_identity: second_fence.clone(),
+                    acceptance_satisfied: false,
+                    active_child_ids: vec!["child-structural-e2e".to_owned()],
+                    pending_consequential_mutation_ids: vec!["publish".to_owned()],
+                    mutation_receipts: vec![first_receipt.clone()],
+                    artifact_verifications: Vec::new(),
+                    policy_state: CompletionGateState::Pending,
+                    approval_state: ApprovalState::Pending,
+                    memory_state: MemoryDurabilityState::Processing,
+                },
+                evidence_refs: vec!["evidence:model-final-too-early".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(premature.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(premature.decision.reason, "acceptance_not_satisfied");
+        assert_eq!(premature.decision.authority_after, 7);
+
+        let issue_publish_approval =
+            |expected_authority_revision: u64, actor: &str, fence: &str, suffix: &str| {
+                store
+                    .issue_approval_grant(IssueApprovalGrantRequest {
+                        task_id: task_id.clone(),
+                        run_id: run_id.clone(),
+                        expected_authority_revision,
+                        approved_actor: actor.to_owned(),
+                        issued_by: "operator".to_owned(),
+                        fencing_identity: fence.to_owned(),
+                        evaluation: PolicyEvaluationRequest {
+                            requested_action: "artifact.publish".to_owned(),
+                            target_scope: "repository:main".to_owned(),
+                            policy_version: "policy-v1".to_owned(),
+                            evaluator_version: "evaluator-v1".to_owned(),
+                            evaluator_status: PolicyEvaluatorStatus::Resolved,
+                            evidence_refs: vec![format!("evidence:operator-approval-{suffix}")],
+                            rules: vec![PolicyRule {
+                                layer: PolicyLayer::ServicePolicy,
+                                policy_id: "service-publish".to_owned(),
+                                exception_id: Some("exception-publish".to_owned()),
+                                requested_action: "artifact.publish".to_owned(),
+                                target_scope: "repository:main".to_owned(),
+                                outcome: ApprovalOutcome::Allow,
+                            }],
+                        },
+                        expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                        max_uses: 1,
+                    })
+                    .unwrap()
+                    .grant
+                    .unwrap()
+            };
+        let pre_handoff_grant =
+            issue_publish_approval(7, first_owner, &second_fence, "pre-handoff");
+        assert_eq!(pre_handoff_grant.authority_revision, 8);
+        let pre_wrong_scope = store
+            .consume_approval_grant(approval_consumption_request(
+                &pre_handoff_grant,
+                "consume-wrong-scope-e2e",
+                8,
+                first_owner,
+                "repository:*",
+                &second_fence,
+            ))
+            .unwrap();
+        assert_eq!(pre_wrong_scope.decision.reason, "approval_scope_mismatch");
+        let pre_wrong_fence = store
+            .consume_approval_grant(approval_consumption_request(
+                &pre_handoff_grant,
+                "consume-wrong-fence-e2e",
+                8,
+                first_owner,
+                "repository:main",
+                "fence-wrong",
+            ))
+            .unwrap();
+        assert_eq!(pre_wrong_fence.decision.reason, "fencing_mismatch");
+        let pre_expired = store
+            .consume_approval_grant_at(
+                approval_consumption_request(
+                    &pre_handoff_grant,
+                    "consume-expired-e2e",
+                    8,
+                    first_owner,
+                    "repository:main",
+                    &second_fence,
+                ),
+                pre_handoff_grant.expires_at,
+            )
+            .unwrap();
+        assert_eq!(pre_expired.decision.reason, "approval_expired");
+        let pre_consumed = store
+            .consume_approval_grant(approval_consumption_request(
+                &pre_handoff_grant,
+                "consume-approved-e2e",
+                8,
+                first_owner,
+                "repository:main",
+                &second_fence,
+            ))
+            .unwrap();
+        assert_eq!(pre_consumed.decision.authority_after, 9);
+        let pre_replayed = store
+            .consume_approval_grant(approval_consumption_request(
+                &pre_handoff_grant,
+                "consume-approved-e2e",
+                9,
+                first_owner,
+                "repository:main",
+                &second_fence,
+            ))
+            .unwrap();
+        assert_eq!(pre_replayed.decision.reason, "approval_replayed");
+        let pre_exhausted = store
+            .consume_approval_grant(approval_consumption_request(
+                &pre_handoff_grant,
+                "consume-exhausted-e2e",
+                9,
+                first_owner,
+                "repository:main",
+                &second_fence,
+            ))
+            .unwrap();
+        assert_eq!(pre_exhausted.decision.reason, "approval_exhausted");
+
+        let handoff_receipt = MutationReceipt {
+            mutation_id: "publish".to_owned(),
+            receipt_id: "receipt-handoff-generation".to_owned(),
+            authority_revision: 9,
+            fencing_identity: second_fence.clone(),
+            durability: MutationDurability::Durable,
+        };
+        let (handoff_port, handoff_rotation, handoff_expected_evidence) =
+            memory_port_at(9, first_owner, &second_fence, "retain-e2e-handoff");
+        let handoff_memory_evidence = ExactMemoryEvidence(handoff_expected_evidence);
+        let handoff_context = store
+            .rotate_context(handoff_rotation, &handoff_port, &handoff_memory_evidence)
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let pre_handoff_acceptance = CompletionObservation {
+            observed_authority_revision: 9,
+            fencing_identity: second_fence.clone(),
+            acceptance_satisfied: true,
+            active_child_ids: Vec::new(),
+            pending_consequential_mutation_ids: Vec::new(),
+            mutation_receipts: vec![handoff_receipt.clone()],
+            artifact_verifications: vec![ArtifactVerification {
+                artifact_id: fixture.artifact.artifact_id.clone(),
+                identity: fixture.artifact.sha256.clone(),
+                authority_revision: 9,
+                fencing_identity: second_fence.clone(),
+                after_mutation_receipt_id: handoff_receipt.receipt_id.clone(),
+            }],
+            policy_state: CompletionGateState::Allow,
+            approval_state: ApprovalState::Allow,
+            memory_state: MemoryDurabilityState::Durable,
+        };
+        assert!(
+            completion_gate_failure(
+                &contract,
+                &pre_handoff_acceptance,
+                9,
+                9,
+                9,
+                &second_fence,
+                true,
+            )
+            .is_none()
+        );
+        let pre_handoff_acceptance_digest = completion_observation_digest(&pre_handoff_acceptance);
+        let stale_before_handoff = store
+            .begin_completion(BeginCompletionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 9,
+                agent_id: first_owner.to_owned(),
+                actor: first_owner.to_owned(),
+                fencing_identity: second_fence.clone(),
+                source: CompletionIntentSource::AgentIntent,
+                contract: contract.clone(),
+                observation: CompletionObservation {
+                    observed_authority_revision: 9,
+                    fencing_identity: second_fence.clone(),
+                    acceptance_satisfied: true,
+                    active_child_ids: Vec::new(),
+                    pending_consequential_mutation_ids: Vec::new(),
+                    mutation_receipts: vec![first_receipt.clone()],
+                    artifact_verifications: Vec::new(),
+                    policy_state: CompletionGateState::Allow,
+                    approval_state: ApprovalState::Allow,
+                    memory_state: MemoryDurabilityState::Durable,
+                },
+                evidence_refs: vec!["evidence:stale-receipt-replay".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(
+            stale_before_handoff.decision.outcome,
+            DecisionOutcome::Defer
+        );
+        assert_eq!(
+            stale_before_handoff.decision.reason,
+            "stale_mutation_receipt"
+        );
+
+        let mut begin_handoff = prepared_begin_handoff_request(
+            "structural-e2e",
+            contract.clone(),
+            &task_id,
+            &run_id,
+            &second_fence,
+            &handoff_context.checkpoint_id,
+        );
+        begin_handoff.expected_authority_revision = 9;
+        begin_handoff.mutation_receipts = vec![handoff_receipt.clone()];
+        begin_handoff.pre_handoff_acceptance = Some(pre_handoff_acceptance.clone());
+        begin_handoff.handoff_capability = stock_handoff_capability.clone();
+        let mut mismatched_acceptance = begin_handoff.clone();
+        mismatched_acceptance
+            .pre_handoff_acceptance
+            .as_mut()
+            .unwrap()
+            .mutation_receipts[0]
+            .receipt_id = "receipt-not-bound-to-handoff".to_owned();
+        let acceptance_binding_loss = store.begin_handoff(mismatched_acceptance).unwrap();
+        assert_eq!(
+            acceptance_binding_loss.decision.outcome,
+            DecisionOutcome::Defer
+        );
+        assert_eq!(
+            acceptance_binding_loss.decision.reason,
+            "handoff_acceptance_binding_mismatch"
+        );
+        assert!(acceptance_binding_loss.checkpoint.is_none());
+        assert_eq!(
+            store
+                .authority(&task_id)
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            9
+        );
+        let mut unavailable_handoff = begin_handoff.clone();
+        unavailable_handoff.handoff_capability = unavailable_handoff_capability.clone();
+        let capability_loss = store.begin_handoff(unavailable_handoff).unwrap();
+        assert_eq!(capability_loss.decision.outcome, DecisionOutcome::Defer);
+        assert_eq!(
+            capability_loss.decision.reason,
+            "handoff_capability_unsupported"
+        );
+        assert!(capability_loss.checkpoint.is_none());
+        assert_eq!(
+            store.authority(&task_id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Running
+        );
+
+        let beginning = store.begin_handoff(begin_handoff).unwrap();
+        let handoff = beginning.checkpoint.unwrap();
+        assert_eq!(beginning.decision.authority_after, 10);
+        assert_eq!(handoff.old_ownership_generation, 2);
+        assert_eq!(handoff.mutation_receipts, vec![handoff_receipt.clone()]);
+        assert_eq!(handoff.acceptance_contract_digest, contract_digest);
+        assert_eq!(
+            handoff.pre_handoff_acceptance.as_ref(),
+            Some(&pre_handoff_acceptance)
+        );
+        assert_eq!(
+            handoff.acceptance_evidence_digest.as_deref(),
+            Some(pre_handoff_acceptance_digest.as_str())
+        );
+        let suspended = store
+            .suspend_handoff(SuspendHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 10,
+                checkpoint_id: handoff.checkpoint_id.clone(),
+                old_owner_agent_id: first_owner.to_owned(),
+                actor: first_owner.to_owned(),
+                fencing_identity: second_fence.clone(),
+                handoff_capability: stock_handoff_capability.clone(),
+                evidence_refs: vec!["evidence:state-ledger-flushed".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(suspended.decision.authority_after, 11);
+        let released = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(released.lifecycle_state, LifecycleState::Suspended);
+        assert!(released.owner_agent_id.is_none());
+        assert!(released.fencing_identity.is_none());
+
+        let old_owner_work = store
+            .begin_completion(BeginCompletionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 11,
+                agent_id: first_owner.to_owned(),
+                actor: first_owner.to_owned(),
+                fencing_identity: second_fence.clone(),
+                source: CompletionIntentSource::AgentIntent,
+                contract: contract.clone(),
+                observation: CompletionObservation {
+                    observed_authority_revision: 11,
+                    fencing_identity: second_fence.clone(),
+                    acceptance_satisfied: true,
+                    active_child_ids: Vec::new(),
+                    pending_consequential_mutation_ids: Vec::new(),
+                    mutation_receipts: vec![handoff_receipt.clone()],
+                    artifact_verifications: Vec::new(),
+                    policy_state: CompletionGateState::Allow,
+                    approval_state: ApprovalState::Allow,
+                    memory_state: MemoryDurabilityState::Durable,
+                },
+                evidence_refs: vec!["evidence:old-owner-work-attempt".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(old_owner_work.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(old_owner_work.decision.reason, "completion_not_available");
+
+        let acquired = store
+            .acquire_handoff(AcquireHandoffRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 11,
+                checkpoint_id: handoff.checkpoint_id.clone(),
+                replacement_agent_id: replacement.to_owned(),
+                actor: "scheduler".to_owned(),
+                handoff_capability: stock_handoff_capability.clone(),
+                evidence_refs: vec!["evidence:replacement-ready".to_owned()],
+            })
+            .unwrap();
+        let replacement_fence = acquired.fencing_identity.unwrap();
+        assert_ne!(replacement_fence, second_fence);
+        assert_eq!(
+            acquired
+                .checkpoint
+                .as_ref()
+                .unwrap()
+                .new_ownership_generation,
+            Some(3)
+        );
+        let resuming_projection = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                agent_id: replacement.to_owned(),
+                consumer_schema_version: 1,
+                redacted_fields: Vec::new(),
+                omitted_fields: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resuming_projection.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Resuming)
+        );
+        assert_eq!(
+            resuming_projection.lease_generation,
+            ProjectionValue::Value(3)
+        );
+        assert_eq!(
+            resuming_projection.waiting_on,
+            ProjectionValue::Value(Some("handoff:resuming".to_owned()))
+        );
+
+        let resumed_handoff = store
+            .resume_handoff(
+                ResumeHandoffRequest {
+                    task_id: task_id.clone(),
+                    run_id: run_id.clone(),
+                    expected_authority_revision: 12,
+                    checkpoint_id: handoff.checkpoint_id.clone(),
+                    replacement_agent_id: replacement.to_owned(),
+                    actor: replacement.to_owned(),
+                    fencing_identity: replacement_fence.clone(),
+                    new_context_id: "context-replacement-parent".to_owned(),
+                    memory_query: "resume selected lifecycle evidence".to_owned(),
+                    handoff_capability: stock_handoff_capability.clone(),
+                    evidence_refs: vec!["evidence:typed-handoff-hydrate".to_owned()],
+                },
+                &handoff_port,
+            )
+            .unwrap();
+        assert_eq!(resumed_handoff.decision.authority_after, 13);
+        let hydration = resumed_handoff.hydration.unwrap();
+        assert_eq!(hydration.status, MemoryHydrateStatus::Hydrated);
+        assert!(
+            hydration
+                .items
+                .iter()
+                .all(|item| item.layer != ContextLayer::KanbanDurableHistory
+                    && !item.content.contains(&handoff_context.kanban_history_ref))
+        );
+        let replacement_authority = store.authority(&task_id).unwrap().unwrap();
+        assert_eq!(replacement_authority.active_run_id, run_id);
+        assert_eq!(
+            replacement_authority.acceptance_contract_digest,
+            contract_digest
+        );
+        assert_eq!(
+            replacement_authority.owner_agent_id.as_deref(),
+            Some(replacement)
+        );
+
+        let replacement_grant =
+            issue_publish_approval(13, replacement, &replacement_fence, "replacement");
+        assert_eq!(replacement_grant.authority_revision, 14);
+        let replacement_consumed = store
+            .consume_approval_grant(approval_consumption_request(
+                &replacement_grant,
+                "consume-replacement-approved-e2e",
+                14,
+                replacement,
+                "repository:main",
+                &replacement_fence,
+            ))
+            .unwrap();
+        assert_eq!(
+            replacement_consumed.decision.outcome,
+            DecisionOutcome::Allow
+        );
+        assert_eq!(replacement_consumed.decision.authority_after, 15);
+
+        let (completion_port, completion_rotation, completion_expected_evidence) =
+            memory_port_at(15, replacement, &replacement_fence, "retain-e2e-completion");
+        let completion_memory_evidence = ExactMemoryEvidence(completion_expected_evidence);
+        let completion_context = store
+            .rotate_context(
+                completion_rotation,
+                &completion_port,
+                &completion_memory_evidence,
+            )
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let stale_after_handoff = store
+            .begin_completion(BeginCompletionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 15,
+                agent_id: replacement.to_owned(),
+                actor: replacement.to_owned(),
+                fencing_identity: replacement_fence.clone(),
+                source: CompletionIntentSource::AgentIntent,
+                contract: contract.clone(),
+                observation: CompletionObservation {
+                    observed_authority_revision: 15,
+                    fencing_identity: replacement_fence.clone(),
+                    acceptance_satisfied: true,
+                    active_child_ids: Vec::new(),
+                    pending_consequential_mutation_ids: Vec::new(),
+                    mutation_receipts: vec![handoff_receipt],
+                    artifact_verifications: Vec::new(),
+                    policy_state: CompletionGateState::Allow,
+                    approval_state: ApprovalState::Allow,
+                    memory_state: MemoryDurabilityState::Durable,
+                },
+                evidence_refs: vec!["evidence:cross-fence-receipt-replay".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(
+            stale_after_handoff.decision.reason,
+            "stale_mutation_receipt"
+        );
+
+        let final_receipt = MutationReceipt {
+            mutation_id: "publish".to_owned(),
+            receipt_id: "receipt-replacement-generation".to_owned(),
+            authority_revision: 15,
+            fencing_identity: replacement_fence.clone(),
+            durability: MutationDurability::Durable,
+        };
+        let begin_observation = CompletionObservation {
+            observed_authority_revision: 15,
+            fencing_identity: replacement_fence.clone(),
+            acceptance_satisfied: true,
+            active_child_ids: Vec::new(),
+            pending_consequential_mutation_ids: Vec::new(),
+            mutation_receipts: vec![final_receipt.clone()],
+            artifact_verifications: vec![ArtifactVerification {
+                artifact_id: fixture.artifact.artifact_id.clone(),
+                identity: fixture.artifact.sha256.clone(),
+                authority_revision: 15,
+                fencing_identity: replacement_fence.clone(),
+                after_mutation_receipt_id: final_receipt.receipt_id.clone(),
+            }],
+            policy_state: CompletionGateState::Allow,
+            approval_state: ApprovalState::Allow,
+            memory_state: MemoryDurabilityState::Durable,
+        };
+        let final_evidence_digest = completion_observation_digest(&begin_observation);
+        let final_receipts_digest =
+            completion_required_receipts_digest(&contract, &begin_observation);
+        let final_evidence_refs = vec![
+            format!("fixture:sha256:{fixture_sha256}"),
+            format!("artifact:sha256:{}", fixture.artifact.sha256),
+            format!("config:{}", fixture.config_id),
+            "evidence:final-acceptance".to_owned(),
+        ];
+        let beginning_completion = store
+            .begin_completion(BeginCompletionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 15,
+                agent_id: replacement.to_owned(),
+                actor: replacement.to_owned(),
+                fencing_identity: replacement_fence.clone(),
+                source: CompletionIntentSource::AgentIntent,
+                contract: contract.clone(),
+                observation: begin_observation.clone(),
+                evidence_refs: final_evidence_refs.clone(),
+            })
+            .unwrap();
+        let barrier = beginning_completion.barrier.unwrap();
+        assert_eq!(beginning_completion.decision.authority_after, 16);
+        let mut finish_observation = begin_observation;
+        finish_observation.observed_authority_revision = 16;
+        finish_observation.artifact_verifications[0].authority_revision = 16;
+        let completed = store
+            .finish_completion(FinishCompletionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                expected_authority_revision: 16,
+                completion_id: barrier.completion_id.clone(),
+                agent_id: replacement.to_owned(),
+                actor: replacement.to_owned(),
+                fencing_identity: replacement_fence.clone(),
+                contract: contract.clone(),
+                observation: finish_observation,
+                evidence_refs: vec!["evidence:semantic-completion-readback".to_owned()],
+            })
+            .unwrap();
+        assert_eq!(completed.decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(completed.decision.reason, "completed");
+        assert_eq!(completed.decision.authority_after, 17);
+
+        let final_projection = store
+            .runtime_projection(RuntimeProjectionRequest {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                agent_id: replacement.to_owned(),
+                consumer_schema_version: 1,
+                redacted_fields: Vec::new(),
+                omitted_fields: Vec::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final_projection.lifecycle_state,
+            ProjectionValue::Value(LifecycleState::Completed)
+        );
+        assert_eq!(
+            final_projection.authority_revision,
+            ProjectionValue::Value(17)
+        );
+        assert_eq!(final_projection.lease_generation, ProjectionValue::Value(3));
+        assert_eq!(
+            final_projection.metadata.authority_scope,
+            ProjectionAuthorityScope::ObserveOnly
+        );
+
+        drop(store);
+        let reopened = GovernanceStore::open(&path).unwrap();
+        let final_authority = reopened.authority(&task_id).unwrap().unwrap();
+        assert_eq!(final_authority.lifecycle_state, LifecycleState::Completed);
+        assert_eq!(final_authority.active_run_id, run_id);
+        assert_eq!(final_authority.acceptance_contract_digest, contract_digest);
+        assert!(final_authority.owner_agent_id.is_none());
+        let ledger = reopened.decisions(&task_id).unwrap();
+        assert!(ledger.iter().all(|decision| decision.run_id == run_id));
+        let expected_decisions = vec![
+            (
+                TransitionKind::Register,
+                DecisionOutcome::Allow,
+                "registered",
+                0,
+                1,
+                true,
+                None,
+            ),
+            (
+                TransitionKind::Claim,
+                DecisionOutcome::Allow,
+                "claimed",
+                1,
+                2,
+                true,
+                Some(first_fence.as_str()),
+            ),
+            (
+                TransitionKind::Start,
+                DecisionOutcome::Allow,
+                "started",
+                2,
+                3,
+                true,
+                Some(first_fence.as_str()),
+            ),
+            (
+                TransitionKind::RotateContext,
+                DecisionOutcome::Allow,
+                "context_rotated",
+                3,
+                3,
+                true,
+                Some(first_fence.as_str()),
+            ),
+            (
+                TransitionKind::Block,
+                DecisionOutcome::Allow,
+                "blocked",
+                3,
+                4,
+                true,
+                Some(first_fence.as_str()),
+            ),
+            (
+                TransitionKind::Resume,
+                DecisionOutcome::Defer,
+                "BLOCKER_UNCHANGED",
+                4,
+                4,
+                false,
+                None,
+            ),
+            (
+                TransitionKind::Resume,
+                DecisionOutcome::Allow,
+                "resumed",
+                4,
+                5,
+                true,
+                None,
+            ),
+            (
+                TransitionKind::Claim,
+                DecisionOutcome::Allow,
+                "claimed",
+                5,
+                6,
+                true,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::Start,
+                DecisionOutcome::Allow,
+                "started",
+                6,
+                7,
+                true,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginCompletion,
+                DecisionOutcome::Deny,
+                "acceptance_not_satisfied",
+                7,
+                7,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::IssueApprovalGrant,
+                DecisionOutcome::Allow,
+                "approval_grant_issued",
+                7,
+                8,
+                true,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::ConsumeApprovalGrant,
+                DecisionOutcome::Deny,
+                "approval_scope_mismatch",
+                8,
+                8,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::ConsumeApprovalGrant,
+                DecisionOutcome::Deny,
+                "fencing_mismatch",
+                8,
+                8,
+                false,
+                Some("fence-wrong"),
+            ),
+            (
+                TransitionKind::ConsumeApprovalGrant,
+                DecisionOutcome::Deny,
+                "approval_expired",
+                8,
+                8,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::ConsumeApprovalGrant,
+                DecisionOutcome::Allow,
+                "approval_grant_consumed",
+                8,
+                9,
+                true,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::ConsumeApprovalGrant,
+                DecisionOutcome::Deny,
+                "approval_replayed",
+                9,
+                9,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::ConsumeApprovalGrant,
+                DecisionOutcome::Deny,
+                "approval_exhausted",
+                9,
+                9,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::RotateContext,
+                DecisionOutcome::Allow,
+                "context_rotated",
+                9,
+                9,
+                true,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginCompletion,
+                DecisionOutcome::Defer,
+                "stale_mutation_receipt",
+                9,
+                9,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginHandoff,
+                DecisionOutcome::Defer,
+                "handoff_acceptance_binding_mismatch",
+                9,
+                9,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginHandoff,
+                DecisionOutcome::Defer,
+                "handoff_capability_unsupported",
+                9,
+                9,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginHandoff,
+                DecisionOutcome::Allow,
+                "handoff_suspending",
+                9,
+                10,
+                true,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::SuspendHandoff,
+                DecisionOutcome::Allow,
+                "handoff_suspended",
+                10,
+                11,
+                true,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginCompletion,
+                DecisionOutcome::Deny,
+                "completion_not_available",
+                11,
+                11,
+                false,
+                Some(second_fence.as_str()),
+            ),
+            (
+                TransitionKind::AcquireHandoff,
+                DecisionOutcome::Allow,
+                "handoff_acquired",
+                11,
+                12,
+                true,
+                Some(replacement_fence.as_str()),
+            ),
+            (
+                TransitionKind::ResumeHandoff,
+                DecisionOutcome::Allow,
+                "handoff_resumed",
+                12,
+                13,
+                true,
+                Some(replacement_fence.as_str()),
+            ),
+            (
+                TransitionKind::IssueApprovalGrant,
+                DecisionOutcome::Allow,
+                "approval_grant_issued",
+                13,
+                14,
+                true,
+                Some(replacement_fence.as_str()),
+            ),
+            (
+                TransitionKind::ConsumeApprovalGrant,
+                DecisionOutcome::Allow,
+                "approval_grant_consumed",
+                14,
+                15,
+                true,
+                Some(replacement_fence.as_str()),
+            ),
+            (
+                TransitionKind::RotateContext,
+                DecisionOutcome::Allow,
+                "context_rotated",
+                15,
+                15,
+                true,
+                Some(replacement_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginCompletion,
+                DecisionOutcome::Defer,
+                "stale_mutation_receipt",
+                15,
+                15,
+                false,
+                Some(replacement_fence.as_str()),
+            ),
+            (
+                TransitionKind::BeginCompletion,
+                DecisionOutcome::Allow,
+                "completing",
+                15,
+                16,
+                true,
+                Some(replacement_fence.as_str()),
+            ),
+            (
+                TransitionKind::Complete,
+                DecisionOutcome::Allow,
+                "completed",
+                16,
+                17,
+                true,
+                Some(replacement_fence.as_str()),
+            ),
+        ];
+        assert_eq!(ledger.len(), expected_decisions.len());
+        for (decision, expected) in ledger.iter().zip(expected_decisions) {
+            assert_eq!(decision.requested_transition, expected.0);
+            assert_eq!(decision.outcome, expected.1);
+            assert_eq!(decision.reason, expected.2);
+            assert_eq!(decision.authority_before, expected.3);
+            assert_eq!(decision.authority_after, expected.4);
+            assert_eq!(decision.performed_at.is_some(), expected.5);
+            assert_eq!(decision.fencing_identity.as_deref(), expected.6);
+        }
+        for (index, decision) in ledger.iter().enumerate() {
+            assert_eq!(decision.decision_id, format!("decision-{:016x}", index + 1));
+        }
+        assert_eq!(ledger[30].evidence_refs, final_evidence_refs);
+        let state = reopened.state.lock().unwrap();
+        assert_eq!(state.schema, SCHEMA);
+        assert_eq!(state.next_decision_seq, 33);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.decisions, ledger);
+        assert_eq!(state.runtime_records.len(), 1);
+        assert_eq!(
+            state.blockers.get(&blocker.blocker_id).unwrap().state,
+            BlockerState::Released
+        );
+        assert_eq!(
+            state
+                .blockers
+                .get(&blocker.blocker_id)
+                .unwrap()
+                .released_at_authority_revision,
+            Some(5)
+        );
+        assert_eq!(state.context_checkpoints.len(), 3);
+        for (checkpoint, revision, owner, fence) in [
+            (&initial_context, 3, first_owner, first_fence.as_str()),
+            (&handoff_context, 9, first_owner, second_fence.as_str()),
+            (
+                &completion_context,
+                15,
+                replacement,
+                replacement_fence.as_str(),
+            ),
+        ] {
+            let persisted = state
+                .context_checkpoints
+                .get(&checkpoint.checkpoint_id)
+                .unwrap();
+            assert_eq!(persisted, checkpoint);
+            assert_eq!(persisted.phase, ContextLifecyclePhase::PostCompactVerify);
+            assert_eq!(persisted.authority_summary.authority_revision, revision);
+            assert_eq!(persisted.authority_summary.owner_agent_id, owner);
+            assert_eq!(persisted.authority_summary.fencing_identity, fence);
+            assert_eq!(
+                persisted.retain_capability.as_ref().unwrap().upstream_id,
+                "hindsight"
+            );
+            assert_eq!(
+                persisted.hydrate_capability.as_ref().unwrap().upstream_id,
+                "hindsight"
+            );
+        }
+        assert_eq!(state.handoff_checkpoints.len(), 1);
+        let persisted_handoff = state
+            .handoff_checkpoints
+            .get(&handoff.checkpoint_id)
+            .unwrap();
+        assert_eq!(persisted_handoff.state, HandoffCheckpointState::Resumed);
+        assert_eq!(persisted_handoff.source_authority_revision, 9);
+        assert_eq!(persisted_handoff.suspending_authority_revision, 10);
+        assert_eq!(persisted_handoff.suspended_authority_revision, Some(11));
+        assert_eq!(persisted_handoff.resuming_authority_revision, Some(12));
+        assert_eq!(persisted_handoff.resumed_authority_revision, Some(13));
+        assert_eq!(persisted_handoff.old_ownership_generation, 2);
+        assert_eq!(persisted_handoff.new_ownership_generation, Some(3));
+        assert_eq!(persisted_handoff.old_fencing_identity, second_fence);
+        assert_eq!(
+            persisted_handoff.new_fencing_identity.as_deref(),
+            Some(replacement_fence.as_str())
+        );
+        assert_eq!(
+            persisted_handoff.handoff_capability,
+            stock_handoff_capability
+        );
+        assert_eq!(
+            persisted_handoff.pre_handoff_acceptance.as_ref(),
+            Some(&pre_handoff_acceptance)
+        );
+        assert_eq!(
+            persisted_handoff.acceptance_evidence_digest.as_deref(),
+            Some(pre_handoff_acceptance_digest.as_str())
+        );
+        assert_eq!(state.completions.len(), 1);
+        let persisted_barrier = state.completions.get(&barrier.completion_id).unwrap();
+        assert_eq!(persisted_barrier.state, CompletionBarrierState::Completed);
+        assert_eq!(persisted_barrier.evidence_digest, final_evidence_digest);
+        assert_eq!(
+            persisted_barrier.mutation_receipts_digest,
+            final_receipts_digest
+        );
+        assert_eq!(persisted_barrier.evidence_authority_revision, 15);
+        assert_eq!(persisted_barrier.began_at_authority_revision, 16);
+        assert_eq!(persisted_barrier.completed_at_authority_revision, Some(17));
+        assert_eq!(
+            persisted_barrier.memory_checkpoint_id.as_deref(),
+            Some(completion_context.checkpoint_id.as_str())
+        );
+        assert_eq!(state.approval_grants.len(), 2);
+        assert!(
+            state
+                .approval_grants
+                .values()
+                .all(|grant| grant.consumed_uses == 1)
+        );
+        assert_eq!(state.approval_consumptions.len(), 2);
+        for consumption in [
+            pre_consumed.consumption.as_ref().unwrap(),
+            replacement_consumed.consumption.as_ref().unwrap(),
+        ] {
+            assert_eq!(
+                state
+                    .approval_consumptions
+                    .get(&consumption.consumption_id)
+                    .unwrap(),
+                consumption
+            );
+        }
     }
 }

@@ -1,0 +1,184 @@
+{
+  "schemaVersion": 1,
+  "configId": "m365-ai-gateway/governance-v1/stock-upstream",
+  "harness": {
+    "harnessId": "m365-ai-gateway/acp-governance-structural-e2e",
+    "sourceCommit": "5102b93d93e601bf497e47e59c01351772ded0ec",
+    "sourceTree": "5024bf83b1ce0401156a7bee2c0dc7b591d10d79"
+  },
+  "upstreams": [
+    {
+      "upstreamId": "hindsight",
+      "repository": "vectorize-io/hindsight",
+      "releaseTag": "v0.9.1",
+      "sourceCommit": "e5b49eb6729512bd9b103058daa93f701da25644",
+      "sourceTree": "b3939ba8b3d054f87a6118dada5dfa723aa0bdbc"
+    },
+    {
+      "upstreamId": "hermes",
+      "repository": "NousResearch/hermes-agent",
+      "releaseTag": "v2026.8.19",
+      "sourceCommit": "fcbd1076a93841fa88855acce810e342a5b78101",
+      "sourceTree": "cc9f987a403a1d02b8b17cc527a57b54402e864b"
+    },
+    {
+      "upstreamId": "semantica",
+      "repository": "semantica-agi/semantica",
+      "releaseTag": "v0.6.5",
+      "sourceCommit": "5b319560fb0b8403644b70bc592864418cdcc740",
+      "sourceTree": "2bff91d9a345897dfc0e570d67363af46dedaf5b"
+    }
+  ],
+  "artifact": {
+    "artifactId": "release-manifest",
+    "content": "M365 AI Gateway Governance v1 structural acceptance\n",
+    "sha256": "3a407b8cebc2421a4f323bc043aca38c0c77a7c1fc9e4b1cd18981cebf36ab3c"
+  },
+  "capabilityProbes": [
+    {
+      "adapterId": "hindsight-adapter",
+      "adapterVersion": "1.0.0",
+      "upstreamId": "hindsight",
+      "upstreamVersion": "0.9.1",
+      "requestedCapability": "memory.retain_durable",
+      "integrationSeam": "ADAPTER",
+      "requiredFieldFamilies": ["operation_state"],
+      "requiredSemantics": ["durable_terminal"],
+      "evidence": {
+        "schemaVersion": 1,
+        "adapterId": "hindsight-adapter",
+        "adapterVersion": "1.0.0",
+        "upstreamId": "hindsight",
+        "upstreamVersion": "0.9.1",
+        "requestedCapability": "memory.retain_durable",
+        "integrationSeam": "ADAPTER",
+        "surfacePresent": true,
+        "versionCompatible": true,
+        "observedFieldFamilies": ["operation_state"],
+        "observedSemantics": ["durable_terminal"],
+        "evidenceRefs": [
+          "evidence:hindsight-capability",
+          "source:vectorize-io/hindsight@e5b49eb6729512bd9b103058daa93f701da25644",
+          "source-tree:b3939ba8b3d054f87a6118dada5dfa723aa0bdbc",
+          "harness:m365-ai-gateway@5102b93d93e601bf497e47e59c01351772ded0ec"
+        ]
+      }
+    },
+    {
+      "adapterId": "hindsight-adapter",
+      "adapterVersion": "1.0.0",
+      "upstreamId": "hindsight",
+      "upstreamVersion": "0.9.1",
+      "requestedCapability": "memory.hydrate",
+      "integrationSeam": "ADAPTER",
+      "requiredFieldFamilies": ["context_identity"],
+      "requiredSemantics": ["typed_hydrate"],
+      "evidence": {
+        "schemaVersion": 1,
+        "adapterId": "hindsight-adapter",
+        "adapterVersion": "1.0.0",
+        "upstreamId": "hindsight",
+        "upstreamVersion": "0.9.1",
+        "requestedCapability": "memory.hydrate",
+        "integrationSeam": "ADAPTER",
+        "surfacePresent": true,
+        "versionCompatible": true,
+        "observedFieldFamilies": ["context_identity"],
+        "observedSemantics": ["typed_hydrate"],
+        "evidenceRefs": [
+          "evidence:hindsight-hydrate-capability",
+          "source:vectorize-io/hindsight@e5b49eb6729512bd9b103058daa93f701da25644",
+          "source-tree:b3939ba8b3d054f87a6118dada5dfa723aa0bdbc",
+          "harness:m365-ai-gateway@5102b93d93e601bf497e47e59c01351772ded0ec"
+        ]
+      }
+    },
+    {
+      "adapterId": "hermes-adapter",
+      "adapterVersion": "1.0.0",
+      "upstreamId": "hermes",
+      "upstreamVersion": "0.20.5",
+      "requestedCapability": "handoff.checkpoint",
+      "integrationSeam": "HOOK",
+      "requiredFieldFamilies": ["checkpoint_identity"],
+      "requiredSemantics": ["durable_handoff", "fenced_release"],
+      "evidence": {
+        "schemaVersion": 1,
+        "adapterId": "hermes-adapter",
+        "adapterVersion": "1.0.0",
+        "upstreamId": "hermes",
+        "upstreamVersion": "0.20.5",
+        "requestedCapability": "handoff.checkpoint",
+        "integrationSeam": "HOOK",
+        "surfacePresent": true,
+        "versionCompatible": true,
+        "observedFieldFamilies": ["checkpoint_identity"],
+        "observedSemantics": ["durable_handoff", "fenced_release"],
+        "evidenceRefs": [
+          "evidence:hermes-handoff-capability",
+          "source:NousResearch/hermes-agent@fcbd1076a93841fa88855acce810e342a5b78101",
+          "source-tree:cc9f987a403a1d02b8b17cc527a57b54402e864b",
+          "harness:m365-ai-gateway@5102b93d93e601bf497e47e59c01351772ded0ec"
+        ]
+      }
+    },
+    {
+      "adapterId": "hermes-adapter",
+      "adapterVersion": "1.0.0",
+      "upstreamId": "hermes",
+      "upstreamVersion": "0.20.5",
+      "requestedCapability": "handoff.checkpoint",
+      "integrationSeam": "HOOK",
+      "requiredFieldFamilies": ["checkpoint_identity"],
+      "requiredSemantics": ["durable_handoff", "fenced_release"],
+      "evidence": {
+        "schemaVersion": 1,
+        "adapterId": "hermes-adapter",
+        "adapterVersion": "1.0.0",
+        "upstreamId": "hermes",
+        "upstreamVersion": "0.20.5",
+        "requestedCapability": "handoff.checkpoint",
+        "integrationSeam": "HOOK",
+        "surfacePresent": false,
+        "versionCompatible": true,
+        "observedFieldFamilies": [],
+        "observedSemantics": [],
+        "evidenceRefs": [
+          "evidence:hermes-stock-surface-absent",
+          "source:NousResearch/hermes-agent@fcbd1076a93841fa88855acce810e342a5b78101",
+          "source-tree:cc9f987a403a1d02b8b17cc527a57b54402e864b",
+          "harness:m365-ai-gateway@5102b93d93e601bf497e47e59c01351772ded0ec"
+        ]
+      }
+    },
+    {
+      "adapterId": "semantica-adapter",
+      "adapterVersion": "1.0.0",
+      "upstreamId": "semantica",
+      "upstreamVersion": "0.6.5",
+      "requestedCapability": "decision.query",
+      "integrationSeam": "SIDECAR",
+      "requiredFieldFamilies": ["decision_identity"],
+      "requiredSemantics": ["provenance_bound_query"],
+      "evidence": {
+        "schemaVersion": 1,
+        "adapterId": "semantica-adapter",
+        "adapterVersion": "1.0.0",
+        "upstreamId": "semantica",
+        "upstreamVersion": "0.6.5",
+        "requestedCapability": "decision.query",
+        "integrationSeam": "SIDECAR",
+        "surfacePresent": true,
+        "versionCompatible": true,
+        "observedFieldFamilies": ["decision_identity"],
+        "observedSemantics": ["provenance_bound_query"],
+        "evidenceRefs": [
+          "evidence:semantica-stock-query",
+          "source:semantica-agi/semantica@5b319560fb0b8403644b70bc592864418cdcc740",
+          "source-tree:2bff91d9a345897dfc0e570d67363af46dedaf5b",
+          "harness:m365-ai-gateway@5102b93d93e601bf497e47e59c01351772ded0ec"
+        ]
+      }
+    }
+  ]
+}
