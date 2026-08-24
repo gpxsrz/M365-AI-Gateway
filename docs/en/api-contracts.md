@@ -68,7 +68,7 @@ spill_reason=<attachment_slots_full|no_safe_candidate|cannot_fit_inline|generate
 input_sha256=<deterministic request identity>
 ```
 
-Hermes / Memory also return consumer-readable `context_length_exceeded` / `input is too long` signals while preserving the real UTF-16 metadata.
+Memory does not participate in auto-spill. When caller text exceeds the limit it keeps the Hindsight-compatible recovery contract: HTTP 400, `code=context_length_exceeded`, a message containing `input is too long`, truthful UTF-16 metadata, `spill_attempted=false`, `spill_reason=memory_spill_disabled`, a deterministic `input_sha256`, and `recommended_action=compact_or_split_and_retry`. This does not imply that `128000 UTF-16` is a model-token context limit.
 
 For non-Memory chat, when oversized content can be moved without relocating system/developer/assistant control semantics, the gateway first spills large `user` / `tool` text into one deterministic, sectioned UTF-8 `.txt` attachment, then re-validates that the remaining inline text is below `128000`. A single oversized user message may be spilled as a whole; in a multi-message conversation the **latest user message always stays inline**, so only older user bulk evidence and tool results are eligible. It fails closed if all three attachment slots are already used, no text can be safely spilled, the generated file exceeds 512 MiB, Graph document authorization is unavailable, or document upload fails. Original text is never truncated and the hard limit is not removed. Generated spill file/section hashes and the Microsoft transport filename are deterministic so identical retries can recognize the same document semantics.
 

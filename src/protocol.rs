@@ -517,17 +517,16 @@ pub(crate) async fn execute_chat_request(
     }
     let text_input_limit = gateway.settings.current().text_input_limit_utf16;
     let received_text_units = utf16_units(&flattened.text);
-    let mut overflow_context =
-        (!memory_request && received_text_units > text_input_limit).then(|| {
-            OverflowContext::new(
-                text_input_limit,
-                received_text_units,
-                &prompt_messages,
-                &flattened.attachments,
-            )
-        });
+    let mut overflow_context = (received_text_units > text_input_limit).then(|| {
+        OverflowContext::new(
+            text_input_limit,
+            received_text_units,
+            &prompt_messages,
+            &flattened.attachments,
+        )
+    });
     let mut spill_failure = None;
-    if let Some(context) = overflow_context.as_mut() {
+    if !memory_request && let Some(context) = overflow_context.as_mut() {
         context.spill_attempted = true;
         match spill_oversized_bulk_text(&prompt_messages, &flattened, text_input_limit) {
             Ok(spilled) => {
@@ -539,6 +538,9 @@ pub(crate) async fn execute_chat_request(
     }
     if utf16_units(&flattened.text) > text_input_limit {
         if let Some(context) = overflow_context.as_ref() {
+            if memory_request {
+                return memory_text_overflow_response(context);
+            }
             return text_overflow_response(
                 context,
                 spill_failure
@@ -1469,11 +1471,41 @@ fn text_overflow_response(
 }
 
 fn text_overflow_value(context: &OverflowContext, spill_reason: &str, message: &str) -> Value {
+    overflow_value(
+        context,
+        "text_input_too_large",
+        spill_reason,
+        message,
+        "reduce_input_or_retry_when_document_spill_is_available",
+    )
+}
+
+fn memory_text_overflow_response(context: &OverflowContext) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(overflow_value(
+            context,
+            "context_length_exceeded",
+            "memory_spill_disabled",
+            "input is too long for the M365 UTF-16 transport policy; compact or split the Memory request and retry",
+            "compact_or_split_and_retry",
+        )),
+    )
+        .into_response()
+}
+
+fn overflow_value(
+    context: &OverflowContext,
+    code: &str,
+    spill_reason: &str,
+    message: &str,
+    recommended_action: &str,
+) -> Value {
     json!({
         "error": {
             "message": message,
             "type": "invalid_request_error",
-            "code": "text_input_too_large",
+            "code": code,
             "limit_type": "caller_text_utf16",
             "limit": context.limit,
             "received": context.received,
@@ -1481,7 +1513,7 @@ fn text_overflow_value(context: &OverflowContext, spill_reason: &str, message: &
             "spill_attempted": context.spill_attempted,
             "spill_reason": spill_reason,
             "input_sha256": context.input_sha256,
-            "recommended_action": "reduce_input_or_retry_when_document_spill_is_available"
+            "recommended_action": recommended_action
         }
     })
 }
@@ -4257,6 +4289,55 @@ mod tests {
         assert_eq!(body["error"]["retryable_after_reduction"], true);
         assert_eq!(body["error"]["spill_attempted"], true);
         assert_eq!(body["error"]["spill_reason"], "no_safe_candidate");
+        assert_eq!(body["error"]["input_sha256"].as_str().unwrap().len(), 64);
+        assert!(chat.0.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_oversize_remains_unspilled_and_keeps_hindsight_recovery_metadata() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let response = app
+            .oneshot(
+                Request::post("/memory/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[{"role":"user","content":"M".repeat(128_100)}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("input is too long"))
+        );
+        assert_eq!(body["error"]["limit_type"], "caller_text_utf16");
+        assert_eq!(body["error"]["limit"], 128_000);
+        assert!(
+            body["error"]["received"]
+                .as_u64()
+                .is_some_and(|value| value > 128_000)
+        );
+        assert_eq!(body["error"]["retryable_after_reduction"], true);
+        assert_eq!(body["error"]["spill_attempted"], false);
+        assert_eq!(body["error"]["spill_reason"], "memory_spill_disabled");
+        assert_eq!(
+            body["error"]["recommended_action"],
+            "compact_or_split_and_retry"
+        );
         assert_eq!(body["error"]["input_sha256"].as_str().unwrap().len(), 64);
         assert!(chat.0.lock().unwrap().is_none());
     }

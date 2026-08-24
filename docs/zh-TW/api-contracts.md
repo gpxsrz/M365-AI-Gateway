@@ -68,7 +68,7 @@ spill_reason=<attachment_slots_full|no_safe_candidate|cannot_fit_inline|generate
 input_sha256=<deterministic request identity>
 ```
 
-Hermes / Memory 會另外提供 consumer 看得懂的 `context_length_exceeded` / `input is too long` 訊號，同時保留真實 UTF-16 metadata。
+Memory 不參與 auto-spill；caller text 超限時維持 Hindsight-compatible recovery：HTTP 400、`code=context_length_exceeded`、message 含 `input is too long`，同時保留真實 UTF-16 metadata、`spill_attempted=false`、`spill_reason=memory_spill_disabled`、deterministic `input_sha256` 與 `recommended_action=compact_or_split_and_retry`。這不代表 `128000 UTF-16` 等於模型 token context。
 
 對非 Memory chat，若超限內容可以在不移動 system/developer/assistant 控制語意的前提下安全拆出，Gateway 會先把大型 `user` / `tool` 文字轉成一個 deterministic、分 section 的 UTF-8 `.txt` attachment，再重新驗證 inline 文字仍低於 `128000`。單一 user 訊息本身超限時可以整包 spill；多訊息對話的**最新 user 訊息永遠留 inline**，只允許較舊 user bulk evidence 與 tool result 進附件。既有附件已滿 3 個、沒有可安全 spill 的文字、generated file 超過 512 MiB、Graph 文件授權不可用或文件 upload 失敗時都 fail closed；不截斷原文，也不把 hard limit 移除。Generated spill 的 file/section hash 與 Microsoft transport filename 都是 deterministic，讓相同輸入 retry 可辨識同一份文件語意。
 
