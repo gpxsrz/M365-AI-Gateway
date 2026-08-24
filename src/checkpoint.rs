@@ -261,7 +261,7 @@ impl CheckpointStore {
                 },
                 outbound: messages[accepted..].to_vec(),
                 rebound,
-                prior_ledger: AgentLedger::default(),
+                prior_ledger: record.tool_ledger.clone(),
             };
             if let Err(error) = save(&self.path, &state) {
                 state.records = snapshot;
@@ -810,6 +810,64 @@ mod tests {
         assert_eq!(turn.binding.conversation_id, "conversation");
         assert_eq!(turn.outbound.len(), 1);
         assert_eq!(turn.outbound[0].content, "two");
+    }
+
+    #[test]
+    fn accepted_history_reuse_preserves_prior_tool_evidence() {
+        use crate::protocol::OpenAiMessage;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let first = vec![message("user", "one")];
+        let turn = store
+            .begin_full("hermes", "owner", "session", &first, false)
+            .unwrap();
+        let ledger = crate::agent_ledger::build(&[
+            OpenAiMessage::text("user", "run the check"),
+            OpenAiMessage {
+                role: "assistant".to_owned(),
+                tool_calls: vec![serde_json::json!({
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"}
+                })],
+                ..OpenAiMessage::default()
+            },
+            OpenAiMessage {
+                role: "tool".to_owned(),
+                content: Value::String(r#"{"output":"ok","exit_code":0}"#.to_owned()),
+                tool_call_id: "call-1".to_owned(),
+                ..OpenAiMessage::default()
+            },
+        ]);
+        assert_eq!(ledger.completed.len(), 1);
+        turn.accept_with_ledger(
+            Binding {
+                conversation_id: "conversation".to_owned(),
+                session_id: "upstream-session".to_owned(),
+            },
+            &[message("assistant", "answer")],
+            ledger,
+        )
+        .unwrap();
+
+        let history = vec![
+            message("user", "one"),
+            message("assistant", "answer"),
+            message("user", "two"),
+        ];
+        let turn = store
+            .begin_full("hermes", "owner", "session", &history, false)
+            .unwrap();
+
+        assert_eq!(turn.outbound.len(), 1);
+        assert_eq!(turn.outbound[0].content, "two");
+        assert_eq!(turn.prior_ledger.completed.len(), 1);
+        assert!(crate::agent_ledger::completion_evidence_allows(
+            "The tool check completed successfully.",
+            &turn.prior_ledger
+        ));
     }
 
     #[test]
