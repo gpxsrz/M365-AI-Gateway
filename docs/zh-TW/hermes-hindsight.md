@@ -18,16 +18,16 @@
 
 ```text
 model-specific context_length=64000
-compression.proactive_prune_tokens=24000
+compression.proactive_prune_tokens=30000
 compression.max_attempts=3
 compression.protect_first_n=3
 compression.protect_last_n=8
 compression.min_tail_user_messages=1
-compression.tail_mode=lean
-global compression.threshold_tokens=42000
+compression.tail_mode=legacy
+global compression.threshold_tokens=null  # 使用 stock resolver，不設 absolute cap
 ```
 
-64K 是現在的保守上限；24K 開始清掉可重建的舊內容，42K 進完整 compression。歷史 80K/41K canary 曾成功，但 tool-heavy 長任務顯示它對 M365 `128000 UTF-16` transport policy 不夠保守。
+64K 仍是目前 provider 的 context override。#89 auto-spill 上線後，M365 `128000 UTF-16` transport wall 由 adapter 處理，不再用它逼 Hermes 提前 compression。現行長任務基線在 30K 做 deterministic 舊 tool-output prune，完整 compression 不設 absolute token cap；以 stock v0.20.5 的 64K small-context resolver 計算，目前約在 54.4K 才觸發。實際 runtime policy 仍以 default／manager live profile config 為權威。
 
 可以保留內建 memory 與 user profile，同時關掉週期背景 reviewer，減少和前景 agent 搶同一帳號：
 

@@ -18,16 +18,16 @@ If you only need to connect the services, use the next section. Exact scheduler,
 
 ```text
 model-specific context_length=64000
-compression.proactive_prune_tokens=24000
+compression.proactive_prune_tokens=30000
 compression.max_attempts=3
 compression.protect_first_n=3
 compression.protect_last_n=8
 compression.min_tail_user_messages=1
-compression.tail_mode=lean
-global compression.threshold_tokens=42000
+compression.tail_mode=legacy
+global compression.threshold_tokens=null  # use the stock resolver; no absolute cap
 ```
 
-64K is the current conservative limit. Reconstructable old context is pruned at 24K and full compression starts at 42K. A historical 80K/41K canary passed, but tool-heavy work showed that it was too permissive for the M365 `128000 UTF-16` transport policy.
+64K remains the provider context override. After #89 auto-spill, the M365 `128000 UTF-16` transport wall is handled by the adapter instead of forcing early Hermes compression. The current long-task baseline performs deterministic old tool-output pruning at 30K and leaves full compression without an absolute token cap; with stock v0.20.5's 64K small-context resolver this currently triggers at about 54.4K. The live default/manager profile config remains the runtime authority.
 
 Built-in memory and user profile can remain enabled while periodic background reviewers are disabled, reducing competition with the foreground agent:
 
