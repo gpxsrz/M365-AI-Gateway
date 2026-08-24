@@ -416,8 +416,18 @@ pub(crate) async fn execute_chat_request(
         .as_ref()
         .map(|turn| turn.prior_ledger.clone())
         .unwrap_or_default();
+    let prompt_messages = checkpoint
+        .as_ref()
+        .map(|turn| {
+            turn.outbound
+                .iter()
+                .cloned()
+                .map(OpenAiMessage::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| body.messages.clone());
     if let Err(message) =
-        crate::agent_ledger::validate_tool_conversation_with_prior(&body.messages, &prior_ledger)
+        crate::agent_ledger::validate_tool_conversation_with_prior(&prompt_messages, &prior_ledger)
     {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -426,7 +436,7 @@ pub(crate) async fn execute_chat_request(
             &message,
         );
     }
-    let agent_ledger = crate::agent_ledger::execution_ledger(&prior_ledger, &body.messages);
+    let agent_ledger = crate::agent_ledger::execution_ledger(&prior_ledger, &prompt_messages);
     let active_ledger =
         crate::agent_ledger::build(crate::agent_ledger::active_messages(&body.messages));
     let settings = gateway.settings.current();
@@ -456,16 +466,6 @@ pub(crate) async fn execute_chat_request(
     }
     let apply_agent_evidence_policy = path != "/v1/chat/completions";
     let checkpoint_response_id = body.checkpoint_response_id.clone();
-    let prompt_messages = checkpoint
-        .as_ref()
-        .map(|turn| {
-            turn.outbound
-                .iter()
-                .cloned()
-                .map(OpenAiMessage::from)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| body.messages.clone());
     if let Some(turn) = &checkpoint {
         if !turn.binding.conversation_id.is_empty() {
             body.conversation_id = turn.binding.conversation_id.clone();
@@ -3689,6 +3689,81 @@ mod tests {
         assert!(!requests[0].tools.is_empty());
         assert!(requests[1].tools.is_empty());
         assert_eq!(requests[1].tool_choice, Value::String("none".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn hermes_full_prefix_reuse_resolves_checkpointed_tool_result_without_duplicate_id() {
+        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+            "```inspect\n{}\n```",
+            "Inspection completed successfully.",
+        ])));
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only synthetic inspection.",
+                "parameters":{"type":"object","properties":{}}
+            }
+        });
+        let first_user = json!({"role":"user","content":"inspect"});
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":"issue88-full-prefix",
+                            "messages":[first_user.clone()],
+                            "tools":[tool.clone()],
+                            "tool_choice":"auto"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let assistant = first["choices"][0]["message"].clone();
+        let call_id = assistant["tool_calls"][0]["id"].as_str().unwrap();
+
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":"issue88-full-prefix",
+                            "messages":[
+                                first_user,
+                                assistant,
+                                {"role":"tool","tool_call_id":call_id,"content":"ok"}
+                            ],
+                            "tools":[tool],
+                            "tool_choice":"auto"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            second["choices"][0]["message"]["content"],
+            "Inspection completed successfully."
+        );
     }
 
     #[tokio::test]
