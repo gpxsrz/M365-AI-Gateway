@@ -166,7 +166,9 @@ Gateway 不刪 Hermes working context，也不能把稍後完成的 recall 反�
 ## Overflow 與 upstream bank mission
 
 - `128000` 是 UTF-16 transport policy，不是 Hermes/Hindsight token context。
-- Hermes 會收到可辨識的 context-length recovery signal，再走 compression → retry。
+- 非 Memory chat 若超限部分是可安全移出的 `user` / `tool` bulk text，M365 會先自動 spill 成單一結構化 `.txt` attachment；system/developer/assistant 控制語意與 tool identity 仍留 inline，最後仍重新套用 `128000` hard guard。單一 user 超限可整包 spill；多訊息的最新 user 永遠留 inline。
+- 只有無法安全 spill、附件 slot 已滿、generated file 過大或文件授權不可用時，Hermes 才需要收到可恢復的 overflow signal。`128000` 不應再單獨驅動 Hermes 提前 compression/rotation；Hermes 的正常 compression/protected-tail/rotation 仍依 model token/context quality 決定。
+- Attachment grounding 不是零 context cost，也不是任意 byte-addressable storage；大型高熵檔可能有 retrieval miss。
 - Hindsight 會收到 `context_length_exceeded` / `input is too long`；Reflect baseline 是 40K / retry 1。
 
 Hermes upstream #18774 修好前，`bank_mission` / `bank_retain_mission` 可能沒有同步到 live Hindsight `reflect_mission` / `retain_mission`。請直接設定 Banks Config API，並用 GET 讀回：

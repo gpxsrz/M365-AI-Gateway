@@ -127,6 +127,8 @@ pub struct Attachment {
     pub transport_name: String,
     #[serde(skip)]
     pub reference_url: String,
+    #[serde(skip)]
+    pub generated_oversize_text: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -203,6 +205,11 @@ pub enum ChatError {
     Terminal { kind: String, message: String },
     #[error("ChatHub transport: {0}")]
     Transport(String),
+    #[error("attachment transport: {message}")]
+    Attachment {
+        generated_oversize_text: bool,
+        message: String,
+    },
     #[error("ChatHub protocol: {0}")]
     Protocol(String),
 }

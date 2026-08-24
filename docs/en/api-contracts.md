@@ -58,14 +58,21 @@ Generic compatibility endpoints return:
 
 ```text
 HTTP 400
-code=text_policy_exceeded
+code=text_input_too_large
 limit_type=caller_text_utf16
 limit=128000
 received=<actual>
 retryable_after_reduction=true
+spill_attempted=<true|false>
+spill_reason=<attachment_slots_full|no_safe_candidate|cannot_fit_inline|generated_file_too_large|graph_authorization_unavailable|document_upload_failed|...>
+input_sha256=<deterministic request identity>
 ```
 
 Hermes / Memory also return consumer-readable `context_length_exceeded` / `input is too long` signals while preserving the real UTF-16 metadata.
+
+For non-Memory chat, when oversized content can be moved without relocating system/developer/assistant control semantics, the gateway first spills large `user` / `tool` text into one deterministic, sectioned UTF-8 `.txt` attachment, then re-validates that the remaining inline text is below `128000`. A single oversized user message may be spilled as a whole; in a multi-message conversation the **latest user message always stays inline**, so only older user bulk evidence and tool results are eligible. It fails closed if all three attachment slots are already used, no text can be safely spilled, the generated file exceeds 512 MiB, Graph document authorization is unavailable, or document upload fails. Original text is never truncated and the hard limit is not removed. Generated spill file/section hashes and the Microsoft transport filename are deterministic so identical retries can recognize the same document semantics.
+
+Attachments use Microsoft's long-file grounding/search path. This does not mean their model-context cost is zero: the gateway's visible usage estimate does not include Microsoft's internal grounding context, and very large high-entropy files are not guaranteed to support exact retrieval at arbitrary byte positions.
 
 Exhausting tool rounds returns terminal HTTP `409` and is not replayed:
 

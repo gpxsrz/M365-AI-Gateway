@@ -58,14 +58,21 @@ usage_estimate_scope=visible_request_and_completion
 
 ```text
 HTTP 400
-code=text_policy_exceeded
+code=text_input_too_large
 limit_type=caller_text_utf16
 limit=128000
 received=<actual>
 retryable_after_reduction=true
+spill_attempted=<true|false>
+spill_reason=<attachment_slots_full|no_safe_candidate|cannot_fit_inline|generated_file_too_large|graph_authorization_unavailable|document_upload_failed|...>
+input_sha256=<deterministic request identity>
 ```
 
 Hermes / Memory 會另外提供 consumer 看得懂的 `context_length_exceeded` / `input is too long` 訊號，同時保留真實 UTF-16 metadata。
+
+對非 Memory chat，若超限內容可以在不移動 system/developer/assistant 控制語意的前提下安全拆出，Gateway 會先把大型 `user` / `tool` 文字轉成一個 deterministic、分 section 的 UTF-8 `.txt` attachment，再重新驗證 inline 文字仍低於 `128000`。單一 user 訊息本身超限時可以整包 spill；多訊息對話的**最新 user 訊息永遠留 inline**，只允許較舊 user bulk evidence 與 tool result 進附件。既有附件已滿 3 個、沒有可安全 spill 的文字、generated file 超過 512 MiB、Graph 文件授權不可用或文件 upload 失敗時都 fail closed；不截斷原文，也不把 hard limit 移除。Generated spill 的 file/section hash 與 Microsoft transport filename 都是 deterministic，讓相同輸入 retry 可辨識同一份文件語意。
+
+Attachment 走 Microsoft long-file grounding/search；這不代表附件的 model-context cost 是 0。Gateway 的 visible usage estimate 不計 Microsoft 內部 grounding context，而且大型高熵檔不保證任意 byte 位置都能精確檢索。
 
 Tool rounds 耗盡時回 terminal HTTP `409`，不自動重播：
 

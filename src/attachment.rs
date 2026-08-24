@@ -16,8 +16,8 @@ use tokio::io::AsyncReadExt;
 
 use crate::chathub::{Account, Attachment, ChatError};
 
-const MAX_ATTACHMENTS: usize = 3;
-const MAX_BYTES: u64 = 512 << 20;
+pub(crate) const MAX_ATTACHMENTS: usize = 3;
+pub(crate) const MAX_BYTES: u64 = 512 << 20;
 const MAX_REDIRECTS: usize = 5;
 const DOCUMENT_CHUNK: usize = 983_040;
 
@@ -30,7 +30,8 @@ pub async fn prepare(
         return Err(protocol("active attachments exceed the shared limit of 3"));
     }
     for (index, attachment) in attachments.iter_mut().enumerate() {
-        match attachment.kind.as_str() {
+        let generated_oversize_text = attachment.generated_oversize_text;
+        let result = match attachment.kind.as_str() {
             "image" => {
                 if !attachment.doc_id.is_empty()
                     && attachment.uploaded_conversation_id == conversation_id
@@ -40,7 +41,7 @@ pub async fn prepare(
                 attachment.doc_id.clear();
                 attachment.file_type.clear();
                 attachment.uploaded_conversation_id.clear();
-                upload_image(account, conversation_id, index, attachment).await?;
+                upload_image(account, conversation_id, index, attachment).await
             }
             "file" => {
                 if !attachment.doc_id.is_empty()
@@ -53,9 +54,15 @@ pub async fn prepare(
                 attachment.reference_url.clear();
                 attachment.transport_name.clear();
                 attachment.uploaded_conversation_id.clear();
-                upload_document(account, conversation_id, attachment).await?;
+                upload_document(account, conversation_id, attachment).await
             }
             _ => return Err(protocol("unsupported attachment type")),
+        };
+        if let Err(error) = result {
+            return Err(ChatError::Attachment {
+                generated_oversize_text,
+                message: error.to_string(),
+            });
         }
     }
     Ok(())
@@ -72,7 +79,7 @@ async fn upload_document(
         ));
     }
     let spool = spool(&attachment.url, &attachment.mime_type, &attachment.name).await?;
-    let transport_name = document_name(&spool.name);
+    let transport_name = document_name(&spool.name, attachment.generated_oversize_text);
     let create_url = format!(
         "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads:/{}:/createUploadSession",
         percent_encode_path(&transport_name)
@@ -545,7 +552,7 @@ fn normalize_image_extension(raw: &str, mime: &str) -> String {
     }
 }
 
-fn document_name(original: &str) -> String {
+fn document_name(original: &str, preserve_generated_name: bool) -> String {
     let safe = original
         .replace('\\', "/")
         .rsplit('/')
@@ -562,6 +569,9 @@ fn document_name(original: &str) -> String {
         .collect::<String>();
     let safe = safe.trim_matches([' ', '.']);
     let safe = if safe.is_empty() { "attachment" } else { safe };
+    if preserve_generated_name && is_generated_oversize_name(safe) {
+        return safe.to_owned();
+    }
     let known = [
         "txt", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "json", "md", "html",
         "htm", "rtf", "xml", "yaml", "yml", "py", "js", "ts", "java", "c", "cc", "cpp", "cs", "go",
@@ -580,6 +590,16 @@ fn document_name(original: &str) -> String {
     } else {
         format!("{}-{suffix}.txt", truncate_utf16(safe, 260))
     }
+}
+
+fn is_generated_oversize_name(value: &str) -> bool {
+    let Some(digest) = value
+        .strip_prefix("m365-oversize-")
+        .and_then(|value| value.strip_suffix(".txt"))
+    else {
+        return false;
+    };
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn truncate_utf16(value: &str, limit: usize) -> String {
@@ -811,10 +831,19 @@ mod tests {
 
     #[test]
     fn document_name_keeps_a_known_extension_at_the_end() {
-        let name = document_name("../Quarterly report.pdf");
+        let name = document_name("../Quarterly report.pdf", false);
         assert!(name.starts_with("Quarterly report-"));
         assert!(name.ends_with(".pdf"));
         assert!(!name.contains('/'));
+    }
+
+    #[test]
+    fn generated_oversize_document_name_is_stable_across_retries() {
+        let original =
+            "m365-oversize-012345abcdef012345abcdef012345abcdef012345abcdef012345abcdef0123.txt";
+        assert_eq!(document_name(original, true), original);
+        assert_eq!(document_name(original, true), original);
+        assert_ne!(document_name(original, false), original);
     }
 
     #[tokio::test]

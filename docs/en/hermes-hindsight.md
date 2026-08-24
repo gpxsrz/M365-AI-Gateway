@@ -166,7 +166,9 @@ The Gateway does not delete Hermes working context and cannot insert a later rec
 ## Overflow and upstream bank mission
 
 - `128000` is a UTF-16 transport policy, not Hermes/Hindsight token context.
-- Hermes receives a recognizable context-length signal and can run compression → retry.
+- For non-Memory chat, when the oversized portion is safely movable `user` / `tool` bulk text, M365 first spills it into one structured `.txt` attachment. System/developer/assistant control semantics and tool identity remain inline, and the final inline payload is still checked against the `128000` hard guard. A single oversized user message may spill as a whole; in multi-message conversations the latest user message always remains inline.
+- Hermes needs a recoverable overflow signal only when safe spill is impossible, attachment slots are full, the generated file is too large, or document authorization is unavailable. The `128000` transport wall should no longer by itself force early Hermes compression/rotation; normal compression, protected-tail, and rotation policy remains driven by model-token/context quality.
+- Attachment grounding is not zero-context-cost and is not arbitrary byte-addressable storage; very large high-entropy files can miss retrieval targets.
 - Hindsight receives `context_length_exceeded` / `input is too long`; Reflect baseline is 40K / retry 1.
 
 Until Hermes upstream #18774 is fixed, `bank_mission` / `bank_retain_mission` may not reach live Hindsight `reflect_mission` / `retain_mission`. Apply them through the Banks Config API and require a GET readback:
