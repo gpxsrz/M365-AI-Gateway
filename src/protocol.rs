@@ -523,6 +523,7 @@ pub(crate) async fn execute_chat_request(
             received_text_units,
             &prompt_messages,
             &flattened.attachments,
+            &flattened.text,
         )
     });
     let mut spill_failure = None;
@@ -2626,10 +2627,13 @@ impl OverflowContext {
         received: usize,
         messages: &[OpenAiMessage],
         attachments: &[Attachment],
+        measured_transport_text: &str,
     ) -> Self {
+        let measured_transport_text_sha256 = sha256_hex(measured_transport_text.as_bytes());
         let bytes = serde_json::to_vec(&json!({
             "messages": messages,
             "attachments": attachments,
+            "measured_transport_text_sha256": measured_transport_text_sha256,
         }))
         .expect("overflow decision input is serializable");
         Self {
@@ -4343,6 +4347,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_overflow_identity_binds_the_effective_schema_instruction() {
+        let (app, raw_key) = app();
+        let message = json!({"role":"user","content":"M".repeat(128_100)});
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/memory/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[message.clone()],
+                            "response_format":{
+                                "type":"json_schema",
+                                "json_schema":{
+                                    "name":"memory_a",
+                                    "schema":{
+                                        "type":"object",
+                                        "properties":{"kind":{"const":"alpha"}},
+                                        "required":["kind"],
+                                        "additionalProperties":false
+                                    }
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = app
+            .oneshot(
+                Request::post("/memory/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[message],
+                            "response_format":{
+                                "type":"json_schema",
+                                "json_schema":{
+                                    "name":"memory_b",
+                                    "schema":{
+                                        "type":"object",
+                                        "properties":{"kind":{"const":"bravo"}},
+                                        "required":["kind"],
+                                        "additionalProperties":false
+                                    }
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+        let first: Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(first["error"]["code"], "context_length_exceeded");
+        assert_eq!(second["error"]["code"], "context_length_exceeded");
+        assert_ne!(
+            first["error"]["input_sha256"],
+            second["error"]["input_sha256"]
+        );
+    }
+
+    #[tokio::test]
     async fn oversize_spill_graph_authorization_failure_returns_recoverable_overflow() {
         let chat = Arc::new(RecordingTransport(Mutex::new(None)));
         let (app, raw_key) = app_with_chat(chat.clone());
@@ -4456,7 +4537,9 @@ mod tests {
     #[test]
     fn overflow_input_identity_binds_existing_attachment_state() {
         let messages = vec![OpenAiMessage::text("user", "A".repeat(128_100))];
-        let first = OverflowContext::new(128_000, 128_100, &messages, &[]);
+        let measured_transport_text = "A".repeat(128_100);
+        let first =
+            OverflowContext::new(128_000, 128_100, &messages, &[], &measured_transport_text);
         let attachment = Attachment {
             kind: "file".to_owned(),
             url: "data:text/plain;base64,YQ==".to_owned(),
@@ -4464,7 +4547,13 @@ mod tests {
             mime_type: "text/plain".to_owned(),
             ..Attachment::default()
         };
-        let second = OverflowContext::new(128_000, 128_100, &messages, &[attachment]);
+        let second = OverflowContext::new(
+            128_000,
+            128_100,
+            &messages,
+            &[attachment],
+            &measured_transport_text,
+        );
 
         assert_ne!(first.input_sha256, second.input_sha256);
         assert_eq!(first.input_sha256.len(), 64);
