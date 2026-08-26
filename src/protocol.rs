@@ -559,11 +559,8 @@ pub(crate) async fn execute_chat_request(
     }
 
     let class = request_class(&path, &body);
-    let permit = match gateway
-        .traffic
-        .acquire(class, TrafficLimits::default())
-        .await
-    {
+    let traffic_limits = traffic_limits(&settings);
+    let permit = match gateway.traffic.acquire(class, traffic_limits).await {
         Ok(permit) => permit,
         Err(error) => {
             let mut response =
@@ -703,6 +700,15 @@ pub(crate) async fn execute_chat_request(
             overflow_context,
         )
         .await
+    }
+}
+
+fn traffic_limits(settings: &crate::runtime_settings::RuntimeSettings) -> TrafficLimits {
+    TrafficLimits {
+        interactive_queue_timeout: std::time::Duration::from_secs(
+            settings.interactive_queue_timeout_seconds,
+        ),
+        memory_queue_timeout: std::time::Duration::from_secs(settings.memory_queue_timeout_seconds),
     }
 }
 
@@ -3573,6 +3579,14 @@ mod tests {
         chat: Arc<dyn ChatHubTransport>,
         oauth_config: OAuthConfig,
     ) -> (Router, String) {
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat, oauth_config);
+        (Gateway::router(gateway), raw_key)
+    }
+
+    fn gateway_with_chat_and_oauth(
+        chat: Arc<dyn ChatHubTransport>,
+        oauth_config: OAuthConfig,
+    ) -> (Arc<Gateway>, String) {
         let root = tempfile::tempdir().unwrap().keep();
         let admin_path = root.join("admin-password");
         std::fs::write(&admin_path, "password\n").unwrap();
@@ -3622,7 +3636,7 @@ mod tests {
             deployments: crate::deployments::Store::open(&root).unwrap(),
             debug: crate::debug::Store::default(),
         });
-        (Gateway::router(gateway), raw_key)
+        (gateway, raw_key)
     }
 
     async fn oauth_with_graph_token_server() -> (OAuthConfig, tokio::task::JoinHandle<()>) {
@@ -5641,6 +5655,110 @@ mod tests {
             json_schema: json!({"schema":{"$ref":"https://example.invalid/schema.json"}}),
         };
         assert!(validate_response_format_definition(Some(&remote)).is_err());
+    }
+
+    #[test]
+    fn runtime_queue_timeouts_drive_traffic_limits() {
+        let settings = crate::runtime_settings::RuntimeSettings {
+            interactive_queue_timeout_seconds: 7,
+            memory_queue_timeout_seconds: 11,
+            ..crate::runtime_settings::RuntimeSettings::default()
+        };
+
+        let limits = traffic_limits(&settings);
+
+        assert_eq!(limits.interactive_queue_timeout, Duration::from_secs(7));
+        assert_eq!(limits.memory_queue_timeout, Duration::from_secs(11));
+    }
+
+    #[tokio::test]
+    async fn open_breaker_is_projected_before_any_chathub_round() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        gateway
+            .traffic
+            .acquire(WorkloadClass::ExternalUser, TrafficLimits::default())
+            .await
+            .unwrap()
+            .finish(StatusCode::TOO_MANY_REQUESTS, Some("5"));
+        let before = gateway.traffic.snapshot();
+        let app = Gateway::router(Arc::clone(&gateway));
+
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "upstream_throttle");
+        assert!(chat.0.lock().unwrap().is_none());
+
+        let after = gateway.traffic.snapshot();
+        assert_eq!(after.shared_circuit_state, before.shared_circuit_state);
+        assert_eq!(after.shared_cooldown_level, before.shared_cooldown_level);
+        assert_eq!(after.shared_429_count, before.shared_429_count);
+        assert_eq!(after.last_429_source, before.last_429_source);
+        assert_eq!(after.interactive_waiting, 0);
+    }
+
+    #[tokio::test]
+    async fn endpoint_admission_uses_current_runtime_queue_timeout() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let mut settings = gateway.settings.current();
+        settings.interactive_queue_timeout_seconds = 1;
+        gateway.settings.save(settings).unwrap();
+
+        let first = gateway
+            .traffic
+            .acquire(WorkloadClass::ExternalUser, TrafficLimits::default())
+            .await
+            .unwrap();
+        let second = gateway
+            .traffic
+            .acquire(WorkloadClass::ExternalUser, TrafficLimits::default())
+            .await
+            .unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("runtime queue timeout should be far below the old 120-second default")
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "interactive_capacity_busy");
+        assert!(elapsed >= Duration::from_millis(900), "elapsed={elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "elapsed={elapsed:?}");
+        assert!(chat.0.lock().unwrap().is_none());
+
+        first.finish(StatusCode::OK, None);
+        second.finish(StatusCode::OK, None);
     }
 
     #[test]

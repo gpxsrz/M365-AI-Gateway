@@ -137,6 +137,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 ```
 
 - `OPEN` expiry only makes a probe possible; it does not close the breaker.
+- While the breaker is definitively `OPEN`, all interactive classes fail fast with the existing local `429 upstream_throttle` projection and `Retry-After`. A request that was already queued when another in-flight request opens the breaker is awakened and receives the same projection instead of waiting for its ordinary queue deadline. This local projection creates no ChatHub round and does not advance breaker counters, level, or source.
 - External-user traffic always has probe priority. If cooldown expires with no external user waiting, one Hermes continuation already classified by the gateway as `Autonomous` may take the single probe. Control-plane traffic (including Goal Judge, even when Hermes falls back from `/v1` to the main `/hermes/v1` provider), `AsyncCompletion`, and Memory still cannot probe; another 429 reopens the circuit at the next cooldown level.
 - A throttled probe returns to `OPEN` at a higher cooldown.
 - A successful probe enters `RECOVERY`.

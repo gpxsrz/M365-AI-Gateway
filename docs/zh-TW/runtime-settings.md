@@ -24,6 +24,8 @@
 | 程序與檔案 | `listenAddress`、`configPath`、`tokenCachePath`、`sessionCachePath`、`debugLogPath` |
 | 網路與 OAuth | `outboundProxy`、`clientId`、`authority`、`redirectUri`、`scope` |
 
+`interactiveQueueTimeoutSeconds` 與 `memoryQueueTimeoutSeconds` 是 shared scheduler 真正使用的一般 admission 等待預算。兩者預設都是 `120` 秒，合法範圍為 `1..=600`。它們不會取代 breaker cooldown：shared breaker 明確處於 `OPEN` 時，interactive traffic 會立即投影成 `429 upstream_throttle` 並附 `Retry-After`，不會先耗掉一般 queue timeout。
+
 ## 首次啟動
 
 1. 讓 `M365_DATA_DIR` 指向可寫、可持久保存的資料夾。

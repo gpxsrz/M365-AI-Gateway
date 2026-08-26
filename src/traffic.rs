@@ -286,7 +286,14 @@ impl TrafficController {
         let ordinary_deadline = Instant::now() + limits.interactive_queue_timeout;
         let id = {
             let mut state = self.state.lock().expect("traffic state poisoned");
-            state.refresh(Instant::now(), self.recovery_observation);
+            let now = Instant::now();
+            state.refresh(now, self.recovery_observation);
+            if state.circuit == CircuitState::Open {
+                if class.is_external() && state.memory_yield.is_some() {
+                    state.finish_memory_yield("preempted_by_interactive", now);
+                }
+                return Err(state.throttle_error(now, &self.cooldowns));
+            }
             if state.interactive_queue.len() >= INTERACTIVE_QUEUE_MAX_WAITING {
                 return Err(capacity_error(
                     "interactive_capacity_busy",
@@ -320,6 +327,11 @@ impl TrafficController {
                 state.refresh(now, self.recovery_observation);
                 if class.is_external() && state.memory_yield.is_some() {
                     state.finish_memory_yield("preempted_by_interactive", now);
+                }
+                if state.circuit == CircuitState::Open {
+                    state.remove_interactive(id);
+                    waiter_guard.disarm();
+                    return Err(state.throttle_error(now, &self.cooldowns));
                 }
                 if state.can_admit_interactive(id, class, now) {
                     state.remove_interactive(id);
@@ -820,6 +832,19 @@ mod tests {
         )
     }
 
+    fn long_cooldown_controller() -> Arc<TrafficController> {
+        TrafficController::with_policy(
+            [
+                Duration::from_millis(500),
+                Duration::from_millis(1_000),
+                Duration::from_millis(2_000),
+                Duration::from_millis(4_000),
+                Duration::from_millis(8_000),
+            ],
+            Duration::from_millis(60),
+        )
+    }
+
     fn fast_limits() -> TrafficLimits {
         TrafficLimits {
             interactive_queue_timeout: Duration::from_millis(80),
@@ -1189,13 +1214,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_user_still_wins_the_half_open_probe_when_already_waiting() {
+    async fn external_user_wins_the_next_half_open_probe_among_probe_inflight_waiters() {
         let controller = fast_controller();
         controller
             .acquire(WorkloadClass::ExternalUser, fast_limits())
             .await
             .unwrap()
             .finish(StatusCode::TOO_MANY_REQUESTS, None);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let first_probe = controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.snapshot().shared_circuit_state,
+            CircuitState::ProbeInFlight
+        );
         let limits = TrafficLimits {
             interactive_queue_timeout: Duration::from_millis(250),
             memory_queue_timeout: Duration::from_millis(250),
@@ -1215,8 +1249,14 @@ mod tests {
             })
         };
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        controller.changed.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while controller.snapshot().interactive_waiting != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first_probe.finish(StatusCode::BAD_GATEWAY, None);
         let probe = tokio::time::timeout(Duration::from_millis(50), external)
             .await
             .unwrap()
@@ -1482,5 +1522,139 @@ mod tests {
         assert_eq!(after.shared_429_count, before.shared_429_count);
         assert_eq!(after.memory_429_count, before.memory_429_count);
         assert_eq!(after.last_429_source, before.last_429_source);
+    }
+
+    #[tokio::test]
+    async fn rejected_queue_full_external_user_does_not_preempt_memory_yield() {
+        let controller = fast_controller();
+        controller.arm_memory_yield();
+        {
+            let mut state = controller.state.lock().unwrap();
+            for offset in 0..INTERACTIVE_QUEUE_MAX_WAITING {
+                state.interactive_queue.push_back(Waiter {
+                    id: 10_000 + offset as u64,
+                    class: WorkloadClass::ControlPlane,
+                });
+            }
+        }
+
+        let error = controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .err()
+            .unwrap();
+        let snapshot = controller.snapshot();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "interactive_capacity_busy");
+        assert!(snapshot.memory_yield_pending);
+        assert_eq!(snapshot.last_memory_yield_outcome, "pending");
+    }
+
+    #[tokio::test]
+    async fn open_breaker_projects_throttle_to_interactive_without_queue_wait() {
+        let controller = long_cooldown_controller();
+        let limits = TrafficLimits {
+            interactive_queue_timeout: Duration::from_millis(100),
+            memory_queue_timeout: Duration::from_millis(100),
+        };
+        controller
+            .acquire(WorkloadClass::ExternalUser, limits)
+            .await
+            .unwrap()
+            .finish(StatusCode::TOO_MANY_REQUESTS, None);
+        let before = controller.snapshot();
+
+        for class in [
+            WorkloadClass::ExternalUser,
+            WorkloadClass::Autonomous,
+            WorkloadClass::ControlPlane,
+            WorkloadClass::AsyncCompletion,
+        ] {
+            let started = Instant::now();
+            let error = controller.acquire(class, limits).await.err().unwrap();
+            assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS, "{class:?}");
+            assert_eq!(error.code, "upstream_throttle", "{class:?}");
+            assert!(started.elapsed() < Duration::from_millis(50), "{class:?}");
+        }
+
+        let after = controller.snapshot();
+        assert_eq!(after.shared_circuit_state, before.shared_circuit_state);
+        assert_eq!(after.shared_cooldown_level, before.shared_cooldown_level);
+        assert_eq!(after.shared_429_count, before.shared_429_count);
+        assert_eq!(after.memory_429_count, before.memory_429_count);
+        assert_eq!(after.last_429_source, before.last_429_source);
+        assert_eq!(after.interactive_waiting, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_interactive_waiter_wakes_when_breaker_opens() {
+        let controller = long_cooldown_controller();
+        let limits = TrafficLimits {
+            interactive_queue_timeout: Duration::from_millis(500),
+            memory_queue_timeout: Duration::from_millis(500),
+        };
+        let first = controller
+            .acquire(WorkloadClass::ExternalUser, limits)
+            .await
+            .unwrap();
+        let second = controller
+            .acquire(WorkloadClass::ExternalUser, limits)
+            .await
+            .unwrap();
+        let waiting = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                controller
+                    .acquire(WorkloadClass::ControlPlane, limits)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while controller.snapshot().interactive_waiting != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        first.finish(StatusCode::TOO_MANY_REQUESTS, None);
+        let error = tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("queued waiter should wake when breaker opens")
+            .unwrap()
+            .err()
+            .unwrap();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.code, "upstream_throttle");
+        assert_eq!(controller.snapshot().interactive_waiting, 0);
+        second.finish(StatusCode::OK, None);
+    }
+
+    #[tokio::test]
+    async fn open_breaker_projection_preserves_external_user_memory_yield_preemption() {
+        let controller = fast_controller();
+        controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .unwrap()
+            .finish(StatusCode::TOO_MANY_REQUESTS, None);
+        controller.arm_memory_yield();
+
+        let error = controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .err()
+            .unwrap();
+        let snapshot = controller.snapshot();
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.code, "upstream_throttle");
+        assert!(!snapshot.memory_yield_pending);
+        assert!(!snapshot.memory_yield_active);
+        assert_eq!(
+            snapshot.last_memory_yield_outcome,
+            "preempted_by_interactive"
+        );
     }
 }

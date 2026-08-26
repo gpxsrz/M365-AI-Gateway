@@ -66,9 +66,9 @@ impl Default for RuntimeSettings {
             hermes_compatibility_enabled: true,
             memory_compatibility_enabled: false,
             interactive_max_concurrent: 2,
-            interactive_queue_timeout_seconds: 300,
+            interactive_queue_timeout_seconds: 120,
             memory_max_concurrent: 2,
-            memory_queue_timeout_seconds: 60,
+            memory_queue_timeout_seconds: 120,
             interactive_priority_holdoff_seconds: 30,
             memory_backoff_initial_seconds: 5,
             memory_backoff_max_seconds: 60,
@@ -608,5 +608,28 @@ mod tests {
         assert_eq!(direct_override_value(Some("9999"), 32, 16, 1, 512), 16);
         assert_eq!(direct_override_value(Some("bad"), 32, 16, 1, 512), 16);
         assert_eq!(direct_override_value(None, 32, 16, 1, 512), 32);
+    }
+
+    #[test]
+    fn queue_timeout_defaults_match_the_live_scheduler_baseline() {
+        let settings = RuntimeSettings::default();
+        assert_eq!(settings.interactive_queue_timeout_seconds, 120);
+        assert_eq!(settings.memory_queue_timeout_seconds, 120);
+    }
+
+    #[test]
+    fn queue_timeout_validation_keeps_the_documented_bounds() {
+        let mut settings = RuntimeSettings {
+            interactive_queue_timeout_seconds: 1,
+            memory_queue_timeout_seconds: 600,
+            ..RuntimeSettings::default()
+        };
+        validate(&settings).unwrap();
+
+        settings.interactive_queue_timeout_seconds = 0;
+        assert!(validate(&settings).is_err());
+        settings.interactive_queue_timeout_seconds = 120;
+        settings.memory_queue_timeout_seconds = 601;
+        assert!(validate(&settings).is_err());
     }
 }

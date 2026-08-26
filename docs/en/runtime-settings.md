@@ -24,6 +24,8 @@ The UI must show both the effective value and its source. A disabled or environm
 | Process and files | `listenAddress`, `configPath`, `tokenCachePath`, `sessionCachePath`, `debugLogPath` |
 | Network and OAuth | `outboundProxy`, `clientId`, `authority`, `redirectUri`, `scope` |
 
+`interactiveQueueTimeoutSeconds` and `memoryQueueTimeoutSeconds` are the effective ordinary admission-wait budgets used by the shared scheduler. Both default to `120` seconds and accept `1..=600`. They do not replace the breaker cooldown ladder: while the shared breaker is definitively `OPEN`, interactive traffic is projected immediately as `429 upstream_throttle` with `Retry-After` instead of spending the ordinary queue timeout.
+
 ## First startup
 
 1. Point `M365_DATA_DIR` to writable persistent storage.

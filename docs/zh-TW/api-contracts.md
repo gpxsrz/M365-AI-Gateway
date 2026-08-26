@@ -137,6 +137,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 ```
 
 - `OPEN` 到期只代表可以 probe，不會直接關閉。
+- Breaker 明確處於 `OPEN` 時，所有 interactive class 都會立即使用既有的本地 `429 upstream_throttle` + `Retry-After` 投影。若某個 request 原本已在排隊、另一筆 in-flight request 才把 breaker 打開，該 waiter 也會被喚醒並收到同一投影，不會繼續等到一般 queue deadline。這個本地投影不會建立 ChatHub round，也不會增加 breaker counter、level 或改寫來源。
 - external-user 永遠優先取得 probe；若 cooldown 到期且沒有 external-user 在等，允許一筆已被 Gateway 明確分類為 `Autonomous` 的 Hermes continuation 做唯一 probe。Control-plane（含 Goal Judge，即使 Hermes 從 `/v1` fallback 到 main `/hermes/v1` provider）仍保持 control-plane 身分；`AsyncCompletion` 與 Memory 也不得 probe。probe 若再次 429 會依原 cooldown ladder 升級後重新 OPEN。
 - Probe 再被 throttle 會回 `OPEN` 並提高 cooldown。
 - Probe 成功才進 `RECOVERY`。
