@@ -466,7 +466,7 @@ pub(crate) async fn execute_chat_request(
             &message,
         );
     }
-    let apply_agent_evidence_policy = path != "/v1/chat/completions";
+    let apply_agent_evidence_policy = path.starts_with("/hermes/");
     let checkpoint_response_id = body.checkpoint_response_id.clone();
     if let Some(turn) = &checkpoint {
         if !turn.binding.conversation_id.is_empty() {
@@ -887,6 +887,17 @@ async fn complete_chat(
                 );
             }
             let projection = policy.projection;
+            if let Err(message) =
+                validate_final_projection_format(&projection, response_format.as_ref())
+            {
+                permit.finish(StatusCode::BAD_GATEWAY, None);
+                return openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "response_format_validation_failed",
+                    &message,
+                );
+            }
             let artifacts = result
                 .artifacts
                 .iter()
@@ -1198,6 +1209,14 @@ async fn stream_chat(
                     );
                 }
                 let projection = policy.projection;
+                if let Err(message) =
+                    validate_final_projection_format(&projection, response_format.as_ref())
+                {
+                    permit.finish(StatusCode::BAD_GATEWAY, None);
+                    send_sse_error(&sender, "response_format_validation_failed", &message);
+                    let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                    return;
+                }
                 if !buffer_for_tools && !result.text.starts_with(&visible_text) {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
@@ -2314,6 +2333,16 @@ fn validate_response_format_text(text: &str, format: &ResponseFormat) -> Result<
         }
         other => Err(format!("unsupported response_format type {other:?}")),
     }
+}
+
+fn validate_final_projection_format(
+    projection: &ToolProjection,
+    format: Option<&ResponseFormat>,
+) -> Result<(), String> {
+    let Some(format) = format else {
+        return Ok(());
+    };
+    validate_response_format_text(&projection.content, format).map(|_| ())
 }
 
 fn normalize_json_text(text: &str) -> String {
@@ -4712,6 +4741,289 @@ mod tests {
                 "path={path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn memory_json_schema_output_survives_post_qualification_agent_policy() {
+        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+            r#"{"status":"completed"}"#,
+        ])));
+        let response = app
+            .oneshot(
+                Request::post("/memory/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[{"role":"user","content":"Return the structured status."}],
+                            "response_format":{
+                                "type":"json_schema",
+                                "json_schema":{
+                                    "name":"memory_status",
+                                    "strict":true,
+                                    "schema":{
+                                        "type":"object",
+                                        "properties":{"status":{"const":"completed"}},
+                                        "required":["status"],
+                                        "additionalProperties":false
+                                    }
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            r#"{"status":"completed"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_responses_and_anthropic_surfaces_do_not_inherit_hermes_evidence_rewrite() {
+        let (responses_app, responses_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
+        let responses = responses_app
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("x-api-key", responses_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "input":"Report deployment status"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(responses.status(), StatusCode::OK);
+        let responses: Value =
+            serde_json::from_slice(&to_bytes(responses.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            responses["output"][0]["content"][0]["text"],
+            "Deployment completed successfully."
+        );
+
+        let (anthropic_app, anthropic_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
+        let anthropic = anthropic_app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("x-api-key", anthropic_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"claude-sonnet",
+                            "max_tokens":64,
+                            "messages":[{"role":"user","content":"Report deployment status"}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anthropic.status(), StatusCode::OK);
+        let anthropic: Value =
+            serde_json::from_slice(&to_bytes(anthropic.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            anthropic["content"][0]["text"],
+            "Deployment completed successfully."
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_memory_json_schema_output_stays_schema_valid() {
+        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+            r#"{"status":"completed"}"#,
+        ])));
+        let response = app
+            .oneshot(
+                Request::post("/memory/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "stream":true,
+                            "messages":[{"role":"user","content":"Return the structured status."}],
+                            "response_format":{
+                                "type":"json_schema",
+                                "json_schema":{
+                                    "name":"memory_status",
+                                    "strict":true,
+                                    "schema":{
+                                        "type":"object",
+                                        "properties":{"status":{"const":"completed"}},
+                                        "required":["status"],
+                                        "additionalProperties":false
+                                    }
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let contents = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| {
+                value["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect::<String>();
+        assert_eq!(contents, r#"{"status":"completed"}"#);
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn hermes_json_schema_cannot_return_policy_rewrite_as_http_200() {
+        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+            r#"{"status":"completed"}"#,
+        ])));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[{"role":"user","content":"Return the structured status."}],
+                            "response_format":{
+                                "type":"json_schema",
+                                "json_schema":{
+                                    "name":"memory_status",
+                                    "strict":true,
+                                    "schema":{
+                                        "type":"object",
+                                        "properties":{"status":{"const":"completed"}},
+                                        "required":["status"],
+                                        "additionalProperties":false
+                                    }
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "response_format_validation_failed");
+    }
+
+    #[tokio::test]
+    async fn memory_non_json_reask_still_returns_schema_valid_output() {
+        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+            "temporarily unstructured",
+            r#"{"status":"completed"}"#,
+        ])));
+        let response = app
+            .oneshot(
+                Request::post("/memory/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[{"role":"user","content":"Return the structured status."}],
+                            "response_format":{
+                                "type":"json_schema",
+                                "json_schema":{
+                                    "name":"memory_status",
+                                    "strict":true,
+                                    "schema":{
+                                        "type":"object",
+                                        "properties":{"status":{"const":"completed"}},
+                                        "required":["status"],
+                                        "additionalProperties":false
+                                    }
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            r#"{"status":"completed"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_accepts_success_claim_with_matching_completed_tool_evidence() {
+        let (app, raw_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[
+                                {"role":"user","content":"Deploy the service."},
+                                {"role":"assistant","content":null,"tool_calls":[{
+                                    "id":"call_1","type":"function",
+                                    "function":{"name":"terminal","arguments":"{\"command\":\"deploy\"}"}
+                                }]},
+                                {"role":"tool","tool_call_id":"call_1","content":"{\"output\":\"deployed\",\"exit_code\":0}"}
+                            ]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "Deployment completed successfully."
+        );
     }
 
     #[tokio::test]

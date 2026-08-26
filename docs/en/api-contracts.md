@@ -96,6 +96,8 @@ If the router-repair input itself is too large, processing stops before a second
 - `arguments` cannot be cut mid-value or have facts invented during transport, repair, or checkpoint handling.
 - Internal `calls/answer` envelopes are not public API. Only a strict direct-answer shape may be unwrapped at the final boundary.
 - `response_format` / `json_schema` is a structured-output contract. Ordinary JSON is not stripped merely because it resembles a router envelope; invalid internal envelopes fail closed.
+- Hermes caller-tool completion-evidence rewriting is owned only by `/hermes/...` execution surfaces. Generic Chat Completions, Responses, Anthropic Messages, and `/memory/...` compatibility traffic do not inherit that policy merely because they share the same transport core.
+- Structured-output validity is checked again after final projection. If a Hermes evidence-policy decision changes an otherwise schema-valid candidate into content that no longer matches the caller's `response_format`, the gateway fails closed instead of returning HTTP 200 with non-schema prose.
 
 Router, repair, and required-tool retry scratch phases each use a new `ConversationId` / `SessionId`. Private mode reapplies `disableMemory=1` to every new WebSocket, but that field is not a context reset.
 

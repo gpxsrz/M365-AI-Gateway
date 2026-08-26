@@ -96,6 +96,8 @@ Router repair input 若本身超過限制，在第二次 upstream call 前停止
 - `arguments` 在 transport、repair、checkpoint 途中不能被截半，也不能補造不存在的事實。
 - Internal `calls/answer` envelope 不是公開 API。只有嚴格符合 direct-answer 形狀時，才可在 final boundary 解包。
 - `response_format` / `json_schema` 是 structured-output contract。普通 JSON 不會因為看起來像 router envelope 就被剝殼；不合法 internal envelope 會 fail closed。
+- Hermes caller-tool completion-evidence 改寫只屬於 `/hermes/...` execution surface。Generic Chat Completions、Responses、Anthropic Messages 與 `/memory/...` compatibility traffic 不會因為共用 transport core 就自動繼承這套 policy。
+- Final projection 後會再驗一次 structured-output contract。若 Hermes evidence policy 把原本 schema-valid 的候選改成不再符合 caller `response_format` 的內容，Gateway 會 fail closed，不會用 HTTP 200 回傳非 schema prose。
 
 Router、repair 與 required-tool retry 的 scratch phase 各使用新的 `ConversationId` / `SessionId`。Private mode 每條新 WebSocket 都重送 `disableMemory=1`，但這個欄位本身不是 context reset。
 
