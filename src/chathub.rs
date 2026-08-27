@@ -1,4 +1,13 @@
-use std::{collections::HashSet, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
@@ -152,6 +161,7 @@ pub struct ChatRequest {
     pub tool_call_limit: usize,
     pub mcp_server_url: String,
     pub disable_built_in_search: bool,
+    pub upstream_attempt_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,6 +211,8 @@ pub enum ChatError {
         retry_after: Option<String>,
         soft: bool,
     },
+    #[error("ChatHub service unavailable after retry")]
+    ServiceUnavailable,
     #[error("ChatHub terminal {kind}: {message}")]
     Terminal { kind: String, message: String },
     #[error("ChatHub transport: {0}")]
@@ -288,6 +300,9 @@ async fn live_chat(
 
     let mut socket = None;
     for attempt in 0..2 {
+        request
+            .upstream_attempt_count
+            .store(attempt + 1, Ordering::Release);
         let mut upgrade = url
             .as_str()
             .into_client_request()
@@ -323,6 +338,9 @@ async fn live_chat(
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
+                    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                        return Err(ChatError::ServiceUnavailable);
+                    }
                 } else if attempt == 0 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -332,60 +350,65 @@ async fn live_chat(
         }
     }
     let mut socket = socket.ok_or_else(|| ChatError::Transport("dial failed".to_owned()))?;
-    socket
-        .send(Message::Text(
-            format!("{{\"protocol\":\"json\",\"version\":1}}{RECORD_SEPARATOR}").into(),
-        ))
-        .await
-        .map_err(transport)?;
-    socket
-        .next()
-        .await
-        .ok_or_else(|| ChatError::Protocol("handshake ended early".to_owned()))?
-        .map_err(transport)?;
-    socket
-        .send(Message::Text(payload.into()))
-        .await
-        .map_err(transport)?;
+    async {
+        socket
+            .send(Message::Text(
+                format!("{{\"protocol\":\"json\",\"version\":1}}{RECORD_SEPARATOR}").into(),
+            ))
+            .await
+            .map_err(transport)?;
+        socket
+            .next()
+            .await
+            .ok_or_else(|| ChatError::Protocol("handshake ended early".to_owned()))?
+            .map_err(transport)?;
+        socket
+            .send(Message::Text(payload.into()))
+            .await
+            .map_err(transport)?;
 
-    let mut collector =
-        SignalRCollector::new(request.conversation_id, request.session_id, request_id);
-    while let Some(message) = socket.next().await {
-        let message = message.map_err(transport)?;
-        match message {
-            Message::Text(text) => {
-                if let Some(result) = collector.ingest(text.as_str(), events)? {
-                    return Ok(result);
+        let mut collector =
+            SignalRCollector::new(request.conversation_id, request.session_id, request_id);
+        while let Some(message) = socket.next().await {
+            let message = message.map_err(transport)?;
+            match message {
+                Message::Text(text) => {
+                    if let Some(result) = collector.ingest(text.as_str(), events)? {
+                        return Ok(result);
+                    }
+                    if collector.ping_seen {
+                        collector.ping_seen = false;
+                        socket
+                            .send(Message::Text(
+                                format!("{{\"type\":6}}{RECORD_SEPARATOR}").into(),
+                            ))
+                            .await
+                            .map_err(transport)?;
+                    }
                 }
-                if collector.ping_seen {
-                    collector.ping_seen = false;
-                    socket
-                        .send(Message::Text(
-                            format!("{{\"type\":6}}{RECORD_SEPARATOR}").into(),
-                        ))
-                        .await
-                        .map_err(transport)?;
+                Message::Binary(bytes) => {
+                    let text = String::from_utf8(bytes.to_vec())
+                        .map_err(|_| ChatError::Protocol("non-UTF-8 frame".to_owned()))?;
+                    if let Some(result) = collector.ingest(&text, events)? {
+                        return Ok(result);
+                    }
                 }
-            }
-            Message::Binary(bytes) => {
-                let text = String::from_utf8(bytes.to_vec())
-                    .map_err(|_| ChatError::Protocol("non-UTF-8 frame".to_owned()))?;
-                if let Some(result) = collector.ingest(&text, events)? {
-                    return Ok(result);
+                Message::Ping(value) => {
+                    socket.send(Message::Pong(value)).await.map_err(transport)?
                 }
+                Message::Close(_) => {
+                    return Err(ChatError::Protocol(
+                        "socket closed before completion".to_owned(),
+                    ));
+                }
+                _ => {}
             }
-            Message::Ping(value) => socket.send(Message::Pong(value)).await.map_err(transport)?,
-            Message::Close(_) => {
-                return Err(ChatError::Protocol(
-                    "socket closed before completion".to_owned(),
-                ));
-            }
-            _ => {}
         }
+        Err(ChatError::Protocol(
+            "socket ended before completion".to_owned(),
+        ))
     }
-    Err(ChatError::Protocol(
-        "socket ended before completion".to_owned(),
-    ))
+    .await
 }
 
 struct SignalRCollector {
@@ -426,10 +449,8 @@ impl SignalRCollector {
             if part.is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(part) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
+            let value: Value = serde_json::from_str(part)
+                .map_err(|_| ChatError::Protocol("JSON decode failed".to_owned()))?;
             self.events.push(value.clone());
             let kind = value
                 .get("type")
@@ -1447,6 +1468,16 @@ mod tests {
         let result = collector.ingest(frame, &mut sink).unwrap().unwrap();
         assert_eq!(result.text, "OK");
         assert!(result.throttling.is_some());
+    }
+
+    #[test]
+    fn malformed_signalr_json_is_a_typed_protocol_failure() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        assert!(matches!(
+            collector.ingest("{malformed}\u{1e}", &mut sink),
+            Err(ChatError::Protocol(message)) if message == "JSON decode failed"
+        ));
     }
 
     #[test]

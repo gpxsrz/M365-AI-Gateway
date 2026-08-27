@@ -31,9 +31,11 @@ The UI must show both the effective value and its source. A disabled or environm
 1. Point `M365_DATA_DIR` to writable persistent storage.
 2. Optionally use one-time `M365_ADMIN_PASSWORD` for the first login.
 3. Replace it with a persistent administrator password after the first successful login.
-4. If `M365_DEBUG_LOG` is set, diagnostics use that path; otherwise they use `debug-logs.json` under the data directory.
+4. If `M365_DEBUG_LOG` is set, privacy telemetry uses that path. Otherwise a saved `debugLogPath` is used, then `debug-telemetry.jsonl` under the data directory is the fallback.
 
-Diagnostic files should use private permissions such as `0600`, atomic replacement, redaction, capacity limits, and TTL cleanup.
+The telemetry path must end in `.jsonl`. The old Synology `log.db` is explicitly not current truth and is rejected by the reader. The writer uses private `0600` append, retains the newest 1000 records in memory, and periodically atomically compacts that same bounded projection. `GET /api/admin/debug/logs`, detail, and export all read this `m365-privacy-telemetry/v1` surface and report its surface ID, path class, and reader/writer state without exposing the private path.
+
+Each request stores closed classifications or bounded metadata only: route/class, queue admission, breaker state/projection, spill decision/reason, before/after UTF-16 values and size classes, recall provenance class, upstream attempt/result, and an independent random correlation ID. Dynamic route segments are always stored as closed templates; for example, an artifact capability is recorded only as `/v1/artifacts/{capability}/content`. Prompt/transcript text, memory or attachment bodies, tokens/cookies/headers, tenant/account/user identity, private URLs, and raw upstream bodies are forbidden. This is a forensic projection, not a durable lifecycle authority.
 
 ## Value precedence
 
@@ -54,6 +56,7 @@ Common environment variables:
 - `M365_HERMES_MAX_TOOL_ROUNDS`
 - `M365_DATA_DIR`
 - `M365_PUBLIC_ORIGIN`
+- `M365_DEBUG_LOG`
 
 `M365_READY_TIMEOUT` controls deployment automation, not an API product setting.
 

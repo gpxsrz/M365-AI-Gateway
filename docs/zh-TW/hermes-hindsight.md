@@ -166,7 +166,8 @@ Gateway 不刪 Hermes working context，也不能把稍後完成的 recall 反�
 ## Overflow 與 upstream bank mission
 
 - `128000` 是 UTF-16 transport policy，不是 Hermes/Hindsight token context。
-- 非 Memory chat 若超限部分是可安全移出的 `user` / `tool` bulk text，M365 會先自動 spill 成單一結構化 `.txt` attachment；system/developer/assistant 控制語意與 tool identity 仍留 inline，最後仍重新套用 `128000` hard guard。單一 user 超限可整包 spill；多訊息的最新 user 永遠留 inline。
+- 非 Memory chat 若超限部分是可安全移出的 `user` / `tool` bulk text，M365 會先自動 spill 成單一結構化 `.txt` attachment；system/developer/assistant 控制語意、tool identity 與真正 current ask 仍留 inline，最後仍重新套用 `128000` hard guard。單一 user 超限仍保留 #89 的整包 spill；多訊息最新 user 只允許可信 integration 簽章綁定的 ephemeral recall/source-material range 局部 spill。
+- Hermes 要啟用本 repo 的 versioned `integrations/hermes/m365_recall_provenance` plugin。它只使用 stock `pre_llm_call` hook 與 `llm_request` middleware：先取得 clean current user bytes，再對最終 request 中由 integration 附加的 recall range 建立 content-free HMAC metadata。Gateway 與 Hermes 必須共用專用 `M365_HERMES_RECALL_PROVENANCE_SECRET`；Hermes 另以 `M365_HERMES_PROVIDER` 限定正確 named provider。Secret 不得出現在設定讀回、log、error 或 evidence。Plugin 未啟用、secret/provider 不符、range malformed、message identity 漂移或只有文字 marker 時一律 fail closed，不修改 Hermes/Hindsight core。
 - 只有無法安全 spill、附件 slot 已滿、generated file 過大或文件授權不可用時，Hermes 才需要收到可恢復的 overflow signal。`128000` 不應再單獨驅動 Hermes 提前 compression/rotation；Hermes 的正常 compression/protected-tail/rotation 仍依 model token/context quality 決定。
 - Attachment grounding 不是零 context cost，也不是任意 byte-addressable storage；大型高熵檔可能有 retrieval miss。
 - Hindsight 會收到 `context_length_exceeded` / `input is too long`；Reflect baseline 是 40K / retry 1。

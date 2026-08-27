@@ -337,6 +337,14 @@ pub fn validate(settings: &RuntimeSettings) -> Result<(), String> {
     ) {
         return Err("日誌等級必須為 silent、error、warn、info 或 debug".to_owned());
     }
+    if !settings.debug_log_path.trim().is_empty()
+        && Path::new(settings.debug_log_path.trim())
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("jsonl")
+    {
+        return Err("診斷紀錄路徑必須使用 .jsonl；舊 log.db 不是 current truth".to_owned());
+    }
     if !matches!(settings.tool_planning_mode.as_str(), "router" | "native") {
         return Err("工具規劃模式必須為 router 或 native".to_owned());
     }

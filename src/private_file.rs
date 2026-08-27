@@ -96,6 +96,66 @@ pub fn write_text(path: &Path, value: &str) -> Result<(), GatewayError> {
     result
 }
 
+pub fn append_line(path: &Path, value: &str) -> Result<(), GatewayError> {
+    if value.contains(['\n', '\r']) {
+        return Err(GatewayError::Storage(format!(
+            "private log line contains a line break: {}",
+            path.display()
+        )));
+    }
+    prepare_private_file(path)?;
+    let parent = path.parent().expect("private path was validated");
+    let created = !path.exists();
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    set_private_file_mode(&mut options);
+    let mut file = options.open(path).map_err(|error| storage(path, error))?;
+    let original_len = file.metadata().map_err(|error| storage(path, error))?.len();
+    let mut line = Vec::with_capacity(value.len() + 1);
+    line.extend_from_slice(value.as_bytes());
+    line.push(b'\n');
+    if let Err(error) = file.write_all(&line).and_then(|()| file.sync_data()) {
+        file.set_len(original_len)
+            .and_then(|()| file.sync_data())
+            .map_err(|rollback| {
+                GatewayError::Storage(format!(
+                    "private log append and rollback failed {}: append={error}; rollback={rollback}",
+                    path.display()
+                ))
+            })?;
+        return Err(storage(path, error));
+    }
+    if created {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+pub fn prepare_private_file(path: &Path) -> Result<(), GatewayError> {
+    let parent = path.parent().ok_or_else(|| {
+        GatewayError::Storage(format!("private path has no parent: {}", path.display()))
+    })?;
+    create_private_dir(parent)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(storage(path, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(GatewayError::Storage(format!(
+            "unsafe private file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| storage(path, error))?;
+    }
+    Ok(())
+}
+
 pub fn create_marker(path: &Path, value: &str) -> Result<bool, GatewayError> {
     let parent = path.parent().ok_or_else(|| {
         GatewayError::Storage(format!("private path has no parent: {}", path.display()))
@@ -185,5 +245,50 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn test_private_log_append_is_line_delimited_and_private() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("telemetry").join("debug.jsonl");
+        append_line(&path, "{\"event\":1}").unwrap();
+        append_line(&path, "{\"event\":2}").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"event\":1}\n{\"event\":2}\n"
+        );
+        assert!(append_line(&path, "forbidden\nsecond line").is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_log_repairs_existing_mode_and_rejects_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug.jsonl");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        append_line(&path, "{\"event\":1}").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let target = root.path().join("target.jsonl");
+        let linked = root.path().join("linked.jsonl");
+        fs::write(&target, "unchanged\n").unwrap();
+        symlink(&target, &linked).unwrap();
+        assert!(append_line(&linked, "forbidden").is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "unchanged\n");
     }
 }

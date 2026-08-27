@@ -1,0 +1,11 @@
+name: m365-recall-provenance
+version: "1.0.0"
+description: "Bind Hermes-injected recall source material to the exact M365 request without sending recall content as metadata."
+author: gpxsrz/M365-AI-Gateway
+requires_env:
+  - M365_HERMES_RECALL_PROVENANCE_SECRET
+  - M365_HERMES_PROVIDER
+hooks:
+  - pre_llm_call
+  - post_llm_call
+  - on_session_end

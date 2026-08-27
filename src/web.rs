@@ -73,6 +73,7 @@ pub struct Gateway {
     pub(crate) settings_lifecycle: Mutex<()>,
     pub(crate) checkpoints: Arc<CheckpointStore>,
     pub(crate) hindsight_webhook_secret: String,
+    pub(crate) hermes_recall_provenance_secret: String,
     pub(crate) mcp: crate::mcp::Server,
     pub(crate) artifacts: crate::artifact::Store,
     pub(crate) deployments: crate::deployments::Store,
@@ -100,6 +101,38 @@ impl Gateway {
         let artifacts = crate::artifact::Store::open(config.data_dir.join("artifacts"))?;
         let deployments = crate::deployments::Store::open(&config.data_dir)?;
         let settings = crate::runtime_settings::Store::open(&config.data_dir, &config)?;
+        let configured_debug_path = env::var("M365_DEBUG_LOG")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let setting_debug_path = settings.current().debug_log_path.trim().to_owned();
+        let (debug_path, debug_path_class) = if !configured_debug_path.is_empty() {
+            let path = PathBuf::from(configured_debug_path);
+            (
+                if path.is_relative() {
+                    config.data_dir.join(path)
+                } else {
+                    path
+                },
+                "environment",
+            )
+        } else if !setting_debug_path.is_empty() {
+            let path = PathBuf::from(setting_debug_path);
+            (
+                if path.is_relative() {
+                    config.data_dir.join(path)
+                } else {
+                    path
+                },
+                "runtime_setting",
+            )
+        } else {
+            (
+                config.data_dir.join("debug-telemetry.jsonl"),
+                "data_dir_default",
+            )
+        };
+        let debug = crate::debug::Store::open(debug_path, debug_path_class)?;
         Ok(Self {
             started_at: Instant::now(),
             admin,
@@ -119,10 +152,14 @@ impl Gateway {
                 .unwrap_or_default()
                 .trim()
                 .to_owned(),
+            hermes_recall_provenance_secret: env::var("M365_HERMES_RECALL_PROVENANCE_SECRET")
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
             mcp: crate::mcp::Server::default(),
             artifacts,
             deployments,
-            debug: crate::debug::Store::default(),
+            debug,
         })
     }
 
@@ -2191,6 +2228,7 @@ mod tests {
             settings_lifecycle: Mutex::new(()),
             checkpoints: CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap(),
             hindsight_webhook_secret: String::new(),
+            hermes_recall_provenance_secret: String::new(),
             mcp: crate::mcp::Server::default(),
             artifacts: crate::artifact::Store::open(root.join("artifacts")).unwrap(),
             deployments: crate::deployments::Store::open(&root).unwrap(),

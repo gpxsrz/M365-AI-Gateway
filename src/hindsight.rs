@@ -109,8 +109,8 @@ fn error(status: StatusCode, kind: &str, message: &str) -> Response {
     openai_error(status, kind, kind, message)
 }
 
-fn valid_signature(secret: &str, provided: &str, payload: &[u8]) -> bool {
-    let expected = format!("sha256={}", hex(&hmac_sha256(secret.as_bytes(), payload)));
+pub(crate) fn valid_signature(secret: &str, provided: &str, payload: &[u8]) -> bool {
+    let expected = signature(secret, payload);
     provided.len() == expected.len()
         && provided
             .bytes()
@@ -119,6 +119,10 @@ fn valid_signature(secret: &str, provided: &str, payload: &[u8]) -> bool {
                 difference | (left ^ right)
             })
             == 0
+}
+
+pub(crate) fn signature(secret: &str, payload: &[u8]) -> String {
+    format!("sha256={}", hex(&hmac_sha256(secret.as_bytes(), payload)))
 }
 
 fn hmac_sha256(key: &[u8], payload: &[u8]) -> [u8; 32] {

@@ -31,9 +31,11 @@
 1. 讓 `M365_DATA_DIR` 指向可寫、可持久保存的資料夾。
 2. 可用一次性 `M365_ADMIN_PASSWORD` 建立首次登入。
 3. 第一次成功登入後，立即換成持久管理員密碼。
-4. 若設定 `M365_DEBUG_LOG`，診斷摘要寫到該路徑；否則使用 data directory 下的 `debug-logs.json`。
+4. 若設定 `M365_DEBUG_LOG`，privacy telemetry 寫到該路徑；否則先使用已保存的 `debugLogPath`，再 fallback 到 data directory 下的 `debug-telemetry.jsonl`。
 
-診斷檔要使用 private file 權限，例如 `0600`，並採 atomic replacement、遮蔽、容量與 TTL 限制。
+Telemetry path 必須是 `.jsonl`；舊 Synology `log.db` 明確不是 current truth，也不會被 reader 接受。Writer 使用 private `0600` append，記憶體只保留最新 1000 筆，並週期性把同一份 bounded projection 做 atomic compaction。`GET /api/admin/debug/logs`、detail 與 export 都從這個 `m365-privacy-telemetry/v1` surface 讀取，回傳 `surfaceId`、path class 與 reader/writer state，不暴露實際 private path。
+
+每筆 request 只記錄封閉分類或 bounded metadata：route/class、queue admission、breaker state/projection、spill decision/reason、UTF-16 前後值與 size class、recall provenance class、upstream attempt/result，以及獨立隨機 correlation ID。Dynamic route segment 一律寫成封閉 template；例如 artifact capability 只會記成 `/v1/artifacts/{capability}/content`。不得記錄 prompt/transcript、memory/attachment body、token/cookie/header、tenant/account/user identity、private URL 或 raw upstream body。這是 forensic projection，不是 durable lifecycle authority。
 
 ## 值的優先順序
 
@@ -54,6 +56,7 @@
 - `M365_HERMES_MAX_TOOL_ROUNDS`
 - `M365_DATA_DIR`
 - `M365_PUBLIC_ORIGIN`
+- `M365_DEBUG_LOG`
 
 `M365_READY_TIMEOUT` 只控制部署腳本，不是 API 產品設定。
 

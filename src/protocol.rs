@@ -1,4 +1,10 @@
-use std::{convert::Infallible, sync::Arc};
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::{
     Json,
@@ -18,6 +24,10 @@ use time::OffsetDateTime;
 use crate::{
     chathub::{Account, Attachment, ChatError, ChatRequest, ChatResult, StreamEvent, Tool},
     checkpoint::{Binding, CheckpointMessage, CheckpointTurn},
+    debug::{
+        AdmissionResult, BreakerProjection, ProvenanceClass, SpillDecision, SpillReason,
+        UpstreamAttempt, UpstreamResult,
+    },
     error::openai_error,
     tool_calls::{ToolProjection, project as project_tool_calls},
     traffic::{TrafficLimits, WorkloadClass},
@@ -296,10 +306,31 @@ pub(crate) async fn execute_chat_request(
     path: String,
     owner: String,
     artifact_origin: String,
+    body: ChatCompletionRequest,
+) -> Response {
+    let trace = gateway.debug.start_request("POST", &path);
+    let mut response =
+        execute_chat_request_inner(gateway, path, owner, artifact_origin, body, trace.clone())
+            .await;
+    trace.http_status(response.status());
+    response
+        .extensions_mut()
+        .insert(crate::debug::TracedResponse);
+    response
+}
+
+async fn execute_chat_request_inner(
+    gateway: Arc<Gateway>,
+    path: String,
+    owner: String,
+    artifact_origin: String,
     mut body: ChatCompletionRequest,
+    trace: crate::debug::Trace,
 ) -> Response {
     normalize_legacy_tools(&mut body);
     clear_untracked_transport_identity(&path, &mut body);
+    let class = request_class(&path, &body);
+    trace.request(class, ProvenanceClass::None);
     let stream_options = match parse_stream_options(&body.stream_options, body.stream) {
         Ok(options) => options,
         Err(message) => {
@@ -346,6 +377,18 @@ pub(crate) async fn execute_chat_request(
     let route_metadata = model
         .route
         .metadata(&model.requested_model, model.effort_ignored);
+    let recalled_source =
+        authenticated_recalled_source(&path, &body, &gateway.hermes_recall_provenance_secret);
+    trace.request(
+        class,
+        if recalled_source.is_some() {
+            ProvenanceClass::AuthenticatedEphemeralRecall
+        } else if body.recall_provenance.is_some() {
+            ProvenanceClass::RejectedUntrusted
+        } else {
+            ProvenanceClass::None
+        },
+    );
     let checkpoint_messages = body
         .messages
         .iter()
@@ -527,15 +570,60 @@ pub(crate) async fn execute_chat_request(
         )
     });
     let mut spill_failure = None;
+    let recalled_source_eligible = recalled_source
+        .as_ref()
+        .and_then(|source| source.candidate(&prompt_messages))
+        .is_some();
     if !memory_request && let Some(context) = overflow_context.as_mut() {
         context.spill_attempted = true;
-        match spill_oversized_bulk_text(&prompt_messages, &flattened, text_input_limit) {
-            Ok(spilled) => {
+        match spill_oversized_bulk_text(
+            &prompt_messages,
+            &flattened,
+            text_input_limit,
+            recalled_source.as_ref(),
+        ) {
+            Ok((spilled, reason)) => {
                 flattened = spilled;
                 context.auto_spilled = true;
+                trace.spill(
+                    SpillDecision::Performed,
+                    reason,
+                    received_text_units,
+                    utf16_units(&flattened.text),
+                );
             }
-            Err(error) => spill_failure = Some(error),
+            Err(error) => {
+                trace.spill(
+                    SpillDecision::Denied,
+                    error.telemetry_reason(),
+                    received_text_units,
+                    received_text_units,
+                );
+                spill_failure = Some(error);
+            }
         }
+    } else if memory_request && overflow_context.is_some() {
+        trace.spill(
+            SpillDecision::Denied,
+            SpillReason::MemorySpillDisabled,
+            received_text_units,
+            received_text_units,
+        );
+    } else {
+        trace.spill(
+            if recalled_source_eligible {
+                SpillDecision::Eligible
+            } else {
+                SpillDecision::None
+            },
+            if recalled_source_eligible {
+                SpillReason::BelowLimit
+            } else {
+                SpillReason::NotRequired
+            },
+            received_text_units,
+            received_text_units,
+        );
     }
     if utf16_units(&flattened.text) > text_input_limit {
         if let Some(context) = overflow_context.as_ref() {
@@ -558,11 +646,37 @@ pub(crate) async fn execute_chat_request(
         );
     }
 
-    let class = request_class(&path, &body);
     let traffic_limits = traffic_limits(&settings);
+    let before_admission = gateway.traffic.snapshot();
+    trace.breaker(
+        before_admission.shared_circuit_state,
+        BreakerProjection::Pending,
+    );
     let permit = match gateway.traffic.acquire(class, traffic_limits).await {
-        Ok(permit) => permit,
+        Ok(permit) => {
+            let admitted = gateway.traffic.snapshot();
+            trace.admission(AdmissionResult::Admitted);
+            trace.breaker(
+                admitted.shared_circuit_state,
+                if admitted.shared_circuit_state == crate::traffic::CircuitState::ProbeInFlight {
+                    BreakerProjection::RecoveryProbe
+                } else {
+                    BreakerProjection::Admitted
+                },
+            );
+            permit
+        }
         Err(error) => {
+            let denied = gateway.traffic.snapshot();
+            trace.admission(admission_result(error.code));
+            trace.breaker(
+                denied.shared_circuit_state,
+                if error.code == "upstream_throttle" {
+                    BreakerProjection::Throttled
+                } else {
+                    BreakerProjection::QueueDenied
+                },
+            );
             let mut response =
                 openai_error(error.status, "rate_limit_error", error.code, error.message);
             if let Ok(value) = HeaderValue::from_str(&error.retry_after_seconds.to_string()) {
@@ -660,7 +774,9 @@ pub(crate) async fn execute_chat_request(
         tool_call_limit,
         mcp_server_url: String::new(),
         disable_built_in_search: false,
+        upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
     };
+    trace.upstream_attempt(UpstreamAttempt::Initial);
     if body.stream {
         stream_chat(
             gateway,
@@ -679,6 +795,7 @@ pub(crate) async fn execute_chat_request(
             agent_ledger,
             apply_agent_evidence_policy,
             overflow_context,
+            trace,
         )
         .await
     } else {
@@ -698,6 +815,7 @@ pub(crate) async fn execute_chat_request(
             agent_ledger,
             apply_agent_evidence_policy,
             overflow_context,
+            trace,
         )
         .await
     }
@@ -709,6 +827,15 @@ fn traffic_limits(settings: &crate::runtime_settings::RuntimeSettings) -> Traffi
             settings.interactive_queue_timeout_seconds,
         ),
         memory_queue_timeout: std::time::Duration::from_secs(settings.memory_queue_timeout_seconds),
+    }
+}
+
+fn admission_result(code: &str) -> AdmissionResult {
+    match code {
+        "upstream_throttle" => AdmissionResult::UpstreamThrottle,
+        "interactive_capacity_busy" => AdmissionResult::InteractiveCapacityBusy,
+        "memory_capacity_deferred" => AdmissionResult::MemoryCapacityDeferred,
+        _ => AdmissionResult::OtherDenied,
     }
 }
 
@@ -732,6 +859,7 @@ async fn complete_chat(
     agent_ledger: crate::agent_ledger::AgentLedger,
     apply_agent_evidence_policy: bool,
     overflow_context: Option<OverflowContext>,
+    trace: crate::debug::Trace,
 ) -> Response {
     let input_units = utf16_units(&request.text);
     let tools = request.tools.clone();
@@ -741,6 +869,7 @@ async fn complete_chat(
     let qualification_request = request.clone();
     let fallback_account = account.clone();
     let fallback_request = request.clone();
+    let upstream_attempt_count = reset_upstream_attempts(&request);
     let mut sink = |_: StreamEvent| Ok(());
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
@@ -749,6 +878,7 @@ async fn complete_chat(
     .await;
     match result {
         Ok(Ok(result)) => {
+            observe_success(&trace, &upstream_attempt_count, UpstreamAttempt::Initial);
             let mut result = match qualify_response_format(
                 &gateway,
                 qualification_account,
@@ -756,11 +886,13 @@ async fn complete_chat(
                 result,
                 response_format.as_ref(),
                 memory_caller_evidence.as_deref(),
+                &trace,
             )
             .await
             {
                 Ok(result) => result,
                 Err(QualificationError::Format(message)) => {
+                    trace.upstream_result(UpstreamResult::ResponseFormatInvalid);
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     return openai_error(
                         StatusCode::BAD_GATEWAY,
@@ -773,6 +905,7 @@ async fn complete_chat(
                     return chat_error_with_overflow(error, permit, overflow_context.as_ref());
                 }
                 Err(QualificationError::Timeout) => {
+                    trace.upstream_result(UpstreamResult::Timeout);
                     permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                     return openai_error(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -819,6 +952,7 @@ async fn complete_chat(
             if policy.completed_call_suppressed {
                 let answer_request =
                     completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
+                let answer_attempt_count = reset_upstream_attempts(&answer_request);
                 let mut answer_sink = |_: StreamEvent| Ok(());
                 let answer = tokio::time::timeout(
                     std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
@@ -830,11 +964,21 @@ async fn complete_chat(
                 )
                 .await;
                 let answer = match answer {
-                    Ok(Ok(answer)) => answer,
+                    Ok(Ok(answer)) => {
+                        observe_success(&trace, &answer_attempt_count, UpstreamAttempt::Followup);
+                        answer
+                    }
                     Ok(Err(error)) => {
+                        observe_error(
+                            &trace,
+                            &error,
+                            &answer_attempt_count,
+                            UpstreamAttempt::Followup,
+                        );
                         return chat_error_with_overflow(error, permit, overflow_context.as_ref());
                     }
                     Err(_) => {
+                        observe_timeout(&trace, &answer_attempt_count, UpstreamAttempt::Followup);
                         permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                         return openai_error(
                             StatusCode::GATEWAY_TIMEOUT,
@@ -851,11 +995,13 @@ async fn complete_chat(
                     answer,
                     response_format.as_ref(),
                     memory_caller_evidence.as_deref(),
+                    &trace,
                 )
                 .await
                 {
                     Ok(answer) => answer,
                     Err(QualificationError::Format(message)) => {
+                        trace.upstream_result(UpstreamResult::ResponseFormatInvalid);
                         permit.finish(StatusCode::BAD_GATEWAY, None);
                         return openai_error(
                             StatusCode::BAD_GATEWAY,
@@ -868,6 +1014,7 @@ async fn complete_chat(
                         return chat_error_with_overflow(error, permit, overflow_context.as_ref());
                     }
                     Err(QualificationError::Timeout) => {
+                        trace.upstream_result(UpstreamResult::Timeout);
                         permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                         return openai_error(
                             StatusCode::GATEWAY_TIMEOUT,
@@ -967,8 +1114,17 @@ async fn complete_chat(
             }))
             .into_response()
         }
-        Ok(Err(error)) => chat_error_with_overflow(error, permit, overflow_context.as_ref()),
+        Ok(Err(error)) => {
+            observe_error(
+                &trace,
+                &error,
+                &upstream_attempt_count,
+                UpstreamAttempt::Initial,
+            );
+            chat_error_with_overflow(error, permit, overflow_context.as_ref())
+        }
         Err(_) => {
+            observe_timeout(&trace, &upstream_attempt_count, UpstreamAttempt::Initial);
             permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
             openai_error(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -998,6 +1154,7 @@ async fn stream_chat(
     agent_ledger: crate::agent_ledger::AgentLedger,
     apply_agent_evidence_policy: bool,
     overflow_context: Option<OverflowContext>,
+    trace: crate::debug::Trace,
 ) -> Response {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, Infallible>>();
     let id = format!("chatcmpl-{}", random_id());
@@ -1012,6 +1169,7 @@ async fn stream_chat(
         let qualification_request = request.clone();
         let fallback_account = account.clone();
         let fallback_request = request.clone();
+        let upstream_attempt_count = reset_upstream_attempts(&request);
         let buffer_for_tools = !tools.is_empty()
             || response_format.is_some()
             || (apply_agent_evidence_policy
@@ -1066,6 +1224,7 @@ async fn stream_chat(
         };
         match result {
             Ok(Ok(result)) => {
+                observe_success(&trace, &upstream_attempt_count, UpstreamAttempt::Initial);
                 let mut result = match qualify_response_format(
                     &gateway,
                     qualification_account,
@@ -1073,11 +1232,13 @@ async fn stream_chat(
                     result,
                     response_format.as_ref(),
                     memory_caller_evidence.as_deref(),
+                    &trace,
                 )
                 .await
                 {
                     Ok(result) => result,
                     Err(QualificationError::Format(message)) => {
+                        trace.upstream_result(UpstreamResult::ResponseFormatInvalid);
                         permit.finish(StatusCode::BAD_GATEWAY, None);
                         send_sse_error(&sender, "response_format_validation_failed", &message);
                         let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
@@ -1089,6 +1250,7 @@ async fn stream_chat(
                         return;
                     }
                     Err(QualificationError::Timeout) => {
+                        trace.upstream_result(UpstreamResult::Timeout);
                         permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                         send_sse_error(&sender, "upstream_timeout", "ChatHub request timed out");
                         let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
@@ -1125,6 +1287,7 @@ async fn stream_chat(
                 if policy.completed_call_suppressed {
                     let answer_request =
                         completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
+                    let answer_attempt_count = reset_upstream_attempts(&answer_request);
                     let mut answer_sink = |_: StreamEvent| Ok(());
                     let answer = tokio::time::timeout(
                         std::time::Duration::from_secs(
@@ -1138,8 +1301,21 @@ async fn stream_chat(
                     )
                     .await;
                     let answer = match answer {
-                        Ok(Ok(answer)) => answer,
+                        Ok(Ok(answer)) => {
+                            observe_success(
+                                &trace,
+                                &answer_attempt_count,
+                                UpstreamAttempt::Followup,
+                            );
+                            answer
+                        }
                         Ok(Err(error)) => {
+                            observe_error(
+                                &trace,
+                                &error,
+                                &answer_attempt_count,
+                                UpstreamAttempt::Followup,
+                            );
                             send_stream_chat_error(
                                 &sender,
                                 error,
@@ -1150,6 +1326,11 @@ async fn stream_chat(
                             return;
                         }
                         Err(_) => {
+                            observe_timeout(
+                                &trace,
+                                &answer_attempt_count,
+                                UpstreamAttempt::Followup,
+                            );
                             permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                             send_sse_error(
                                 &sender,
@@ -1167,11 +1348,13 @@ async fn stream_chat(
                         answer,
                         response_format.as_ref(),
                         memory_caller_evidence.as_deref(),
+                        &trace,
                     )
                     .await
                     {
                         Ok(answer) => answer,
                         Err(QualificationError::Format(message)) => {
+                            trace.upstream_result(UpstreamResult::ResponseFormatInvalid);
                             permit.finish(StatusCode::BAD_GATEWAY, None);
                             send_sse_error(&sender, "response_format_validation_failed", &message);
                             let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
@@ -1188,6 +1371,7 @@ async fn stream_chat(
                             return;
                         }
                         Err(QualificationError::Timeout) => {
+                            trace.upstream_result(UpstreamResult::Timeout);
                             permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                             send_sse_error(
                                 &sender,
@@ -1357,9 +1541,16 @@ async fn stream_chat(
                 }
             }
             Ok(Err(error)) => {
+                observe_error(
+                    &trace,
+                    &error,
+                    &upstream_attempt_count,
+                    UpstreamAttempt::Initial,
+                );
                 send_stream_chat_error(&sender, error, permit, overflow_context.as_ref());
             }
             Err(_) => {
+                observe_timeout(&trace, &upstream_attempt_count, UpstreamAttempt::Initial);
                 permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                 send_sse_error(&sender, "upstream_timeout", "ChatHub request timed out");
             }
@@ -1394,6 +1585,86 @@ enum ChatFailureClass<'a> {
     RateLimited(Option<&'a str>),
     AutoSpillOverflow,
     Upstream,
+}
+
+fn observe_success(
+    trace: &crate::debug::Trace,
+    upstream_attempt_count: &AtomicUsize,
+    base: UpstreamAttempt,
+) {
+    trace.upstream_attempt(upstream_attempt_class(upstream_attempt_count, base));
+    trace.upstream_result(UpstreamResult::Success);
+}
+
+fn observe_error(
+    trace: &crate::debug::Trace,
+    error: &ChatError,
+    upstream_attempt_count: &AtomicUsize,
+    base: UpstreamAttempt,
+) {
+    trace.upstream_attempt(upstream_attempt_class(upstream_attempt_count, base));
+    trace.upstream_result(chat_error_telemetry_class(error));
+}
+
+fn upstream_attempt_class(
+    upstream_attempt_count: &AtomicUsize,
+    base: UpstreamAttempt,
+) -> UpstreamAttempt {
+    match (base, upstream_attempt_count.load(Ordering::Acquire) > 1) {
+        (UpstreamAttempt::Initial, true) => UpstreamAttempt::Retried,
+        (UpstreamAttempt::Followup, true) => UpstreamAttempt::FollowupRetried,
+        _ => base,
+    }
+}
+
+fn reset_upstream_attempts(request: &ChatRequest) -> Arc<AtomicUsize> {
+    request.upstream_attempt_count.store(0, Ordering::Release);
+    Arc::clone(&request.upstream_attempt_count)
+}
+
+fn observe_timeout(
+    trace: &crate::debug::Trace,
+    upstream_attempt_count: &AtomicUsize,
+    base: UpstreamAttempt,
+) {
+    trace.upstream_attempt(upstream_attempt_class(upstream_attempt_count, base));
+    trace.upstream_result(UpstreamResult::Timeout);
+}
+
+fn chat_error_telemetry_class(error: &ChatError) -> UpstreamResult {
+    match error {
+        ChatError::MissingIdentity => UpstreamResult::MissingIdentity,
+        ChatError::EmptyPrompt => UpstreamResult::EmptyPrompt,
+        ChatError::RateLimited { .. } => UpstreamResult::RateLimited429,
+        ChatError::ServiceUnavailable => UpstreamResult::ServiceUnavailable503,
+        ChatError::Attachment { .. } => UpstreamResult::AttachmentError,
+        ChatError::Terminal { message, .. } => {
+            classify_upstream_text(message, UpstreamResult::TerminalError)
+        }
+        ChatError::Transport(message) => {
+            classify_upstream_text(message, UpstreamResult::TransportError)
+        }
+        ChatError::Protocol(message) => {
+            classify_upstream_text(message, UpstreamResult::ProtocolError)
+        }
+    }
+}
+
+fn classify_upstream_text(value: &str, fallback: UpstreamResult) -> UpstreamResult {
+    let value = value.to_ascii_lowercase();
+    if value.contains("context_length")
+        || value.contains("context length")
+        || value.contains("maximum context")
+        || value.contains("input is too long")
+    {
+        UpstreamResult::ContextLength
+    } else if value.contains("service unavailable") || value.contains("503") {
+        UpstreamResult::ServiceUnavailable503
+    } else if value.contains("json") || value.contains("decode") || value.contains("deserialize") {
+        UpstreamResult::JsonDecode
+    } else {
+        fallback
+    }
 }
 
 fn classify_chat_failure<'a>(
@@ -1716,6 +1987,8 @@ pub(crate) struct ChatCompletionRequest {
     pub(crate) parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub(crate) function_call: Value,
+    #[serde(default, rename = "m365_recall_provenance")]
+    pub(crate) recall_provenance: Option<RecallProvenance>,
     #[serde(skip)]
     pub(crate) legacy_attachments: Vec<Attachment>,
     #[serde(skip)]
@@ -1728,6 +2001,20 @@ pub(crate) struct ChatCompletionRequest {
     pub(crate) checkpoint_response_id: String,
     #[serde(skip)]
     pub(crate) checkpoint_force_new: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecallProvenance {
+    schema: String,
+    message_index: usize,
+    message_sha256: String,
+    clean_prefix_utf8_bytes: usize,
+    clean_prefix_sha256: String,
+    source_start_utf8: usize,
+    source_end_utf8: usize,
+    source_sha256: String,
+    signature: String,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -1802,6 +2089,7 @@ async fn qualify_response_format(
     mut result: ChatResult,
     format: Option<&ResponseFormat>,
     memory_caller_evidence: Option<&str>,
+    trace: &crate::debug::Trace,
 ) -> Result<ChatResult, QualificationError> {
     let Some(format) = format else {
         return Ok(result);
@@ -1830,7 +2118,7 @@ async fn qualify_response_format(
         let prompt = memory_schema_reask_prompt(memory_caller_evidence.unwrap_or_default(), format);
         validate_internal_prompt(gateway, &prompt).map_err(QualificationError::Format)?;
         let reask = internal_qualification_request(&base_request, prompt, true);
-        let mut reasked = qualification_chat(gateway, account.clone(), reask).await?;
+        let mut reasked = qualification_chat(gateway, account.clone(), reask, trace).await?;
         match formatted_result(&mut reasked, format) {
             Ok(formatted) => {
                 reasked.text = formatted;
@@ -1859,7 +2147,7 @@ async fn qualify_response_format(
     let prompt = memory_schema_repair_prompt(&candidate, format, &validation_error);
     validate_internal_prompt(gateway, &prompt).map_err(QualificationError::Format)?;
     let repair = internal_qualification_request(&base_request, prompt, false);
-    let mut repaired = qualification_chat(gateway, account, repair).await?;
+    let mut repaired = qualification_chat(gateway, account, repair, trace).await?;
     let formatted = formatted_result(&mut repaired, format).map_err(QualificationError::Format)?;
     memory_repair_preserves_facts(&candidate, &formatted, format)
         .map_err(QualificationError::Format)?;
@@ -1871,15 +2159,35 @@ async fn qualification_chat(
     gateway: &Gateway,
     account: Account,
     request: ChatRequest,
+    trace: &crate::debug::Trace,
 ) -> Result<ChatResult, QualificationError> {
+    let upstream_attempt_count = reset_upstream_attempts(&request);
+    trace.upstream_attempt(UpstreamAttempt::Followup);
     let mut sink = |_: StreamEvent| Ok(());
-    tokio::time::timeout(
+    match tokio::time::timeout(
         std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
         gateway.chat.chat(account, request, &mut sink),
     )
     .await
-    .map_err(|_| QualificationError::Timeout)?
-    .map_err(QualificationError::Chat)
+    {
+        Ok(Ok(result)) => {
+            observe_success(trace, &upstream_attempt_count, UpstreamAttempt::Followup);
+            Ok(result)
+        }
+        Ok(Err(error)) => {
+            observe_error(
+                trace,
+                &error,
+                &upstream_attempt_count,
+                UpstreamAttempt::Followup,
+            );
+            Err(QualificationError::Chat(error))
+        }
+        Err(_) => {
+            observe_timeout(trace, &upstream_attempt_count, UpstreamAttempt::Followup);
+            Err(QualificationError::Timeout)
+        }
+    }
 }
 
 fn internal_qualification_request(
@@ -1903,6 +2211,7 @@ fn internal_qualification_request(
         tool_call_limit: 1,
         mcp_server_url: String::new(),
         disable_built_in_search: true,
+        upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
     }
 }
 
@@ -2700,12 +3009,23 @@ impl SpillFailure {
             Self::ProjectionFailed => "projection_failed",
         }
     }
+
+    fn telemetry_reason(self) -> SpillReason {
+        match self {
+            Self::AttachmentSlotsFull => SpillReason::AttachmentSlotsFull,
+            Self::NoSafeCandidate => SpillReason::NoSafeCandidate,
+            Self::CannotFitInline => SpillReason::CannotFitInline,
+            Self::GeneratedFileTooLarge => SpillReason::GeneratedFileTooLarge,
+            Self::ProjectionFailed => SpillReason::ProjectionFailed,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct SpillCandidate {
     message_index: usize,
     part_index: Option<usize>,
+    source_range: Option<(usize, usize)>,
     role: String,
     content_class: String,
     tool_call_id: String,
@@ -2715,22 +3035,143 @@ struct SpillCandidate {
 
 impl SpillCandidate {
     fn section_id(&self) -> String {
-        match self.part_index {
-            Some(part_index) => format!("message-{}-part-{part_index}", self.message_index),
-            None => format!("message-{}", self.message_index),
+        match (self.part_index, self.source_range) {
+            (_, Some(_)) => format!("message-{}-recalled-source", self.message_index),
+            (Some(part_index), None) => {
+                format!("message-{}-part-{part_index}", self.message_index)
+            }
+            (None, None) => format!("message-{}", self.message_index),
         }
     }
+}
+
+#[derive(Clone)]
+struct AuthenticatedRecalledSource {
+    message_sha256: String,
+    source_start_utf8: usize,
+    source_end_utf8: usize,
+    source_sha256: String,
+}
+
+impl AuthenticatedRecalledSource {
+    fn candidate(&self, messages: &[OpenAiMessage]) -> Option<SpillCandidate> {
+        let mut matches = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(message_index, message)| {
+                if !message.role.trim().eq_ignore_ascii_case("user") {
+                    return None;
+                }
+                let text = message.content.as_str()?;
+                if sha256_hex(text.as_bytes()) != self.message_sha256 {
+                    return None;
+                }
+                let source = text.get(self.source_start_utf8..self.source_end_utf8)?;
+                if sha256_hex(source.as_bytes()) != self.source_sha256 {
+                    return None;
+                }
+                Some(SpillCandidate {
+                    message_index,
+                    part_index: None,
+                    source_range: Some((self.source_start_utf8, self.source_end_utf8)),
+                    role: "user".to_owned(),
+                    content_class: "recalled_source_material".to_owned(),
+                    tool_call_id: String::new(),
+                    text: source.to_owned(),
+                    section_sha: self.source_sha256.clone(),
+                })
+            });
+        let candidate = matches.next()?;
+        matches.next().is_none().then_some(candidate)
+    }
+}
+
+fn authenticated_recalled_source(
+    path: &str,
+    body: &ChatCompletionRequest,
+    secret: &str,
+) -> Option<AuthenticatedRecalledSource> {
+    if !path.starts_with("/hermes/v1/") || secret.is_empty() {
+        return None;
+    }
+    let provenance = body.recall_provenance.as_ref()?;
+    if provenance.schema != "m365-hermes-recall-provenance/v1"
+        || !is_sha256(&provenance.message_sha256)
+        || !is_sha256(&provenance.clean_prefix_sha256)
+        || !is_sha256(&provenance.source_sha256)
+    {
+        return None;
+    }
+    let signature_payload = recall_provenance_signature_payload(provenance);
+    if !crate::hindsight::valid_signature(
+        secret,
+        &provenance.signature,
+        signature_payload.as_bytes(),
+    ) {
+        return None;
+    }
+    let latest_user = body
+        .messages
+        .iter()
+        .rposition(|message| message.role.trim().eq_ignore_ascii_case("user"))?;
+    if provenance.message_index != latest_user || provenance.clean_prefix_utf8_bytes == 0 {
+        return None;
+    }
+    let message = body.messages.get(provenance.message_index)?;
+    let text = message.content.as_str()?;
+    if sha256_hex(text.as_bytes()) != provenance.message_sha256
+        || provenance.source_start_utf8 != provenance.clean_prefix_utf8_bytes.checked_add(2)?
+        || text.get(provenance.clean_prefix_utf8_bytes..provenance.source_start_utf8)? != "\n\n"
+        || provenance.source_start_utf8 >= provenance.source_end_utf8
+    {
+        return None;
+    }
+    let clean = text.get(..provenance.clean_prefix_utf8_bytes)?;
+    let source = text.get(provenance.source_start_utf8..provenance.source_end_utf8)?;
+    if sha256_hex(clean.as_bytes()) != provenance.clean_prefix_sha256
+        || sha256_hex(source.as_bytes()) != provenance.source_sha256
+    {
+        return None;
+    }
+    Some(AuthenticatedRecalledSource {
+        message_sha256: provenance.message_sha256.clone(),
+        source_start_utf8: provenance.source_start_utf8,
+        source_end_utf8: provenance.source_end_utf8,
+        source_sha256: provenance.source_sha256.clone(),
+    })
+}
+
+fn recall_provenance_signature_payload(provenance: &RecallProvenance) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        provenance.schema,
+        provenance.message_index,
+        provenance.message_sha256,
+        provenance.clean_prefix_utf8_bytes,
+        provenance.clean_prefix_sha256,
+        provenance.source_start_utf8,
+        provenance.source_end_utf8,
+        provenance.source_sha256,
+    )
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn spill_oversized_bulk_text(
     messages: &[OpenAiMessage],
     flattened: &FlattenedMessages,
     text_input_limit: usize,
-) -> Result<FlattenedMessages, SpillFailure> {
+    recalled_source: Option<&AuthenticatedRecalledSource>,
+) -> Result<(FlattenedMessages, SpillReason), SpillFailure> {
     if flattened.attachments.len() >= crate::attachment::MAX_ATTACHMENTS {
         return Err(SpillFailure::AttachmentSlotsFull);
     }
-    let mut candidates = spill_candidates(messages);
+    let mut candidates = spill_candidates(messages, recalled_source);
     if candidates.is_empty() {
         return Err(SpillFailure::NoSafeCandidate);
     }
@@ -2739,6 +3180,7 @@ fn spill_oversized_bulk_text(
             .cmp(&utf16_units(&left.text))
             .then_with(|| left.message_index.cmp(&right.message_index))
             .then_with(|| left.part_index.cmp(&right.part_index))
+            .then_with(|| left.source_range.cmp(&right.source_range))
     });
 
     let provisional_name =
@@ -2770,7 +3212,16 @@ fn spill_oversized_bulk_text(
         left.message_index
             .cmp(&right.message_index)
             .then_with(|| left.part_index.cmp(&right.part_index))
+            .then_with(|| left.source_range.cmp(&right.source_range))
     });
+    let reason = if selected
+        .iter()
+        .any(|candidate| candidate.content_class == "recalled_source_material")
+    {
+        SpillReason::RecalledSourceMaterial
+    } else {
+        SpillReason::SafeBulkCandidate
+    };
     let spill = spill_document(&selected);
     if spill.len() as u64 > crate::attachment::MAX_BYTES {
         return Err(SpillFailure::GeneratedFileTooLarge);
@@ -2804,11 +3255,18 @@ fn spill_oversized_bulk_text(
     };
     final_flattened.attachments = flattened.attachments.clone();
     final_flattened.attachments.push(attachment);
-    Ok(final_flattened)
+    Ok((final_flattened, reason))
 }
 
-fn spill_candidates(messages: &[OpenAiMessage]) -> Vec<SpillCandidate> {
+fn spill_candidates(
+    messages: &[OpenAiMessage],
+    recalled_source: Option<&AuthenticatedRecalledSource>,
+) -> Vec<SpillCandidate> {
     let mut candidates = Vec::new();
+    let recalled_candidate = recalled_source.and_then(|source| source.candidate(messages));
+    let recalled_message_index = recalled_candidate
+        .as_ref()
+        .map(|candidate| candidate.message_index);
     let latest_user = messages
         .iter()
         .rposition(|message| message.role.trim().eq_ignore_ascii_case("user"));
@@ -2820,10 +3278,14 @@ fn spill_candidates(messages: &[OpenAiMessage]) -> Vec<SpillCandidate> {
         if role == "user" && messages.len() > 1 && latest_user == Some(message_index) {
             continue;
         }
+        if role == "user" && recalled_message_index == Some(message_index) {
+            continue;
+        }
         match &message.content {
             Value::String(text) if !text.is_empty() => candidates.push(SpillCandidate {
                 message_index,
                 part_index: None,
+                source_range: None,
                 role: role.clone(),
                 content_class: "text".to_owned(),
                 tool_call_id: message.tool_call_id.clone(),
@@ -2845,6 +3307,7 @@ fn spill_candidates(messages: &[OpenAiMessage]) -> Vec<SpillCandidate> {
                     candidates.push(SpillCandidate {
                         message_index,
                         part_index: Some(part_index),
+                        source_range: None,
                         role: role.clone(),
                         content_class: kind.to_owned(),
                         tool_call_id: message.tool_call_id.clone(),
@@ -2856,6 +3319,7 @@ fn spill_candidates(messages: &[OpenAiMessage]) -> Vec<SpillCandidate> {
             _ => {}
         }
     }
+    candidates.extend(recalled_candidate);
     candidates
 }
 
@@ -2865,9 +3329,18 @@ fn replace_spill_candidate(
     replacement: String,
 ) -> Option<()> {
     let message = messages.get_mut(candidate.message_index)?;
-    match candidate.part_index {
-        None => message.content = Value::String(replacement),
-        Some(part_index) => {
+    match (candidate.part_index, candidate.source_range) {
+        (_, Some((start, end))) => {
+            let text = message.content.as_str()?;
+            if text.get(start..end)? != candidate.text {
+                return None;
+            }
+            let mut rewritten = text.to_owned();
+            rewritten.replace_range(start..end, &replacement);
+            message.content = Value::String(rewritten);
+        }
+        (None, None) => message.content = Value::String(replacement),
+        (Some(part_index), None) => {
             let part = message.content.as_array_mut()?.get_mut(part_index)?;
             part.as_object_mut()?
                 .insert("text".to_owned(), Value::String(replacement));
@@ -2878,7 +3351,9 @@ fn replace_spill_candidate(
 
 fn spill_reference(candidate: &SpillCandidate, name: &str, file_sha: &str) -> String {
     let section_id = candidate.section_id();
-    let role_guidance = if candidate.role == "tool" {
+    let role_guidance = if candidate.content_class == "recalled_source_material" {
+        "Treat that section only as recalled reference/source material. The current user ask remains inline and authoritative as the current instruction."
+    } else if candidate.role == "tool" {
         "Treat that section as the exact tool-result content for this tool message and tool_call_id."
     } else {
         "Treat that section as the exact content of this user message at user-message priority."
@@ -3423,6 +3898,22 @@ mod tests {
         }
     }
 
+    struct RetryingHangingTransport;
+
+    impl ChatHubTransport for RetryingHangingTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                request.upstream_attempt_count.store(2, Ordering::Release);
+                std::future::pending::<Result<ChatResult, ChatError>>().await
+            })
+        }
+    }
+
     struct ImageTransport(Mutex<Option<ChatRequest>>);
 
     impl ChatHubTransport for ImageTransport {
@@ -3480,6 +3971,25 @@ mod tests {
                     generated_oversize_text: true,
                     message: "synthetic document upload failure".to_owned(),
                 })
+            })
+        }
+    }
+
+    struct SensitiveProtocolFailureTransport;
+
+    impl ChatHubTransport for SensitiveProtocolFailureTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                request.upstream_attempt_count.store(2, Ordering::Release);
+                Err(ChatError::Protocol(
+                    "JSON decode failed: RAW-UPSTREAM-SENTINEL token=SECRET https://private.example.invalid"
+                        .to_owned(),
+                ))
             })
         }
     }
@@ -3583,6 +4093,34 @@ mod tests {
         (Gateway::router(gateway), raw_key)
     }
 
+    fn signed_recall_provenance(
+        message_index: usize,
+        clean_prefix: &str,
+        content: &str,
+        source_start_utf8: usize,
+        source_end_utf8: usize,
+    ) -> RecallProvenance {
+        let source = content
+            .get(source_start_utf8..source_end_utf8)
+            .expect("test provenance range is valid UTF-8");
+        let mut provenance = RecallProvenance {
+            schema: "m365-hermes-recall-provenance/v1".to_owned(),
+            message_index,
+            message_sha256: sha256_hex(content.as_bytes()),
+            clean_prefix_utf8_bytes: clean_prefix.len(),
+            clean_prefix_sha256: sha256_hex(clean_prefix.as_bytes()),
+            source_start_utf8,
+            source_end_utf8,
+            source_sha256: sha256_hex(source.as_bytes()),
+            signature: String::new(),
+        };
+        provenance.signature = crate::hindsight::signature(
+            "test-recall-provenance-secret",
+            recall_provenance_signature_payload(&provenance).as_bytes(),
+        );
+        provenance
+    }
+
     fn gateway_with_chat_and_oauth(
         chat: Arc<dyn ChatHubTransport>,
         oauth_config: OAuthConfig,
@@ -3631,10 +4169,15 @@ mod tests {
             settings_lifecycle: std::sync::Mutex::new(()),
             checkpoints: CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap(),
             hindsight_webhook_secret: String::new(),
+            hermes_recall_provenance_secret: "test-recall-provenance-secret".to_owned(),
             mcp: crate::mcp::Server::default(),
             artifacts: crate::artifact::Store::open(root.join("artifacts")).unwrap(),
             deployments: crate::deployments::Store::open(&root).unwrap(),
-            debug: crate::debug::Store::default(),
+            debug: crate::debug::Store::open(
+                root.join("debug-telemetry.jsonl"),
+                "data_dir_default",
+            )
+            .unwrap(),
         });
         (gateway, raw_key)
     }
@@ -4105,6 +4648,564 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_recall_bulk_can_spill_while_current_user_ask_stays_inline() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let app = Gateway::router(gateway);
+        let ask = "Use the recalled source to answer this current question.";
+        let recall = format!(
+            "<memory-context>\n[System note: recalled reference data]\n\nRECALL-START\n{}\nRECALL-END\n</memory-context>",
+            "R".repeat(128_100)
+        );
+        let content = format!("{ask}\n\n{recall}");
+        let source_start = ask.len() + 2;
+        let source_end = content.len();
+        let provenance = signed_recall_provenance(1, ask, &content, source_start, source_end);
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[
+                                {"role":"assistant","content":"Earlier context"},
+                                {"role":"user","content":content}
+                            ],
+                            "m365_recall_provenance": provenance
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let request = chat.0.lock().unwrap();
+        let request = request.as_ref().expect("request reached chat transport");
+        assert!(utf16_units(&request.text) < 128_000);
+        assert!(request.text.contains(ask));
+        assert!(!request.text.contains("RECALL-START"));
+        assert_eq!(request.attachments.len(), 1);
+        let encoded = request.attachments[0]
+            .url
+            .strip_prefix("data:text/plain;base64,")
+            .unwrap();
+        let spill = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+        assert!(spill.contains("RECALL-START"));
+        assert!(!spill.contains(ask));
+        let telemetry_raw = std::fs::read_to_string(telemetry_path).unwrap();
+        assert!(!telemetry_raw.contains(ask));
+        assert!(!telemetry_raw.contains("RECALL-START"));
+        let telemetry: Value = serde_json::from_str(telemetry_raw.lines().last().unwrap()).unwrap();
+        assert_eq!(telemetry["schema"], "m365-privacy-telemetry/v1");
+        assert_eq!(telemetry["route"], "hermes");
+        assert_eq!(telemetry["requestClass"], "external_user");
+        assert_eq!(
+            telemetry["provenanceClass"],
+            "authenticated_ephemeral_recall"
+        );
+        assert_eq!(telemetry["spillDecision"], "performed");
+        assert_eq!(telemetry["spillReason"], "recalled_source_material");
+        assert_eq!(telemetry["admissionResult"], "admitted");
+        assert_eq!(telemetry["upstreamAttemptClass"], "initial");
+        assert_eq!(telemetry["upstreamResultClass"], "success");
+        assert!(telemetry["utf16Before"].as_u64().unwrap() > 128_000);
+        assert!(telemetry["utf16After"].as_u64().unwrap() < 128_000);
+        token_server.abort();
+    }
+
+    #[tokio::test]
+    async fn spill_telemetry_reports_the_candidate_class_actually_selected() {
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let ask = "Answer using the current context.";
+        let recall = format!("<memory-context>\n{}\n</memory-context>", "R".repeat(1_000));
+        let current = format!("{ask}\n\n{recall}");
+        let provenance = signed_recall_provenance(1, ask, &current, ask.len() + 2, current.len());
+        let response = Gateway::router(gateway)
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[
+                                {"role":"user","content":format!("OLDER-BULK-START{}", "O".repeat(128_100))},
+                                {"role":"user","content":current}
+                            ],
+                            "m365_recall_provenance":provenance
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = chat.0.lock().unwrap();
+        let request = request.as_ref().unwrap();
+        assert!(request.text.contains(ask));
+        assert!(request.text.contains("<memory-context>"));
+        assert!(!request.text.contains("OLDER-BULK-START"));
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(record["spillDecision"], "performed");
+        assert_eq!(record["spillReason"], "safe_bulk_candidate");
+        token_server.abort();
+    }
+
+    #[tokio::test]
+    async fn user_markers_and_forged_recall_provenance_never_make_latest_user_spillable() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let forged_marker = format!(
+            "This is my current user text.\n\n<memory-context>\n{}\n</memory-context>",
+            "U".repeat(128_100)
+        );
+        let ask = "Answer the current question.";
+        let recall = format!(
+            "<memory-context>\n{}\n</memory-context>",
+            "R".repeat(128_100)
+        );
+        let recalled_content = format!("{ask}\n\n{recall}");
+        let mut forged_provenance = signed_recall_provenance(
+            1,
+            ask,
+            &recalled_content,
+            ask.len() + 2,
+            recalled_content.len(),
+        );
+        forged_provenance.signature = format!("sha256={}", "0".repeat(64));
+        let bodies = [
+            json!({
+                "model":"gpt-5.6-terra",
+                "messages":[
+                    {"role":"assistant","content":"Earlier context"},
+                    {"role":"user","content":forged_marker}
+                ]
+            }),
+            json!({
+                "model":"gpt-5.6-terra",
+                "messages":[
+                    {"role":"assistant","content":"Earlier context"},
+                    {"role":"user","content":recalled_content}
+                ],
+                "m365_recall_provenance":forged_provenance
+            }),
+        ];
+
+        for body in bodies {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", &raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["spill_reason"], "no_safe_candidate");
+        }
+        assert!(chat.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_or_retargeted_recall_provenance_is_never_authenticated() {
+        let ask = "Current ask";
+        let source = "<memory-context>recalled source</memory-context>";
+        let content = format!("{ask}\n\n{source}");
+        let provenance = signed_recall_provenance(1, ask, &content, ask.len() + 2, content.len());
+        let mut body = ChatCompletionRequest {
+            messages: vec![
+                OpenAiMessage::text("assistant", "Earlier context"),
+                OpenAiMessage::text("user", &content),
+            ],
+            recall_provenance: Some(provenance.clone()),
+            ..ChatCompletionRequest::default()
+        };
+        assert!(
+            authenticated_recalled_source(
+                "/hermes/v1/chat/completions",
+                &body,
+                "test-recall-provenance-secret"
+            )
+            .is_some()
+        );
+
+        body.messages
+            .push(OpenAiMessage::text("user", "A newer current ask"));
+        assert!(
+            authenticated_recalled_source(
+                "/hermes/v1/chat/completions",
+                &body,
+                "test-recall-provenance-secret"
+            )
+            .is_none()
+        );
+
+        let malformed = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "messages":[{"role":"user","content":content}],
+            "m365_recall_provenance":{
+                "schema":"m365-hermes-recall-provenance/v1",
+                "message_index":0
+            }
+        }));
+        assert!(malformed.is_err());
+
+        let mut out_of_range = provenance;
+        out_of_range.source_end_utf8 = content.len() + 1;
+        out_of_range.signature = crate::hindsight::signature(
+            "test-recall-provenance-secret",
+            recall_provenance_signature_payload(&out_of_range).as_bytes(),
+        );
+        body.messages.pop();
+        body.recall_provenance = Some(out_of_range);
+        assert!(
+            authenticated_recalled_source(
+                "/hermes/v1/chat/completions",
+                &body,
+                "test-recall-provenance-secret"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn recall_provenance_signature_matches_the_hermes_plugin_contract() {
+        let provenance = RecallProvenance {
+            schema: "m365-hermes-recall-provenance/v1".to_owned(),
+            message_index: 2,
+            message_sha256: "692b7a4484fd14973e0200726f435bb3799493d55919c3b4a52feabbe4c97ed4"
+                .to_owned(),
+            clean_prefix_utf8_bytes: 16,
+            clean_prefix_sha256: "56845b4afcf02654415e316c021b493d451613a5e3de794fd8b4156bb6e67b5b"
+                .to_owned(),
+            source_start_utf8: 18,
+            source_end_utf8: 59,
+            source_sha256: "f3551d2d2a6d4e84acf533e5942f2d245af22f28cde88ce08a26f59731fffdfc"
+                .to_owned(),
+            signature: String::new(),
+        };
+        assert_eq!(
+            crate::hindsight::signature(
+                "contract-secret",
+                recall_provenance_signature_payload(&provenance).as_bytes()
+            ),
+            "sha256=d3ce8d5c6f6272ccaec39d5d4d890bb539a0ae7c8a74c2aa379f8063d4d4fcf7"
+        );
+    }
+
+    #[test]
+    fn upstream_telemetry_outcomes_are_closed_typed_classes() {
+        assert_eq!(
+            chat_error_telemetry_class(&ChatError::RateLimited {
+                retry_after: None,
+                soft: false,
+            }),
+            UpstreamResult::RateLimited429
+        );
+        assert_eq!(
+            chat_error_telemetry_class(&ChatError::ServiceUnavailable),
+            UpstreamResult::ServiceUnavailable503
+        );
+        assert_eq!(
+            chat_error_telemetry_class(&ChatError::Terminal {
+                kind: "error".to_owned(),
+                message: "context_length exceeded: SENSITIVE-UPSTREAM-BODY".to_owned(),
+            }),
+            UpstreamResult::ContextLength
+        );
+        assert_eq!(
+            chat_error_telemetry_class(&ChatError::Protocol(
+                "JSON decode failed: SENSITIVE-UPSTREAM-BODY".to_owned(),
+            )),
+            UpstreamResult::JsonDecode
+        );
+        assert_eq!(
+            chat_error_telemetry_class(&ChatError::Transport(
+                "opaque transport failure: SENSITIVE-UPSTREAM-BODY".to_owned(),
+            )),
+            UpstreamResult::TransportError
+        );
+    }
+
+    #[test]
+    fn timeout_after_transport_retry_preserves_retry_identity() {
+        let attempts = std::sync::atomic::AtomicUsize::new(2);
+        assert_eq!(
+            upstream_attempt_class(&attempts, UpstreamAttempt::Initial),
+            UpstreamAttempt::Retried
+        );
+        assert_eq!(
+            upstream_attempt_class(&attempts, UpstreamAttempt::Followup),
+            UpstreamAttempt::FollowupRetried
+        );
+    }
+
+    #[tokio::test]
+    async fn outer_timeout_records_the_retry_that_happened_before_cancellation() {
+        let (gateway, raw_key) =
+            gateway_with_chat_and_oauth(Arc::new(RetryingHangingTransport), oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let mut settings = gateway.settings.current();
+        settings.chat_timeout_seconds = 5;
+        gateway.settings.save(settings).unwrap();
+
+        let response = Gateway::router(gateway)
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"timeout safely"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(record["upstreamAttemptClass"], "retried");
+        assert_eq!(record["upstreamResultClass"], "timeout");
+    }
+
+    #[tokio::test]
+    async fn authoritative_reader_uses_new_surface_and_telemetry_excludes_sensitive_content() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat, oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let stale = telemetry_path.parent().unwrap().join("log.db");
+        std::fs::write(&stale, "STALE-LOG-DB-SENTINEL").unwrap();
+        let sensitive = concat!(
+            "PROMPT-SENTINEL token=SECRET-COOKIE ",
+            "tenant=PRIVATE-TENANT https://private.example.invalid/resource"
+        );
+        let request_body = serde_json::to_vec(&json!({
+            "model":"gpt-5.6-terra",
+            "messages":[{"role":"user","content":sensitive}]
+        }))
+        .unwrap();
+        let app = Gateway::router(gateway.clone());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", &raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(request_body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let raw = std::fs::read_to_string(&telemetry_path).unwrap();
+        assert!(!raw.contains("PROMPT-SENTINEL"));
+        assert!(!raw.contains("SECRET-COOKIE"));
+        assert!(!raw.contains("PRIVATE-TENANT"));
+        assert!(!raw.contains("private.example.invalid"));
+        let records = raw
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0]["correlationId"], records[1]["correlationId"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record["upstreamResultClass"] == "success")
+        );
+
+        let login = gateway
+            .admin
+            .login("password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::get("/api/admin/debug/logs")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(
+                        header::COOKIE,
+                        format!("m365_admin_session={}", login.token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let reader: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reader["schema"], "m365-privacy-telemetry/v1");
+        assert_eq!(reader["source"]["kind"], "authoritative_jsonl");
+        assert_eq!(reader["source"]["pathClass"], "data_dir_default");
+        assert_eq!(reader["records"].as_array().unwrap().len(), 2);
+        let reader = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!reader.contains("STALE-LOG-DB-SENTINEL"));
+        assert!(!reader.contains("PROMPT-SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn streaming_trace_finishes_on_the_upstream_task_not_the_http_envelope() {
+        let chat = Arc::new(StreamTextTransport {
+            events: vec!["streamed".to_owned()],
+            text: "streamed".to_owned(),
+        });
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat, oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let response = Gateway::router(gateway)
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","stream":true,"messages":[{"role":"user","content":"stream safely"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).ends_with("data: [DONE]\n\n"));
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(record["upstreamAttemptClass"], "initial");
+        assert_eq!(record["upstreamResultClass"], "success");
+        assert_eq!(record["status"], 200);
+    }
+
+    #[tokio::test]
+    async fn telemetry_classifies_but_never_persists_raw_upstream_failure_text() {
+        let (gateway, raw_key) =
+            gateway_with_chat_and_oauth(Arc::new(SensitiveProtocolFailureTransport), oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let response = Gateway::router(gateway)
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"safe request"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        assert!(!raw.contains("RAW-UPSTREAM-SENTINEL"));
+        assert!(!raw.contains("token=SECRET"));
+        assert!(!raw.contains("private.example.invalid"));
+        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(record["upstreamAttemptClass"], "retried");
+        assert_eq!(record["upstreamResultClass"], "json_decode");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_projection_relocates_only_the_same_authenticated_recalled_input() {
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (app, raw_key) = app_with_chat_and_oauth(chat.clone(), oauth);
+        let first_user = json!({"role":"user","content":"Earlier request"});
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":"issue91-recalled-input-identity",
+                            "messages":[first_user.clone()]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let assistant = first["choices"][0]["message"].clone();
+        let ask = "Answer this post-compression current ask.";
+        let recall = format!(
+            "<memory-context>\n{}\n</memory-context>",
+            "R".repeat(128_100)
+        );
+        let content = format!("{ask}\n\n{recall}");
+        let provenance = signed_recall_provenance(2, ask, &content, ask.len() + 2, content.len());
+
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":"issue91-recalled-input-identity",
+                            "messages":[
+                                first_user,
+                                assistant,
+                                {"role":"user","content":content}
+                            ],
+                            "m365_recall_provenance":provenance
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = second.status();
+        let body = to_bytes(second.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let request = chat.0.lock().unwrap();
+        let request = request.as_ref().unwrap();
+        assert!(request.text.contains(ask));
+        assert!(!request.text.contains("<memory-context>"));
+        assert_eq!(request.attachments.len(), 1);
+        token_server.abort();
+    }
+
+    #[tokio::test]
     async fn below_limit_single_user_text_is_not_spilled() {
         let chat = Arc::new(RecordingTransport(Mutex::new(None)));
         let (app, raw_key) = app_with_chat(chat.clone());
@@ -4344,6 +5445,10 @@ mod tests {
     async fn memory_oversize_remains_unspilled_and_keeps_hindsight_recovery_metadata() {
         let chat = Arc::new(RecordingTransport(Mutex::new(None)));
         let (app, raw_key) = app_with_chat(chat.clone());
+        let ask = "Current memory request";
+        let recalled = format!("<memory-context>{}</memory-context>", "M".repeat(128_100));
+        let content = format!("{ask}\n\n{recalled}");
+        let provenance = signed_recall_provenance(0, ask, &content, ask.len() + 2, content.len());
         let response = app
             .oneshot(
                 Request::post("/memory/v1/chat/completions")
@@ -4352,7 +5457,8 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "model":"gpt-5.6-terra",
-                            "messages":[{"role":"user","content":"M".repeat(128_100)}]
+                            "messages":[{"role":"user","content":content}],
+                            "m365_recall_provenance":provenance
                         }))
                         .unwrap(),
                     ))
@@ -4570,11 +5676,12 @@ mod tests {
     fn oversize_spill_is_deterministic_for_identical_input() {
         let messages = vec![OpenAiMessage::text("user", "A".repeat(128_100))];
         let flattened = flatten_messages(&messages).unwrap();
-        let first = spill_oversized_bulk_text(&messages, &flattened, 128_000).unwrap();
-        let second = spill_oversized_bulk_text(&messages, &flattened, 128_000).unwrap();
-        assert_eq!(first.text, second.text);
-        assert_eq!(first.attachments[0].name, second.attachments[0].name);
-        assert_eq!(first.attachments[0].url, second.attachments[0].url);
+        let first = spill_oversized_bulk_text(&messages, &flattened, 128_000, None).unwrap();
+        let second = spill_oversized_bulk_text(&messages, &flattened, 128_000, None).unwrap();
+        assert_eq!(first.0.text, second.0.text);
+        assert_eq!(first.0.attachments[0].name, second.0.attachments[0].name);
+        assert_eq!(first.0.attachments[0].url, second.0.attachments[0].url);
+        assert_eq!(first.1, SpillReason::SafeBulkCandidate);
     }
 
     #[test]
