@@ -35,7 +35,7 @@
 
 Telemetry path 必須是 `.jsonl`；舊 Synology `log.db` 明確不是 current truth，也不會被 reader 接受。Writer 使用 private `0600` append，記憶體只保留最新 1000 筆，並週期性把同一份 bounded projection 做 atomic compaction。`GET /api/admin/debug/logs`、detail 與 export 都從這個 `m365-privacy-telemetry/v1` surface 讀取，回傳 `surfaceId`、path class 與 reader/writer state，不暴露實際 private path。
 
-每筆 request 只記錄封閉分類或 bounded metadata：route/class、queue admission、breaker state/projection、spill decision/reason、UTF-16 前後值與 size class、recall provenance class、upstream attempt/result，以及獨立隨機 correlation ID。Dynamic route segment 一律寫成封閉 template；例如 artifact capability 只會記成 `/v1/artifacts/{capability}/content`。不得記錄 prompt/transcript、memory/attachment body、token/cookie/header、tenant/account/user identity、private URL 或 raw upstream body。這是 forensic projection，不是 durable lifecycle authority。
+每筆 request 只記錄封閉分類或 bounded metadata：route/class、queue admission、breaker state/projection、spill decision/reason、UTF-16 前後值與 size class、recall provenance class、upstream attempt/result，以及獨立隨機 correlation ID。管理 API 會從這些既有封閉欄位推導 `throttleKind`：`hard_http_429`、`soft_bot_notice`、`projected_breaker` 或 `none`；這個欄位只存在 reader projection，**不改動 durable `m365-privacy-telemetry/v1` JSONL schema**，因此舊 binary rollback 仍能讀取既有 telemetry。Dynamic route segment 一律寫成封閉 template；例如 artifact capability 只會記成 `/v1/artifacts/{capability}/content`。不得記錄 prompt/transcript、memory/attachment body、token/cookie/header、tenant/account/user identity、conversation/session identity、private URL 或 raw upstream body。這是 forensic projection，不是 durable lifecycle authority。
 
 ## 值的優先順序
 

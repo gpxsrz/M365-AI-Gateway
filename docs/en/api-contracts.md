@@ -128,7 +128,7 @@ Forward-compatible extension observability may record field names or counts, nev
 
 Local queue full/timeout errors use HTTP `503` with `Retry-After`. They are different from Microsoft 429 and do not make every 5xx safe to replay.
 
-A Microsoft hard 429 or verified ChatHub soft-throttle is normalized to HTTP `429 rate_limit_error`. A non-empty `item.throttling` may be ordinary quota/metering metadata and is not enough to open the breaker. A valid upstream `Retry-After` is preserved; a soft throttle without one uses the first 1125-second level. Once throttling is confirmed, repair, re-ask, and required-tool/router retry stop.
+A Microsoft hard WebSocket HTTP 429 and a verified ChatHub soft-throttle are both normalized to HTTP `429 rate_limit_error` for the caller, but only the hard HTTP 429 is shared-account pressure authority that opens or escalates the shared breaker. A soft `BotConnection` notice proves only that the current ChatHub conversation/turn cannot continue; it ends the current request and leaves retry/backoff to the caller without changing shared cooldown from one preserved Hermes conversation. If a soft notice occurs on an existing recovery probe, the breaker returns to `HALF_OPEN_READY` for another eligible probe rather than escalating cooldown or claiming recovery. A non-empty `item.throttling` may still be ordinary quota/metering metadata and is not enough to classify a soft throttle or open the breaker. A valid upstream `Retry-After` on a hard 429 is preserved. Once a throttle response is established, repair, re-ask, and required-tool/router retry stop.
 
 Breaker states:
 
@@ -139,7 +139,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 - `OPEN` expiry only makes a probe possible; it does not close the breaker.
 - While the breaker is definitively `OPEN`, all interactive classes fail fast with the existing local `429 upstream_throttle` projection and `Retry-After`. A request that was already queued when another in-flight request opens the breaker is awakened and receives the same projection instead of waiting for its ordinary queue deadline. This local projection creates no ChatHub round and does not advance breaker counters, level, or source.
 - External-user traffic always has probe priority. If cooldown expires with no external user waiting, one Hermes continuation already classified by the gateway as `Autonomous` may take the single probe. Control-plane traffic (including Goal Judge, even when Hermes falls back from `/v1` to the main `/hermes/v1` provider), `AsyncCompletion`, and Memory still cannot probe; another 429 reopens the circuit at the next cooldown level.
-- A throttled probe returns to `OPEN` at a higher cooldown.
+- A probe receiving a hard HTTP 429 returns to `OPEN` at a higher cooldown; a soft `BotConnection` notice returns the probe to `HALF_OPEN_READY` without escalating shared cooldown.
 - A successful probe enters `RECOVERY`.
 - `RECOVERY` keeps shared concurrency at 1 and still blocks Memory upstream.
 - After a successful request, the Gateway observes 60 quiet seconds. With no running or queued work, the next admission/snapshot returns to `CLOSED` automatically.

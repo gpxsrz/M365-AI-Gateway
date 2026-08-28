@@ -709,6 +709,10 @@ impl Trace {
         });
     }
 
+    pub(crate) fn breaker_projection(&self, projection: BreakerProjection) {
+        self.update(|record| record.breaker_projection = projection.as_str().to_owned());
+    }
+
     pub(crate) fn admission(&self, result: AdmissionResult) {
         self.update(|record| record.admission_result = result.as_str().to_owned());
     }
@@ -803,7 +807,7 @@ pub(crate) async fn list(State(gateway): State<Arc<Gateway>>) -> Response {
             "readerState": inner.reader_state,
             "writerState": inner.writer_state,
         },
-        "records": inner.records,
+        "records": inner.records.iter().map(public_record).collect::<Vec<_>>(),
         "audit": inner.audit,
         "session": inner.session,
     }))
@@ -838,6 +842,7 @@ pub(crate) async fn detail(
         "admissionResult": record.admission_result,
         "breakerState": record.breaker_state,
         "breakerProjection": record.breaker_projection,
+        "throttleKind": throttle_kind(record),
         "spillDecision": record.spill_decision,
         "spillReason": record.spill_reason,
         "utf16Before": record.utf16_before,
@@ -914,10 +919,32 @@ pub(crate) async fn export(State(gateway): State<Arc<Gateway>>) -> Response {
             "writerState": inner.writer_state,
         },
         "exportedAt": now(),
-        "records": inner.records,
+        "records": inner.records.iter().map(public_record).collect::<Vec<_>>(),
         "audit": inner.audit,
     }))
     .into_response()
+}
+
+fn public_record(record: &Record) -> serde_json::Value {
+    let mut value = serde_json::to_value(record).expect("typed telemetry is serializable");
+    value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
+    value
+}
+
+fn throttle_kind(record: &Record) -> &'static str {
+    if record.admission_result == "upstream_throttle"
+        && record.upstream_result_class == "not_attempted"
+    {
+        "projected_breaker"
+    } else if record.upstream_result_class == "rate_limited_429" {
+        if record.breaker_projection == "throttled" {
+            "hard_http_429"
+        } else {
+            "soft_bot_notice"
+        }
+    } else {
+        "none"
+    }
 }
 
 fn expire(inner: &mut Inner) {
@@ -1052,6 +1079,31 @@ fn format_time(value: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttle_kind_is_derived_without_changing_the_durable_record_schema() {
+        let mut soft = Record::new("POST", "/hermes/v1/chat/completions");
+        soft.upstream_attempt_class = "initial".to_owned();
+        soft.upstream_result_class = "rate_limited_429".to_owned();
+        soft.breaker_projection = "admitted".to_owned();
+        assert_eq!(throttle_kind(&soft), "soft_bot_notice");
+        assert_eq!(public_record(&soft)["throttleKind"], "soft_bot_notice");
+        assert!(
+            serde_json::to_value(&soft)
+                .unwrap()
+                .get("throttleKind")
+                .is_none()
+        );
+
+        let mut hard = soft.clone();
+        hard.breaker_projection = "throttled".to_owned();
+        assert_eq!(throttle_kind(&hard), "hard_http_429");
+
+        let mut projected = Record::new("POST", "/hermes/v1/chat/completions");
+        projected.admission_result = "upstream_throttle".to_owned();
+        projected.breaker_projection = "throttled".to_owned();
+        assert_eq!(throttle_kind(&projected), "projected_breaker");
+    }
 
     #[test]
     fn authoritative_telemetry_surface_is_durable_and_typed() {

@@ -1582,7 +1582,10 @@ async fn stream_chat(
 }
 
 enum ChatFailureClass<'a> {
-    RateLimited(Option<&'a str>),
+    RateLimited {
+        retry_after: Option<&'a str>,
+        soft: bool,
+    },
     AutoSpillOverflow,
     Upstream,
 }
@@ -1604,6 +1607,9 @@ fn observe_error(
 ) {
     trace.upstream_attempt(upstream_attempt_class(upstream_attempt_count, base));
     trace.upstream_result(chat_error_telemetry_class(error));
+    if matches!(error, ChatError::RateLimited { soft: false, .. }) {
+        trace.breaker_projection(BreakerProjection::Throttled);
+    }
 }
 
 fn upstream_attempt_class(
@@ -1672,9 +1678,10 @@ fn classify_chat_failure<'a>(
     overflow_context: Option<&OverflowContext>,
 ) -> ChatFailureClass<'a> {
     match error {
-        ChatError::RateLimited { retry_after, .. } => {
-            ChatFailureClass::RateLimited(retry_after.as_deref())
-        }
+        ChatError::RateLimited { retry_after, soft } => ChatFailureClass::RateLimited {
+            retry_after: retry_after.as_deref(),
+            soft: *soft,
+        },
         ChatError::Attachment {
             generated_oversize_text: true,
             ..
@@ -1691,8 +1698,12 @@ fn chat_error_with_overflow(
     overflow_context: Option<&OverflowContext>,
 ) -> Response {
     match classify_chat_failure(&error, overflow_context) {
-        ChatFailureClass::RateLimited(retry_after) => {
-            permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
+        ChatFailureClass::RateLimited { retry_after, soft } => {
+            if soft {
+                permit.finish_soft_throttle();
+            } else {
+                permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
+            }
             let mut response = openai_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
@@ -1733,8 +1744,12 @@ fn send_stream_chat_error(
     overflow_context: Option<&OverflowContext>,
 ) {
     match classify_chat_failure(&error, overflow_context) {
-        ChatFailureClass::RateLimited(retry_after) => {
-            permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
+        ChatFailureClass::RateLimited { retry_after, soft } => {
+            if soft {
+                permit.finish_soft_throttle();
+            } else {
+                permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
+            }
             send_sse_error(sender, "rate_limit_error", "ChatHub rate limited");
         }
         ChatFailureClass::AutoSpillOverflow => {
@@ -3994,6 +4009,52 @@ mod tests {
         }
     }
 
+    struct RateLimitedTransport {
+        soft: bool,
+    }
+
+    impl ChatHubTransport for RateLimitedTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                Err(ChatError::RateLimited {
+                    retry_after: None,
+                    soft: self.soft,
+                })
+            })
+        }
+    }
+
+    struct SoftThenSuccessTransport(AtomicBool);
+
+    impl ChatHubTransport for SoftThenSuccessTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                if !self.0.swap(true, Ordering::AcqRel) {
+                    return Err(ChatError::RateLimited {
+                        retry_after: None,
+                        soft: true,
+                    });
+                }
+                Ok(ChatResult {
+                    text: "independent scope remains usable".to_owned(),
+                    conversation_id: "independent-conversation".to_owned(),
+                    session_id: "independent-session".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
     struct StreamTextTransport {
         events: Vec<String>,
         text: String,
@@ -4993,6 +5054,101 @@ mod tests {
         let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
         assert_eq!(record["upstreamAttemptClass"], "retried");
         assert_eq!(record["upstreamResultClass"], "timeout");
+    }
+
+    #[tokio::test]
+    async fn soft_chathub_throttle_does_not_open_the_shared_account_breaker() {
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(
+            Arc::new(SoftThenSuccessTransport(AtomicBool::new(false))),
+            oauth(),
+        );
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"soft throttle scope"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let snapshot = gateway.traffic.snapshot();
+        assert_eq!(
+            snapshot.shared_circuit_state,
+            crate::traffic::CircuitState::Closed
+        );
+        assert_eq!(snapshot.shared_cooldown_level, 0);
+        assert_eq!(snapshot.shared_429_count, 0);
+
+        let independent = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"independent scope"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(independent.status(), StatusCode::OK);
+        let after_independent = gateway.traffic.snapshot();
+        assert_eq!(
+            after_independent.shared_circuit_state,
+            crate::traffic::CircuitState::Closed
+        );
+        assert_eq!(after_independent.shared_429_count, 0);
+
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let records = raw
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["upstreamResultClass"], "rate_limited_429");
+        assert_ne!(records[0]["breakerProjection"], "throttled");
+        assert_eq!(records[1]["upstreamResultClass"], "success");
+    }
+
+    #[tokio::test]
+    async fn hard_chathub_429_still_opens_the_shared_account_breaker() {
+        let (gateway, raw_key) =
+            gateway_with_chat_and_oauth(Arc::new(RateLimitedTransport { soft: false }), oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"hard throttle scope"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let snapshot = gateway.traffic.snapshot();
+        assert_eq!(
+            snapshot.shared_circuit_state,
+            crate::traffic::CircuitState::Open
+        );
+        assert_eq!(snapshot.shared_cooldown_level, 1);
+        assert_eq!(snapshot.shared_429_count, 1);
+
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(record["upstreamResultClass"], "rate_limited_429");
+        assert_eq!(record["breakerProjection"], "throttled");
     }
 
     #[tokio::test]

@@ -128,7 +128,7 @@ Forward-compatible extension 可以在 observability 中記錄欄位名稱或數
 
 本地 queue full / timeout 回 HTTP `503` 並附 `Retry-After`。這與 Microsoft 429 不同，也不代表所有 5xx 都可安全重送。
 
-Microsoft hard 429 或已驗證的 ChatHub soft-throttle 會正規化為 HTTP `429 rate_limit_error`。非空 `item.throttling` 可能只是一般 quota / metering metadata，不足以開 breaker。有效 upstream `Retry-After` 會保留；soft throttle 沒提供時使用第一階 1125 秒。Throttle 成立後，repair、reask 與 required-tool/router retry 都必須停止。
+Microsoft hard WebSocket HTTP 429 與已驗證的 ChatHub soft-throttle 都會對 caller 正規化為 HTTP `429 rate_limit_error`，但只有 hard HTTP 429 是 shared-account pressure authority，會開啟或升級 shared breaker。Soft `BotConnection` notice 只證明目前 ChatHub conversation/turn 不可繼續；它會結束目前 request 並交由 caller 做 retry/backoff，不會單憑一個 preserved Hermes conversation 改寫 shared cooldown。若 soft notice 發生在既有 recovery probe，breaker 回到 `HALF_OPEN_READY` 等待另一個 eligible probe，不會升級 cooldown，也不會誤宣告 recovery。非空 `item.throttling` 仍可能只是一般 quota / metering metadata，不足以判 soft throttle或開 breaker。Hard 429 的有效 upstream `Retry-After` 會保留。Throttle response 成立後，repair、reask 與 required-tool/router retry 都必須停止。
 
 Breaker 狀態：
 
@@ -139,7 +139,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 - `OPEN` 到期只代表可以 probe，不會直接關閉。
 - Breaker 明確處於 `OPEN` 時，所有 interactive class 都會立即使用既有的本地 `429 upstream_throttle` + `Retry-After` 投影。若某個 request 原本已在排隊、另一筆 in-flight request 才把 breaker 打開，該 waiter 也會被喚醒並收到同一投影，不會繼續等到一般 queue deadline。這個本地投影不會建立 ChatHub round，也不會增加 breaker counter、level 或改寫來源。
 - external-user 永遠優先取得 probe；若 cooldown 到期且沒有 external-user 在等，允許一筆已被 Gateway 明確分類為 `Autonomous` 的 Hermes continuation 做唯一 probe。Control-plane（含 Goal Judge，即使 Hermes 從 `/v1` fallback 到 main `/hermes/v1` provider）仍保持 control-plane 身分；`AsyncCompletion` 與 Memory 也不得 probe。probe 若再次 429 會依原 cooldown ladder 升級後重新 OPEN。
-- Probe 再被 throttle 會回 `OPEN` 並提高 cooldown。
+- Probe 再收到 hard HTTP 429 會回 `OPEN` 並提高 cooldown；soft `BotConnection` notice 只讓 probe 回 `HALF_OPEN_READY`，不升級 shared cooldown。
 - Probe 成功才進 `RECOVERY`。
 - `RECOVERY` shared concurrency 仍是 1，Memory 仍不進 upstream。
 - 完成一筆成功 request 後，要安靜觀察 60 秒；沒有執行中或排隊流量時，下一次 admission／snapshot 才自動回 `CLOSED`。

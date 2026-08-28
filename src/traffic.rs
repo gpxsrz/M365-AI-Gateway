@@ -615,6 +615,29 @@ impl TrafficController {
         drop(state);
         self.changed.notify_waiters();
     }
+
+    fn release_soft_throttle(&self, class: WorkloadClass) {
+        let mut state = self.state.lock().expect("traffic state poisoned");
+        let now = Instant::now();
+        if class == WorkloadClass::Memory {
+            state.memory_in_flight = state.memory_in_flight.saturating_sub(1);
+        } else {
+            state.interactive_in_flight = state.interactive_in_flight.saturating_sub(1);
+            if class.is_external() {
+                state.external_in_flight = state.external_in_flight.saturating_sub(1);
+            } else {
+                state.autonomous_in_flight = state.autonomous_in_flight.saturating_sub(1);
+            }
+            if state.circuit == CircuitState::ProbeInFlight {
+                state.circuit = CircuitState::HalfOpenReady;
+                state.recovery_quiet_since = None;
+            } else if state.circuit == CircuitState::Recovery {
+                state.recovery_quiet_since = Some(now);
+            }
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
 }
 
 impl State {
@@ -771,6 +794,11 @@ impl State {
 impl Permit {
     pub fn finish(mut self, status: StatusCode, retry_after: Option<&str>) {
         self.controller.release(self.class, status, retry_after);
+        self.finished = true;
+    }
+
+    pub fn finish_soft_throttle(mut self) {
+        self.controller.release_soft_throttle(self.class);
         self.finished = true;
     }
 }
@@ -1301,6 +1329,31 @@ mod tests {
             controller.snapshot().shared_circuit_state,
             CircuitState::HalfOpenReady
         );
+    }
+
+    #[tokio::test]
+    async fn soft_throttle_on_recovery_probe_does_not_escalate_shared_cooldown() {
+        let controller = fast_controller();
+        controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .unwrap()
+            .finish(StatusCode::TOO_MANY_REQUESTS, None);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let probe = controller
+            .acquire(WorkloadClass::ExternalUser, fast_limits())
+            .await
+            .unwrap();
+        let before = controller.snapshot();
+        assert_eq!(before.shared_circuit_state, CircuitState::ProbeInFlight);
+
+        probe.finish_soft_throttle();
+        let after = controller.snapshot();
+        assert_eq!(after.shared_circuit_state, CircuitState::HalfOpenReady);
+        assert_eq!(after.shared_cooldown_level, before.shared_cooldown_level);
+        assert_eq!(after.shared_429_count, before.shared_429_count);
+        assert_eq!(after.last_429_source, before.last_429_source);
     }
 
     #[tokio::test]
