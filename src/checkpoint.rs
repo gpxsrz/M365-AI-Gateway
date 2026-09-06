@@ -27,6 +27,8 @@ const MAX_CURSORS: usize = 64;
 pub struct CheckpointMessage {
     pub role: String,
     pub content: Value,
+    #[serde(skip)]
+    pub empty_recovery_synthetic: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -243,7 +245,7 @@ impl CheckpointStore {
                 return Err(CheckpointError::Busy);
             }
             let rollback_record = record.clone();
-            let accepted = record.accepted_count.min(messages.len());
+            let accepted = record.accepted_count;
             record.in_flight = true;
             record.revision += 1;
             record.updated_at = now;
@@ -259,7 +261,7 @@ impl CheckpointStore {
                     conversation_id: record.conversation_id.clone(),
                     session_id: record.session_id.clone(),
                 },
-                outbound: messages[accepted..].to_vec(),
+                outbound: outbound_after_accepted(messages, accepted),
                 rebound,
                 prior_ledger: record.tool_ledger.clone(),
             };
@@ -714,12 +716,33 @@ fn valid_identity(value: &str, max: usize) -> bool {
 fn message_digests(messages: &[CheckpointMessage]) -> Result<Vec<String>, CheckpointError> {
     messages
         .iter()
+        .filter(|message| !message.empty_recovery_synthetic)
         .map(|message| {
             serde_json::to_vec(message)
                 .map(|bytes| digest(MESSAGE_DOMAIN, &bytes))
                 .map_err(|error| CheckpointError::Persistence(error.to_string()))
         })
         .collect()
+}
+
+fn outbound_after_accepted(
+    messages: &[CheckpointMessage],
+    accepted_durable_count: usize,
+) -> Vec<CheckpointMessage> {
+    if accepted_durable_count == 0 {
+        return messages.to_vec();
+    }
+    let mut durable_seen = 0;
+    for (index, message) in messages.iter().enumerate() {
+        if message.empty_recovery_synthetic {
+            continue;
+        }
+        durable_seen += 1;
+        if durable_seen == accepted_durable_count {
+            return messages[index + 1..].to_vec();
+        }
+    }
+    Vec::new()
 }
 
 fn hash_chain(digests: &[String]) -> Vec<String> {
@@ -774,11 +797,18 @@ mod tests {
         CheckpointMessage {
             role: role.to_owned(),
             content: Value::String(text.to_owned()),
+            empty_recovery_synthetic: false,
             name: String::new(),
             tool_call_id: String::new(),
             tool_calls: Vec::new(),
             tool_result_is_error: false,
         }
+    }
+
+    fn synthetic_message(role: &str, text: &str) -> CheckpointMessage {
+        let mut message = message(role, text);
+        message.empty_recovery_synthetic = true;
+        message
     }
 
     #[test]
@@ -868,6 +898,81 @@ mod tests {
             "The tool check completed successfully.",
             &turn.prior_ledger
         ));
+    }
+
+    #[test]
+    fn synthetic_recovery_scaffolding_is_not_durable_checkpoint_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let tool_call = CheckpointMessage {
+            role: "assistant".to_owned(),
+            content: Value::Null,
+            empty_recovery_synthetic: false,
+            name: String::new(),
+            tool_call_id: String::new(),
+            tool_calls: vec![serde_json::json!({
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "inspect", "arguments": "{}"}
+            })],
+            tool_result_is_error: false,
+        };
+        let tool_result = CheckpointMessage {
+            role: "tool".to_owned(),
+            content: Value::String("ok".to_owned()),
+            empty_recovery_synthetic: false,
+            name: String::new(),
+            tool_call_id: "call-1".to_owned(),
+            tool_calls: Vec::new(),
+            tool_result_is_error: false,
+        };
+        let recovery = vec![
+            message("user", "inspect"),
+            tool_call.clone(),
+            tool_result.clone(),
+            synthetic_message("assistant", "(empty)"),
+            synthetic_message(
+                "user",
+                "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.",
+            ),
+        ];
+        let turn = store
+            .begin_full("hermes", "owner", "session", &recovery, false)
+            .unwrap();
+        assert_eq!(turn.outbound.len(), recovery.len());
+        assert!(turn.outbound[3].empty_recovery_synthetic);
+        assert!(turn.outbound[4].empty_recovery_synthetic);
+        turn.accept(
+            Binding {
+                conversation_id: "conversation".to_owned(),
+                session_id: "upstream-session".to_owned(),
+            },
+            &[message("assistant", "answer")],
+        )
+        .unwrap();
+        drop(store);
+
+        let reopened = CheckpointStore::open(&path).unwrap();
+        let normal_continuation = vec![
+            message("user", "inspect"),
+            tool_call,
+            tool_result,
+            message("assistant", "answer"),
+            message("user", "continue"),
+        ];
+        let turn = reopened
+            .begin_full("hermes", "owner", "session", &normal_continuation, false)
+            .unwrap();
+
+        assert!(
+            !turn.rebound,
+            "recovery scaffolding must not force a new checkpoint"
+        );
+        assert_eq!(turn.binding.conversation_id, "conversation");
+        assert_eq!(turn.outbound.len(), 1);
+        assert_eq!(turn.outbound[0].role, "user");
+        assert_eq!(turn.outbound[0].content, "continue");
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub(crate) enum UpstreamResult {
     Timeout,
     MissingIdentity,
     EmptyPrompt,
+    EmptyResponse,
     RateLimited429,
     ServiceUnavailable503,
     AttachmentError,
@@ -194,6 +195,7 @@ telemetry_names!(UpstreamResult, {
     UpstreamResult::Timeout => "timeout",
     UpstreamResult::MissingIdentity => "missing_identity",
     UpstreamResult::EmptyPrompt => "empty_prompt",
+    UpstreamResult::EmptyResponse => "empty_response",
     UpstreamResult::RateLimited429 => "rate_limited_429",
     UpstreamResult::ServiceUnavailable503 => "service_unavailable_503",
     UpstreamResult::AttachmentError => "attachment_error",
@@ -570,6 +572,7 @@ impl Record {
                     | "timeout"
                     | "missing_identity"
                     | "empty_prompt"
+                    | "empty_response"
                     | "rate_limited_429"
                     | "service_unavailable_503"
                     | "attachment_error"

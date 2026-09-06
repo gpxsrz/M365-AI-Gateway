@@ -140,7 +140,7 @@ pub(crate) fn validate_tool_conversation_with_prior(
                     return Err(format!("unexpected tool result: {}", message.tool_call_id));
                 }
             }
-            "user" => pending.clear(),
+            "user" if message.is_execution_user_boundary() => pending.clear(),
             _ => {}
         }
     }
@@ -155,7 +155,10 @@ pub(crate) fn build(messages: &[OpenAiMessage]) -> AgentLedger {
 }
 
 pub(crate) fn execution_ledger(prior: &AgentLedger, messages: &[OpenAiMessage]) -> AgentLedger {
-    let Some(last_user) = messages.iter().rposition(|message| message.role == "user") else {
+    let Some(last_user) = messages
+        .iter()
+        .rposition(OpenAiMessage::is_execution_user_boundary)
+    else {
         return build_with_prior(messages, prior.clone());
     };
 
@@ -265,7 +268,9 @@ pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -
 }
 
 pub(crate) fn active_messages(messages: &[OpenAiMessage]) -> &[OpenAiMessage] {
-    let last_user = messages.iter().rposition(|message| message.role == "user");
+    let last_user = messages
+        .iter()
+        .rposition(OpenAiMessage::is_execution_user_boundary);
     last_user.map_or(messages, |index| &messages[index..])
 }
 
@@ -579,6 +584,36 @@ mod tests {
 
         assert_eq!(calls.len(), 1);
         assert!(!suppressed);
+    }
+
+    #[test]
+    fn synthetic_empty_recovery_user_keeps_completed_tool_evidence() {
+        let mut synthetic_empty = OpenAiMessage::text("assistant", "(empty)");
+        synthetic_empty.empty_recovery_synthetic = true;
+        let mut synthetic_recovery = OpenAiMessage::text(
+            "user",
+            "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.",
+        );
+        synthetic_recovery.empty_recovery_synthetic = true;
+        let messages = vec![
+            OpenAiMessage::text("user", "Inspect the current state."),
+            call("c1", "terminal", r#"{"command":"inspect"}"#),
+            result("c1", r#"{"output":"ok","exit_code":0,"error":null}"#),
+            synthetic_empty,
+            synthetic_recovery,
+        ];
+
+        let ledger = execution_ledger(&AgentLedger::default(), &messages);
+
+        assert_eq!(
+            ledger.completed.len(),
+            1,
+            "synthetic recovery must preserve completed evidence"
+        );
+        assert!(completion_evidence_allows(
+            "Inspection completed successfully.",
+            &ledger
+        ));
     }
 
     #[test]

@@ -2154,6 +2154,7 @@ mod tests {
         let message = crate::checkpoint::CheckpointMessage {
             role: "user".to_owned(),
             content: Value::String("private conversation".to_owned()),
+            empty_recovery_synthetic: false,
             name: String::new(),
             tool_call_id: String::new(),
             tool_calls: Vec::new(),
