@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
 
-use crate::{error::openai_error, private_file, web::Gateway};
+use crate::{
+    agent_ledger::{CompletionPolicyDisposition, CompletionPolicyReason},
+    error::openai_error,
+    private_file,
+    web::Gateway,
+};
 
 const MAX_RECORDS: usize = 1_000;
 const COMPACT_EVERY: usize = 100;
@@ -119,6 +124,14 @@ pub(crate) enum UpstreamResult {
     JsonDecode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CallerDelivery {
+    NotEvaluated,
+    Sent,
+    Failed,
+    Cancelled,
+}
+
 macro_rules! telemetry_names {
     ($type:ty, {$($variant:path => $name:literal),+ $(,)?}) => {
         impl $type {
@@ -205,6 +218,12 @@ telemetry_names!(UpstreamResult, {
     UpstreamResult::ContextLength => "context_length",
     UpstreamResult::JsonDecode => "json_decode",
 });
+telemetry_names!(CallerDelivery, {
+    CallerDelivery::NotEvaluated => "not_evaluated",
+    CallerDelivery::Sent => "sent",
+    CallerDelivery::Failed => "failed",
+    CallerDelivery::Cancelled => "cancelled",
+});
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -233,6 +252,14 @@ struct Record {
     provenance_class: String,
     upstream_attempt_class: String,
     upstream_result_class: String,
+    #[serde(default = "default_not_evaluated")]
+    post_policy_disposition: String,
+    #[serde(default = "default_not_evaluated")]
+    post_policy_reason: String,
+    #[serde(default = "default_not_evaluated")]
+    caller_delivery: String,
+    #[serde(default)]
+    tool_call_suppressed: bool,
     request_id: String,
     error_code: String,
     input_tokens: usize,
@@ -243,6 +270,10 @@ struct Record {
     event_count: usize,
     snapshot_available: bool,
     snapshot_expires_at: Option<String>,
+}
+
+fn default_not_evaluated() -> String {
+    "not_evaluated".to_owned()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -460,6 +491,10 @@ impl Record {
             provenance_class: ProvenanceClass::None.as_str().to_owned(),
             upstream_attempt_class: UpstreamAttempt::None.as_str().to_owned(),
             upstream_result_class: UpstreamResult::NotAttempted.as_str().to_owned(),
+            post_policy_disposition: "not_evaluated".to_owned(),
+            post_policy_reason: "not_evaluated".to_owned(),
+            caller_delivery: CallerDelivery::NotEvaluated.as_str().to_owned(),
+            tool_call_suppressed: false,
             request_id: String::new(),
             error_code: String::new(),
             input_tokens: 0,
@@ -581,6 +616,31 @@ impl Record {
                     | "protocol_error"
                     | "context_length"
                     | "json_decode"
+            )
+            && matches!(
+                self.post_policy_disposition.as_str(),
+                "not_evaluated" | "not_applicable" | "allowed" | "rewritten" | "suppressed"
+            )
+            && matches!(
+                self.post_policy_reason.as_str(),
+                "not_evaluated"
+                    | "policy_disabled"
+                    | "tool_calls"
+                    | "no_external_claim"
+                    | "matching_evidence"
+                    | "pending_evidence"
+                    | "missing_evidence"
+                    | "no_matching_operation"
+                    | "ambiguous_claim"
+                    | "ambiguous_evidence"
+                    | "failed_or_unknown_evidence"
+                    | "missing_target_binding"
+                    | "target_mismatch"
+                    | "completed_call_suppressed"
+            )
+            && matches!(
+                self.caller_delivery.as_str(),
+                "not_evaluated" | "sent" | "failed" | "cancelled"
             )
             && valid_spill_relation(
                 &self.route,
@@ -745,6 +805,25 @@ impl Trace {
         self.update(|record| record.upstream_result_class = class.as_str().to_owned());
     }
 
+    pub(crate) fn post_policy(
+        &self,
+        disposition: CompletionPolicyDisposition,
+        reason: CompletionPolicyReason,
+    ) {
+        self.update(|record| {
+            record.post_policy_disposition = disposition.as_str().to_owned();
+            record.post_policy_reason = reason.as_str().to_owned();
+        });
+    }
+
+    pub(crate) fn caller_delivery(&self, delivery: CallerDelivery) {
+        self.update(|record| record.caller_delivery = delivery.as_str().to_owned());
+    }
+
+    pub(crate) fn tool_call_suppressed(&self) {
+        self.update(|record| record.tool_call_suppressed = true);
+    }
+
     pub(crate) fn http_status(&self, status: StatusCode) {
         self.update(|record| {
             record.status = status.as_u16();
@@ -855,6 +934,10 @@ pub(crate) async fn detail(
         "provenanceClass": record.provenance_class,
         "upstreamAttemptClass": record.upstream_attempt_class,
         "upstreamResultClass": record.upstream_result_class,
+        "postPolicyDisposition": record.post_policy_disposition,
+        "postPolicyReason": record.post_policy_reason,
+        "callerDelivery": record.caller_delivery,
+        "toolCallSuppressed": record.tool_call_suppressed,
         "requestId": record.request_id,
         "errorCode": record.error_code,
         "inputTokens": record.input_tokens,

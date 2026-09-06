@@ -25,8 +25,8 @@ use crate::{
     chathub::{Account, Attachment, ChatError, ChatRequest, ChatResult, StreamEvent, Tool},
     checkpoint::{Binding, CheckpointMessage, CheckpointTurn},
     debug::{
-        AdmissionResult, BreakerProjection, ProvenanceClass, SpillDecision, SpillReason,
-        UpstreamAttempt, UpstreamResult,
+        AdmissionResult, BreakerProjection, CallerDelivery, ProvenanceClass, SpillDecision,
+        SpillReason, UpstreamAttempt, UpstreamResult,
     },
     error::openai_error,
     tool_calls::{ToolProjection, project as project_tool_calls},
@@ -327,7 +327,16 @@ async fn execute_chat_request_inner(
     mut body: ChatCompletionRequest,
     trace: crate::debug::Trace,
 ) -> Response {
+    trace.caller_delivery(CallerDelivery::Failed);
     normalize_legacy_tools(&mut body);
+    if let Err(message) = validate_message_roles(&body.messages) {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_message_role",
+            message,
+        );
+    }
     clear_untracked_transport_identity(&path, &mut body);
     scope_execution_control_provenance(&path, &mut body, &gateway.hermes_recall_provenance_secret);
     let class = request_class(&path, &body);
@@ -462,7 +471,7 @@ async fn execute_chat_request_inner(
         .as_ref()
         .map(|turn| turn.prior_ledger.clone())
         .unwrap_or_default();
-    let prompt_messages = checkpoint
+    let mut prompt_messages = checkpoint
         .as_ref()
         .map(|turn| {
             turn.outbound
@@ -472,6 +481,7 @@ async fn execute_chat_request_inner(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| body.messages.clone());
+    normalize_internal_message_roles(&mut prompt_messages);
     if let Err(message) =
         crate::agent_ledger::validate_tool_conversation_with_prior(&prompt_messages, &prior_ledger)
     {
@@ -862,6 +872,7 @@ async fn complete_chat(
     overflow_context: Option<OverflowContext>,
     trace: crate::debug::Trace,
 ) -> Response {
+    trace.caller_delivery(CallerDelivery::Failed);
     let input_units = utf16_units(&request.text);
     let tools = request.tools.clone();
     let tool_choice = request.tool_choice.clone();
@@ -903,7 +914,12 @@ async fn complete_chat(
                     );
                 }
                 Err(QualificationError::Chat(error)) => {
-                    return chat_error_with_overflow(error, permit, overflow_context.as_ref());
+                    return chat_error_with_overflow(
+                        &trace,
+                        error,
+                        permit,
+                        overflow_context.as_ref(),
+                    );
                 }
                 Err(QualificationError::Timeout) => {
                     trace.upstream_result(UpstreamResult::Timeout);
@@ -952,6 +968,7 @@ async fn complete_chat(
                 );
             }
             if policy.completed_call_suppressed {
+                trace.tool_call_suppressed();
                 let answer_request =
                     completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
                 let answer_attempt_count = reset_upstream_attempts(&answer_request);
@@ -977,7 +994,12 @@ async fn complete_chat(
                             &answer_attempt_count,
                             UpstreamAttempt::Followup,
                         );
-                        return chat_error_with_overflow(error, permit, overflow_context.as_ref());
+                        return chat_error_with_overflow(
+                            &trace,
+                            error,
+                            permit,
+                            overflow_context.as_ref(),
+                        );
                     }
                     Err(_) => {
                         observe_timeout(&trace, &answer_attempt_count, UpstreamAttempt::Followup);
@@ -1013,7 +1035,12 @@ async fn complete_chat(
                         );
                     }
                     Err(QualificationError::Chat(error)) => {
-                        return chat_error_with_overflow(error, permit, overflow_context.as_ref());
+                        return chat_error_with_overflow(
+                            &trace,
+                            error,
+                            permit,
+                            overflow_context.as_ref(),
+                        );
                     }
                     Err(QualificationError::Timeout) => {
                         trace.upstream_result(UpstreamResult::Timeout);
@@ -1042,6 +1069,7 @@ async fn complete_chat(
                     apply_agent_evidence_policy,
                 );
             }
+            trace.post_policy(policy.decision.disposition, policy.decision.reason);
             let projection = policy.projection;
             if let Err(message) =
                 validate_final_projection_format(&projection, response_format.as_ref())
@@ -1076,6 +1104,7 @@ async fn complete_chat(
                 )
             {
                 permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
+                trace.caller_delivery(CallerDelivery::Failed);
                 return openai_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "checkpoint_error",
@@ -1083,6 +1112,7 @@ async fn complete_chat(
                     &error,
                 );
             }
+            trace.caller_delivery(CallerDelivery::Sent);
             permit.finish(StatusCode::OK, None);
             let output_units = utf16_units(&projection.content);
             let finish_reason = if projection.calls.is_empty() {
@@ -1124,7 +1154,7 @@ async fn complete_chat(
                 &upstream_attempt_count,
                 UpstreamAttempt::Initial,
             );
-            chat_error_with_overflow(error, permit, overflow_context.as_ref())
+            chat_error_with_overflow(&trace, error, permit, overflow_context.as_ref())
         }
         Err(_) => {
             observe_timeout(&trace, &upstream_attempt_count, UpstreamAttempt::Initial);
@@ -1173,17 +1203,17 @@ async fn stream_chat(
         let fallback_account = account.clone();
         let fallback_request = request.clone();
         let upstream_attempt_count = reset_upstream_attempts(&request);
-        let buffer_for_tools = !tools.is_empty()
+        let buffer_for_tools = checkpoint.is_some()
+            || !tools.is_empty()
             || response_format.is_some()
-            || (apply_agent_evidence_policy
-                && (!agent_ledger.pending.is_empty()
-                    || agent_ledger.has_failed_completed_evidence()));
+            || apply_agent_evidence_policy;
         let mut first = true;
         let stream_id = id.clone();
         let stream_model = model_id.clone();
         let stream_sender = sender.clone();
         let mut visible_text = String::new();
         let mut artifact_stream_buffer = String::new();
+        let mut final_frames_sent = false;
         let mut sink = |event: StreamEvent| {
             if buffer_for_tools || event.kind != "text" || event.text.is_empty() {
                 return Ok(());
@@ -1217,6 +1247,7 @@ async fn stream_chat(
         let result = tokio::select! {
             biased;
             _ = sender.closed() => {
+                trace.caller_delivery(CallerDelivery::Cancelled);
                 permit.finish(StatusCode::REQUEST_TIMEOUT, None);
                 return;
             }
@@ -1243,20 +1274,36 @@ async fn stream_chat(
                     Err(QualificationError::Format(message)) => {
                         trace.upstream_result(UpstreamResult::ResponseFormatInvalid);
                         permit.finish(StatusCode::BAD_GATEWAY, None);
-                        send_sse_error(&sender, "response_format_validation_failed", &message);
-                        let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                        send_sse_error(
+                            &trace,
+                            &sender,
+                            "response_format_validation_failed",
+                            &message,
+                        );
+                        let _ = send_sse_done(&trace, &sender);
                         return;
                     }
                     Err(QualificationError::Chat(error)) => {
-                        send_stream_chat_error(&sender, error, permit, overflow_context.as_ref());
-                        let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                        send_stream_chat_error(
+                            &trace,
+                            &sender,
+                            error,
+                            permit,
+                            overflow_context.as_ref(),
+                        );
+                        let _ = send_sse_done(&trace, &sender);
                         return;
                     }
                     Err(QualificationError::Timeout) => {
                         trace.upstream_result(UpstreamResult::Timeout);
                         permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
-                        send_sse_error(&sender, "upstream_timeout", "ChatHub request timed out");
-                        let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                        send_sse_error(
+                            &trace,
+                            &sender,
+                            "upstream_timeout",
+                            "ChatHub request timed out",
+                        );
+                        let _ = send_sse_done(&trace, &sender);
                         return;
                     }
                 };
@@ -1265,22 +1312,24 @@ async fn stream_chat(
                 {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
+                        &trace,
                         &sender,
                         "artifact_materialization_failed",
                         &error.to_string(),
                     );
-                    let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
                 if result.text.trim().is_empty() {
                     trace.upstream_result(UpstreamResult::EmptyResponse);
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
+                        &trace,
                         &sender,
                         "upstream_empty_response",
                         "ChatHub returned an empty response",
                     );
-                    let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
                 let mut policy = apply_agent_policy(
@@ -1291,14 +1340,16 @@ async fn stream_chat(
                 if policy.projection.overflowed {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
+                        &trace,
                         &sender,
                         "invalid_tool_call",
                         "model returned more tool calls than the safe request limit",
                     );
-                    let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
                 if policy.completed_call_suppressed {
+                    trace.tool_call_suppressed();
                     let answer_request =
                         completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
                     let answer_attempt_count = reset_upstream_attempts(&answer_request);
@@ -1331,12 +1382,13 @@ async fn stream_chat(
                                 UpstreamAttempt::Followup,
                             );
                             send_stream_chat_error(
+                                &trace,
                                 &sender,
                                 error,
                                 permit,
                                 overflow_context.as_ref(),
                             );
-                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            let _ = send_sse_done(&trace, &sender);
                             return;
                         }
                         Err(_) => {
@@ -1347,11 +1399,12 @@ async fn stream_chat(
                             );
                             permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                             send_sse_error(
+                                &trace,
                                 &sender,
                                 "upstream_timeout",
                                 "ChatHub final-answer fallback timed out",
                             );
-                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            let _ = send_sse_done(&trace, &sender);
                             return;
                         }
                     };
@@ -1370,29 +1423,36 @@ async fn stream_chat(
                         Err(QualificationError::Format(message)) => {
                             trace.upstream_result(UpstreamResult::ResponseFormatInvalid);
                             permit.finish(StatusCode::BAD_GATEWAY, None);
-                            send_sse_error(&sender, "response_format_validation_failed", &message);
-                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            send_sse_error(
+                                &trace,
+                                &sender,
+                                "response_format_validation_failed",
+                                &message,
+                            );
+                            let _ = send_sse_done(&trace, &sender);
                             return;
                         }
                         Err(QualificationError::Chat(error)) => {
                             send_stream_chat_error(
+                                &trace,
                                 &sender,
                                 error,
                                 permit,
                                 overflow_context.as_ref(),
                             );
-                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            let _ = send_sse_done(&trace, &sender);
                             return;
                         }
                         Err(QualificationError::Timeout) => {
                             trace.upstream_result(UpstreamResult::Timeout);
                             permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
                             send_sse_error(
+                                &trace,
                                 &sender,
                                 "upstream_timeout",
                                 "ChatHub final-answer qualification timed out",
                             );
-                            let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                            let _ = send_sse_done(&trace, &sender);
                             return;
                         }
                     };
@@ -1400,11 +1460,12 @@ async fn stream_chat(
                         trace.upstream_result(UpstreamResult::EmptyResponse);
                         permit.finish(StatusCode::BAD_GATEWAY, None);
                         send_sse_error(
+                            &trace,
                             &sender,
                             "upstream_empty_response",
                             "ChatHub final-answer fallback returned an empty response",
                         );
-                        let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                        let _ = send_sse_done(&trace, &sender);
                         return;
                     }
                     policy = apply_agent_policy(
@@ -1413,23 +1474,30 @@ async fn stream_chat(
                         apply_agent_evidence_policy,
                     );
                 }
+                trace.post_policy(policy.decision.disposition, policy.decision.reason);
                 let projection = policy.projection;
                 if let Err(message) =
                     validate_final_projection_format(&projection, response_format.as_ref())
                 {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
-                    send_sse_error(&sender, "response_format_validation_failed", &message);
-                    let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                    send_sse_error(
+                        &trace,
+                        &sender,
+                        "response_format_validation_failed",
+                        &message,
+                    );
+                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
                 if !buffer_for_tools && !result.text.starts_with(&visible_text) {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
+                        &trace,
                         &sender,
                         "artifact_materialization_failed",
                         "generated artifact stream could not be reconciled",
                     );
-                    let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
                 let artifacts = result
@@ -1444,6 +1512,95 @@ async fn stream_chat(
                         })
                     })
                     .collect::<Vec<_>>();
+                let text_delta = if buffer_for_tools {
+                    projection.content.as_str()
+                } else {
+                    result.text.strip_prefix(&visible_text).unwrap_or_default()
+                };
+                let mut final_frames = Vec::new();
+                if !text_delta.is_empty() {
+                    let mut delta = json!({"content": text_delta});
+                    if buffer_for_tools || visible_text.is_empty() {
+                        delta["role"] = Value::String("assistant".to_owned());
+                    }
+                    final_frames.push(stream_value(
+                        json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+                        }),
+                        include_usage,
+                    ));
+                }
+                if !projection.calls.is_empty() {
+                    final_frames.push(stream_value(
+                        json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "tool_calls": projection.calls},
+                                "finish_reason": null
+                            }]
+                        }),
+                        include_usage,
+                    ));
+                }
+                let finish_reason = if projection.calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                };
+                final_frames.push(stream_value(
+                    json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                        "m365": {
+                            "conversationId": result.conversation_id,
+                            "sessionId": result.session_id,
+                            "requestId": result.request_id,
+                            "textRelation": result.text_relation,
+                            "textSource": result.text_source,
+                            "upstreamTone": resolved_tone,
+                            "route": route_metadata,
+                            "artifacts": artifacts,
+                        }
+                    }),
+                    include_usage,
+                ));
+                if include_usage {
+                    let output_units = utf16_units(&projection.content)
+                        + projection
+                            .calls
+                            .iter()
+                            .map(|call| utf16_units(&call.function.to_string()))
+                            .sum::<usize>();
+                    final_frames.push(json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [],
+                        "usage": usage(input_units, output_units),
+                        "m365": {
+                            "usage_source": "utf16_estimate",
+                            "usage_values_are_estimates": true,
+                            "usage_estimate_scope": "visible_request_and_completion",
+                        }
+                    }));
+                }
+                if checkpoint.is_some() && sender.is_closed() {
+                    permit.finish(StatusCode::REQUEST_TIMEOUT, None);
+                    trace.caller_delivery(CallerDelivery::Cancelled);
+                    return;
+                }
                 if let Some(turn) = checkpoint
                     && let Err(error) = accept_checkpoint(
                         turn,
@@ -1454,106 +1611,21 @@ async fn stream_chat(
                     )
                 {
                     permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
-                    send_sse_error(&sender, "checkpoint_error", &error);
-                    let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+                    send_sse_error(&trace, &sender, "checkpoint_error", &error);
+                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
-                let text_delta = if buffer_for_tools {
-                    projection.content.as_str()
-                } else {
-                    result.text.strip_prefix(&visible_text).unwrap_or_default()
-                };
-                if !text_delta.is_empty() {
-                    let mut delta = json!({"content": text_delta});
-                    if buffer_for_tools || visible_text.is_empty() {
-                        delta["role"] = Value::String("assistant".to_owned());
-                    }
-                    send_sse(
-                        &sender,
-                        stream_value(
-                            json!({
-                                "id": id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_id,
-                                "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
-                            }),
-                            include_usage,
-                        ),
-                    );
-                }
-                if !projection.calls.is_empty() {
-                    send_sse(
-                        &sender,
-                        stream_value(
-                            json!({
-                                "id": id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_id,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"role": "assistant", "tool_calls": projection.calls},
-                                    "finish_reason": null
-                                }]
-                            }),
-                            include_usage,
-                        ),
-                    );
-                }
-                permit.finish(StatusCode::OK, None);
-                let finish_reason = if projection.calls.is_empty() {
-                    "stop"
-                } else {
-                    "tool_calls"
-                };
-                send_sse(
-                    &sender,
-                    stream_value(
-                        json!({
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                            "m365": {
-                                "conversationId": result.conversation_id,
-                                "sessionId": result.session_id,
-                                "requestId": result.request_id,
-                                "textRelation": result.text_relation,
-                                "textSource": result.text_source,
-                                "upstreamTone": resolved_tone,
-                                "route": route_metadata,
-                                "artifacts": artifacts,
-                            }
-                        }),
-                        include_usage,
-                    ),
+                final_frames_sent = final_frames
+                    .into_iter()
+                    .all(|frame| send_sse(&sender, frame));
+                permit.finish(
+                    if final_frames_sent {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::REQUEST_TIMEOUT
+                    },
+                    None,
                 );
-                if include_usage {
-                    let output_units = utf16_units(&projection.content)
-                        + projection
-                            .calls
-                            .iter()
-                            .map(|call| utf16_units(&call.function.to_string()))
-                            .sum::<usize>();
-                    send_sse(
-                        &sender,
-                        json!({
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id,
-                            "choices": [],
-                            "usage": usage(input_units, output_units),
-                            "m365": {
-                                "usage_source": "utf16_estimate",
-                                "usage_values_are_estimates": true,
-                                "usage_estimate_scope": "visible_request_and_completion",
-                            }
-                        }),
-                    );
-                }
             }
             Ok(Err(error)) => {
                 observe_error(
@@ -1562,15 +1634,30 @@ async fn stream_chat(
                     &upstream_attempt_count,
                     UpstreamAttempt::Initial,
                 );
-                send_stream_chat_error(&sender, error, permit, overflow_context.as_ref());
+                send_stream_chat_error(&trace, &sender, error, permit, overflow_context.as_ref());
             }
             Err(_) => {
                 observe_timeout(&trace, &upstream_attempt_count, UpstreamAttempt::Initial);
                 permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
-                send_sse_error(&sender, "upstream_timeout", "ChatHub request timed out");
+                send_sse_error(
+                    &trace,
+                    &sender,
+                    "upstream_timeout",
+                    "ChatHub request timed out",
+                );
             }
         }
-        let _ = sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+        let done_sent = sender
+            .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+            .is_ok();
+        let delivery = if sender.is_closed() {
+            CallerDelivery::Cancelled
+        } else if final_frames_sent && done_sent {
+            CallerDelivery::Sent
+        } else {
+            CallerDelivery::Failed
+        };
+        trace.caller_delivery(delivery);
     });
 
     let stream = stream::unfold(receiver, |mut receiver| async move {
@@ -1708,10 +1795,12 @@ fn classify_chat_failure<'a>(
 }
 
 fn chat_error_with_overflow(
+    trace: &crate::debug::Trace,
     error: ChatError,
     permit: crate::traffic::Permit,
     overflow_context: Option<&OverflowContext>,
 ) -> Response {
+    trace.caller_delivery(CallerDelivery::Failed);
     match classify_chat_failure(&error, overflow_context) {
         ChatFailureClass::RateLimited { retry_after, soft } => {
             if soft {
@@ -1753,11 +1842,13 @@ fn chat_error_with_overflow(
 }
 
 fn send_stream_chat_error(
+    trace: &crate::debug::Trace,
     sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
     error: ChatError,
     permit: crate::traffic::Permit,
     overflow_context: Option<&OverflowContext>,
 ) {
+    trace.caller_delivery(CallerDelivery::Failed);
     match classify_chat_failure(&error, overflow_context) {
         ChatFailureClass::RateLimited { retry_after, soft } => {
             if soft {
@@ -1765,11 +1856,11 @@ fn send_stream_chat_error(
             } else {
                 permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
             }
-            send_sse_error(sender, "rate_limit_error", "ChatHub rate limited");
+            send_sse_error(trace, sender, "rate_limit_error", "ChatHub rate limited");
         }
         ChatFailureClass::AutoSpillOverflow => {
             permit.finish(StatusCode::BAD_REQUEST, None);
-            send_sse(
+            let sent = send_sse(
                 sender,
                 text_overflow_value(
                     overflow_context.expect("auto-spill attachment failure has overflow context"),
@@ -1777,10 +1868,11 @@ fn send_stream_chat_error(
                     "輸入文字超過目前上限，且自動文件轉移無法完成",
                 ),
             );
+            trace.caller_delivery(stream_error_delivery(sender, sent));
         }
         ChatFailureClass::Upstream => {
             permit.finish(StatusCode::BAD_GATEWAY, None);
-            send_sse_error(sender, "upstream_error", &error.to_string());
+            send_sse_error(trace, sender, "upstream_error", &error.to_string());
         }
     }
 }
@@ -1862,6 +1954,7 @@ fn assistant_message(projection: &ToolProjection) -> Value {
 struct AgentPolicyOutcome {
     projection: ToolProjection,
     completed_call_suppressed: bool,
+    decision: crate::agent_ledger::CompletionPolicyDecision,
 }
 
 fn apply_agent_policy(
@@ -1873,25 +1966,50 @@ fn apply_agent_policy(
         return AgentPolicyOutcome {
             projection,
             completed_call_suppressed: false,
+            decision: crate::agent_ledger::CompletionPolicyDecision {
+                allowed: true,
+                disposition: crate::agent_ledger::CompletionPolicyDisposition::NotApplicable,
+                reason: crate::agent_ledger::CompletionPolicyReason::PolicyDisabled,
+            },
         };
     }
     let (calls, suppressed) = ledger.filter_known_calls(projection.calls);
     projection.calls = calls;
     let mut completed_call_suppressed = false;
+    let mut decision = if projection.calls.is_empty() {
+        crate::agent_ledger::completion_evidence_decision(&projection.content, ledger)
+    } else {
+        crate::agent_ledger::CompletionPolicyDecision {
+            allowed: true,
+            disposition: crate::agent_ledger::CompletionPolicyDisposition::Allowed,
+            reason: crate::agent_ledger::CompletionPolicyReason::ToolCalls,
+        }
+    };
     if projection.calls.is_empty() {
-        if !crate::agent_ledger::completion_evidence_allows(&projection.content, ledger) {
+        if !decision.allowed {
             projection.content = crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME.to_owned();
         } else if suppressed && projection.content.trim().is_empty() {
             if ledger.pending.is_empty() {
                 completed_call_suppressed = true;
+                decision = crate::agent_ledger::CompletionPolicyDecision {
+                    allowed: true,
+                    disposition: crate::agent_ledger::CompletionPolicyDisposition::Suppressed,
+                    reason: crate::agent_ledger::CompletionPolicyReason::CompletedCallSuppressed,
+                };
             } else {
                 projection.content = crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME.to_owned();
+                decision = crate::agent_ledger::CompletionPolicyDecision {
+                    allowed: false,
+                    disposition: crate::agent_ledger::CompletionPolicyDisposition::Rewritten,
+                    reason: crate::agent_ledger::CompletionPolicyReason::PendingEvidence,
+                };
             }
         }
     }
     AgentPolicyOutcome {
         projection,
         completed_call_suppressed,
+        decision,
     }
 }
 
@@ -2960,6 +3078,31 @@ impl OpenAiMessage {
 
     pub(crate) fn is_execution_user_boundary(&self) -> bool {
         self.role == "user" && !self.empty_recovery_synthetic
+    }
+}
+
+fn validate_message_roles(messages: &[OpenAiMessage]) -> Result<(), &'static str> {
+    if messages.iter().all(|message| {
+        matches!(
+            message.role.as_str(),
+            "system" | "developer" | "user" | "assistant" | "tool"
+        )
+    }) {
+        Ok(())
+    } else {
+        Err("message role must be one of the canonical lowercase roles")
+    }
+}
+
+fn normalize_internal_message_roles(messages: &mut [OpenAiMessage]) {
+    for message in messages {
+        let role = message.role.trim().to_ascii_lowercase();
+        if matches!(
+            role.as_str(),
+            "system" | "developer" | "user" | "assistant" | "tool"
+        ) {
+            message.role = role;
+        }
     }
 }
 
@@ -4086,19 +4229,52 @@ fn random_id() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn send_sse(sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>, value: Value) {
-    let _ = sender.send(Ok(Bytes::from(format!("data: {value}\n\n"))));
+fn send_sse(
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+    value: Value,
+) -> bool {
+    sender
+        .send(Ok(Bytes::from(format!("data: {value}\n\n"))))
+        .is_ok()
 }
 
 fn send_sse_error(
+    trace: &crate::debug::Trace,
     sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
     code: &str,
     message: &str,
 ) {
-    send_sse(
+    let sent = send_sse(
         sender,
         json!({"error": {"message": message, "type": "upstream_error", "code": code}}),
     );
+    trace.caller_delivery(stream_error_delivery(sender, sent));
+}
+
+fn stream_error_delivery(
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+    sent: bool,
+) -> CallerDelivery {
+    if sent {
+        CallerDelivery::Failed
+    } else if sender.is_closed() {
+        CallerDelivery::Cancelled
+    } else {
+        CallerDelivery::Failed
+    }
+}
+
+fn send_sse_done(
+    trace: &crate::debug::Trace,
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+) -> bool {
+    let sent = sender
+        .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+        .is_ok();
+    if !sent {
+        trace.caller_delivery(CallerDelivery::Cancelled);
+    }
+    sent
 }
 
 #[cfg(test)]
@@ -4674,6 +4850,40 @@ mod tests {
                     text,
                     conversation_id: "conversation-1".to_owned(),
                     session_id: "session-1".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
+    struct ConversationSequenceTransport(AtomicUsize);
+
+    impl ChatHubTransport for ConversationSequenceTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            sink: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                let attempt = self.0.fetch_add(1, Ordering::AcqRel);
+                let (text, conversation_id) = if attempt == 0 {
+                    ("first answer", "conversation-a")
+                } else {
+                    sink.send(StreamEvent {
+                        kind: "text".to_owned(),
+                        text: "second answer".to_owned(),
+                        message_type: String::new(),
+                        content_type: String::new(),
+                        tool_name: String::new(),
+                        arguments: Value::Null,
+                    })?;
+                    ("second answer", "conversation-b")
+                };
+                Ok(ChatResult {
+                    text: text.to_owned(),
+                    conversation_id: conversation_id.to_owned(),
+                    session_id: "session-sequence".to_owned(),
                     ..ChatResult::default()
                 })
             })
@@ -6228,6 +6438,7 @@ mod tests {
         let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
         assert_eq!(record["upstreamAttemptClass"], "initial");
         assert_eq!(record["upstreamResultClass"], "success");
+        assert_eq!(record["callerDelivery"], "sent");
         assert_eq!(record["status"], 200);
     }
 
@@ -6272,6 +6483,151 @@ mod tests {
         let record = record.expect("streaming telemetry must be durably recorded");
         assert_eq!(record["upstreamAttemptClass"], "initial");
         assert_eq!(record["upstreamResultClass"], "empty_response");
+        assert_eq!(record["callerDelivery"], "failed");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_hermes_empty_upstream_result_records_failed_delivery() {
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let response = Gateway::router(gateway)
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"empty non-stream contract"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "upstream_empty_response");
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(record["upstreamResultClass"], "empty_response");
+        assert_eq!(record["callerDelivery"], "failed");
+    }
+
+    #[tokio::test]
+    async fn streaming_hermes_policy_denial_is_not_leaked_before_final_projection() {
+        let text = "Deployment completed successfully.";
+        let (app, raw_key) = app_with_chat(Arc::new(StreamTextTransport {
+            events: vec![text.to_owned()],
+            text: text.to_owned(),
+        }));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","stream":true,"messages":[{"role":"user","content":"Report deployment status"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            body.contains(crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME),
+            "body={body}"
+        );
+        assert!(
+            !body.contains(text),
+            "policy-denied upstream text leaked: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_checkpoint_failure_does_not_emit_uncommitted_success_frames() {
+        let (app, raw_key) =
+            app_with_chat(Arc::new(ConversationSequenceTransport(AtomicUsize::new(0))));
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","session_key":"stream-checkpoint-failure","messages":[{"role":"user","content":"first"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_eq!(first["choices"][0]["message"]["content"], "first answer");
+
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","stream":true,"session_key":"stream-checkpoint-failure","messages":[{"role":"user","content":"first"},{"role":"assistant","content":"first answer"},{"role":"user","content":"second"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(second.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("checkpoint_error"), "body={body}");
+        assert!(!body.contains("second answer"), "body={body}");
+        assert!(!body.contains("\"finish_reason\":\"stop\""), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn noncanonical_message_role_is_rejected_before_checkpoint_or_upstream() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let app = Gateway::router(gateway);
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","session_key":"role-boundary","messages":[{"role":" User ","content":"current ask"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "invalid_message_role");
+        assert!(chat.0.lock().unwrap().is_none());
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(record["upstreamResultClass"], "not_attempted");
+        assert_eq!(record["callerDelivery"], "failed");
     }
 
     #[tokio::test]
@@ -6356,6 +6712,7 @@ mod tests {
         let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
         assert_eq!(record["upstreamAttemptClass"], "retried");
         assert_eq!(record["upstreamResultClass"], "json_decode");
+        assert_eq!(record["callerDelivery"], "failed");
     }
 
     #[tokio::test]
@@ -7182,6 +7539,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hermes_completion_policy_composition_matrix_keeps_claims_bound_to_results() {
+        let unconfirmed = "I cannot confirm completion because no matching tool results were returned. No external action has been verified.";
+        let cases: Vec<(Value, &'static str, &'static str)> = vec![
+            (
+                json!([{"role":"user","content":"Explain the word success."}]),
+                "The word success is a noun.",
+                "The word success is a noun.",
+            ),
+            (
+                json!([{"role":"user","content":"Did I deploy anything?"}]),
+                "I have not deployed anything.",
+                "I have not deployed anything.",
+            ),
+            (
+                json!([{"role":"user","content":"回報部署狀態"}]),
+                "已完成部署，服務已啟動。",
+                unconfirmed,
+            ),
+            (
+                json!([
+                    {"role":"user","content":"Report deployment status"},
+                    {"role":"assistant","content":null,"tool_calls":[{
+                        "id":"read-1","type":"function",
+                        "function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
+                    }]},
+                    {"role":"tool","tool_call_id":"read-1","content":"Documentation: error handling and timeout recovery"}
+                ]),
+                "Deployment completed successfully.",
+                unconfirmed,
+            ),
+            (
+                json!([
+                    {"role":"user","content":"Report deployment status"},
+                    {"role":"assistant","content":null,"tool_calls":[{
+                        "id":"read-1","type":"function",
+                        "function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
+                    }]},
+                    {"role":"tool","tool_call_id":"read-1","content":"{\"output\":\"documentation\",\"exit_code\":0}"},
+                    {"role":"assistant","content":null,"tool_calls":[{
+                        "id":"deploy-1","type":"function",
+                        "function":{"name":"terminal","arguments":"{\"command\":\"deploy\"}"}
+                    }]},
+                    {"role":"tool","tool_call_id":"deploy-1","content":"{\"output\":\"failed\",\"exit_code\":1}"}
+                ]),
+                "Deployment completed successfully.",
+                unconfirmed,
+            ),
+            (
+                json!([
+                    {"role":"user","content":"Read the file."},
+                    {"role":"assistant","content":null,"tool_calls":[{
+                        "id":"read-1","type":"function",
+                        "function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
+                    }]},
+                    {"role":"tool","tool_call_id":"read-1","content":"{\"output\":\"documentation\",\"exit_code\":0}"}
+                ]),
+                "Reading completed successfully.",
+                "Reading completed successfully.",
+            ),
+        ];
+
+        for (messages, upstream, expected) in cases {
+            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([upstream])));
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "messages":messages
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "upstream={upstream}");
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["choices"][0]["message"]["content"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_policy_telemetry_separates_upstream_success_from_local_rewrite() {
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(
+            Arc::new(SequenceTransport::new([
+                "The word success is a noun.",
+                "Deployment completed successfully.",
+            ])),
+            oauth(),
+        );
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        for (prompt, expected) in [
+            ("Explain the word success.", "The word success is a noun."),
+            (
+                "Report deployment status",
+                "I cannot confirm completion because no matching tool results were returned. No external action has been verified.",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", &raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "messages":[{"role":"user","content":prompt}]
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["choices"][0]["message"]["content"], expected);
+        }
+
+        let raw = std::fs::read_to_string(telemetry_path).unwrap();
+        let records = raw
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["upstreamResultClass"], "success");
+        assert_eq!(records[0]["postPolicyDisposition"], "allowed");
+        assert_eq!(records[0]["postPolicyReason"], "no_external_claim");
+        assert_eq!(records[0]["callerDelivery"], "sent");
+        assert_eq!(records[1]["upstreamResultClass"], "success");
+        assert_eq!(records[1]["postPolicyDisposition"], "rewritten");
+        assert_eq!(records[1]["postPolicyReason"], "missing_evidence");
+        assert_eq!(records[1]["callerDelivery"], "sent");
+    }
+
+    #[tokio::test]
     async fn memory_json_schema_output_survives_post_qualification_agent_policy() {
         let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
             r#"{"status":"completed"}"#,
@@ -7442,7 +7946,7 @@ mod tests {
                                 {"role":"user","content":"Deploy the service."},
                                 {"role":"assistant","content":null,"tool_calls":[{
                                     "id":"call_1","type":"function",
-                                    "function":{"name":"terminal","arguments":"{\"command\":\"deploy\"}"}
+                                    "function":{"name":"terminal","arguments":"{\"command\":\"deploy service-a\"}"}
                                 }]},
                                 {"role":"tool","tool_call_id":"call_1","content":"{\"output\":\"deployed\",\"exit_code\":0}"}
                             ]
@@ -7468,19 +7972,19 @@ mod tests {
     async fn hermes_synthetic_empty_recovery_nudge_keeps_matching_completed_tool_evidence() {
         let (app, raw_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
         let messages = vec![
-            OpenAiMessage::text("user", "Inspect the service."),
+            OpenAiMessage::text("user", "Deploy the service."),
             OpenAiMessage {
                 role: "assistant".to_owned(),
                 content: Value::Null,
                 tool_calls: vec![json!({
                     "id":"call_1","type":"function",
-                    "function":{"name":"terminal","arguments":"{\"command\":\"inspect\"}"}
+                    "function":{"name":"terminal","arguments":"{\"command\":\"deploy service-a\"}"}
                 })],
                 ..OpenAiMessage::default()
             },
             OpenAiMessage {
                 role: "tool".to_owned(),
-                content: Value::String(r#"{"output":"ok","exit_code":0,"error":null}"#.to_owned()),
+                content: Value::String(r#"{"output":"ok","exit_code":0}"#.to_owned()),
                 tool_call_id: "call_1".to_owned(),
                 ..OpenAiMessage::default()
             },
@@ -7521,23 +8025,23 @@ mod tests {
 
     #[tokio::test]
     async fn hermes_multiple_empty_recoveries_keep_completed_tool_evidence_in_one_turn() {
-        let (app, raw_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
+        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+            "Deployments completed successfully for service-one and service-two.",
+        ])));
         let messages = vec![
-            OpenAiMessage::text("user", "Inspect the service."),
+            OpenAiMessage::text("user", "Deploy the service."),
             OpenAiMessage {
                 role: "assistant".to_owned(),
                 content: Value::Null,
                 tool_calls: vec![json!({
                     "id":"call_1","type":"function",
-                    "function":{"name":"terminal","arguments":"{\"command\":\"inspect-one\"}"}
+                    "function":{"name":"terminal","arguments":"{\"command\":\"deploy service-one\"}"}
                 })],
                 ..OpenAiMessage::default()
             },
             OpenAiMessage {
                 role: "tool".to_owned(),
-                content: Value::String(
-                    r#"{"output":"ok-1","exit_code":0,"error":null}"#.to_owned(),
-                ),
+                content: Value::String(r#"{"output":"ok-1","exit_code":0}"#.to_owned()),
                 tool_call_id: "call_1".to_owned(),
                 ..OpenAiMessage::default()
             },
@@ -7548,15 +8052,13 @@ mod tests {
                 content: Value::Null,
                 tool_calls: vec![json!({
                     "id":"call_2","type":"function",
-                    "function":{"name":"terminal","arguments":"{\"command\":\"inspect-two\"}"}
+                    "function":{"name":"terminal","arguments":"{\"command\":\"deploy service-two\"}"}
                 })],
                 ..OpenAiMessage::default()
             },
             OpenAiMessage {
                 role: "tool".to_owned(),
-                content: Value::String(
-                    r#"{"output":"ok-2","exit_code":0,"error":null}"#.to_owned(),
-                ),
+                content: Value::String(r#"{"output":"ok-2","exit_code":0}"#.to_owned()),
                 tool_call_id: "call_2".to_owned(),
                 ..OpenAiMessage::default()
             },
@@ -7593,7 +8095,8 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(
-            body["choices"][0]["message"]["content"], "Deployment completed successfully.",
+            body["choices"][0]["message"]["content"],
+            "Deployments completed successfully for service-one and service-two.",
             "each authenticated recovery in the same real user turn must preserve completed evidence"
         );
     }
@@ -7604,7 +8107,9 @@ mod tests {
             "```kanban_show\n{\"task_id\":\"t_c3de88aa\"}\n```",
             "No. The task is still blocked and has no active worker.",
         ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
         let response = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
@@ -7647,12 +8152,23 @@ mod tests {
         assert!(!requests[0].tools.is_empty());
         assert!(requests[1].tools.is_empty());
         assert_eq!(requests[1].tool_choice, Value::String("none".to_owned()));
+
+        let record: Value = serde_json::from_str(
+            std::fs::read_to_string(telemetry_path)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["toolCallSuppressed"], true);
+        assert_eq!(record["postPolicyDisposition"], "allowed");
     }
 
     #[tokio::test]
     async fn hermes_full_prefix_reuse_resolves_checkpointed_tool_result_without_duplicate_id() {
         let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
-            "```inspect\n{}\n```",
+            "```inspect\n{\"target\":\"service-a\"}\n```",
             "Inspection completed successfully.",
         ])));
         let tool = json!({
@@ -7702,7 +8218,7 @@ mod tests {
                             "messages":[
                                 first_user,
                                 assistant,
-                                {"role":"tool","tool_call_id":call_id,"content":"ok"}
+                                {"role":"tool","tool_call_id":call_id,"content":"{\"output\":\"ok\",\"exit_code\":0}"}
                             ],
                             "tools":[tool],
                             "tool_choice":"auto"

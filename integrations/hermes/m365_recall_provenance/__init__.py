@@ -23,14 +23,20 @@ _EMPTY_RECOVERY_USER_NUDGE = (
     "Please process the tool results above and continue with the task."
 )
 _MAX_ACTIVE_TURNS = 256
+_CANONICAL_ROLES = frozenset(("system", "developer", "user", "assistant", "tool"))
 _turns: OrderedDict[tuple[str, str], str] = OrderedDict()
 _lock = threading.Lock()
 
 
 def _key(session_id: str, turn_id: str) -> tuple[str, str] | None:
-    if not session_id or not turn_id:
+    if (
+        not isinstance(session_id, str)
+        or not isinstance(turn_id, str)
+        or not session_id.strip()
+        or not turn_id.strip()
+    ):
         return None
-    return session_id, turn_id
+    return session_id.strip(), turn_id.strip()
 
 
 def on_pre_llm_call(
@@ -50,12 +56,14 @@ def on_pre_llm_call(
 
 
 def _forget(session_id: str = "", turn_id: str = "", **_: Any) -> None:
+    key = _key(session_id, turn_id)
     with _lock:
-        if turn_id:
-            _turns.pop((session_id, turn_id), None)
-        elif session_id:
-            for key in [key for key in _turns if key[0] == session_id]:
-                _turns.pop(key, None)
+        if key is not None:
+            _turns.pop(key, None)
+        elif isinstance(session_id, str) and session_id.strip():
+            session = session_id.strip()
+            for candidate in [key for key in _turns if key[0] == session]:
+                _turns.pop(candidate, None)
 
 
 def _signature_payload(metadata: dict[str, Any]) -> bytes:
@@ -141,13 +149,16 @@ def _json_sha256(value: Any) -> str:
 def _normalized_message(message: Any) -> dict[str, Any] | None:
     if not isinstance(message, dict):
         return None
+    role = message.get("role")
+    if not isinstance(role, str) or role not in _CANONICAL_ROLES:
+        return None
     tool_calls = message.get("tool_calls")
     if not isinstance(tool_calls, list):
         tool_calls = []
     return {
         "content": message.get("content"),
         "name": str(message.get("name") or ""),
-        "role": str(message.get("role") or ""),
+        "role": role,
         "tool_call_id": str(message.get("tool_call_id") or ""),
         "tool_calls": tool_calls,
         "tool_result_is_error": bool(message.get("tool_result_is_error", False)),
@@ -171,24 +182,6 @@ def _context_sha256(
     return hashlib.sha256(
         "\0".join((_CONTROL_CONTEXT_DOMAIN, session_key, messages_sha256)).encode("utf-8")
     ).hexdigest()
-
-
-def _stock_gateway_session_key() -> str:
-    """Read Hermes' task-local gateway conversation key from the stock host seam.
-
-    Hermes v0.21.0 binds ``HERMES_SESSION_KEY`` in ``gateway.session_context``
-    before the agent turn and propagates that ContextVar into its worker thread.
-    Reading it here gives the plugin the same stable conversation subject that
-    M365 already uses for implicit Hermes checkpoints, without modifying Hermes
-    core or trusting a caller-provided request field.
-    """
-
-    try:
-        from gateway.session_context import get_session_env
-
-        return str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
-    except Exception:
-        return ""
 
 
 def _control_signature_payload(metadata: dict[str, Any]) -> bytes:
@@ -399,15 +392,34 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
     if not isinstance(messages, list):
         return None
     updated = dict(request)
-    extra_body = dict(request.get("extra_body") or {})
+    raw_extra_body = request.get("extra_body")
+    if raw_extra_body is None:
+        extra_body = {}
+    elif not isinstance(raw_extra_body, dict):
+        return None
+    else:
+        extra_body = dict(raw_extra_body)
     changed = False
+    raw_session_id = kwargs.get("session_id")
+    raw_turn_id = kwargs.get("turn_id")
+    raw_api_request_id = kwargs.get("api_request_id")
+    session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+    turn_id = raw_turn_id if isinstance(raw_turn_id, str) else ""
+    api_request_id = raw_api_request_id if isinstance(raw_api_request_id, str) else ""
+    try:
+        raw_api_call_count = kwargs.get("api_call_count")
+        api_call_count = (
+            raw_api_call_count
+            if isinstance(raw_api_call_count, int) and not isinstance(raw_api_call_count, bool)
+            else 0
+        )
+    except (TypeError, ValueError):
+        api_call_count = 0
 
-    # The stable Hermes gateway conversation key is host-owned task-local
-    # state.  Project it onto the existing M365 ``session_key`` checkpoint
-    # seam, but never overwrite a conflicting request value.  A conflict
-    # makes execution-control provenance ineligible rather than letting the
-    # signer retarget a request chosen by the caller/provider config.
-    stock_session_key = _stock_gateway_session_key()
+    # Hermes supplies session_id as the execution identity for this worker.
+    # HERMES_SESSION_KEY is a routing ContextVar and may be inherited by a
+    # delegated child, so it is not a safe checkpoint subject.
+    execution_session_key = session_id
     wire_session_key_present = "session_key" in extra_body
     raw_wire_session_key = extra_body.get("session_key")
     if wire_session_key_present and not isinstance(raw_wire_session_key, str):
@@ -419,46 +431,13 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
             if isinstance(raw_wire_session_key, str)
             else ""
         )
-        session_binding_ok = bool(stock_session_key) and (
-            not wire_session_key or wire_session_key == stock_session_key
+        session_binding_ok = bool(execution_session_key) and (
+            not wire_session_key or wire_session_key == execution_session_key
         )
-    if session_binding_ok and raw_wire_session_key != stock_session_key:
-        extra_body["session_key"] = stock_session_key
-        wire_session_key = stock_session_key
+    if session_binding_ok and raw_wire_session_key != execution_session_key:
+        extra_body["session_key"] = execution_session_key
         changed = True
 
-    key = _key(str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or ""))
-    if key is not None:
-        with _lock:
-            clean = _turns.get(key)
-        if clean is not None:
-            indexed = [
-                (index, message)
-                for index, message in enumerate(messages)
-                if isinstance(message, dict)
-                and str(message.get("role") or "").strip().lower() == "user"
-            ]
-            if indexed:
-                message_index, message = indexed[-1]
-                content = message.get("content")
-                if isinstance(content, str):
-                    metadata = _metadata(message_index, clean, content)
-                    if metadata is not None:
-                        metadata["signature"] = "sha256=" + hmac.new(
-                            secret.encode("utf-8"),
-                            _signature_payload(metadata),
-                            hashlib.sha256,
-                        ).hexdigest()
-                        extra_body[_FIELD] = metadata
-                        changed = True
-
-    session_id = str(kwargs.get("session_id") or "")
-    turn_id = str(kwargs.get("turn_id") or "")
-    api_request_id = str(kwargs.get("api_request_id") or "")
-    try:
-        api_call_count = int(kwargs.get("api_call_count") or 0)
-    except (TypeError, ValueError):
-        api_call_count = 0
     key = _key(session_id, turn_id)
     clean = None
     if key is not None:
@@ -468,7 +447,7 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
         _execution_control_metadata(
             messages,
             clean=clean,
-            session_key=stock_session_key,
+            session_key=execution_session_key,
             session_id=session_id,
             turn_id=turn_id,
             api_request_id=api_request_id,
@@ -477,6 +456,33 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
         if clean is not None and session_binding_ok
         else None
     )
+    trusted_recovery_users = {
+        int(control_entry["user_index"])
+        for control_entry in (control or {}).get("controls", [])
+        if isinstance(control_entry, dict) and isinstance(control_entry.get("user_index"), int)
+    }
+    if clean is not None and session_binding_ok:
+        indexed = [
+            (index, message)
+            for index, message in enumerate(messages)
+            if index not in trusted_recovery_users
+            and isinstance(message, dict)
+            and message.get("role") == "user"
+        ]
+        if indexed:
+            message_index, message = indexed[-1]
+            content = message.get("content")
+            if isinstance(content, str):
+                metadata = _metadata(message_index, clean, content)
+                if metadata is not None:
+                    metadata["signature"] = "sha256=" + hmac.new(
+                        secret.encode("utf-8"),
+                        _signature_payload(metadata),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    extra_body[_FIELD] = metadata
+                    changed = True
+
     if control is not None:
         control["signature"] = "sha256=" + hmac.new(
             secret.encode("utf-8"),

@@ -30,7 +30,7 @@ class FakeContext:
 class RecallProvenanceTests(unittest.TestCase):
     def setUp(self):
         plugin._forget("session", "turn")
-        self.stock_session_key = "agent:main:test:dm:fixture"
+        self.execution_identity = "execution-session"
         self.environment = patch.dict(
             os.environ,
             {
@@ -44,14 +44,6 @@ class RecallProvenanceTests(unittest.TestCase):
     def tearDown(self):
         self.environment.stop()
         plugin._forget("session", "turn")
-
-    def stock_session(self, value=None):
-        return patch.object(
-            plugin,
-            "_stock_gateway_session_key",
-            return_value=self.stock_session_key if value is None else value,
-            create=True,
-        )
 
     @staticmethod
     def execution_control_from(result):
@@ -115,7 +107,8 @@ class RecallProvenanceTests(unittest.TestCase):
             provider="m365",
             api_mode="chat_completions",
         )
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])
 
     def _stock_empty_recovery_messages(self, *, clean="inspect", result="ok", arguments="{}"):
         return [
@@ -139,16 +132,15 @@ class RecallProvenanceTests(unittest.TestCase):
     def test_emits_signed_execution_control_provenance_for_observed_stock_empty_recovery(self):
         messages = self._stock_empty_recovery_messages()
         plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
-        with self.stock_session():
-            result = plugin.on_llm_request(
-                request={"messages": messages},
-                session_id="session",
-                turn_id="turn",
-                api_request_id="turn:api:2",
-                api_call_count=2,
-                provider="m365",
-                api_mode="chat_completions",
-            )
+        result = plugin.on_llm_request(
+            request={"messages": messages},
+            session_id="session",
+            turn_id="turn",
+            api_request_id="turn:api:2",
+            api_call_count=2,
+            provider="m365",
+            api_mode="chat_completions",
+        )
         self.assertIsNotNone(result)
         metadata = result["request"]["extra_body"][plugin._CONTROL_FIELD]
         serialized = json.dumps(metadata, sort_keys=True)
@@ -160,16 +152,16 @@ class RecallProvenanceTests(unittest.TestCase):
         expected_context = hashlib.sha256(
             (
                 "m365-hermes-execution-control-context/v2\0"
-                + self.stock_session_key
+                + "session"
                 + "\0"
                 + metadata["messages_sha256"]
             ).encode("utf-8")
         ).hexdigest()
         self.assertEqual(metadata["context_sha256"], expected_context)
         self.assertEqual(
-            result["request"]["extra_body"]["session_key"], self.stock_session_key
+            result["request"]["extra_body"]["session_key"], "session"
         )
-        self.assertNotIn(self.stock_session_key, serialized)
+        self.assertNotIn(self.execution_identity, serialized)
         self.assertEqual(len(metadata["controls"]), 1)
         control = metadata["controls"][0]
         self.assertEqual(
@@ -191,6 +183,49 @@ class RecallProvenanceTests(unittest.TestCase):
             b"test-secret", plugin._control_signature_payload(metadata), hashlib.sha256
         ).hexdigest()
         self.assertTrue(hmac.compare_digest(metadata["signature"], expected))
+
+    def test_recall_provenance_stays_bound_to_real_user_after_recovery_nudge(self):
+        clean = "inspect"
+        source = "<memory-context>\nrecalled evidence\n</memory-context>"
+        current = f"{clean}\n\n{source}"
+        messages = self._stock_empty_recovery_messages(clean=clean)
+        messages[0]["content"] = current
+        plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message=clean)
+
+        result = plugin.on_llm_request(
+            request={"messages": messages},
+            session_id="session",
+            turn_id="turn",
+            api_request_id="turn:api:2",
+            api_call_count=2,
+            provider="m365",
+            api_mode="chat_completions",
+        )
+
+        self.assertIsNotNone(result)
+        metadata = result["request"]["extra_body"][plugin._FIELD]
+        self.assertEqual(metadata["message_index"], 0)
+        self.assertEqual(metadata["clean_prefix_sha256"], hashlib.sha256(clean.encode()).hexdigest())
+
+    def test_execution_checkpoint_identity_uses_host_execution_session_not_routing_key(self):
+        messages = self._stock_empty_recovery_messages()
+        plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
+
+        result = plugin.on_llm_request(
+            request={"messages": messages},
+            session_id="child-execution-session",
+            turn_id="turn",
+            api_request_id="turn:api:2",
+            api_call_count=2,
+            provider="m365",
+            api_mode="chat_completions",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["request"]["extra_body"]["session_key"],
+            "child-execution-session",
+        )
 
     def test_execution_control_signs_multiple_stock_recoveries_in_one_real_user_turn(self):
         messages = self._stock_empty_recovery_messages()
@@ -214,16 +249,15 @@ class RecallProvenanceTests(unittest.TestCase):
         )
         plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
 
-        with self.stock_session():
-            result = plugin.on_llm_request(
-                request={"messages": messages},
-                session_id="session",
-                turn_id="turn",
-                api_request_id="turn:api:3",
-                api_call_count=3,
-                provider="m365",
-                api_mode="chat_completions",
-            )
+        result = plugin.on_llm_request(
+            request={"messages": messages},
+            session_id="session",
+            turn_id="turn",
+            api_request_id="turn:api:3",
+            api_call_count=3,
+            provider="m365",
+            api_mode="chat_completions",
+        )
 
         metadata = self.execution_control_from(result)
         self.assertIsNotNone(metadata)
@@ -255,23 +289,22 @@ class RecallProvenanceTests(unittest.TestCase):
         )
         plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
 
-        with self.stock_session():
-            result = plugin.on_llm_request(
-                request={"messages": messages},
-                session_id="session",
-                turn_id="turn",
-                api_request_id="turn:api:3",
-                api_call_count=3,
-                provider="m365",
-                api_mode="chat_completions",
-            )
+        result = plugin.on_llm_request(
+            request={"messages": messages},
+            session_id="session",
+            turn_id="turn",
+            api_request_id="turn:api:3",
+            api_call_count=3,
+            provider="m365",
+            api_mode="chat_completions",
+        )
 
         metadata = self.execution_control_from(result)
         self.assertIsNotNone(metadata)
         self.assertEqual(len(metadata["controls"]), 1)
         self.assertEqual(metadata["controls"][0]["user_index"], 4)
 
-    def test_execution_control_requires_stock_session_context_and_never_retargets_conflict(self):
+    def test_execution_control_requires_host_execution_identity_and_never_retargets_conflict(self):
         messages = self._stock_empty_recovery_messages()
         plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
         common = {
@@ -282,34 +315,44 @@ class RecallProvenanceTests(unittest.TestCase):
             "provider": "m365",
             "api_mode": "chat_completions",
         }
-        with self.stock_session(""):
-            missing = plugin.on_llm_request(request={"messages": messages}, **common)
+        missing_common = dict(common)
+        missing_common["session_id"] = ""
+        missing = plugin.on_llm_request(request={"messages": messages}, **missing_common)
         self.assertIsNone(self.execution_control_from(missing))
-        with self.stock_session():
-            conflict = plugin.on_llm_request(
-                request={
-                    "messages": messages,
-                    "extra_body": {"session_key": "different-session"},
-                },
-                **common,
-            )
+        conflict = plugin.on_llm_request(
+            request={
+                "messages": messages,
+                "extra_body": {"session_key": "different-session"},
+            },
+            **common,
+        )
         self.assertIsNone(self.execution_control_from(conflict))
         if conflict is not None:
             self.assertEqual(
                 conflict["request"]["extra_body"]["session_key"], "different-session"
             )
-        with self.stock_session():
-            canonical = plugin.on_llm_request(
-                request={
-                    "messages": messages,
-                    "extra_body": {"session_key": f"  {self.stock_session_key}  "},
-                },
-                **common,
-            )
+            self.assertNotIn(plugin._FIELD, conflict["request"]["extra_body"])
+        canonical = plugin.on_llm_request(
+            request={
+                "messages": messages,
+                "extra_body": {"session_key": "  session  "},
+            },
+            **common,
+        )
         self.assertIsNotNone(self.execution_control_from(canonical))
         self.assertEqual(
-            canonical["request"]["extra_body"]["session_key"], self.stock_session_key
+            canonical["request"]["extra_body"]["session_key"], "session"
         )
+
+        for invalid in (None, 7, [], {}):
+            with self.subTest(invalid_session_id=invalid):
+                invalid_common = dict(common)
+                invalid_common["session_id"] = invalid
+                result = plugin.on_llm_request(
+                    request={"messages": messages},
+                    **invalid_common,
+                )
+                self.assertIsNone(self.execution_control_from(result))
 
     def test_execution_control_never_rewrites_present_non_string_session_key(self):
         messages = self._stock_empty_recovery_messages()
@@ -324,14 +367,13 @@ class RecallProvenanceTests(unittest.TestCase):
         }
         for invalid in (None, 7, {"caller": "value"}, ["caller"]):
             with self.subTest(invalid=invalid):
-                with self.stock_session():
-                    result = plugin.on_llm_request(
-                        request={
-                            "messages": messages,
-                            "extra_body": {"session_key": invalid},
-                        },
-                        **common,
-                    )
+                result = plugin.on_llm_request(
+                    request={
+                        "messages": messages,
+                        "extra_body": {"session_key": invalid},
+                    },
+                    **common,
+                )
                 self.assertIsNone(
                     self.execution_control_from(result),
                     "a present malformed caller session_key must never be upgraded into authority",
@@ -340,6 +382,25 @@ class RecallProvenanceTests(unittest.TestCase):
                     self.assertEqual(
                         result["request"]["extra_body"]["session_key"], invalid
                     )
+
+    def test_malformed_lifecycle_and_extra_body_inputs_fail_closed_without_exception(self):
+        messages = self._stock_empty_recovery_messages()
+        plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
+        for session_id, turn_id in (([], "turn"), ("session", []), (" ", "turn")):
+            with self.subTest(session_id=session_id, turn_id=turn_id):
+                plugin._forget(session_id=session_id, turn_id=turn_id)
+        for extra_body in (["not-a-map"], "not-a-map", 7):
+            with self.subTest(extra_body=extra_body):
+                result = plugin.on_llm_request(
+                    request={"messages": messages, "extra_body": extra_body},
+                    session_id="session",
+                    turn_id="turn",
+                    api_request_id="turn:api:2",
+                    api_call_count=2,
+                    provider="m365",
+                    api_mode="chat_completions",
+                )
+                self.assertIsNone(result)
 
     def test_execution_control_requires_observed_turn_and_followup_api_call(self):
         messages = self._stock_empty_recovery_messages()
@@ -352,31 +413,26 @@ class RecallProvenanceTests(unittest.TestCase):
             "provider": "m365",
             "api_mode": "chat_completions",
         }
-        with self.stock_session():
-            result = plugin.on_llm_request(**common)
+        result = plugin.on_llm_request(**common)
         self.assertIsNone(self.execution_control_from(result))
         plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
         first = dict(common)
         first["api_request_id"] = "turn:api:1"
         first["api_call_count"] = 1
-        with self.stock_session():
-            result = plugin.on_llm_request(**first)
+        result = plugin.on_llm_request(**first)
         self.assertIsNone(self.execution_control_from(result))
         wrong_id = dict(common)
         wrong_id["api_request_id"] = "different:api:2"
-        with self.stock_session():
-            result = plugin.on_llm_request(**wrong_id)
+        result = plugin.on_llm_request(**wrong_id)
         self.assertIsNone(self.execution_control_from(result))
         wrong_session = dict(common)
         wrong_session["session_id"] = "different-session"
-        with self.stock_session():
-            result = plugin.on_llm_request(**wrong_session)
+        result = plugin.on_llm_request(**wrong_session)
         self.assertIsNone(self.execution_control_from(result))
         wrong_turn = dict(common)
         wrong_turn["turn_id"] = "different-turn"
         wrong_turn["api_request_id"] = "different-turn:api:2"
-        with self.stock_session():
-            result = plugin.on_llm_request(**wrong_turn)
+        result = plugin.on_llm_request(**wrong_turn)
         self.assertIsNone(self.execution_control_from(result))
 
     def test_execution_control_does_not_sign_retargeted_or_malformed_recovery(self):
@@ -398,16 +454,15 @@ class RecallProvenanceTests(unittest.TestCase):
         cases.append(wrong_nudge)
         for messages in cases:
             with self.subTest(messages=messages):
-                with self.stock_session():
-                    result = plugin.on_llm_request(
-                        request={"messages": messages},
-                        session_id="session",
-                        turn_id="turn",
-                        api_request_id="turn:api:2",
-                        api_call_count=2,
-                        provider="m365",
-                        api_mode="chat_completions",
-                    )
+                result = plugin.on_llm_request(
+                    request={"messages": messages},
+                    session_id="session",
+                    turn_id="turn",
+                    api_request_id="turn:api:2",
+                    api_call_count=2,
+                    provider="m365",
+                    api_mode="chat_completions",
+                )
                 self.assertIsNone(self.execution_control_from(result))
 
     def test_signature_contract_matches_gateway_unicode_fixture(self):
@@ -431,7 +486,7 @@ class RecallProvenanceTests(unittest.TestCase):
         metadata = plugin._execution_control_metadata(
             messages,
             clean="目前問題🙂",
-            session_key=self.stock_session_key,
+            session_key=self.execution_identity,
             session_id="session-🙂",
             turn_id="turn-🙂",
             api_request_id="turn-🙂:api:2",
@@ -449,7 +504,7 @@ class RecallProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(
             metadata["context_sha256"],
-            "aa3cb99de3da6fac1681621676100156677ad94a3f6ebfb7eb59d26e079eefe3",
+            "649a3fb70769bf62d7629a5c02e9f1e7ae10930721daa494096176e886ddf866",
         )
         self.assertEqual(
             metadata["controls"][0]["tool_call_sha256"],
@@ -461,7 +516,7 @@ class RecallProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(
             signature,
-            "sha256=9ed1215c621f00b6e1bf6a9a47d105cd1a7839277d050ad742f284960111d0d7",
+            "sha256=0a1e4f49bbe809737341314ee7cfe2e5638ad0a14a5a109e864aed4439a3cc1f",
         )
 
     def test_execution_control_canonical_json_matches_gateway_float_fixture(self):
@@ -512,12 +567,12 @@ class RecallProvenanceTests(unittest.TestCase):
             ]
         }
         common = {"request": request, "provider": "m365", "api_mode": "chat_completions"}
-        self.assertIsNone(
-            plugin.on_llm_request(session_id="session", turn_id="turn", **common)
-        )
-        self.assertIsNone(
-            plugin.on_llm_request(session_id="session", turn_id="other", **common)
-        )
+        result = plugin.on_llm_request(session_id="session", turn_id="turn", **common)
+        self.assertIsNotNone(result)
+        self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])
+        result = plugin.on_llm_request(session_id="session", turn_id="other", **common)
+        self.assertIsNotNone(result)
+        self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])
         self.assertIsNone(
             plugin.on_llm_request(
                 session_id="session",
@@ -527,6 +582,20 @@ class RecallProvenanceTests(unittest.TestCase):
                 api_mode="chat_completions",
             )
         )
+
+    def test_non_string_message_roles_fail_closed_without_hashing_exception(self):
+        plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="Current ask")
+        for role in (None, [], {}, 7):
+            with self.subTest(role=role):
+                result = plugin.on_llm_request(
+                    request={"messages": [{"role": role, "content": "Current ask"}]},
+                    session_id="session",
+                    turn_id="turn",
+                    provider="m365",
+                    api_mode="chat_completions",
+                )
+                self.assertIsNotNone(result)
+                self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])
 
 
 if __name__ == "__main__":

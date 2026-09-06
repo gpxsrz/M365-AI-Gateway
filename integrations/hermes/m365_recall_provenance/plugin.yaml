@@ -1,6 +1,6 @@
 name: m365-recall-provenance
-version: "1.1.0"
-description: "Bind Hermes-injected recall source material and internal empty-response recovery control to the exact M365 request without sending private content as metadata."
+version: "1.2.0"
+description: "Bind Hermes-injected recall source material and internal empty-response recovery control to the exact M365 request, using the stock execution session identity rather than inherited routing context."
 author: gpxsrz/M365-AI-Gateway
 requires_env:
   - M365_HERMES_RECALL_PROVENANCE_SECRET

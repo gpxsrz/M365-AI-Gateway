@@ -8,6 +8,95 @@ use crate::{protocol::OpenAiMessage, tool_calls::DetectedToolCall};
 
 pub(crate) const UNCONFIRMED_TOOL_OUTCOME: &str = "I cannot confirm completion because no matching tool results were returned. No external action has been verified.";
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolResultStatus {
+    #[default]
+    Unknown,
+    Success,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolOperation {
+    #[default]
+    Unknown,
+    Read,
+    Deploy,
+    Install,
+    Start,
+    Stop,
+    Create,
+    Delete,
+    Write,
+    Execute,
+    Verify,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionPolicyDisposition {
+    NotApplicable,
+    Allowed,
+    Rewritten,
+    Suppressed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionPolicyReason {
+    PolicyDisabled,
+    ToolCalls,
+    NoExternalClaim,
+    MatchingEvidence,
+    PendingEvidence,
+    MissingEvidence,
+    NoMatchingOperation,
+    AmbiguousClaim,
+    AmbiguousEvidence,
+    FailedOrUnknownEvidence,
+    MissingTargetBinding,
+    TargetMismatch,
+    CompletedCallSuppressed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompletionPolicyDecision {
+    pub(crate) allowed: bool,
+    pub(crate) disposition: CompletionPolicyDisposition,
+    pub(crate) reason: CompletionPolicyReason,
+}
+
+impl CompletionPolicyDisposition {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Allowed => "allowed",
+            Self::Rewritten => "rewritten",
+            Self::Suppressed => "suppressed",
+        }
+    }
+}
+
+impl CompletionPolicyReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyDisabled => "policy_disabled",
+            Self::ToolCalls => "tool_calls",
+            Self::NoExternalClaim => "no_external_claim",
+            Self::MatchingEvidence => "matching_evidence",
+            Self::PendingEvidence => "pending_evidence",
+            Self::MissingEvidence => "missing_evidence",
+            Self::NoMatchingOperation => "no_matching_operation",
+            Self::AmbiguousClaim => "ambiguous_claim",
+            Self::AmbiguousEvidence => "ambiguous_evidence",
+            Self::FailedOrUnknownEvidence => "failed_or_unknown_evidence",
+            Self::MissingTargetBinding => "missing_target_binding",
+            Self::TargetMismatch => "target_mismatch",
+            Self::CompletedCallSuppressed => "completed_call_suppressed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ToolEvidence {
     id: String,
@@ -17,6 +106,34 @@ pub(crate) struct ToolEvidence {
     result_digest: String,
     failed: bool,
     has_result: bool,
+    #[serde(default)]
+    result_status: ToolResultStatus,
+    #[serde(default)]
+    operation: ToolOperation,
+    #[serde(default)]
+    target_digest: String,
+    #[serde(default)]
+    target_claim_digest: String,
+}
+
+impl ToolEvidence {
+    fn result_status(&self) -> ToolResultStatus {
+        if self.result_status != ToolResultStatus::Unknown {
+            self.result_status
+        } else if self.failed {
+            ToolResultStatus::Failed
+        } else {
+            ToolResultStatus::Unknown
+        }
+    }
+
+    fn operation(&self) -> ToolOperation {
+        if self.operation != ToolOperation::Unknown {
+            self.operation
+        } else {
+            tool_operation(&self.name, "")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -38,10 +155,6 @@ impl AgentLedger {
             return Err("pending tool results must be returned before another turn".to_owned());
         }
         Ok(())
-    }
-
-    pub(crate) fn has_failed_completed_evidence(&self) -> bool {
-        self.completed.iter().any(|evidence| evidence.failed)
     }
 
     fn pending_ids(&self) -> impl Iterator<Item = &str> {
@@ -209,6 +322,9 @@ pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -
                             id: id.to_owned(),
                             name: name.to_owned(),
                             arguments_digest: arguments_digest(arguments),
+                            operation: tool_operation(name, arguments),
+                            target_digest: tool_target_digest(arguments),
+                            target_claim_digest: tool_target_claim_digest(arguments),
                             ..ToolEvidence::default()
                         },
                     );
@@ -224,8 +340,9 @@ pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -
             let result = content_string(&message.content);
             evidence.result_length = result.len();
             evidence.result_digest = digest(result.as_bytes());
-            evidence.failed =
-                tool_result_failed(message.tool_result_is_error, &evidence.name, &result);
+            evidence.result_status =
+                tool_result_status(message.tool_result_is_error, &evidence.name, &result);
+            evidence.failed = evidence.result_status == ToolResultStatus::Failed;
             evidence.has_result = true;
         }
     }
@@ -248,7 +365,7 @@ pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -
         *call_count += 1;
         ledger.repeated_call |= *call_count >= 2;
         if evidence.has_result {
-            if evidence.failed {
+            if evidence.result_status() == ToolResultStatus::Failed {
                 let failure_count = failures_seen
                     .entry((
                         evidence.name.clone(),
@@ -274,81 +391,413 @@ pub(crate) fn active_messages(messages: &[OpenAiMessage]) -> &[OpenAiMessage] {
     last_user.map_or(messages, |index| &messages[index..])
 }
 
+#[cfg(test)]
 pub(crate) fn completion_evidence_allows(answer: &str, ledger: &AgentLedger) -> bool {
-    let claims_success = claims_unsupported_success(answer);
-    if !ledger.pending.is_empty() {
-        return !claims_success;
-    }
-    if !ledger.completed.is_empty() {
-        return !claims_success
-            || ledger
-                .completed
-                .iter()
-                .any(|evidence| evidence.result_length > 0 && !evidence.failed);
-    }
-    !claims_success
+    completion_evidence_decision(answer, ledger).allowed
 }
 
-fn tool_result_failed(explicit: bool, name: &str, result: &str) -> bool {
-    if explicit {
-        return true;
+pub(crate) fn completion_evidence_decision(
+    answer: &str,
+    ledger: &AgentLedger,
+) -> CompletionPolicyDecision {
+    let Some(claim) = completion_claim(answer) else {
+        return CompletionPolicyDecision {
+            allowed: true,
+            disposition: CompletionPolicyDisposition::Allowed,
+            reason: CompletionPolicyReason::NoExternalClaim,
+        };
+    };
+    if matches!(claim, CompletionClaim::AmbiguousOperation) {
+        return CompletionPolicyDecision {
+            allowed: false,
+            disposition: CompletionPolicyDisposition::Rewritten,
+            reason: CompletionPolicyReason::AmbiguousClaim,
+        };
     }
-    if name == "terminal"
-        && let Ok(object) = serde_json::from_str::<serde_json::Map<String, Value>>(result.trim())
+    if !ledger.pending.is_empty() {
+        return CompletionPolicyDecision {
+            allowed: false,
+            disposition: CompletionPolicyDisposition::Rewritten,
+            reason: CompletionPolicyReason::PendingEvidence,
+        };
+    }
+
+    let mut matching = match claim {
+        CompletionClaim::Operation(operation) => ledger
+            .completed
+            .iter()
+            .filter(|evidence| evidence.operation() == operation)
+            .collect::<Vec<_>>(),
+        CompletionClaim::AmbiguousOperation => unreachable!("ambiguous claim handled above"),
+        CompletionClaim::Unqualified => ledger
+            .completed
+            .iter()
+            .filter(|evidence| {
+                !matches!(
+                    evidence.operation(),
+                    ToolOperation::Unknown | ToolOperation::Read
+                )
+            })
+            .collect::<Vec<_>>(),
+    };
+    if matching.is_empty() {
+        return CompletionPolicyDecision {
+            allowed: false,
+            disposition: CompletionPolicyDisposition::Rewritten,
+            reason: if ledger.completed.is_empty() {
+                CompletionPolicyReason::MissingEvidence
+            } else {
+                CompletionPolicyReason::NoMatchingOperation
+            },
+        };
+    }
+    let claimed_targets = completion_target_digests(answer);
+    if !claimed_targets.is_empty() {
+        matching.retain(|evidence| claimed_targets.contains(&evidence.target_claim_digest));
+        if matching.is_empty() {
+            return CompletionPolicyDecision {
+                allowed: false,
+                disposition: CompletionPolicyDisposition::Rewritten,
+                reason: CompletionPolicyReason::TargetMismatch,
+            };
+        }
+        let evidence_targets = matching
+            .iter()
+            .map(|evidence| evidence.target_claim_digest.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if evidence_targets.len() != claimed_targets.len()
+            || claimed_targets
+                .iter()
+                .any(|target| !evidence_targets.contains(target.as_str()))
+        {
+            return CompletionPolicyDecision {
+                allowed: false,
+                disposition: CompletionPolicyDisposition::Rewritten,
+                reason: CompletionPolicyReason::TargetMismatch,
+            };
+        }
+    }
+    if matching
+        .iter()
+        .any(|evidence| evidence.result_status() != ToolResultStatus::Success)
+    {
+        return CompletionPolicyDecision {
+            allowed: false,
+            disposition: CompletionPolicyDisposition::Rewritten,
+            reason: CompletionPolicyReason::FailedOrUnknownEvidence,
+        };
+    }
+    if matches!(claim, CompletionClaim::Unqualified) {
+        let mut operations = matching.iter().map(|evidence| evidence.operation());
+        let first = operations.next();
+        if first.is_none() || operations.any(|operation| Some(operation) != first) {
+            return CompletionPolicyDecision {
+                allowed: false,
+                disposition: CompletionPolicyDisposition::Rewritten,
+                reason: CompletionPolicyReason::NoMatchingOperation,
+            };
+        }
+    }
+    if matching.iter().any(|evidence| {
+        evidence.target_digest.is_empty() || evidence.target_claim_digest.is_empty()
+    }) {
+        return CompletionPolicyDecision {
+            allowed: false,
+            disposition: CompletionPolicyDisposition::Rewritten,
+            reason: CompletionPolicyReason::MissingTargetBinding,
+        };
+    }
+    let mut target_contexts_by_claim = HashMap::<&str, HashSet<&str>>::new();
+    for evidence in &matching {
+        target_contexts_by_claim
+            .entry(evidence.target_claim_digest.as_str())
+            .or_default()
+            .insert(evidence.target_digest.as_str());
+    }
+    if target_contexts_by_claim
+        .values()
+        .any(|contexts| contexts.len() > 1)
+    {
+        return CompletionPolicyDecision {
+            allowed: false,
+            disposition: CompletionPolicyDisposition::Rewritten,
+            reason: CompletionPolicyReason::AmbiguousEvidence,
+        };
+    }
+    let target_digests = matching
+        .iter()
+        .map(|evidence| evidence.target_digest.as_str())
+        .filter(|digest| !digest.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if target_digests.len() > 1 && claimed_targets.is_empty() {
+        return CompletionPolicyDecision {
+            allowed: false,
+            disposition: CompletionPolicyDisposition::Rewritten,
+            reason: CompletionPolicyReason::AmbiguousEvidence,
+        };
+    }
+    CompletionPolicyDecision {
+        allowed: true,
+        disposition: CompletionPolicyDisposition::Allowed,
+        reason: CompletionPolicyReason::MatchingEvidence,
+    }
+}
+
+fn tool_result_status(explicit: bool, _name: &str, result: &str) -> ToolResultStatus {
+    if explicit {
+        return ToolResultStatus::Failed;
+    }
+    if let Ok(object) = serde_json::from_str::<serde_json::Map<String, Value>>(result.trim())
         && object.contains_key("output")
         && let Some(exit_code) = object.get("exit_code").and_then(Value::as_i64)
     {
-        return exit_code != 0
+        let failed = exit_code != 0
             || object.get("error").is_some_and(|error| {
                 !error.is_null() && error.as_str().is_none_or(|s| !s.trim().is_empty())
-            });
+            })
+            || object
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| {
+                    matches!(
+                        status.trim().to_ascii_lowercase().as_str(),
+                        "error" | "failed" | "failure"
+                    )
+                });
+        return if failed {
+            ToolResultStatus::Failed
+        } else {
+            ToolResultStatus::Success
+        };
     }
     if let Ok(value) = serde_json::from_str::<Value>(result.trim()) {
         let Some(object) = value.as_object() else {
-            return false;
+            return ToolResultStatus::Unknown;
         };
-        if let Some(success) = object.get("success").and_then(Value::as_bool) {
-            return !success;
-        }
-        if let Some(ok) = object.get("ok").and_then(Value::as_bool) {
-            return !ok;
+        if object
+            .get("success")
+            .and_then(Value::as_bool)
+            .is_some_and(|success| !success)
+            || object
+                .get("ok")
+                .and_then(Value::as_bool)
+                .is_some_and(|ok| !ok)
+        {
+            return ToolResultStatus::Failed;
         }
         if object.get("error").is_some_and(|error| {
             !error.is_null() && error.as_str().is_none_or(|text| !text.trim().is_empty())
         }) {
-            return true;
+            return ToolResultStatus::Failed;
         }
-        return object
+        return match object
             .get("status")
             .and_then(Value::as_str)
-            .is_some_and(|status| {
-                matches!(
-                    status.trim().to_ascii_lowercase().as_str(),
-                    "error" | "failed" | "failure"
-                )
-            });
+            .map(|status| status.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("error" | "failed" | "failure") => ToolResultStatus::Failed,
+            _ => ToolResultStatus::Unknown,
+        };
     }
-    let lower = result.to_ascii_lowercase();
-    [
-        "error",
-        "failed",
-        "failure",
-        "exception",
-        "traceback",
-        "timed out",
-        "timeout",
-        "permission denied",
-        "not found",
-        "refused",
-        "exit code 1",
-        "exit status 1",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    ToolResultStatus::Unknown
 }
 
-fn claims_unsupported_success(answer: &str) -> bool {
+fn tool_operation(name: &str, arguments: &str) -> ToolOperation {
+    let name = name.trim().to_ascii_lowercase();
+    if matches!(name.as_str(), "terminal" | "shell" | "exec" | "run_command") {
+        let command = serde_json::from_str::<Value>(arguments.trim())
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        return operation_from_tool_name(command.split_whitespace().next().unwrap_or(""))
+            .unwrap_or(ToolOperation::Execute);
+    }
+    operation_from_tool_name(&name).unwrap_or(ToolOperation::Unknown)
+}
+
+fn operation_from_tool_name(name: &str) -> Option<ToolOperation> {
+    let name = name.trim().trim_start_matches("./").to_ascii_lowercase();
+    let exact =
+        |variants: &[&str], operation| variants.contains(&name.as_str()).then_some(operation);
+    exact(
+        &[
+            "read",
+            "read_file",
+            "search",
+            "search_files",
+            "list",
+            "list_files",
+            "inspect",
+            "get",
+            "fetch",
+            "retrieve",
+            "kanban_show",
+        ],
+        ToolOperation::Read,
+    )
+    .or_else(|| {
+        exact(
+            &["deploy", "deployment", "publish", "release"],
+            ToolOperation::Deploy,
+        )
+    })
+    .or_else(|| {
+        exact(
+            &["install", "installation", "upgrade"],
+            ToolOperation::Install,
+        )
+    })
+    .or_else(|| exact(&["start", "restart", "launch"], ToolOperation::Start))
+    .or_else(|| {
+        exact(
+            &["stop", "shutdown", "terminate", "kill"],
+            ToolOperation::Stop,
+        )
+    })
+    .or_else(|| exact(&["create", "provision"], ToolOperation::Create))
+    .or_else(|| exact(&["delete", "remove", "destroy"], ToolOperation::Delete))
+    .or_else(|| {
+        exact(
+            &[
+                "write", "update", "modify", "edit", "patch", "commit", "push",
+            ],
+            ToolOperation::Write,
+        )
+    })
+    .or_else(|| exact(&["execute", "run", "apply"], ToolOperation::Execute))
+    .or_else(|| exact(&["verify", "validate"], ToolOperation::Verify))
+}
+
+fn operations_from_text(text: &str) -> Vec<ToolOperation> {
+    let mut operations = Vec::new();
+    for (operation, words) in [
+        (
+            ToolOperation::Read,
+            &[
+                "read",
+                "reading",
+                "inspect",
+                "inspection",
+                "retrieve",
+                "query",
+                "queried",
+                "查詢",
+                "檢查",
+                "讀取",
+                "讀檔",
+            ][..],
+        ),
+        (
+            ToolOperation::Deploy,
+            &[
+                "deploy",
+                "deployment",
+                "publish",
+                "release",
+                "部署",
+                "發布",
+                "发布",
+            ][..],
+        ),
+        (
+            ToolOperation::Install,
+            &[
+                "install",
+                "installation",
+                "upgrade",
+                "安裝",
+                "安装",
+                "升級",
+                "升级",
+            ][..],
+        ),
+        (
+            ToolOperation::Start,
+            &[
+                "start", "started", "restart", "launch", "running", "啟動", "启动", "重啟", "重启",
+            ][..],
+        ),
+        (
+            ToolOperation::Stop,
+            &[
+                "stop",
+                "stopped",
+                "shutdown",
+                "terminate",
+                "kill",
+                "停止",
+                "關閉",
+                "关闭",
+            ][..],
+        ),
+        (
+            ToolOperation::Create,
+            &["create", "created", "provision", "建立", "创建", "新增"][..],
+        ),
+        (
+            ToolOperation::Delete,
+            &[
+                "delete", "deleted", "remove", "removed", "destroy", "刪除", "删除",
+            ][..],
+        ),
+        (
+            ToolOperation::Write,
+            &[
+                "write", "written", "update", "updated", "modify", "modified", "edit", "edited",
+                "patch", "commit", "push", "寫入", "更新",
+            ][..],
+        ),
+        (
+            ToolOperation::Execute,
+            &[
+                "execute", "executed", "run", "ran", "apply", "applied", "執行", "执行", "套用",
+            ][..],
+        ),
+        (
+            ToolOperation::Verify,
+            &[
+                "verify",
+                "verified",
+                "validate",
+                "validated",
+                "驗證",
+                "验证",
+            ][..],
+        ),
+    ] {
+        if words.iter().any(|word| contains_token(text, word)) {
+            operations.push(operation);
+        }
+    }
+    operations
+}
+
+fn contains_token(text: &str, token: &str) -> bool {
+    if token.is_ascii() {
+        contains_word(text, token)
+    } else {
+        text.contains(token)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionClaim {
+    Operation(ToolOperation),
+    AmbiguousOperation,
+    Unqualified,
+}
+
+fn completion_claim(answer: &str) -> Option<CompletionClaim> {
     let lower = answer.to_ascii_lowercase();
+    if answer.trim().is_empty() || is_non_claim_framing(answer, &lower) {
+        return None;
+    }
     let success_words = [
         "installed",
         "created",
@@ -369,7 +818,7 @@ fn claims_unsupported_success(answer: &str) -> bool {
         "passed",
         "applied",
     ];
-    success_words.iter().any(|word| contains_word(&lower, word))
+    let positive = success_words.iter().any(|word| contains_word(&lower, word))
         || [
             "service is running",
             "server is active",
@@ -377,13 +826,214 @@ fn claims_unsupported_success(answer: &str) -> bool {
         ]
         .iter()
         .any(|phrase| lower.contains(phrase))
+        || ["完成", "成功", "已啟動", "已启动", "已完成"]
+            .iter()
+            .any(|phrase| answer.contains(phrase));
+    if !positive {
+        return None;
+    }
+    let (negated_positive, unnegated_positive) = positive_polarity(&lower, &success_words);
+    if negated_positive && unnegated_positive {
+        return Some(CompletionClaim::AmbiguousOperation);
+    }
+    if has_unnegated_failure_marker(&lower, answer) {
+        return Some(CompletionClaim::AmbiguousOperation);
+    }
+    if (negated_positive && !unnegated_positive) || has_negation_marker(&lower) {
+        return None;
+    }
+    match operations_from_text(&lower).as_slice() {
+        [] => Some(CompletionClaim::Unqualified),
+        [operation] => Some(CompletionClaim::Operation(*operation)),
+        _ => Some(CompletionClaim::AmbiguousOperation),
+    }
+}
+
+fn is_non_claim_framing(answer: &str, lower: &str) -> bool {
+    let trimmed = answer.trim();
+    let question = trimmed.ends_with(['?', '？'])
         || [
-            "issue is fixed",
-            "bug was resolved",
-            "problem has been fixed",
+            "is ",
+            "was ",
+            "were ",
+            "did ",
+            "has ",
+            "have ",
+            "can ",
+            "could ",
+            "what ",
+            "why ",
+            "how ",
+            "是否",
+            "有沒有",
+            "有沒有",
+            "是否已",
         ]
         .iter()
-        .any(|phrase| lower.contains(phrase))
+        .any(|marker| lower.starts_with(marker));
+    let explanatory = [
+        "it means ",
+        "this means ",
+        "that means ",
+        "which means ",
+        "in other words",
+        "the meaning is ",
+        "意思是",
+        "這表示",
+        "这表示",
+        "也就是",
+    ]
+    .iter()
+    .any(|marker| lower.starts_with(marker));
+    let framed = [
+        "the word ",
+        "the term ",
+        "the phrase ",
+        "the sentence ",
+        "for example",
+        "example:",
+        "translation:",
+        "translate:",
+        "translated:",
+        "quote:",
+        "quotation:",
+        "quoted",
+        "historical",
+        "history:",
+        "previously",
+        "in the past",
+        "code:",
+        "definition:",
+    ]
+    .iter()
+    .any(|marker| lower.starts_with(marker));
+    let fenced_code = trimmed.starts_with("```") && trimmed.ends_with("```");
+    let inline_code = trimmed.starts_with('`') && trimmed.ends_with('`');
+    let quoted = (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('“') && trimmed.ends_with('”'))
+        || (trimmed.starts_with('‘') && trimmed.ends_with('’'));
+    let definition = lower.starts_with("success is a noun")
+        || lower.starts_with("success is the noun")
+        || trimmed.starts_with("成功是主觀的")
+        || trimmed.starts_with("成功是主观的");
+    let (outside, delimited) = outside_delimited_text(answer);
+    let delimited_framing = delimited
+        && [
+            "phrase",
+            "sentence",
+            "quote",
+            "quotation",
+            "example",
+            "translation",
+            "翻譯",
+            "翻译",
+            "引述",
+            "引用",
+        ]
+        .iter()
+        .any(|marker| outside.to_ascii_lowercase().contains(marker));
+    question
+        || framed
+        || explanatory
+        || fenced_code
+        || inline_code
+        || quoted
+        || definition
+        || delimited_framing
+}
+
+fn positive_polarity(answer: &str, success_words: &[&str]) -> (bool, bool) {
+    let mut negated = false;
+    let mut unnegated = false;
+    for word in success_words {
+        for (index, _) in answer.match_indices(word) {
+            if answer[..index]
+                .split_whitespace()
+                .rev()
+                .take(4)
+                .any(|preceding| matches!(preceding, "not" | "never" | "no"))
+            {
+                negated = true;
+            } else {
+                unnegated = true;
+            }
+        }
+    }
+    (negated, unnegated)
+}
+
+fn has_negation_marker(answer: &str) -> bool {
+    [
+        "cannot confirm",
+        "can't confirm",
+        "unable to confirm",
+        "unconfirmed",
+        "無法確認",
+        "无法确认",
+        "未確認",
+        "未确认",
+        "未完成",
+        "尚未完成",
+        "沒有完成",
+        "没有完成",
+        "未成功",
+        "沒有成功",
+        "没有成功",
+    ]
+    .iter()
+    .any(|marker| answer.contains(marker))
+}
+
+fn has_unnegated_failure_marker(lower: &str, original: &str) -> bool {
+    let english = ["failed", "failure", "failures"].iter().any(|word| {
+        lower.match_indices(word).any(|(index, _)| {
+            !lower[..index]
+                .split_whitespace()
+                .rev()
+                .take(4)
+                .any(|preceding| matches!(preceding, "no" | "not" | "never" | "without"))
+        })
+    });
+    if english {
+        return true;
+    }
+    ["失敗", "失败"].iter().any(|marker| {
+        original.contains(marker)
+            && ![
+                "未失敗",
+                "未失败",
+                "沒有失敗",
+                "没有失败",
+                "無失敗",
+                "无失败",
+            ]
+            .iter()
+            .any(|negated| original.contains(negated))
+    })
+}
+
+fn outside_delimited_text(answer: &str) -> (String, bool) {
+    let mut outside = String::with_capacity(answer.len());
+    let mut delimiter = None;
+    let mut had_delimiter = false;
+    for character in answer.chars() {
+        if let Some(active) = delimiter {
+            if character == active {
+                delimiter = None;
+            }
+            had_delimiter = true;
+        } else if matches!(character, '`' | '"' | '“' | '”' | '‘' | '’') {
+            delimiter = Some(match character {
+                '“' => '”',
+                '‘' => '’',
+                _ => character,
+            });
+            had_delimiter = true;
+        } else {
+            outside.push(character);
+        }
+    }
+    (outside, had_delimiter)
 }
 
 fn contains_word(text: &str, word: &str) -> bool {
@@ -401,6 +1051,170 @@ fn arguments_digest(arguments: &str) -> String {
         .and_then(|value| serde_json::to_string(&value).ok())
         .unwrap_or_else(|| arguments.trim().to_owned());
     digest(canonical.as_bytes())
+}
+
+fn tool_target_digest(arguments: &str) -> String {
+    let Some(Value::Object(object)) = serde_json::from_str(arguments.trim()).ok() else {
+        return String::new();
+    };
+    let target = [
+        "target",
+        "target_id",
+        "path",
+        "service",
+        "environment",
+        "name",
+        "resource",
+        "resource_id",
+        "task_id",
+        "url",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        object
+            .get(key)
+            .filter(|value| target_value_is_credible(value))
+            .cloned()
+            .map(|value| (key.to_owned(), value))
+    })
+    .collect::<serde_json::Map<_, _>>();
+    let binding = if target.is_empty() {
+        let command = object
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(command_target) = terminal_command_target_parts(command) else {
+            return String::new();
+        };
+        let mut binding = serde_json::Map::new();
+        binding.insert(
+            "_command_target".to_owned(),
+            Value::String(command_target.join(" ")),
+        );
+        binding
+    } else {
+        target
+    };
+    serde_json::to_vec(&binding)
+        .map(|value| digest(&value))
+        .unwrap_or_default()
+}
+
+fn tool_target_claim_digest(arguments: &str) -> String {
+    let Some(Value::Object(object)) = serde_json::from_str(arguments.trim()).ok() else {
+        return String::new();
+    };
+    for key in [
+        "target",
+        "target_id",
+        "path",
+        "service",
+        "environment",
+        "name",
+        "resource",
+        "resource_id",
+        "task_id",
+        "url",
+    ] {
+        if let Some(value) = object
+            .get(key)
+            .filter(|value| target_value_is_credible(value))
+        {
+            return target_claim_digest_value(value);
+        }
+    }
+    let command = object
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    terminal_command_target_parts(command)
+        .and_then(|parts| parts.first().map(|target| target_claim_digest_text(target)))
+        .unwrap_or_default()
+}
+
+fn terminal_command_target_parts(command: &str) -> Option<Vec<&str>> {
+    let mut words = command.split_whitespace();
+    words.next()?;
+    let first = words.next()?;
+    if first.starts_with('-') {
+        return None;
+    }
+    Some(std::iter::once(first).chain(words).collect())
+}
+
+fn target_value_is_credible(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| !value.trim().is_empty()) || value.is_number()
+}
+
+fn target_claim_digest_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(target_claim_digest_text)
+        .unwrap_or_else(|| digest(value.to_string().as_bytes()))
+}
+
+fn target_claim_digest_text(value: &str) -> String {
+    digest(value.trim().as_bytes())
+}
+
+fn completion_target_digests(answer: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let words = answer.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index];
+        let marker = word
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .to_ascii_lowercase();
+        if !matches!(marker.as_str(), "for" | "to" | "on" | "target") {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let mut separated = true;
+        while separated && index < words.len() {
+            let raw = words[index];
+            let target = raw.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '/' | ':')
+            });
+            if target.is_empty()
+                || matches!(
+                    target.to_ascii_lowercase().as_str(),
+                    "and"
+                        | "or"
+                        | "the"
+                        | "a"
+                        | "an"
+                        | "success"
+                        | "successful"
+                        | "successfully"
+                        | "completed"
+                        | "done"
+                )
+            {
+                break;
+            }
+            targets.push(target_claim_digest_text(target));
+            let has_trailing_separator = raw.ends_with(',') || raw.ends_with(';');
+            index += 1;
+            if index >= words.len() {
+                break;
+            }
+            let next = words[index]
+                .trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric()
+                        && !matches!(character, '_' | '-' | '/' | ':')
+                })
+                .to_ascii_lowercase();
+            separated = has_trailing_separator || matches!(next.as_str(), "and" | "or" | "&");
+            if separated && matches!(next.as_str(), "and" | "or" | "&") {
+                index += 1;
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 fn digest(value: &[u8]) -> String {
@@ -490,18 +1304,28 @@ mod tests {
     }
 
     #[test]
-    fn structured_tool_success_ignores_null_error_fields() {
-        for (content, failed) in [
+    fn untyped_success_flags_never_authorize_but_explicit_false_fails_closed() {
+        for (content, status) in [
             (
                 r#"{"success":true,"job":{"last_delivery_error":null,"last_fire_error":null}}"#,
-                false,
+                ToolResultStatus::Unknown,
             ),
-            (r#"{"ok":true,"error":null}"#, false),
-            (r#"{"success":false,"error":"update rejected"}"#, true),
-            (r#"{"ok":false,"error":"not found"}"#, true),
+            (r#"{"ok":true,"error":null}"#, ToolResultStatus::Unknown),
+            (
+                r#"{"success":false,"error":"update rejected"}"#,
+                ToolResultStatus::Failed,
+            ),
+            (
+                r#"{"ok":false,"error":"not found"}"#,
+                ToolResultStatus::Failed,
+            ),
         ] {
             let ledger = build(&[call("c1", "cronjob", "{}"), result("c1", content)]);
-            assert_eq!(ledger.completed[0].failed, failed, "content={content}");
+            assert_eq!(
+                ledger.completed[0].result_status(),
+                status,
+                "content={content}"
+            );
         }
     }
 
@@ -518,7 +1342,7 @@ mod tests {
         ));
 
         let succeeded = build(&[
-            call("c1", "terminal", "{}"),
+            call("c1", "terminal", r#"{"command":"verify service-a"}"#),
             result("c1", r#"{"output":"ok","exit_code":0,"error":null}"#),
         ]);
         assert!(completion_evidence_allows(
@@ -538,6 +1362,239 @@ mod tests {
             "Deployment failed and remains incomplete.",
             &failed
         ));
+    }
+
+    #[test]
+    fn ordinary_explanations_and_negated_actions_do_not_trigger_completion_guard() {
+        let ledger = AgentLedger::default();
+
+        assert!(completion_evidence_allows(
+            "The word success is a noun.",
+            &ledger
+        ));
+        assert!(completion_evidence_allows("成功是主觀的。", &ledger));
+        assert!(completion_evidence_allows(
+            "I have not deployed anything.",
+            &ledger
+        ));
+        assert!(completion_evidence_allows(
+            "Translation: \"Deployment completed successfully.\"",
+            &ledger
+        ));
+        assert!(completion_evidence_allows(
+            "Historical note: deployment completed successfully in 2020.",
+            &ledger
+        ));
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully, but verification failed.",
+            &ledger
+        ));
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully; see `status`.",
+            &ledger
+        ));
+        assert!(completion_evidence_allows(
+            "```\nDeployment completed successfully.\n```",
+            &ledger
+        ));
+        assert!(completion_evidence_allows(
+            "Was the deployment successful?",
+            &ledger
+        ));
+        assert!(completion_evidence_allows(
+            "The phrase \"Deployment completed successfully.\" is an example.",
+            &ledger
+        ));
+        assert!(completion_evidence_allows(
+            "It means the deployment completed successfully.",
+            &ledger
+        ));
+        assert!(completion_evidence_allows("這表示部署已成功。", &ledger));
+        assert!(!completion_evidence_allows(
+            "It was not successfully deployed, but the deployment was successful.",
+            &ledger
+        ));
+    }
+
+    #[test]
+    fn completion_claim_requires_the_matching_operation_and_authoritative_result() {
+        let read = build(&[
+            call("read-1", "read_file", r#"{"path":"README.md"}"#),
+            result(
+                "read-1",
+                "Documentation: error handling and timeout recovery",
+            ),
+        ]);
+        assert!(!read.completed[0].failed);
+        assert_eq!(
+            read.completed[0].result_status(),
+            ToolResultStatus::Unknown,
+            "human-readable file content is not an execution status"
+        );
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully.",
+            &read
+        ));
+
+        let mixed = build(&[
+            call("read-1", "read_file", r#"{"path":"README.md"}"#),
+            result("read-1", "documentation"),
+            call("deploy-1", "terminal", r#"{"command":"deploy"}"#),
+            result(
+                "deploy-1",
+                r#"{"output":"failed","exit_code":1,"error":null}"#,
+            ),
+        ]);
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully.",
+            &mixed
+        ));
+
+        let target_a = build(&[
+            call("deploy-a", "deploy", r#"{"target":"service-a"}"#),
+            result("deploy-a", r#"{"output":"ok","exit_code":0}"#),
+            call("deploy-b", "deploy", r#"{"target":"service-b"}"#),
+            result("deploy-b", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        let decision =
+            completion_evidence_decision("Deployment completed successfully.", &target_a);
+        assert_eq!(decision.reason, CompletionPolicyReason::AmbiguousEvidence);
+        assert!(!decision.allowed);
+
+        let ambiguous_context = build(&[
+            call(
+                "deploy-prod",
+                "deploy",
+                r#"{"target":"service-a","environment":"production"}"#,
+            ),
+            result("deploy-prod", r#"{"output":"ok","exit_code":0}"#),
+            call(
+                "deploy-staging",
+                "deploy",
+                r#"{"target":"service-a","environment":"staging"}"#,
+            ),
+            result("deploy-staging", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        let decision = completion_evidence_decision(
+            "Deployment completed successfully for service-a.",
+            &ambiguous_context,
+        );
+        assert_eq!(decision.reason, CompletionPolicyReason::AmbiguousEvidence);
+        assert!(!decision.allowed);
+
+        let successful_deploy = build(&[
+            call("deploy-a", "deploy", r#"{"target":"service-a"}"#),
+            result("deploy-a", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        let decision = completion_evidence_decision(
+            "Deployment completed successfully, but the deployment failed.",
+            &successful_deploy,
+        );
+        assert_eq!(decision.reason, CompletionPolicyReason::AmbiguousClaim);
+        assert!(!decision.allowed);
+
+        let command_without_target = build(&[
+            call(
+                "deploy-force",
+                "terminal",
+                r#"{"command":"deploy --force"}"#,
+            ),
+            result("deploy-force", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        let decision = completion_evidence_decision(
+            "Deployment completed successfully.",
+            &command_without_target,
+        );
+        assert_eq!(
+            decision.reason,
+            CompletionPolicyReason::MissingTargetBinding
+        );
+        assert!(!decision.allowed);
+
+        assert!(completion_evidence_allows(
+            "Deployments completed successfully for service-a and service-b.",
+            &target_a
+        ));
+
+        let one_target_claim = completion_evidence_decision(
+            "Deployment completed successfully for service-a.",
+            &target_a,
+        );
+        assert!(one_target_claim.allowed);
+
+        let unrecognized_targets = build(&[
+            call(
+                "deploy-a",
+                "deploy",
+                r#"{"destination":{"cluster":"service-a"}}"#,
+            ),
+            result("deploy-a", r#"{"output":"ok","exit_code":0}"#),
+            call(
+                "deploy-b",
+                "deploy",
+                r#"{"destination":{"cluster":"service-b"}}"#,
+            ),
+            result("deploy-b", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        let decision = completion_evidence_decision(
+            "Deployment completed successfully.",
+            &unrecognized_targets,
+        );
+        assert_eq!(
+            decision.reason,
+            CompletionPolicyReason::MissingTargetBinding
+        );
+        assert!(!decision.allowed);
+
+        let mixed_claim = build(&[
+            call("write-1", "write", r#"{"target":"service-a"}"#),
+            result("write-1", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        let decision = completion_evidence_decision(
+            "Inspect and deploy completed successfully.",
+            &mixed_claim,
+        );
+        assert_eq!(decision.reason, CompletionPolicyReason::AmbiguousClaim);
+        assert!(!decision.allowed);
+
+        let echo = build(&[
+            call(
+                "terminal-1",
+                "terminal",
+                r#"{"command":"echo deploy","target":"service-a"}"#,
+            ),
+            result("terminal-1", r#"{"output":"deploy","exit_code":0}"#),
+        ]);
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully.",
+            &echo
+        ));
+    }
+
+    #[test]
+    fn legacy_ledger_evidence_is_compatible_but_never_upgraded_to_success() {
+        let legacy: AgentLedger = serde_json::from_value(json!({
+            "completed": [{
+                "id":"legacy",
+                "name":"deploy",
+                "arguments_digest":"old",
+                "result_length":2,
+                "result_digest":"old",
+                "failed":false,
+                "has_result":true
+            }],
+            "pending":[],
+            "tool_rounds":1,
+            "repeated_call":false,
+            "repeated_failure":false
+        }))
+        .unwrap();
+        let decision = completion_evidence_decision("Deployment completed successfully.", &legacy);
+        assert_eq!(
+            decision.reason,
+            CompletionPolicyReason::FailedOrUnknownEvidence
+        );
+        assert!(!decision.allowed);
     }
 
     #[test]
@@ -597,7 +1654,7 @@ mod tests {
         synthetic_recovery.empty_recovery_synthetic = true;
         let messages = vec![
             OpenAiMessage::text("user", "Inspect the current state."),
-            call("c1", "terminal", r#"{"command":"inspect"}"#),
+            call("c1", "terminal", r#"{"command":"inspect service-a"}"#),
             result("c1", r#"{"output":"ok","exit_code":0,"error":null}"#),
             synthetic_empty,
             synthetic_recovery,
@@ -618,8 +1675,8 @@ mod tests {
 
     #[test]
     fn persisted_pending_call_can_be_resolved_by_an_append_only_result() {
-        let prior = build(&[call("pending", "deploy", "{}")]);
-        let appended = vec![result("pending", "ok")];
+        let prior = build(&[call("pending", "deploy", r#"{"target":"service-a"}"#)]);
+        let appended = vec![result("pending", r#"{"output":"ok","exit_code":0}"#)];
         validate_tool_conversation_with_prior(&appended, &prior).unwrap();
         let ledger = execution_ledger(&prior, &appended);
         assert!(ledger.pending.is_empty());
@@ -627,6 +1684,56 @@ mod tests {
         assert!(completion_evidence_allows(
             "Deployment completed successfully.",
             &ledger
+        ));
+    }
+
+    #[test]
+    fn completion_guard_requires_a_bound_target_and_rejects_untrusted_success_text() {
+        let no_target = build(&[
+            call("deploy", "deploy", "{}"),
+            result("deploy", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        assert_eq!(
+            completion_evidence_decision("Deployment completed successfully.", &no_target).reason,
+            CompletionPolicyReason::MissingTargetBinding
+        );
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully.",
+            &no_target
+        ));
+
+        let target_a = build(&[
+            call("deploy", "deploy", r#"{"target":"service-a"}"#),
+            result("deploy", r#"{"output":"ok","exit_code":0}"#),
+        ]);
+        assert!(completion_evidence_allows(
+            "Deployment completed successfully for service-a.",
+            &target_a
+        ));
+        assert_eq!(
+            completion_evidence_decision(
+                "Deployment completed successfully for service-b.",
+                &target_a
+            )
+            .reason,
+            CompletionPolicyReason::TargetMismatch
+        );
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully for service-b.",
+            &target_a
+        ));
+
+        let untrusted = build(&[
+            call("deploy", "deploy", r#"{"target":"service-a"}"#),
+            result("deploy", r#"{"status":"success","output":"ok"}"#),
+        ]);
+        assert_eq!(
+            untrusted.completed[0].result_status(),
+            ToolResultStatus::Unknown
+        );
+        assert!(!completion_evidence_allows(
+            "Deployment completed successfully.",
+            &untrusted
         ));
     }
 }

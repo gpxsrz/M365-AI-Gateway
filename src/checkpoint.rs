@@ -860,7 +860,7 @@ mod tests {
                 tool_calls: vec![serde_json::json!({
                     "id": "call-1",
                     "type": "function",
-                    "function": {"name": "terminal", "arguments": "{}"}
+                    "function": {"name": "terminal", "arguments": "{\"command\":\"verify service-a\"}"}
                 })],
                 ..OpenAiMessage::default()
             },
