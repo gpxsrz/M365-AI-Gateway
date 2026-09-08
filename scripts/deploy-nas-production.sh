@@ -213,7 +213,10 @@ compose_cmd=("$docker_bin" compose -p "$project" -f "$compose")
 backup="$(dirname "$compose")/.deploy-backup-$(date +%Y%m%d-%H%M%S)-$$"
 stage_dir="${stage%.tar}.dir"
 web_dir="$(dirname "$app")/web"
+checkpoint_state="$data/transport-checkpoints.json"
+checkpoint_key="$data/.transport-checkpoints.json.key"
 backup_ready=0
+checkpoint_backup_ready=0
 rollback_running=0
 
 sha256_file() {
@@ -264,6 +267,73 @@ atomic_restore_file() {
   mv -f "$tmp" "$target"
 }
 
+snapshot_optional_file() {
+  local source=$1 name=$2 marker
+  marker="$backup/$name.presence"
+  if [[ -L "$source" ]]; then
+    echo "unsafe rollback source symlink: $source" >&2
+    return 1
+  fi
+  if [[ -e "$source" ]]; then
+    [[ -f "$source" ]] || { echo "unsafe rollback source: $source" >&2; return 1; }
+    cp -p "$source" "$backup/$name"
+    [[ -s "$backup/$name" ]] || { echo "backup verification failed: $name" >&2; return 1; }
+    printf 'present\n' > "$marker"
+  else
+    printf 'absent\n' > "$marker"
+  fi
+}
+
+restore_optional_file() {
+  local name=$1 target=$2 marker state
+  marker="$backup/$name.presence"
+  [[ -f "$marker" ]] || return 1
+  state=$(cat "$marker")
+  case "$state" in
+    present)
+      [[ -f "$backup/$name" ]] || return 1
+      atomic_restore_file "$backup/$name" "$target"
+      ;;
+    absent)
+      rm -f "$target"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+verify_optional_restore() {
+  local name=$1 target=$2 marker state
+  marker="$backup/$name.presence"
+  [[ -f "$marker" ]] || return 1
+  state=$(cat "$marker")
+  case "$state" in
+    present)
+      [[ -f "$target" && -f "$backup/$name" ]] && cmp -s "$backup/$name" "$target"
+      ;;
+    absent)
+      [[ ! -e "$target" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+verify_restored_files() {
+  [[ "$(sha256_file "$backup/m365-native")" == "$(sha256_file "$app")" ]] || return 1
+  [[ "$(sha256_file "$backup/index.html")" == "$(sha256_file "$web_dir/index.html")" ]] || return 1
+  [[ "$(sha256_file "$backup/login.html")" == "$(sha256_file "$web_dir/login.html")" ]] || return 1
+  [[ "$(sha256_file "$backup/debug.html")" == "$(sha256_file "$web_dir/debug.html")" ]] || return 1
+  [[ "$(sha256_file "$backup/compose.yaml")" == "$(sha256_file "$compose")" ]] || return 1
+  [[ "$(sha256_file "$backup/settings.json")" == "$(sha256_file "$data/settings.json")" ]] || return 1
+  if ((checkpoint_backup_ready)); then
+    verify_optional_restore "transport-checkpoints.json" "$checkpoint_state" || return 1
+    verify_optional_restore "transport-checkpoints.key" "$checkpoint_key" || return 1
+  fi
+}
+
 rollback() {
   local original_rc=${1:-1}
   local rollback_ok=1
@@ -272,24 +342,32 @@ rollback() {
   trap - ERR
   set +e
   printf 'deployment failed; rolling back from %s\n' "$backup" >&2
-  "${compose_cmd[@]}" stop "$service" >/dev/null 2>&1 || rollback_ok=0
+  if ! "${compose_cmd[@]}" stop "$service" >/dev/null 2>&1; then
+    printf 'rollback stop failed; no files were restored and the service was not restarted\n' >&2
+    printf 'rollback incomplete; backup retained at %s\n' "$backup" >&2
+    exit "$original_rc"
+  fi
   atomic_restore_file "$backup/m365-native" "$app" || rollback_ok=0
   atomic_restore_file "$backup/index.html" "$web_dir/index.html" || rollback_ok=0
   atomic_restore_file "$backup/login.html" "$web_dir/login.html" || rollback_ok=0
   atomic_restore_file "$backup/debug.html" "$web_dir/debug.html" || rollback_ok=0
   atomic_restore_file "$backup/compose.yaml" "$compose" || rollback_ok=0
   atomic_restore_file "$backup/settings.json" "$data/settings.json" || rollback_ok=0
-  "${compose_cmd[@]}" up -d --no-deps --force-recreate "$service" || rollback_ok=0
-  if ((rollback_ok)) && ! wait_ready; then
+  if ((checkpoint_backup_ready)); then
+    restore_optional_file "transport-checkpoints.json" "$checkpoint_state" || rollback_ok=0
+    restore_optional_file "transport-checkpoints.key" "$checkpoint_key" || rollback_ok=0
+  fi
+  if ((rollback_ok)) && ! verify_restored_files; then
     rollback_ok=0
   fi
   if ((rollback_ok)); then
-    [[ "$(sha256_file "$backup/m365-native")" == "$(sha256_file "$app")" ]] || rollback_ok=0
-    [[ "$(sha256_file "$backup/index.html")" == "$(sha256_file "$web_dir/index.html")" ]] || rollback_ok=0
-    [[ "$(sha256_file "$backup/login.html")" == "$(sha256_file "$web_dir/login.html")" ]] || rollback_ok=0
-    [[ "$(sha256_file "$backup/debug.html")" == "$(sha256_file "$web_dir/debug.html")" ]] || rollback_ok=0
-    [[ "$(sha256_file "$backup/compose.yaml")" == "$(sha256_file "$compose")" ]] || rollback_ok=0
-    [[ "$(sha256_file "$backup/settings.json")" == "$(sha256_file "$data/settings.json")" ]] || rollback_ok=0
+    "${compose_cmd[@]}" up -d --no-deps --force-recreate "$service" || rollback_ok=0
+  fi
+  if ((rollback_ok)) && ! wait_ready; then
+    rollback_ok=0
+  fi
+  if ((rollback_ok)) && ! verify_restored_files; then
+    rollback_ok=0
   fi
   if ((rollback_ok)); then
     rm -rf "$backup"
@@ -420,6 +498,9 @@ PY
 }
 
 "${compose_cmd[@]}" stop "$service"
+snapshot_optional_file "$checkpoint_state" "transport-checkpoints.json"
+snapshot_optional_file "$checkpoint_key" "transport-checkpoints.key"
+checkpoint_backup_ready=1
 atomic_install_file "$stage_dir/m365-native" "$app" "$expected_sha"
 atomic_install_file "$stage_dir/web/index.html" "$web_dir/index.html" "$index_sha"
 atomic_install_file "$stage_dir/web/login.html" "$web_dir/login.html" "$login_sha"

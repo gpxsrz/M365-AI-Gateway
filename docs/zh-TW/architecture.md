@@ -25,7 +25,7 @@ Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 | 你要做的事 | 入口 | 白話說明 |
 |---|---|---|
 | Goal Judge 等輔助／控制工作 | `/v1/chat/completions` | 每次都是新的，不沿用 Agent 的執行證據 |
-| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | 會保存工具續接與完成證據 |
+| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | 會保存工具續接與 transport evidence；Task/Run completion 由 ACP 判定 |
 | Hindsight Memory | `/memory/v1/chat/completions` | 走背景 Memory 優先順序 |
 | OpenAI Responses 格式 | `/v1/responses` | 把 Responses request 轉到同一聊天核心 |
 | Anthropic Messages 格式 | `/v1/messages` | 回傳 Anthropic 形狀；串流是完成後再轉成事件 |
@@ -42,9 +42,9 @@ Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
 4. 必要時讀取短期 checkpoint，接回上一輪工具結果。
 5. 建立新的 Microsoft ChatHub 連線；Private mode 每次都重新帶上 `disableMemory=1`。
 6. 把 Microsoft 回應轉成呼叫端要求的格式。
-7. 只有看到完整結束證據，才宣告完成並保存可續接狀態。
+7. 只有看到完整 transport result，才保存可續接狀態；Gateway 不宣告 Agent Task/Run 完成。
 
-一般 `/v1/chat/completions` 不會沿用 Hermes 的執行紀錄，也不會把合法的 `done` 或 `verified` 判定改寫成「尚未確認」。
+一般 `/v1/chat/completions` 不會沿用 Hermes 的 transport ledger，也不會把 provider 的 `done` 或 `verified` content 改寫成 Task/Run verdict。
 
 ## 串流與工具
 

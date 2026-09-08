@@ -58,7 +58,7 @@ A Production runtime once had a current binary with three older Web files. That 
 
 ### Goal Judge control plane
 
-Historical live traces showed that a valid Goal Judge `done` JSON response could be rewritten as prose by Agent completion-evidence policy when sent through `/hermes/v1`. Goal Judge now uses P2 `/v1/chat/completions` with ForceNew / Untracked checkpoint policy. It keeps scheduler / breaker / `MEMORY_YIELD` behavior but does not inject the Agent evidence ledger. The original completion guard remains on `/hermes/v1`.
+Historical live traces showed that a valid Goal Judge `done` JSON response could be rewritten as prose by the former Agent completion-evidence prototype when sent through `/hermes/v1`. That trace is retained in the external ACP salvage bundle as failure-corpus evidence. The current M365 source no longer owns that semantic guard: Goal Judge uses P2 `/v1/chat/completions` with ForceNew / Untracked checkpoint policy, while `/hermes/v1` retains only provider transport, typed evidence, and duplicate-effect protections. ACP owns any Task/Run completion semantics.
 
 Exact identities from the old Go implementation, CI, NAS, Production, and live canaries are historical evidence. They cannot be inherited as Rust PASS. See [`rust-rewrite-parity.md`](rust-rewrite-parity.md); every new live or Production check must pin the Rust commit and artifact again.
 

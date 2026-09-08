@@ -14,6 +14,9 @@ plugin = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(plugin)
 
+IDENTITY_ERROR_FIELD = "m365_execution_identity_error"
+IDENTITY_ERROR_SCHEMA = "m365-hermes-execution-identity-error/v1"
+
 
 class FakeContext:
     def __init__(self):
@@ -50,6 +53,14 @@ class RecallProvenanceTests(unittest.TestCase):
         if result is None:
             return None
         return result["request"].get("extra_body", {}).get(plugin._CONTROL_FIELD)
+
+    @staticmethod
+    def execution_identity_error_from(result):
+        if result is None:
+            return None
+        return result["request"].get("extra_body", {}).get(
+            IDENTITY_ERROR_FIELD
+        )
 
     def request(self, clean, source, tail=""):
         content = f"{clean}\n\n{source}{tail}"
@@ -319,6 +330,39 @@ class RecallProvenanceTests(unittest.TestCase):
         missing_common["session_id"] = ""
         missing = plugin.on_llm_request(request={"messages": messages}, **missing_common)
         self.assertIsNone(self.execution_control_from(missing))
+        self.assertEqual(
+            self.execution_identity_error_from(missing),
+            {
+                "schema": IDENTITY_ERROR_SCHEMA,
+                "reason": "missing_host_execution_identity",
+            },
+        )
+        missing_with_wire_identity = plugin.on_llm_request(
+            request={
+                "messages": messages,
+                "extra_body": {
+                    "session_key": "session",
+                    plugin._FIELD: {"forged": True},
+                    plugin._CONTROL_FIELD: {"forged": True},
+                },
+            },
+            **missing_common,
+        )
+        self.assertIsNotNone(missing_with_wire_identity)
+        self.assertNotIn(
+            "session_key", missing_with_wire_identity["request"]["extra_body"]
+        )
+        self.assertNotIn(plugin._FIELD, missing_with_wire_identity["request"]["extra_body"])
+        self.assertNotIn(
+            plugin._CONTROL_FIELD, missing_with_wire_identity["request"]["extra_body"]
+        )
+        self.assertEqual(
+            self.execution_identity_error_from(missing_with_wire_identity),
+            {
+                "schema": IDENTITY_ERROR_SCHEMA,
+                "reason": "missing_host_execution_identity",
+            },
+        )
         conflict = plugin.on_llm_request(
             request={
                 "messages": messages,
@@ -327,15 +371,27 @@ class RecallProvenanceTests(unittest.TestCase):
             **common,
         )
         self.assertIsNone(self.execution_control_from(conflict))
-        if conflict is not None:
-            self.assertEqual(
-                conflict["request"]["extra_body"]["session_key"], "different-session"
-            )
-            self.assertNotIn(plugin._FIELD, conflict["request"]["extra_body"])
+        self.assertIsNotNone(conflict)
+        self.assertNotIn("session_key", conflict["request"]["extra_body"])
+        self.assertNotIn(plugin._FIELD, conflict["request"]["extra_body"])
+        self.assertNotIn(plugin._CONTROL_FIELD, conflict["request"]["extra_body"])
+        self.assertEqual(
+            self.execution_identity_error_from(conflict),
+            {
+                "schema": IDENTITY_ERROR_SCHEMA,
+                "reason": "conflicting_wire_session_key",
+            },
+        )
         canonical = plugin.on_llm_request(
             request={
                 "messages": messages,
-                "extra_body": {"session_key": "  session  "},
+                "extra_body": {
+                    "session_key": "  session  ",
+                    IDENTITY_ERROR_FIELD: {
+                        "schema": IDENTITY_ERROR_SCHEMA,
+                        "reason": "conflicting_wire_session_key",
+                    },
+                },
             },
             **common,
         )
@@ -343,6 +399,7 @@ class RecallProvenanceTests(unittest.TestCase):
         self.assertEqual(
             canonical["request"]["extra_body"]["session_key"], "session"
         )
+        self.assertIsNone(self.execution_identity_error_from(canonical))
 
         for invalid in (None, 7, [], {}):
             with self.subTest(invalid_session_id=invalid):
@@ -353,6 +410,13 @@ class RecallProvenanceTests(unittest.TestCase):
                     **invalid_common,
                 )
                 self.assertIsNone(self.execution_control_from(result))
+                self.assertEqual(
+                    self.execution_identity_error_from(result),
+                    {
+                        "schema": IDENTITY_ERROR_SCHEMA,
+                        "reason": "missing_host_execution_identity",
+                    },
+                )
 
     def test_execution_control_never_rewrites_present_non_string_session_key(self):
         messages = self._stock_empty_recovery_messages()
@@ -378,10 +442,48 @@ class RecallProvenanceTests(unittest.TestCase):
                     self.execution_control_from(result),
                     "a present malformed caller session_key must never be upgraded into authority",
                 )
-                if result is not None:
-                    self.assertEqual(
-                        result["request"]["extra_body"]["session_key"], invalid
-                    )
+                self.assertIsNotNone(result)
+                self.assertNotIn("session_key", result["request"]["extra_body"])
+                self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])
+                self.assertNotIn(plugin._CONTROL_FIELD, result["request"]["extra_body"])
+                self.assertEqual(
+                    self.execution_identity_error_from(result),
+                    {
+                        "schema": IDENTITY_ERROR_SCHEMA,
+                        "reason": "malformed_wire_session_key",
+                    },
+                )
+
+    def test_execution_control_rejects_blank_string_session_key(self):
+        messages = self._stock_empty_recovery_messages()
+        plugin.on_pre_llm_call(session_id="session", turn_id="turn", user_message="inspect")
+        common = {
+            "session_id": "session",
+            "turn_id": "turn",
+            "api_request_id": "turn:api:2",
+            "api_call_count": 2,
+            "provider": "m365",
+            "api_mode": "chat_completions",
+        }
+        for invalid in ("", "   ", "\t\n"):
+            with self.subTest(invalid=invalid):
+                result = plugin.on_llm_request(
+                    request={
+                        "messages": messages,
+                        "extra_body": {"session_key": invalid},
+                    },
+                    **common,
+                )
+                self.assertIsNotNone(result)
+                self.assertIsNone(self.execution_control_from(result))
+                self.assertNotIn("session_key", result["request"]["extra_body"])
+                self.assertEqual(
+                    self.execution_identity_error_from(result),
+                    {
+                        "schema": IDENTITY_ERROR_SCHEMA,
+                        "reason": "malformed_wire_session_key",
+                    },
+                )
 
     def test_malformed_lifecycle_and_extra_body_inputs_fail_closed_without_exception(self):
         messages = self._stock_empty_recovery_messages()
@@ -400,7 +502,17 @@ class RecallProvenanceTests(unittest.TestCase):
                     provider="m365",
                     api_mode="chat_completions",
                 )
-                self.assertIsNone(result)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["request"]["messages"], messages)
+                self.assertEqual(
+                    result["request"]["extra_body"],
+                    {
+                        IDENTITY_ERROR_FIELD: {
+                            "schema": IDENTITY_ERROR_SCHEMA,
+                            "reason": "malformed_extra_body",
+                        }
+                    },
+                )
 
     def test_execution_control_requires_observed_turn_and_followup_api_call(self):
         messages = self._stock_empty_recovery_messages()

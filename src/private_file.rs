@@ -11,6 +11,7 @@ use crate::error::GatewayError;
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, GatewayError> {
+    prepare_private_file(path)?;
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -245,6 +246,30 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_json_read_repairs_mode_and_rejects_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        fs::write(&path, b"{\"mode\":\"legacy\"}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let value: BTreeMap<String, String> = read_json(&path).unwrap().unwrap();
+        assert_eq!(value.get("mode"), Some(&"legacy".to_owned()));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let target = root.path().join("target.json");
+        let linked = root.path().join("linked.json");
+        fs::write(&target, b"{\"target\":true}\n").unwrap();
+        symlink(&target, &linked).unwrap();
+        assert!(read_json::<BTreeMap<String, bool>>(&linked).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"target\":true}\n");
     }
 
     #[test]

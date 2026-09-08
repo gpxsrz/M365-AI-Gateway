@@ -17,6 +17,8 @@ _FIELD = "m365_recall_provenance"
 _CONTROL_SCHEMA = "m365-hermes-execution-control-provenance/v2"
 _CONTROL_FIELD = "m365_execution_control_provenance"
 _CONTROL_CONTEXT_DOMAIN = "m365-hermes-execution-control-context/v2"
+_IDENTITY_ERROR_SCHEMA = "m365-hermes-execution-identity-error/v1"
+_IDENTITY_ERROR_FIELD = "m365_execution_identity_error"
 _EMPTY_RECOVERY_ASSISTANT = "(empty)"
 _EMPTY_RECOVERY_USER_NUDGE = (
     "You just executed tool calls but returned an empty response. "
@@ -396,7 +398,17 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
     if raw_extra_body is None:
         extra_body = {}
     elif not isinstance(raw_extra_body, dict):
-        return None
+        updated["extra_body"] = {
+            _IDENTITY_ERROR_FIELD: {
+                "schema": _IDENTITY_ERROR_SCHEMA,
+                "reason": "malformed_extra_body",
+            }
+        }
+        return {
+            "request": updated,
+            "source": "m365-hermes-provenance",
+            "reason": "malformed Hermes extra_body denied",
+        }
     else:
         extra_body = dict(raw_extra_body)
     changed = False
@@ -422,21 +434,37 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
     execution_session_key = session_id
     wire_session_key_present = "session_key" in extra_body
     raw_wire_session_key = extra_body.get("session_key")
-    if wire_session_key_present and not isinstance(raw_wire_session_key, str):
-        wire_session_key = ""
-        session_binding_ok = False
-    else:
-        wire_session_key = (
-            raw_wire_session_key.strip()
-            if isinstance(raw_wire_session_key, str)
-            else ""
-        )
-        session_binding_ok = bool(execution_session_key) and (
-            not wire_session_key or wire_session_key == execution_session_key
-        )
-    if session_binding_ok and raw_wire_session_key != execution_session_key:
-        extra_body["session_key"] = execution_session_key
+    wire_session_key = (
+        raw_wire_session_key.strip()
+        if isinstance(raw_wire_session_key, str)
+        else ""
+    )
+    identity_error_reason = None
+    if not execution_session_key:
+        identity_error_reason = "missing_host_execution_identity"
+    elif wire_session_key_present and not isinstance(raw_wire_session_key, str):
+        identity_error_reason = "malformed_wire_session_key"
+    elif wire_session_key_present and not wire_session_key:
+        identity_error_reason = "malformed_wire_session_key"
+    elif wire_session_key and wire_session_key != execution_session_key:
+        identity_error_reason = "conflicting_wire_session_key"
+    session_binding_ok = identity_error_reason is None
+    if not session_binding_ok:
+        extra_body.pop("session_key", None)
+        extra_body.pop(_FIELD, None)
+        extra_body.pop(_CONTROL_FIELD, None)
+        extra_body[_IDENTITY_ERROR_FIELD] = {
+            "schema": _IDENTITY_ERROR_SCHEMA,
+            "reason": identity_error_reason,
+        }
         changed = True
+    else:
+        if _IDENTITY_ERROR_FIELD in extra_body:
+            extra_body.pop(_IDENTITY_ERROR_FIELD, None)
+            changed = True
+        if raw_wire_session_key != execution_session_key:
+            extra_body["session_key"] = execution_session_key
+            changed = True
 
     key = _key(session_id, turn_id)
     clean = None

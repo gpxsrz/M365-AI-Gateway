@@ -105,6 +105,22 @@ case "${1:-}" in
     esac
     ;;
   compose)
+    if [[ "$*" == *" stop "* ]]; then
+      stop_count=0
+      if [[ -n "${DOCKER_STOP_COUNT_FILE:-}" ]]; then
+        if [[ -f "$DOCKER_STOP_COUNT_FILE" ]]; then
+          stop_count=$(cat "$DOCKER_STOP_COUNT_FILE")
+        fi
+        stop_count=$((stop_count + 1))
+        printf '%s' "$stop_count" > "$DOCKER_STOP_COUNT_FILE"
+      fi
+      if [[ -n "${DOCKER_STOP_MARKER:-}" ]]; then
+        : > "$DOCKER_STOP_MARKER"
+      fi
+      if [[ -n "${DOCKER_FAIL_STOP_ON_COUNT:-}" && "$stop_count" -eq "$DOCKER_FAIL_STOP_ON_COUNT" ]]; then
+        exit 43
+      fi
+    fi
     if [[ "$*" == *" up "* && ( "${DOCKER_FAIL_FIRST_UP:-0}" == 1 || -n "${DOCKER_CORRUPT_ON_SECOND_UP:-}" ) ]]; then
       [[ -n "${DOCKER_UP_COUNT_FILE:-}" ]] || exit 97
       up_count=0
@@ -114,6 +130,10 @@ case "${1:-}" in
       up_count=$((up_count + 1))
       printf '%s' "$up_count" > "$DOCKER_UP_COUNT_FILE"
       if [[ $up_count -eq 1 && "${DOCKER_FAIL_FIRST_UP:-0}" == 1 ]]; then
+        if [[ "${DOCKER_MUTATE_CHECKPOINT_ON_FIRST_UP:-0}" == 1 ]]; then
+          printf 'candidate-checkpoint\n' > "$DOCKER_CHECKPOINT_PATH"
+          printf 'candidate-integrity-key\n' > "$DOCKER_CHECKPOINT_KEY_PATH"
+        fi
         exit 42
       fi
       if [[ $up_count -eq 2 && -n "${DOCKER_CORRUPT_ON_SECOND_UP:-}" ]]; then
@@ -142,6 +162,32 @@ done
 printf '200'
 EOF
 chmod +x "$tmp/bin/curl"
+
+cat > "$tmp/bin/cp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${CP_REQUIRE_STOP_FOR:-}" ]]; then
+  for argument in "$@"; do
+    if [[ "$argument" == "$CP_REQUIRE_STOP_FOR" ]]; then
+      if [[ -z "${DOCKER_STOP_MARKER:-}" || ! -f "$DOCKER_STOP_MARKER" ]]; then
+        echo "checkpoint snapshot attempted before service stop" >&2
+        exit 86
+      fi
+    fi
+  done
+fi
+if [[ -n "${CP_FAIL_RESTORE_BASENAME:-}" && $# -ge 2 ]]; then
+  source_path=${@: -2:1}
+  target_path=${@: -1}
+  if [[ "$source_path" == *"/.deploy-backup-"*"/$CP_FAIL_RESTORE_BASENAME" \
+      && "$target_path" == *"/$CP_FAIL_RESTORE_BASENAME.restore."* ]]; then
+    echo "injected rollback restore failure: $CP_FAIL_RESTORE_BASENAME" >&2
+    exit 87
+  fi
+fi
+exec /bin/cp "$@"
+EOF
+chmod +x "$tmp/bin/cp"
 
 err="$tmp/missing-web.err"
 export SSH_COUNT_FILE="$tmp/ssh-count"
@@ -335,6 +381,12 @@ EOF
 cat > "$remote/data/settings.json" <<'EOF'
 {"chatTimeoutSeconds":1800,"imageTimeoutSeconds":1800,"memoryCompatibilityEnabled":true}
 EOF
+cat > "$remote/data/transport-checkpoints.json" <<'EOF'
+{"schema":"wp6-transport-checkpoints/rust-v1","records":[]}
+EOF
+cat > "$remote/data/.transport-checkpoints.json.key" <<'EOF'
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+EOF
 
 : > "$SSH_LOG"
 rm -f "$SSH_COUNT_FILE"
@@ -363,7 +415,12 @@ if [[ $rc -ne 0 ]]; then
   cat "$tmp/success.err" >&2
   exit 1
 fi
-cmp -s "$tmp/m365-native" "$remote/app/m365-native" || { echo "FAIL: binary not deployed" >&2; exit 1; }
+cmp -s "$tmp/m365-native" "$remote/app/m365-native" || {
+  echo "FAIL: binary not deployed" >&2
+  cat "$tmp/success.out" >&2
+  cat "$tmp/success.err" >&2
+  exit 1
+}
 for asset in index.html login.html debug.html; do
   cmp -s "$tmp/web/$asset" "$remote/app/web/$asset" || {
     echo "FAIL: web/$asset not deployed with binary" >&2
@@ -460,12 +517,20 @@ cp "$remote/app/web/login.html" "$tmp/rollback-login"
 cp "$remote/app/web/debug.html" "$tmp/rollback-debug"
 cp "$remote/compose.yaml" "$tmp/rollback-compose"
 cp "$remote/data/settings.json" "$tmp/rollback-settings"
+cp "$remote/data/transport-checkpoints.json" "$tmp/rollback-checkpoints"
+cp "$remote/data/.transport-checkpoints.json.key" "$tmp/rollback-checkpoint-key"
 : > "$SSH_LOG"
 rm -f "$SSH_COUNT_FILE" "$tmp/docker-up-count"
 export SSH_FAIL_ON_CALL=999
 export SSH_EXEC_REMOTE=1
 export DOCKER_FAIL_FIRST_UP=1
 export DOCKER_UP_COUNT_FILE="$tmp/docker-up-count"
+export DOCKER_MUTATE_CHECKPOINT_ON_FIRST_UP=1
+export DOCKER_CHECKPOINT_PATH="$remote/data/transport-checkpoints.json"
+export DOCKER_CHECKPOINT_KEY_PATH="$remote/data/.transport-checkpoints.json.key"
+export DOCKER_STOP_MARKER="$tmp/docker-stop"
+export CP_REQUIRE_STOP_FOR="$remote/data/transport-checkpoints.json"
+rm -f "$DOCKER_STOP_MARKER"
 export SSH_STAGE_CAPTURE="$tmp/rollback-release.tar"
 set +e
 PATH="$tmp/bin:$PATH" \
@@ -495,12 +560,180 @@ cmp -s "$tmp/rollback-login" "$remote/app/web/login.html" || { echo "FAIL: rollb
 cmp -s "$tmp/rollback-debug" "$remote/app/web/debug.html" || { echo "FAIL: rollback did not restore debug" >&2; exit 1; }
 cmp -s "$tmp/rollback-compose" "$remote/compose.yaml" || { echo "FAIL: rollback did not restore compose" >&2; exit 1; }
 cmp -s "$tmp/rollback-settings" "$remote/data/settings.json" || { echo "FAIL: rollback did not restore settings" >&2; exit 1; }
+cmp -s "$tmp/rollback-checkpoints" "$remote/data/transport-checkpoints.json" || { echo "FAIL: rollback did not restore checkpoint state" >&2; exit 1; }
+cmp -s "$tmp/rollback-checkpoint-key" "$remote/data/.transport-checkpoints.json.key" || { echo "FAIL: rollback did not restore checkpoint integrity key" >&2; exit 1; }
 if find "$remote" -maxdepth 1 -type d -name '.deploy-backup-*' | grep -q .; then
   echo "FAIL: successful rollback left backup directory behind" >&2
   exit 1
 fi
 
-echo "PASS: injected failure rolls back binary web compose and settings together"
+echo "PASS: injected failure rolls back runtime and checkpoint state together"
+
+rm -rf "$remote"/.deploy-backup-*
+: > "$SSH_LOG"
+rm -f "$SSH_COUNT_FILE" "$tmp/docker-up-count" "$tmp/docker-stop-count" "$DOCKER_STOP_MARKER"
+export SSH_FAIL_ON_CALL=999
+export SSH_EXEC_REMOTE=1
+export DOCKER_FAIL_FIRST_UP=1
+export DOCKER_UP_COUNT_FILE="$tmp/docker-up-count"
+export DOCKER_MUTATE_CHECKPOINT_ON_FIRST_UP=1
+export DOCKER_STOP_COUNT_FILE="$tmp/docker-stop-count"
+export DOCKER_FAIL_STOP_ON_COUNT=2
+export SSH_STAGE_CAPTURE="$tmp/rollback-stop-failure-release.tar"
+set +e
+PATH="$tmp/bin:$PATH" \
+M365_REMOTE_APP="$remote/app/m365-native" \
+M365_REMOTE_DATA="$remote/data" \
+M365_REMOTE_COMPOSE="$remote/compose.yaml" \
+M365_SMOKE_ENV="$remote/missing-smoke.env" \
+M365_READY_TIMEOUT=10 \
+bash "$deploy" \
+  --binary "$tmp/m365-native" \
+  --web-dir "$tmp/web" \
+  --sha256 "$sha" \
+  --commit "$commit" \
+  --tree "$tree" \
+  >"$tmp/rollback-stop-failure.out" 2>"$tmp/rollback-stop-failure.err"
+rc=$?
+set -e
+if [[ $rc -ne 42 ]]; then
+  echo "FAIL: rollback stop-failure probe did not preserve original rc=42 (rc=$rc)" >&2
+  cat "$tmp/rollback-stop-failure.err" >&2
+  exit 1
+fi
+grep -Fq 'rollback incomplete; backup retained' "$tmp/rollback-stop-failure.err" || {
+  echo "FAIL: rollback stop failure did not retain the recovery backup" >&2
+  cat "$tmp/rollback-stop-failure.err" >&2
+  exit 1
+}
+[[ "$(cat "$tmp/docker-up-count")" == "1" ]] || {
+  echo "FAIL: rollback restarted the service after rollback stop failed" >&2
+  cat "$tmp/rollback-stop-failure.err" >&2
+  exit 1
+}
+cmp -s "$tmp/m365-native" "$remote/app/m365-native" || {
+  echo "FAIL: rollback restored runtime files even though rollback stop failed" >&2
+  exit 1
+}
+grep -Fq 'candidate-checkpoint' "$remote/data/transport-checkpoints.json" || {
+  echo "FAIL: rollback replaced checkpoint state even though rollback stop failed" >&2
+  exit 1
+}
+if ! find "$remote" -maxdepth 1 -type d -name '.deploy-backup-*' | grep -q .; then
+  echo "FAIL: rollback stop failure did not retain a recovery backup" >&2
+  exit 1
+fi
+
+echo "PASS: rollback stop failure retains backup without restoring or restarting"
+
+unset DOCKER_FAIL_STOP_ON_COUNT DOCKER_STOP_COUNT_FILE
+cp "$tmp/rollback-binary" "$remote/app/m365-native"
+chmod 755 "$remote/app/m365-native"
+cp "$tmp/rollback-index" "$remote/app/web/index.html"
+cp "$tmp/rollback-login" "$remote/app/web/login.html"
+cp "$tmp/rollback-debug" "$remote/app/web/debug.html"
+cp "$tmp/rollback-compose" "$remote/compose.yaml"
+cp "$tmp/rollback-settings" "$remote/data/settings.json"
+cp "$tmp/rollback-checkpoints" "$remote/data/transport-checkpoints.json"
+cp "$tmp/rollback-checkpoint-key" "$remote/data/.transport-checkpoints.json.key"
+rm -rf "$remote"/.deploy-backup-*
+
+: > "$SSH_LOG"
+rm -f "$SSH_COUNT_FILE" "$tmp/docker-up-count" "$DOCKER_STOP_MARKER"
+export SSH_FAIL_ON_CALL=999
+export SSH_EXEC_REMOTE=1
+export DOCKER_FAIL_FIRST_UP=1
+export DOCKER_UP_COUNT_FILE="$tmp/docker-up-count"
+export DOCKER_MUTATE_CHECKPOINT_ON_FIRST_UP=1
+export CP_FAIL_RESTORE_BASENAME="index.html"
+export SSH_STAGE_CAPTURE="$tmp/rollback-restore-failure-release.tar"
+set +e
+PATH="$tmp/bin:$PATH" \
+M365_REMOTE_APP="$remote/app/m365-native" \
+M365_REMOTE_DATA="$remote/data" \
+M365_REMOTE_COMPOSE="$remote/compose.yaml" \
+M365_SMOKE_ENV="$remote/missing-smoke.env" \
+M365_READY_TIMEOUT=10 \
+bash "$deploy" \
+  --binary "$tmp/m365-native" \
+  --web-dir "$tmp/web" \
+  --sha256 "$sha" \
+  --commit "$commit" \
+  --tree "$tree" \
+  >"$tmp/rollback-restore-failure.out" 2>"$tmp/rollback-restore-failure.err"
+rc=$?
+set -e
+if [[ $rc -ne 42 ]]; then
+  echo "FAIL: rollback restore-failure probe did not preserve original rc=42 (rc=$rc)" >&2
+  cat "$tmp/rollback-restore-failure.err" >&2
+  exit 1
+fi
+grep -Fq 'rollback incomplete; backup retained' "$tmp/rollback-restore-failure.err" || {
+  echo "FAIL: rollback restore failure did not retain the recovery backup" >&2
+  cat "$tmp/rollback-restore-failure.err" >&2
+  exit 1
+}
+[[ "$(cat "$tmp/docker-up-count")" == "1" ]] || {
+  echo "FAIL: rollback restarted the service after a restore operation failed" >&2
+  cat "$tmp/rollback-restore-failure.err" >&2
+  exit 1
+}
+if ! find "$remote" -maxdepth 1 -type d -name '.deploy-backup-*' | grep -q .; then
+  echo "FAIL: rollback restore failure did not retain a recovery backup" >&2
+  exit 1
+fi
+
+echo "PASS: rollback restore failure leaves the service stopped and retains backup"
+
+unset CP_FAIL_RESTORE_BASENAME
+cp "$tmp/rollback-binary" "$remote/app/m365-native"
+chmod 755 "$remote/app/m365-native"
+cp "$tmp/rollback-index" "$remote/app/web/index.html"
+cp "$tmp/rollback-login" "$remote/app/web/login.html"
+cp "$tmp/rollback-debug" "$remote/app/web/debug.html"
+cp "$tmp/rollback-compose" "$remote/compose.yaml"
+cp "$tmp/rollback-settings" "$remote/data/settings.json"
+cp "$tmp/rollback-checkpoints" "$remote/data/transport-checkpoints.json"
+cp "$tmp/rollback-checkpoint-key" "$remote/data/.transport-checkpoints.json.key"
+rm -rf "$remote"/.deploy-backup-*
+
+rm -f "$remote/data/transport-checkpoints.json" "$remote/data/.transport-checkpoints.json.key"
+: > "$SSH_LOG"
+rm -f "$SSH_COUNT_FILE" "$tmp/docker-up-count" "$DOCKER_STOP_MARKER"
+export SSH_FAIL_ON_CALL=999
+export SSH_EXEC_REMOTE=1
+export DOCKER_FAIL_FIRST_UP=1
+export DOCKER_UP_COUNT_FILE="$tmp/docker-up-count"
+export DOCKER_MUTATE_CHECKPOINT_ON_FIRST_UP=1
+export SSH_STAGE_CAPTURE="$tmp/rollback-absent-release.tar"
+set +e
+PATH="$tmp/bin:$PATH" \
+M365_REMOTE_APP="$remote/app/m365-native" \
+M365_REMOTE_DATA="$remote/data" \
+M365_REMOTE_COMPOSE="$remote/compose.yaml" \
+M365_SMOKE_ENV="$remote/missing-smoke.env" \
+M365_READY_TIMEOUT=10 \
+bash "$deploy" \
+  --binary "$tmp/m365-native" \
+  --web-dir "$tmp/web" \
+  --sha256 "$sha" \
+  --commit "$commit" \
+  --tree "$tree" \
+  >"$tmp/rollback-absent.out" 2>"$tmp/rollback-absent.err"
+rc=$?
+set -e
+if [[ $rc -ne 42 ]]; then
+  echo "FAIL: absent-state rollback probe did not preserve original rc=42 (rc=$rc)" >&2
+  cat "$tmp/rollback-absent.err" >&2
+  exit 1
+fi
+grep -Fq 'rollback succeeded' "$tmp/rollback-absent.err" || { echo "FAIL: absent-state rollback did not report success" >&2; cat "$tmp/rollback-absent.err" >&2; exit 1; }
+[[ ! -e "$remote/data/transport-checkpoints.json" ]] || { echo "FAIL: rollback retained candidate-created checkpoint state" >&2; exit 1; }
+[[ ! -e "$remote/data/.transport-checkpoints.json.key" ]] || { echo "FAIL: rollback retained candidate-created checkpoint key" >&2; exit 1; }
+
+echo "PASS: rollback restores predeploy absence of checkpoint state and key"
+
+unset DOCKER_MUTATE_CHECKPOINT_ON_FIRST_UP DOCKER_CHECKPOINT_PATH DOCKER_CHECKPOINT_KEY_PATH DOCKER_STOP_MARKER CP_REQUIRE_STOP_FOR
 
 rm -rf "$remote"/.deploy-backup-*
 printf 'verify-binary\n' > "$remote/app/m365-native"

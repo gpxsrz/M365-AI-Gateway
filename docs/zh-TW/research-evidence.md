@@ -58,7 +58,7 @@ Production runtime 曾出現 binary 已更新、三個 Web 檔仍是舊版的 mi
 
 ### Goal Judge control-plane
 
-歷史 live trace 證明：Goal Judge 經 `/hermes/v1` 時，合法 `done` JSON 曾被 Agent completion-evidence guard 改成自然語言。修正後 Goal Judge 走 P2 `/v1/chat/completions`，使用 ForceNew / Untracked checkpoint policy，保留 scheduler / breaker / `MEMORY_YIELD`，但不注入 Agent evidence ledger。`/hermes/v1` 原本的 completion guard 沒有移除。
+歷史 live trace 證明：Goal Judge 經 `/hermes/v1` 時，合法 `done` JSON 曾被舊的 Agent completion-evidence prototype 改成自然語言。該 trace 已保存在 repo 外 ACP salvage bundle，作為 failure corpus；不是 current runtime authority。現在的 M365 source 已移除這個 semantic guard：Goal Judge 走 P2 `/v1/chat/completions`，使用 ForceNew / Untracked checkpoint policy；`/hermes/v1` 只保留 provider transport、typed evidence 與 duplicate-effect protection。Task/Run completion semantics 由 ACP 負責。
 
 舊 Go implementation、CI、NAS、Production 與 live canary 的 exact identities 是歷史證據，不可直接當成 Rust PASS。Rust 對照請讀 [`rust-rewrite-parity.md`](rust-rewrite-parity.md)；每次新的 live／Production 驗證都要重新固定 Rust commit 與 artifact。
 

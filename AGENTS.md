@@ -17,7 +17,7 @@
 
 ## 工程規則
 
-- 每個實質不同的開發作業單元開始前，先經 Gabriel Skill Router 依任務目的挑選最小且適合的 Skill，再動手。`open_workspace` 當下列出的 Skills 只是目前 scope 的 discovery snapshot，不是完整能力清單；若沒有直接匹配但任務明顯需要專用能力，必須依 Router 的 dynamic resolution 規則尋找 exact hidden / plugin Skill，不能因第一次清單未列出就宣稱不存在。診斷、設計、實作、review、部署、QA、cleanup 等作業類別改變時要重新 route / 選 Skill，不能慣性沿用上一階段。
+- 每個實質不同作業單元開始前，依目前執行環境挑選並讀取最小適用 Skills。**本機 Codex 使用原生工具與 Skill discovery；Web ChatGPT 才經 Gabriel Skill Router / DevSpace。** Web 的 `open_workspace` 清單只是 scope snapshot，必要時按 Router 精確解析 hidden/plugin Skill；本機 Codex 依原生機制解析，不能因 connector 存在就改走 DevSpace。診斷、設計、實作、review、部署、QA、cleanup 改變時重新選擇；仍適用的 Skill 可沿用。本機 Codex 不建立 Web execution-guard session、不套用 Web 回合預算；被 guarded Web parent 委派時只遵守供給的 child self-stamp contract。
 - 所有工程工作預設採 **Ponytail full**：先刪除不必要工作、優先重用既有 seam/helper、做最小正確 diff，不因未來可能需求新增 speculative abstraction、依賴、設定或第二份 authority。
 - 先追完整執行路徑，再做最小的共同根因修正。
 - TDD 不能取代 trace；先確認 callers、sibling paths、shared state 與 authority boundary，再開始實作。

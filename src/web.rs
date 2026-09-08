@@ -55,6 +55,7 @@ const BUILD_TIME: &str = match option_env!("M365_BUILD_TIME") {
 };
 const ADMIN_COOKIE: &str = "m365_admin_session";
 const SESSION_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
+const TRANSPORT_CHECKPOINT_RECOVERY_CODE: &str = "transport_checkpoint_recovery_required";
 const OAUTH_COMPLETION_PAGE: &str = r#"<!doctype html><html lang="zh-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M365 AI Gateway 授權完成</title><style>body{font:16px system-ui;text-align:center;padding:15vh 20px;color:#242424}main{max-width:520px;margin:auto}h1{font-size:26px}</style></head><body><main><h1>授權完成</h1><p>Microsoft 帳號已登入，可以關閉此頁面。</p><script>if(window.opener){window.opener.postMessage({type:"m365-auth-complete"},window.location.origin);setTimeout(()=>window.close(),300)}</script></main></body></html>"#;
 
 pub struct Gateway {
@@ -184,6 +185,14 @@ impl Gateway {
             .route(
                 "/api/admin/traffic/recovery",
                 post(Self::admin_traffic_recovery),
+            )
+            .route(
+                "/api/admin/checkpoints/recovery",
+                get(Self::admin_checkpoint_recovery),
+            )
+            .route(
+                "/api/admin/checkpoints/reconcile",
+                post(Self::admin_checkpoint_reconcile),
             )
             .route(
                 "/api/admin/settings",
@@ -564,6 +573,71 @@ impl Gateway {
         }
     }
 
+    async fn admin_checkpoint_recovery(State(gateway): State<Arc<Self>>) -> Response {
+        match gateway.checkpoints.recovery_views() {
+            Ok(recoveries) => Json(serde_json::json!({"recoveries": recoveries})).into_response(),
+            Err(_) => openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "storage_error",
+                "無法讀取待 reconciliation 的 checkpoint",
+            ),
+        }
+    }
+
+    async fn admin_checkpoint_reconcile(
+        State(gateway): State<Arc<Self>>,
+        request: Request,
+    ) -> Response {
+        let body = match read_json::<ReconcileCheckpointRequest>(request, 4_096).await {
+            Ok(body)
+                if body.action.trim() == "acknowledge_unknown" && !body.id.trim().is_empty() =>
+            {
+                body
+            }
+            _ => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "invalid_reconciliation_action",
+                    "action must be acknowledge_unknown and id is required",
+                );
+            }
+        };
+        let id = body.id.trim();
+        match gateway.checkpoints.reconcile_unknown(id) {
+            Ok(true) => Json(serde_json::json!({
+                "id": id,
+                "status": "unknown_external_outcome",
+                "replayAllowed": false,
+            }))
+            .into_response(),
+            Ok(false) => openai_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "not_found",
+                "找不到待 reconciliation 的 checkpoint",
+            ),
+            Err(crate::checkpoint::CheckpointError::Identity) => openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_checkpoint_id",
+                "checkpoint id 格式錯誤",
+            ),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired) => {
+                checkpoint_recovery_required(
+                    "checkpoint 仍在執行中或不是可完成 reconciliation 的未知結果",
+                )
+            }
+            Err(_) => openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "storage_error",
+                "無法完成 checkpoint reconciliation",
+            ),
+        }
+    }
+
     async fn admin_traffic(State(gateway): State<Arc<Self>>) -> Response {
         Json(serde_json::json!({
             "compatibilityTraffic": gateway.traffic.snapshot(),
@@ -658,10 +732,21 @@ impl Gateway {
                 "transport_checkpoint_clear_failed",
                 "無法安全更新聊天模式的連線狀態",
             ),
+            Err(Err(ClearThenError::RecoveryRequired)) => checkpoint_recovery_required(
+                "有尚未核對的上游聊天結果，完成 reconciliation 前不能更新聊天模式",
+            ),
             Err(Err(ClearThenError::Change(error))) => settings_error(&error),
             Err(Err(ClearThenError::Restore { change, restore })) => {
-                let _ = restore;
-                settings_error(&change)
+                let _ = (&change, &restore);
+                checkpoint_restore_failed(
+                    "聊天模式更新失敗，checkpoint 已保留復原證據；完成 recovery 前拒絕繼續",
+                )
+            }
+            Err(Err(ClearThenError::Finalize(error))) => {
+                let _ = error;
+                checkpoint_recovery_required(
+                    "聊天模式更新結果可能已套用，但 recovery marker 未能清除；完成 reconciliation 前拒絕重試",
+                )
             }
         }
     }
@@ -834,6 +919,11 @@ impl Gateway {
                 "not_found",
                 "找不到對話",
             ),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired) => {
+                checkpoint_recovery_required(
+                    "有尚未核對的上游聊天結果，完成 reconciliation 前不能刪除對話",
+                )
+            }
             Err(_) => openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
@@ -860,12 +950,27 @@ impl Gateway {
                 "transport_checkpoint_clear_failed",
                 "無法安全清除帳號的聊天連線狀態",
             ),
-            Err(ClearThenError::Change(_) | ClearThenError::Restore { .. }) => openai_error(
+            Err(ClearThenError::RecoveryRequired) => checkpoint_recovery_required(
+                "有尚未核對的上游聊天結果，完成 reconciliation 前不能登出帳號",
+            ),
+            Err(ClearThenError::Change(_)) => openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
                 "storage_error",
                 "無法刪除帳號",
             ),
+            Err(ClearThenError::Restore { change, restore }) => {
+                let _ = (&change, &restore);
+                checkpoint_restore_failed(
+                    "登出失敗，checkpoint 已保留復原證據；完成 recovery 前拒絕繼續",
+                )
+            }
+            Err(ClearThenError::Finalize(error)) => {
+                let _ = error;
+                checkpoint_recovery_required(
+                    "登出結果可能已套用，但 recovery marker 未能清除；完成 reconciliation 前拒絕重試",
+                )
+            }
         }
     }
 
@@ -1225,6 +1330,45 @@ impl Gateway {
                     "無法安全更新 Microsoft 帳號的聊天連線狀態",
                 );
             }
+            Err(OAuthTokenStoreError::CheckpointRecovery) => {
+                gateway.pkce.failed(
+                    &input.state,
+                    TRANSPORT_CHECKPOINT_RECOVERY_CODE,
+                    "有尚未核對的上游聊天結果，完成 reconciliation 前不能更新 Microsoft 帳號",
+                );
+                discard_failed_oauth(&gateway, &claimed);
+                return oauth_error(
+                    StatusCode::CONFLICT,
+                    TRANSPORT_CHECKPOINT_RECOVERY_CODE,
+                    "有尚未核對的上游聊天結果，完成 reconciliation 前不能更新 Microsoft 帳號",
+                );
+            }
+            Err(OAuthTokenStoreError::CheckpointRestore) => {
+                gateway.pkce.failed(
+                    &input.state,
+                    "transport_checkpoint_restore_failed",
+                    "Microsoft 帳號更新失敗，checkpoint 已保留復原證據；完成 recovery 前拒絕繼續",
+                );
+                discard_failed_oauth(&gateway, &claimed);
+                return oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "transport_checkpoint_restore_failed",
+                    "Microsoft 帳號更新失敗，checkpoint 已保留復原證據；完成 recovery 前拒絕繼續",
+                );
+            }
+            Err(OAuthTokenStoreError::CheckpointFinalize) => {
+                gateway.pkce.failed(
+                    &input.state,
+                    TRANSPORT_CHECKPOINT_RECOVERY_CODE,
+                    "Microsoft 帳號更新結果可能已套用，但 recovery marker 未能清除；完成 reconciliation 前拒絕重試",
+                );
+                discard_failed_oauth(&gateway, &claimed);
+                return oauth_error(
+                    StatusCode::CONFLICT,
+                    TRANSPORT_CHECKPOINT_RECOVERY_CODE,
+                    "Microsoft 帳號更新結果可能已套用，但 recovery marker 未能清除；完成 reconciliation 前拒絕重試",
+                );
+            }
             Err(OAuthTokenStoreError::Token) => {
                 gateway.pkce.failed(
                     &input.state,
@@ -1373,6 +1517,13 @@ struct CreateKeyResponse {
 #[derive(Default, Deserialize)]
 struct RecoveryRequest {
     #[serde(default)]
+    action: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconcileCheckpointRequest {
+    id: String,
     action: String,
 }
 
@@ -1841,6 +1992,9 @@ fn discard_failed_oauth(gateway: &Gateway, claimed: &crate::oauth_flow::ClaimedP
 #[derive(Debug)]
 enum OAuthTokenStoreError {
     Checkpoint,
+    CheckpointRecovery,
+    CheckpointRestore,
+    CheckpointFinalize,
     Token,
 }
 
@@ -1856,8 +2010,15 @@ fn store_oauth_token(
     match gateway.checkpoints.clear_then(|| store.upsert(token)) {
         Ok(account) => Ok(account),
         Err(ClearThenError::Clear) => Err(OAuthTokenStoreError::Checkpoint),
-        Err(ClearThenError::Change(_) | ClearThenError::Restore { .. }) => {
-            Err(OAuthTokenStoreError::Token)
+        Err(ClearThenError::RecoveryRequired) => Err(OAuthTokenStoreError::CheckpointRecovery),
+        Err(ClearThenError::Change(_)) => Err(OAuthTokenStoreError::Token),
+        Err(ClearThenError::Restore { change, restore }) => {
+            let _ = (&change, &restore);
+            Err(OAuthTokenStoreError::CheckpointRestore)
+        }
+        Err(ClearThenError::Finalize(error)) => {
+            let _ = error;
+            Err(OAuthTokenStoreError::CheckpointFinalize)
         }
     }
 }
@@ -1949,6 +2110,24 @@ fn settings_error(error: &GatewayError) -> Response {
         "invalid_request_error",
         "invalid_settings",
         &error.to_string(),
+    )
+}
+
+fn checkpoint_recovery_required(message: &str) -> Response {
+    openai_error(
+        StatusCode::CONFLICT,
+        "invalid_state_error",
+        TRANSPORT_CHECKPOINT_RECOVERY_CODE,
+        message,
+    )
+}
+
+fn checkpoint_restore_failed(message: &str) -> Response {
+    openai_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "storage_error",
+        "transport_checkpoint_restore_failed",
+        message,
     )
 }
 
@@ -2173,6 +2352,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+    }
+
+    fn seed_upstream_started_checkpoint(gateway: &Arc<Gateway>) -> String {
+        seed_checkpoint(gateway);
+        let message = crate::checkpoint::CheckpointMessage {
+            role: "user".to_owned(),
+            content: Value::String("private conversation".to_owned()),
+            empty_recovery_synthetic: false,
+            name: String::new(),
+            tool_call_id: String::new(),
+            tool_calls: Vec::new(),
+            tool_result_is_error: false,
+        };
+        let mut turn = gateway
+            .checkpoints
+            .begin_full("hermes", "owner", "session", &[message], false)
+            .unwrap();
+        turn.mark_upstream_started().unwrap();
+        gateway.checkpoints.list().unwrap()[0].id.clone()
     }
 
     fn token_set(id: &str) -> crate::auth::TokenSet {
@@ -2806,6 +3004,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_chat_mode_restore_failure_is_typed_and_leaves_recovery_required() {
+        let gateway = gateway();
+        seed_checkpoint(&gateway);
+        let settings_path = gateway
+            .tokens
+            .path()
+            .parent()
+            .unwrap()
+            .join("settings.json");
+        std::fs::create_dir(&settings_path).unwrap();
+        gateway.checkpoints.fail_next_clear_then_restore_for_test();
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let current = gateway.settings.current();
+        let next_mode = if current.chat_mode == "private" {
+            "normal"
+        } else {
+            "private"
+        };
+
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::put("/api/admin/settings")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::from(
+                        serde_json::json!({"chatMode": next_mode}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            value["error"]["code"],
+            "transport_checkpoint_restore_failed"
+        );
+        assert_eq!(gateway.settings.current().chat_mode, current.chat_mode);
+        assert!(matches!(
+            gateway.checkpoints.clear(),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired)
+        ));
+        std::fs::remove_dir(&settings_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_chat_mode_change_refuses_unresolved_checkpoint() {
+        let gateway = gateway();
+        let id = seed_upstream_started_checkpoint(&gateway);
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let current = gateway.settings.current();
+        let next_mode = if current.chat_mode == "private" {
+            "normal"
+        } else {
+            "private"
+        };
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::put("/api/admin/settings")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::from(
+                        serde_json::json!({"chatMode": next_mode}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(value["error"]["code"], TRANSPORT_CHECKPOINT_RECOVERY_CODE);
+        assert_eq!(gateway.settings.current().chat_mode, current.chat_mode);
+        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+
+        assert!(gateway.checkpoints.reconcile_unknown(&id).unwrap());
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::put("/api/admin/settings")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::from(
+                        serde_json::json!({"chatMode": next_mode}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(gateway.settings.current().chat_mode, next_mode);
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+        let replay = crate::checkpoint::CheckpointMessage {
+            role: "user".to_owned(),
+            content: Value::String("private conversation".to_owned()),
+            empty_recovery_synthetic: false,
+            name: String::new(),
+            tool_call_id: String::new(),
+            tool_calls: Vec::new(),
+            tool_result_is_error: false,
+        };
+        assert!(matches!(
+            gateway
+                .checkpoints
+                .begin_full("hermes", "owner", "session", &[replay], false,),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_admin_settings_partial_put_preserves_capability_evidence() {
         let gateway = gateway();
         let digest = "4".repeat(64);
@@ -3158,6 +3482,295 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(gateway.tokens.first().is_none());
         assert!(gateway.checkpoints.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_logout_restore_failure_is_typed_and_leaves_recovery_required() {
+        let gateway = gateway();
+        gateway.tokens.upsert(token_set("before")).unwrap();
+        seed_checkpoint(&gateway);
+        let token_path = gateway.tokens.path().to_owned();
+        std::fs::remove_file(&token_path).unwrap();
+        std::fs::create_dir(&token_path).unwrap();
+        gateway.checkpoints.fail_next_clear_then_restore_for_test();
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::post("/api/account/logout")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            value["error"]["code"],
+            "transport_checkpoint_restore_failed"
+        );
+        assert_eq!(gateway.tokens.first().unwrap().access_token, "token-before");
+        assert!(matches!(
+            gateway.checkpoints.clear(),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired)
+        ));
+        std::fs::remove_dir(&token_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation_refuses_unresolved_checkpoint() {
+        let gateway = gateway();
+        let id = seed_upstream_started_checkpoint(&gateway);
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::post("/api/conversations/delete")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::from(serde_json::json!({"id": id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(value["error"]["code"], TRANSPORT_CHECKPOINT_RECOVERY_CODE);
+        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_admin_checkpoint_reconciliation_is_explicitly_terminal_unknown() {
+        let gateway = gateway();
+        let id = seed_upstream_started_checkpoint(&gateway);
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let app = Gateway::router(gateway.clone());
+        let cookie = format!("{ADMIN_COOKIE}={}", login.token);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::get("/api/admin/checkpoints/recovery")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["recoveries"][0]["id"], id);
+        assert!(listed["recoveries"][0].get("conversationId").is_none());
+        assert!(listed["recoveries"][0].get("sessionId").is_none());
+
+        let reconciled = app
+            .clone()
+            .oneshot(
+                Request::post("/api/admin/checkpoints/reconcile")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": id,
+                            "action": "acknowledge_unknown"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconciled.status(), StatusCode::OK);
+        let reconciled: Value =
+            serde_json::from_slice(&to_bytes(reconciled.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(reconciled["status"], "unknown_external_outcome");
+        assert_eq!(reconciled["replayAllowed"], false);
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+
+        let deleted = app
+            .oneshot(
+                Request::post("/api/conversations/delete")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(serde_json::json!({"id": id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::CONFLICT);
+        let deleted: Value =
+            serde_json::from_slice(&to_bytes(deleted.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(deleted["error"]["code"], TRANSPORT_CHECKPOINT_RECOVERY_CODE);
+        assert!(matches!(
+            gateway.checkpoints.begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[crate::checkpoint::CheckpointMessage {
+                    role: "user".to_owned(),
+                    content: Value::String("one".to_owned()),
+                    empty_recovery_synthetic: false,
+                    name: String::new(),
+                    tool_call_id: String::new(),
+                    tool_calls: Vec::new(),
+                    tool_result_is_error: false,
+                }],
+                false,
+            ),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_logout_refuses_unresolved_checkpoint() {
+        let gateway = gateway();
+        gateway.tokens.upsert(token_set("before")).unwrap();
+        let id = seed_upstream_started_checkpoint(&gateway);
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::post("/api/account/logout")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(value["error"]["code"], TRANSPORT_CHECKPOINT_RECOVERY_CODE);
+        assert_eq!(gateway.tokens.first().unwrap().access_token, "token-before");
+        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+
+        assert!(gateway.checkpoints.reconcile_unknown(&id).unwrap());
+        let response = Gateway::router(gateway.clone())
+            .oneshot(
+                Request::post("/api/account/logout")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(gateway.tokens.first().is_none());
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+        let replay = crate::checkpoint::CheckpointMessage {
+            role: "user".to_owned(),
+            content: Value::String("private conversation".to_owned()),
+            empty_recovery_synthetic: false,
+            name: String::new(),
+            tool_call_id: String::new(),
+            tool_calls: Vec::new(),
+            tool_result_is_error: false,
+        };
+        assert!(matches!(
+            gateway
+                .checkpoints
+                .begin_full("hermes", "owner", "session", &[replay], false,),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn test_active_oauth_replacement_refuses_unresolved_checkpoint() {
+        let gateway = gateway();
+        gateway.tokens.upsert(token_set("before")).unwrap();
+        let id = seed_upstream_started_checkpoint(&gateway);
+
+        let result = store_oauth_token(&gateway, &gateway.tokens, token_set("after"), true);
+
+        assert!(matches!(
+            result,
+            Err(OAuthTokenStoreError::CheckpointRecovery)
+        ));
+        assert_eq!(gateway.tokens.first().unwrap().access_token, "token-before");
+        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+
+        assert!(gateway.checkpoints.reconcile_unknown(&id).unwrap());
+        let account =
+            store_oauth_token(&gateway, &gateway.tokens, token_set("after"), true).unwrap();
+        assert_eq!(account.access_token, "token-after");
+        assert_eq!(gateway.tokens.first().unwrap().access_token, "token-after");
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+        let replay = crate::checkpoint::CheckpointMessage {
+            role: "user".to_owned(),
+            content: Value::String("private conversation".to_owned()),
+            empty_recovery_synthetic: false,
+            name: String::new(),
+            tool_call_id: String::new(),
+            tool_calls: Vec::new(),
+            tool_result_is_error: false,
+        };
+        assert!(matches!(
+            gateway
+                .checkpoints
+                .begin_full("hermes", "owner", "session", &[replay], false,),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn test_active_oauth_replacement_restore_failure_is_typed_and_leaves_recovery_required() {
+        let gateway = gateway();
+        gateway.tokens.upsert(token_set("before")).unwrap();
+        seed_checkpoint(&gateway);
+        let token_path = gateway.tokens.path().to_owned();
+        std::fs::remove_file(&token_path).unwrap();
+        std::fs::create_dir(&token_path).unwrap();
+        gateway.checkpoints.fail_next_clear_then_restore_for_test();
+
+        let result = store_oauth_token(&gateway, &gateway.tokens, token_set("after"), true);
+
+        assert!(matches!(
+            result,
+            Err(OAuthTokenStoreError::CheckpointRestore)
+        ));
+        assert_eq!(gateway.tokens.first().unwrap().access_token, "token-before");
+        assert!(matches!(
+            gateway.checkpoints.clear(),
+            Err(crate::checkpoint::CheckpointError::RecoveryRequired)
+        ));
+        std::fs::remove_dir(&token_path).unwrap();
     }
 
     #[tokio::test]

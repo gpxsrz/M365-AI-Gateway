@@ -312,6 +312,14 @@ pub(crate) async fn execute_chat_request(
     let mut response =
         execute_chat_request_inner(gateway, path, owner, artifact_origin, body, trace.clone())
             .await;
+    let is_stream = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    if !is_stream {
+        trace.caller_delivery(CallerDelivery::Sent);
+    }
     trace.http_status(response.status());
     response
         .extensions_mut()
@@ -337,8 +345,15 @@ async fn execute_chat_request_inner(
             message,
         );
     }
+    if let Some(response) = hermes_execution_identity_denial(&path, &mut body) {
+        return response;
+    }
     clear_untracked_transport_identity(&path, &mut body);
-    scope_execution_control_provenance(&path, &mut body, &gateway.hermes_recall_provenance_secret);
+    let authenticated_empty_recovery = scope_execution_control_provenance(
+        &path,
+        &mut body,
+        &gateway.hermes_recall_provenance_secret,
+    );
     let class = request_class(&path, &body);
     trace.request(class, ProvenanceClass::None);
     let stream_options = match parse_stream_options(&body.stream_options, body.stream) {
@@ -409,16 +424,29 @@ async fn execute_chat_request_inner(
         && body.checkpoint_mode.is_empty()
         && !body.session_key.trim().is_empty();
     let checkpoint_result = if implicit_hermes {
-        gateway
-            .checkpoints
-            .begin_full(
-                "hermes",
-                &owner,
-                &body.session_key,
-                &checkpoint_messages,
-                false,
-            )
-            .map(Some)
+        if authenticated_empty_recovery {
+            gateway
+                .checkpoints
+                .begin_full_recovery(
+                    "hermes",
+                    &owner,
+                    &body.session_key,
+                    &checkpoint_messages,
+                    false,
+                )
+                .map(Some)
+        } else {
+            gateway
+                .checkpoints
+                .begin_full(
+                    "hermes",
+                    &owner,
+                    &body.session_key,
+                    &checkpoint_messages,
+                    false,
+                )
+                .map(Some)
+        }
     } else {
         match body.checkpoint_mode.as_str() {
             "full" => gateway
@@ -520,7 +548,7 @@ async fn execute_chat_request_inner(
             &message,
         );
     }
-    let apply_agent_evidence_policy = path.starts_with("/hermes/");
+    let suppress_duplicate_tool_calls = path.starts_with("/hermes/");
     let checkpoint_response_id = body.checkpoint_response_id.clone();
     if let Some(turn) = &checkpoint {
         if !turn.binding.conversation_id.is_empty() {
@@ -804,7 +832,7 @@ async fn execute_chat_request_inner(
             memory_caller_evidence,
             checkpoint_response_id,
             agent_ledger,
-            apply_agent_evidence_policy,
+            suppress_duplicate_tool_calls,
             overflow_context,
             trace,
         )
@@ -824,7 +852,7 @@ async fn execute_chat_request_inner(
             memory_caller_evidence,
             checkpoint_response_id,
             agent_ledger,
-            apply_agent_evidence_policy,
+            suppress_duplicate_tool_calls,
             overflow_context,
             trace,
         )
@@ -863,12 +891,12 @@ async fn complete_chat(
     route_metadata: Value,
     artifact_origin: String,
     permit: crate::traffic::Permit,
-    checkpoint: Option<CheckpointTurn>,
+    mut checkpoint: Option<CheckpointTurn>,
     response_format: Option<ResponseFormat>,
     memory_caller_evidence: Option<String>,
     checkpoint_response_id: String,
     agent_ledger: crate::agent_ledger::AgentLedger,
-    apply_agent_evidence_policy: bool,
+    suppress_duplicate_tool_calls: bool,
     overflow_context: Option<OverflowContext>,
     trace: crate::debug::Trace,
 ) -> Response {
@@ -883,9 +911,17 @@ async fn complete_chat(
     let fallback_request = request.clone();
     let upstream_attempt_count = reset_upstream_attempts(&request);
     let mut sink = |_: StreamEvent| Ok(());
+    let upstream = async {
+        if let Some(turn) = checkpoint.as_mut() {
+            turn.mark_upstream_started().map_err(|error| {
+                ChatError::Protocol(format!("checkpoint start failed: {error}"))
+            })?;
+        }
+        gateway.chat.chat(account, request, &mut sink).await
+    };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
-        gateway.chat.chat(account, request, &mut sink),
+        upstream,
     )
     .await;
     match result {
@@ -953,12 +989,12 @@ async fn complete_chat(
                     "ChatHub returned an empty response",
                 );
             }
-            let mut policy = apply_agent_policy(
+            let mut transport = apply_transport_projection(
                 project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
                 &agent_ledger,
-                apply_agent_evidence_policy,
+                suppress_duplicate_tool_calls,
             );
-            if policy.projection.overflowed {
+            if transport.projection.overflowed {
                 permit.finish(StatusCode::BAD_GATEWAY, None);
                 return openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -967,7 +1003,7 @@ async fn complete_chat(
                     "model returned more tool calls than the safe request limit",
                 );
             }
-            if policy.completed_call_suppressed {
+            if transport.completed_call_suppressed {
                 trace.tool_call_suppressed();
                 let answer_request =
                     completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
@@ -1063,14 +1099,13 @@ async fn complete_chat(
                         "ChatHub final-answer fallback returned an empty response",
                     );
                 }
-                policy = apply_agent_policy(
+                transport = apply_transport_projection(
                     project_tool_calls(&result.text, &[], &Value::String("none".to_owned()), 1),
                     &agent_ledger,
-                    apply_agent_evidence_policy,
+                    suppress_duplicate_tool_calls,
                 );
             }
-            trace.post_policy(policy.decision.disposition, policy.decision.reason);
-            let projection = policy.projection;
+            let projection = transport.projection;
             if let Err(message) =
                 validate_final_projection_format(&projection, response_format.as_ref())
             {
@@ -1114,7 +1149,7 @@ async fn complete_chat(
             }
             trace.caller_delivery(CallerDelivery::Sent);
             permit.finish(StatusCode::OK, None);
-            let output_units = utf16_units(&projection.content);
+            let output_units = projected_output_units(&projection);
             let finish_reason = if projection.calls.is_empty() {
                 "stop"
             } else {
@@ -1179,13 +1214,13 @@ async fn stream_chat(
     route_metadata: Value,
     artifact_origin: String,
     permit: crate::traffic::Permit,
-    checkpoint: Option<CheckpointTurn>,
+    mut checkpoint: Option<CheckpointTurn>,
     stream_options: StreamOptions,
     response_format: Option<ResponseFormat>,
     memory_caller_evidence: Option<String>,
     checkpoint_response_id: String,
     agent_ledger: crate::agent_ledger::AgentLedger,
-    apply_agent_evidence_policy: bool,
+    suppress_duplicate_tool_calls: bool,
     overflow_context: Option<OverflowContext>,
     trace: crate::debug::Trace,
 ) -> Response {
@@ -1206,7 +1241,7 @@ async fn stream_chat(
         let buffer_for_tools = checkpoint.is_some()
             || !tools.is_empty()
             || response_format.is_some()
-            || apply_agent_evidence_policy;
+            || suppress_duplicate_tool_calls;
         let mut first = true;
         let stream_id = id.clone();
         let stream_model = model_id.clone();
@@ -1214,6 +1249,7 @@ async fn stream_chat(
         let mut visible_text = String::new();
         let mut artifact_stream_buffer = String::new();
         let mut final_frames_sent = false;
+        let mut response_frame_sent = false;
         let mut sink = |event: StreamEvent| {
             if buffer_for_tools || event.kind != "text" || event.text.is_empty() {
                 return Ok(());
@@ -1244,6 +1280,14 @@ async fn stream_chat(
             );
             Ok(())
         };
+        let upstream = async {
+            if let Some(turn) = checkpoint.as_mut() {
+                turn.mark_upstream_started().map_err(|error| {
+                    ChatError::Protocol(format!("checkpoint start failed: {error}"))
+                })?;
+            }
+            gateway.chat.chat(account, request, &mut sink).await
+        };
         let result = tokio::select! {
             biased;
             _ = sender.closed() => {
@@ -1253,7 +1297,7 @@ async fn stream_chat(
             }
             result = tokio::time::timeout(
                 std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
-                gateway.chat.chat(account, request, &mut sink),
+                upstream,
             ) => result,
         };
         match result {
@@ -1332,12 +1376,12 @@ async fn stream_chat(
                     let _ = send_sse_done(&trace, &sender);
                     return;
                 }
-                let mut policy = apply_agent_policy(
+                let mut transport = apply_transport_projection(
                     project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
                     &agent_ledger,
-                    apply_agent_evidence_policy,
+                    suppress_duplicate_tool_calls,
                 );
-                if policy.projection.overflowed {
+                if transport.projection.overflowed {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
                         &trace,
@@ -1348,7 +1392,7 @@ async fn stream_chat(
                     let _ = send_sse_done(&trace, &sender);
                     return;
                 }
-                if policy.completed_call_suppressed {
+                if transport.completed_call_suppressed {
                     trace.tool_call_suppressed();
                     let answer_request =
                         completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
@@ -1468,14 +1512,13 @@ async fn stream_chat(
                         let _ = send_sse_done(&trace, &sender);
                         return;
                     }
-                    policy = apply_agent_policy(
+                    transport = apply_transport_projection(
                         project_tool_calls(&result.text, &[], &Value::String("none".to_owned()), 1),
                         &agent_ledger,
-                        apply_agent_evidence_policy,
+                        suppress_duplicate_tool_calls,
                     );
                 }
-                trace.post_policy(policy.decision.disposition, policy.decision.reason);
-                let projection = policy.projection;
+                let projection = transport.projection;
                 if let Err(message) =
                     validate_final_projection_format(&projection, response_format.as_ref())
                 {
@@ -1576,12 +1619,7 @@ async fn stream_chat(
                     include_usage,
                 ));
                 if include_usage {
-                    let output_units = utf16_units(&projection.content)
-                        + projection
-                            .calls
-                            .iter()
-                            .map(|call| utf16_units(&call.function.to_string()))
-                            .sum::<usize>();
+                    let output_units = projected_output_units(&projection);
                     final_frames.push(json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -1634,12 +1672,18 @@ async fn stream_chat(
                     &upstream_attempt_count,
                     UpstreamAttempt::Initial,
                 );
-                send_stream_chat_error(&trace, &sender, error, permit, overflow_context.as_ref());
+                response_frame_sent = send_stream_chat_error(
+                    &trace,
+                    &sender,
+                    error,
+                    permit,
+                    overflow_context.as_ref(),
+                );
             }
             Err(_) => {
                 observe_timeout(&trace, &upstream_attempt_count, UpstreamAttempt::Initial);
                 permit.finish(StatusCode::GATEWAY_TIMEOUT, None);
-                send_sse_error(
+                response_frame_sent = send_sse_error(
                     &trace,
                     &sender,
                     "upstream_timeout",
@@ -1652,7 +1696,7 @@ async fn stream_chat(
             .is_ok();
         let delivery = if sender.is_closed() {
             CallerDelivery::Cancelled
-        } else if final_frames_sent && done_sent {
+        } else if done_sent && (final_frames_sent || response_frame_sent) {
             CallerDelivery::Sent
         } else {
             CallerDelivery::Failed
@@ -1800,7 +1844,7 @@ fn chat_error_with_overflow(
     permit: crate::traffic::Permit,
     overflow_context: Option<&OverflowContext>,
 ) -> Response {
-    trace.caller_delivery(CallerDelivery::Failed);
+    trace.caller_delivery(CallerDelivery::Sent);
     match classify_chat_failure(&error, overflow_context) {
         ChatFailureClass::RateLimited { retry_after, soft } => {
             if soft {
@@ -1847,7 +1891,7 @@ fn send_stream_chat_error(
     error: ChatError,
     permit: crate::traffic::Permit,
     overflow_context: Option<&OverflowContext>,
-) {
+) -> bool {
     trace.caller_delivery(CallerDelivery::Failed);
     match classify_chat_failure(&error, overflow_context) {
         ChatFailureClass::RateLimited { retry_after, soft } => {
@@ -1856,7 +1900,7 @@ fn send_stream_chat_error(
             } else {
                 permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
             }
-            send_sse_error(trace, sender, "rate_limit_error", "ChatHub rate limited");
+            send_sse_error(trace, sender, "rate_limit_error", "ChatHub rate limited")
         }
         ChatFailureClass::AutoSpillOverflow => {
             permit.finish(StatusCode::BAD_REQUEST, None);
@@ -1869,10 +1913,11 @@ fn send_stream_chat_error(
                 ),
             );
             trace.caller_delivery(stream_error_delivery(sender, sent));
+            sent
         }
         ChatFailureClass::Upstream => {
             permit.finish(StatusCode::BAD_GATEWAY, None);
-            send_sse_error(trace, sender, "upstream_error", &error.to_string());
+            send_sse_error(trace, sender, "upstream_error", &error.to_string())
         }
     }
 }
@@ -1951,65 +1996,29 @@ fn assistant_message(projection: &ToolProjection) -> Value {
     message
 }
 
-struct AgentPolicyOutcome {
+struct TransportProjection {
     projection: ToolProjection,
     completed_call_suppressed: bool,
-    decision: crate::agent_ledger::CompletionPolicyDecision,
 }
 
-fn apply_agent_policy(
+fn apply_transport_projection(
     mut projection: ToolProjection,
     ledger: &crate::agent_ledger::AgentLedger,
-    enabled: bool,
-) -> AgentPolicyOutcome {
-    if !enabled {
-        return AgentPolicyOutcome {
+    suppress_duplicates: bool,
+) -> TransportProjection {
+    if !suppress_duplicates {
+        return TransportProjection {
             projection,
             completed_call_suppressed: false,
-            decision: crate::agent_ledger::CompletionPolicyDecision {
-                allowed: true,
-                disposition: crate::agent_ledger::CompletionPolicyDisposition::NotApplicable,
-                reason: crate::agent_ledger::CompletionPolicyReason::PolicyDisabled,
-            },
         };
     }
     let (calls, suppressed) = ledger.filter_known_calls(projection.calls);
     projection.calls = calls;
-    let mut completed_call_suppressed = false;
-    let mut decision = if projection.calls.is_empty() {
-        crate::agent_ledger::completion_evidence_decision(&projection.content, ledger)
-    } else {
-        crate::agent_ledger::CompletionPolicyDecision {
-            allowed: true,
-            disposition: crate::agent_ledger::CompletionPolicyDisposition::Allowed,
-            reason: crate::agent_ledger::CompletionPolicyReason::ToolCalls,
-        }
-    };
-    if projection.calls.is_empty() {
-        if !decision.allowed {
-            projection.content = crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME.to_owned();
-        } else if suppressed && projection.content.trim().is_empty() {
-            if ledger.pending.is_empty() {
-                completed_call_suppressed = true;
-                decision = crate::agent_ledger::CompletionPolicyDecision {
-                    allowed: true,
-                    disposition: crate::agent_ledger::CompletionPolicyDisposition::Suppressed,
-                    reason: crate::agent_ledger::CompletionPolicyReason::CompletedCallSuppressed,
-                };
-            } else {
-                projection.content = crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME.to_owned();
-                decision = crate::agent_ledger::CompletionPolicyDecision {
-                    allowed: false,
-                    disposition: crate::agent_ledger::CompletionPolicyDisposition::Rewritten,
-                    reason: crate::agent_ledger::CompletionPolicyReason::PendingEvidence,
-                };
-            }
-        }
-    }
-    AgentPolicyOutcome {
+    let completed_call_suppressed =
+        suppressed && projection.calls.is_empty() && projection.content.trim().is_empty();
+    TransportProjection {
         projection,
         completed_call_suppressed,
-        decision,
     }
 }
 
@@ -2020,7 +2029,7 @@ fn completed_tool_answer_request(
 ) -> ChatRequest {
     let mut answer = request.clone();
     answer.text = format!(
-        "{}\n\n{}\n\nFINAL ANSWER RULE: A caller tool you selected has already completed with a matching result in the conversation above. Do not reissue any caller tool. Answer the user's latest request directly using the existing completed tool result. If that result is insufficient, state exactly what remains unconfirmed.",
+        "{}\n\n{}\n\nTRANSPORT CONTINUATION RULE: A caller tool with the same name and arguments is already represented in the conversation above. Do not reissue it. Continue the user's request using the retained tool evidence; if it is insufficient, state that plainly.",
         request.text,
         ledger.router_context(),
     );
@@ -2140,6 +2149,8 @@ pub(crate) struct ChatCompletionRequest {
     pub(crate) recall_provenance: Option<RecallProvenance>,
     #[serde(default, rename = "m365_execution_control_provenance")]
     pub(crate) execution_control_provenance: Option<ExecutionControlProvenance>,
+    #[serde(default, rename = "m365_execution_identity_error")]
+    pub(crate) execution_identity_error: Option<Value>,
     #[serde(skip)]
     pub(crate) legacy_attachments: Vec<Attachment>,
     #[serde(skip)]
@@ -2177,6 +2188,41 @@ pub(crate) struct ExecutionControlProvenance {
     api_call_count: usize,
     controls: Vec<ExecutionControlClaim>,
     signature: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionIdentityErrorMarker {
+    schema: String,
+    reason: ExecutionIdentityErrorReason,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionIdentityErrorReason {
+    MissingHostExecutionIdentity,
+    ConflictingWireSessionKey,
+    MalformedWireSessionKey,
+    MalformedExtraBody,
+}
+
+impl ExecutionIdentityErrorReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::MissingHostExecutionIdentity => {
+                "Hermes host execution identity is unavailable; request was not sent upstream"
+            }
+            Self::ConflictingWireSessionKey => {
+                "Hermes wire session identity conflicts with host execution identity; request was not sent upstream"
+            }
+            Self::MalformedWireSessionKey => {
+                "Hermes wire session identity is malformed; request was not sent upstream"
+            }
+            Self::MalformedExtraBody => {
+                "Hermes extra_body is malformed; request was not sent upstream"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -3154,6 +3200,7 @@ fn normalize_legacy_tools(body: &mut ChatCompletionRequest) {
 }
 
 const HERMES_EXECUTION_CONTROL_SCHEMA: &str = "m365-hermes-execution-control-provenance/v2";
+const HERMES_EXECUTION_IDENTITY_ERROR_SCHEMA: &str = "m365-hermes-execution-identity-error/v1";
 const HERMES_EXECUTION_CONTROL_CONTEXT_DOMAIN: &str = "m365-hermes-execution-control-context/v2";
 const HERMES_EMPTY_RECOVERY_ASSISTANT: &str = "(empty)";
 const HERMES_EMPTY_RECOVERY_USER_NUDGE: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
@@ -3366,18 +3413,23 @@ fn authenticated_execution_control_messages(
     Some(trusted)
 }
 
-fn scope_execution_control_provenance(path: &str, body: &mut ChatCompletionRequest, secret: &str) {
+fn scope_execution_control_provenance(
+    path: &str,
+    body: &mut ChatCompletionRequest,
+    secret: &str,
+) -> bool {
     for message in &mut body.messages {
         message.empty_recovery_synthetic = false;
     }
     let Some(trusted) = authenticated_execution_control_messages(path, body, secret) else {
-        return;
+        return false;
     };
     for (index, trusted) in trusted.into_iter().enumerate() {
         if trusted {
             body.messages[index].empty_recovery_synthetic = true;
         }
     }
+    true
 }
 
 fn latest_execution_user_index(messages: &[OpenAiMessage]) -> Option<usize> {
@@ -3388,6 +3440,40 @@ fn latest_execution_user_index(messages: &[OpenAiMessage]) -> Option<usize> {
 
 fn latest_execution_user(messages: &[OpenAiMessage]) -> Option<&OpenAiMessage> {
     latest_execution_user_index(messages).and_then(|index| messages.get(index))
+}
+
+fn hermes_execution_identity_denial(
+    path: &str,
+    body: &mut ChatCompletionRequest,
+) -> Option<Response> {
+    if !path.starts_with("/hermes/v1/") {
+        body.execution_identity_error = None;
+        return None;
+    }
+    let raw = body.execution_identity_error.take()?;
+    let marker = serde_json::from_value::<ExecutionIdentityErrorMarker>(raw).ok();
+    let Some(marker) = marker else {
+        return Some(openai_error(
+            StatusCode::CONFLICT,
+            "invalid_state_error",
+            "hermes_execution_identity_error",
+            "Hermes execution identity marker is malformed; request was not sent upstream",
+        ));
+    };
+    if marker.schema != HERMES_EXECUTION_IDENTITY_ERROR_SCHEMA {
+        return Some(openai_error(
+            StatusCode::CONFLICT,
+            "invalid_state_error",
+            "hermes_execution_identity_error",
+            "Hermes execution identity marker schema is invalid; request was not sent upstream",
+        ));
+    }
+    Some(openai_error(
+        StatusCode::CONFLICT,
+        "invalid_state_error",
+        "hermes_execution_identity_error",
+        marker.reason.message(),
+    ))
 }
 
 fn clear_untracked_transport_identity(path: &str, body: &mut ChatCompletionRequest) {
@@ -4219,6 +4305,15 @@ fn usage(input_units: usize, output_units: usize) -> Value {
     })
 }
 
+fn projected_output_units(projection: &ToolProjection) -> usize {
+    utf16_units(&projection.content)
+        + projection
+            .calls
+            .iter()
+            .map(|call| utf16_units(&call.function.to_string()))
+            .sum::<usize>()
+}
+
 fn utf16_units(value: &str) -> usize {
     value.encode_utf16().count()
 }
@@ -4243,12 +4338,13 @@ fn send_sse_error(
     sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
     code: &str,
     message: &str,
-) {
+) -> bool {
     let sent = send_sse(
         sender,
         json!({"error": {"message": message, "type": "upstream_error", "code": code}}),
     );
     trace.caller_delivery(stream_error_delivery(sender, sent));
+    sent
 }
 
 fn stream_error_delivery(
@@ -4256,7 +4352,7 @@ fn stream_error_delivery(
     sent: bool,
 ) -> CallerDelivery {
     if sent {
-        CallerDelivery::Failed
+        CallerDelivery::Sent
     } else if sender.is_closed() {
         CallerDelivery::Cancelled
     } else {
@@ -4286,7 +4382,7 @@ mod tests {
         path::PathBuf,
         sync::{
             Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -4727,6 +4823,46 @@ mod tests {
         oauth_config: OAuthConfig,
     ) -> (Arc<Gateway>, String) {
         let root = tempfile::tempdir().unwrap().keep();
+        gateway_with_chat_and_oauth_at_root(chat, oauth_config, root, None)
+    }
+
+    fn app_with_durable_inflight_recovery(
+        chat: Arc<dyn ChatHubTransport>,
+        oauth_config: OAuthConfig,
+        session_key: &str,
+        messages: &[OpenAiMessage],
+    ) -> (Router, String) {
+        let root = tempfile::tempdir().unwrap().keep();
+        let checkpoints = CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap();
+        let (gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+            chat,
+            oauth_config,
+            root,
+            Some(Arc::clone(&checkpoints)),
+        );
+        let owner = gateway
+            .api_keys
+            .authenticate(&raw_key)
+            .expect("test API key");
+        let checkpoint_messages = messages
+            .iter()
+            .cloned()
+            .map(CheckpointMessage::from)
+            .collect::<Vec<_>>();
+        let mut turn = checkpoints
+            .begin_full("hermes", &owner, session_key, &checkpoint_messages, false)
+            .unwrap();
+        turn.mark_upstream_started().unwrap();
+        drop(turn);
+        (Gateway::router(gateway), raw_key)
+    }
+
+    fn gateway_with_chat_and_oauth_at_root(
+        chat: Arc<dyn ChatHubTransport>,
+        oauth_config: OAuthConfig,
+        root: std::path::PathBuf,
+        checkpoints: Option<Arc<CheckpointStore>>,
+    ) -> (Arc<Gateway>, String) {
         let admin_path = root.join("admin-password");
         std::fs::write(&admin_path, "password\n").unwrap();
         let api_keys = ApiKeyStore::open(root.join("api-keys.json")).unwrap();
@@ -4768,7 +4904,9 @@ mod tests {
             )
             .unwrap(),
             settings_lifecycle: std::sync::Mutex::new(()),
-            checkpoints: CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap(),
+            checkpoints: checkpoints.unwrap_or_else(|| {
+                CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap()
+            }),
             hindsight_webhook_secret: String::new(),
             hermes_recall_provenance_secret: "test-recall-provenance-secret".to_owned(),
             mcp: crate::mcp::Server::default(),
@@ -4929,6 +5067,57 @@ mod tests {
         }
     }
 
+    struct RecoveryRaceTransport {
+        results: Mutex<VecDeque<String>>,
+        requests: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl RecoveryRaceTransport {
+        fn new(results: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().map(str::to_owned).collect()),
+                requests: AtomicUsize::new(0),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::Acquire)
+        }
+    }
+
+    impl ChatHubTransport for RecoveryRaceTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                let request_index = self.requests.fetch_add(1, Ordering::AcqRel);
+                let text = self
+                    .results
+                    .lock()
+                    .expect("recovery race sequence poisoned")
+                    .pop_front()
+                    .expect("unexpected upstream request");
+                if request_index == 2 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(ChatResult {
+                    text,
+                    conversation_id: "conversation-1".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
     #[test]
     fn role_envelope_prevents_caller_text_from_creating_roles() {
         let prompt = flatten_messages(&[
@@ -5043,21 +5232,18 @@ mod tests {
     }
 
     fn synthetic_empty_recovery_user() -> OpenAiMessage {
-        serde_json::from_value(json!({
-            "role":"user",
-            "content":"You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.",
-            "_empty_recovery_synthetic":true
-        }))
-        .unwrap()
+        let mut message = OpenAiMessage::text(
+            "user",
+            "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.",
+        );
+        message.empty_recovery_synthetic = true;
+        message
     }
 
     fn synthetic_empty_recovery_assistant() -> OpenAiMessage {
-        serde_json::from_value(json!({
-            "role":"assistant",
-            "content":"(empty)",
-            "_empty_recovery_synthetic":true
-        }))
-        .unwrap()
+        let mut message = OpenAiMessage::text("assistant", "(empty)");
+        message.empty_recovery_synthetic = true;
+        message
     }
 
     #[test]
@@ -5489,6 +5675,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn hermes_execution_identity_error_marker_is_rejected_before_upstream_and_isolated_elsewhere()
+     {
+        for (reason, expected_message) in [
+            ("missing_host_execution_identity", "host execution identity"),
+            (
+                "conflicting_wire_session_key",
+                "conflicts with host execution identity",
+            ),
+            (
+                "malformed_wire_session_key",
+                "wire session identity is malformed",
+            ),
+            ("malformed_extra_body", "extra_body is malformed"),
+        ] {
+            let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+            let (app, raw_key) = app_with_chat(chat.clone());
+            let request = json!({
+                "model":"gpt-5.6-terra",
+                "messages":[{"role":"user","content":"identity probe"}],
+                "m365_execution_identity_error":{
+                    "schema":"m365-hermes-execution-identity-error/v1",
+                    "reason":reason
+                }
+            });
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "reason={reason}");
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "hermes_execution_identity_error");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(expected_message)),
+                "reason={reason} body={body}"
+            );
+            assert!(
+                chat.0.lock().unwrap().is_none(),
+                "identity denial must happen before upstream: reason={reason}"
+            );
+        }
+
+        for path in ["/v1/chat/completions", "/memory/v1/chat/completions"] {
+            let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+            let (app, raw_key) = app_with_chat(chat.clone());
+            let response = app
+                .oneshot(
+                    Request::post(path)
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "messages":[{"role":"user","content":"identity probe"}],
+                                "m365_execution_identity_error":{
+                                    "schema":"m365-hermes-execution-identity-error/v1",
+                                    "reason":"conflicting_wire_session_key"
+                                }
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "path={path}");
+            assert!(
+                chat.0.lock().unwrap().is_some(),
+                "Hermes identity metadata must not affect generic route: path={path}"
+            );
+        }
+    }
+
     #[test]
     fn synthetic_empty_recovery_user_does_not_replace_the_real_workload_boundary() {
         let mut body = hermes_body(vec![
@@ -5856,7 +6125,7 @@ mod tests {
         let recall = format!("<memory-context>\n{}\n</memory-context>", "R".repeat(1_000));
         let current = format!("{ask}\n\n{recall}");
         let provenance = signed_recall_provenance(1, ask, &current, ask.len() + 2, current.len());
-        let response = Gateway::router(gateway)
+        let response = Gateway::router(Arc::clone(&gateway))
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
@@ -6218,7 +6487,7 @@ mod tests {
         settings.chat_timeout_seconds = 5;
         gateway.settings.save(settings).unwrap();
 
-        let response = Gateway::router(gateway)
+        let response = Gateway::router(Arc::clone(&gateway))
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
@@ -6419,7 +6688,7 @@ mod tests {
         });
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat, oauth());
         let telemetry_path = gateway.debug.path_for_test().unwrap();
-        let response = Gateway::router(gateway)
+        let response = Gateway::router(Arc::clone(&gateway))
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
@@ -6435,9 +6704,11 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).ends_with("data: [DONE]\n\n"));
         let raw = std::fs::read_to_string(telemetry_path).unwrap();
-        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
-        assert_eq!(record["upstreamAttemptClass"], "initial");
-        assert_eq!(record["upstreamResultClass"], "success");
+        let durable: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(durable["upstreamAttemptClass"], "initial");
+        assert_eq!(durable["upstreamResultClass"], "success");
+        let live = gateway.debug.records_for_test();
+        let record = live.first().unwrap();
         assert_eq!(record["callerDelivery"], "sent");
         assert_eq!(record["status"], 200);
     }
@@ -6446,7 +6717,7 @@ mod tests {
     async fn streaming_hermes_empty_upstream_result_fails_closed() {
         let (gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth());
         let telemetry_path = gateway.debug.path_for_test().unwrap();
-        let response = Gateway::router(gateway)
+        let response = Gateway::router(Arc::clone(&gateway))
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
@@ -6459,7 +6730,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = String::from_utf8(
             to_bytes(response.into_body(), 1024 * 1024)
                 .await
@@ -6467,6 +6738,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
+        assert_eq!(status, StatusCode::OK);
         assert!(body.contains("upstream_empty_response"), "body={body}");
         assert!(!body.contains("\"finish_reason\":\"stop\""), "body={body}");
         assert!(body.ends_with("data: [DONE]\n\n"));
@@ -6480,17 +6752,19 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        let record = record.expect("streaming telemetry must be durably recorded");
-        assert_eq!(record["upstreamAttemptClass"], "initial");
-        assert_eq!(record["upstreamResultClass"], "empty_response");
-        assert_eq!(record["callerDelivery"], "failed");
+        let durable = record.expect("streaming telemetry must be durably recorded");
+        assert_eq!(durable["upstreamAttemptClass"], "initial");
+        assert_eq!(durable["upstreamResultClass"], "empty_response");
+        let live = gateway.debug.records_for_test();
+        let record = live.first().unwrap();
+        assert_eq!(record["callerDelivery"], "sent");
     }
 
     #[tokio::test]
-    async fn non_streaming_hermes_empty_upstream_result_records_failed_delivery() {
+    async fn non_streaming_hermes_empty_upstream_result_records_delivered_error() {
         let (gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth());
         let telemetry_path = gateway.debug.path_for_test().unwrap();
-        let response = Gateway::router(gateway)
+        let response = Gateway::router(Arc::clone(&gateway))
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
@@ -6509,32 +6783,382 @@ mod tests {
                 .unwrap();
         assert_eq!(body["error"]["code"], "upstream_empty_response");
         let raw = std::fs::read_to_string(telemetry_path).unwrap();
-        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
-        assert_eq!(record["upstreamResultClass"], "empty_response");
-        assert_eq!(record["callerDelivery"], "failed");
+        let durable: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(durable["upstreamResultClass"], "empty_response");
+        let live = gateway.debug.records_for_test();
+        let record = live.first().unwrap();
+        assert_eq!(record["callerDelivery"], "sent");
     }
 
     #[tokio::test]
-    async fn streaming_hermes_policy_denial_is_not_leaked_before_final_projection() {
-        let text = "Deployment completed successfully.";
-        let (app, raw_key) = app_with_chat(Arc::new(StreamTextTransport {
-            events: vec![text.to_owned()],
-            text: text.to_owned(),
-        }));
+    async fn non_streaming_keyed_upstream_failure_retains_checkpoint_for_reconciliation() {
+        let (app, raw_key) = app_with_chat(Arc::new(EmptyTransport));
+        let request = r#"{"model":"gpt-5.6-terra","session_key":"non-stream-recovery","messages":[{"role":"user","content":"recover"}]}"#;
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "checkpoint_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("in-flight"))
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_keyed_empty_response_recovery_reaches_final_for_json_and_sse() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only inspection.",
+                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
+            }
+        });
+        for stream in [false, true] {
+            let chat = Arc::new(DuplicateFallbackTransport::new([
+                "\x60\x60\x60inspect\n{\"target\":\"service-a\"}\n\x60\x60\x60",
+                "",
+                "Inspection completed successfully.",
+            ]));
+            let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+            let app = Gateway::router(Arc::clone(&gateway));
+            let session_key = if stream {
+                "json-sse-recovery-stream"
+            } else {
+                "json-sse-recovery-json"
+            };
+            let first = app
+                .clone()
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", &raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "stream":stream,
+                                "session_key":session_key,
+                                "messages":[{"role":"user","content":"Inspect service-a."}],
+                                "tools":[tool.clone()],
+                                "tool_choice":"auto"
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(first.status(), StatusCode::OK, "stream={stream}");
+            let first_body = String::from_utf8(
+                to_bytes(first.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(first_body.contains("tool_calls"), "stream={stream}");
+            let assistant = if stream {
+                first_body
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find_map(|value| {
+                        value["choices"][0]["delta"]["tool_calls"]
+                            .as_array()
+                            .and_then(|calls| calls.first())
+                            .cloned()
+                    })
+                    .map(|call| json!({"role":"assistant","content":null,"tool_calls":[call]}))
+                    .expect("stream tool call frame")
+            } else {
+                serde_json::from_str::<Value>(&first_body).unwrap()["choices"][0]["message"].clone()
+            };
+            let tool_call_id = assistant["tool_calls"][0]["id"]
+                .as_str()
+                .expect("tool call id")
+                .to_owned();
+            let prefix = vec![
+                OpenAiMessage::text("user", "Inspect service-a."),
+                serde_json::from_value(assistant).unwrap(),
+                OpenAiMessage {
+                    role: "tool".to_owned(),
+                    content: Value::String(
+                        r#"{"output":"ok","exit_code":0,"status":"completed"}"#.to_owned(),
+                    ),
+                    tool_call_id: tool_call_id.clone(),
+                    ..OpenAiMessage::default()
+                },
+            ];
+            let second = app
+                .clone()
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", &raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "stream":stream,
+                                "session_key":session_key,
+                                "messages":prefix.clone(),
+                                "tools":[tool.clone()],
+                                "tool_choice":"auto"
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                second.status(),
+                if stream {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            let second_body = String::from_utf8(
+                to_bytes(second.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(second_body.contains("upstream_empty_response"));
+
+            let recovery_messages = [
+                prefix[0].clone(),
+                prefix[1].clone(),
+                prefix[2].clone(),
+                synthetic_empty_recovery_assistant(),
+                synthetic_empty_recovery_user(),
+            ];
+            let control = signed_execution_control_provenance_for_session(
+                &recovery_messages,
+                &[(2, 3, 4)],
+                session_key,
+            );
+            let third_request = serde_json::to_vec(&json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "session_key":session_key,
+                "messages":recovery_messages.to_vec(),
+                "m365_execution_control_provenance":control,
+                "tools":[tool.clone()],
+                "tool_choice":"auto"
+            }))
+            .unwrap();
+            let third = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(third_request))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(third.status(), StatusCode::OK, "stream={stream}");
+            let third_body = String::from_utf8(
+                to_bytes(third.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(
+                third_body.contains("Inspection completed successfully."),
+                "stream={stream} body={third_body}"
+            );
+            assert_eq!(chat.requests.lock().unwrap().len(), 3);
+            assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn hermes_recovery_requires_a_durable_inflight_checkpoint_at_public_seam() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(gateway.clone());
+        let session_key = "missing-recovery-checkpoint";
+        let messages = vec![
+            OpenAiMessage::text("user", "Inspect service-a."),
+            OpenAiMessage {
+                role: "assistant".to_owned(),
+                tool_calls: vec![json!({
+                    "id":"call-1",
+                    "type":"function",
+                    "function":{
+                        "name":"inspect",
+                        "arguments":"{\"target\":\"service-a\"}"
+                    }
+                })],
+                ..OpenAiMessage::default()
+            },
+            OpenAiMessage {
+                role: "tool".to_owned(),
+                content: Value::String(
+                    r#"{"output":"ok","exit_code":0,"status":"completed"}"#.to_owned(),
+                ),
+                tool_call_id: "call-1".to_owned(),
+                ..OpenAiMessage::default()
+            },
+            synthetic_empty_recovery_assistant(),
+            synthetic_empty_recovery_user(),
+        ];
+        let control =
+            signed_execution_control_provenance_for_session(&messages, &[(2, 3, 4)], session_key);
         let response = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"model":"gpt-5.6-terra","stream":true,"messages":[{"role":"user","content":"Report deployment status"}]}"#,
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":session_key,
+                            "messages":messages,
+                            "m365_execution_control_provenance":control,
+                            "tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}}],
+                            "tool_choice":"auto"
+                        }))
+                        .unwrap(),
                     ))
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(chat.0.lock().unwrap().is_none());
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hermes_restarted_gateway_can_reconcile_an_inflight_checkpoint() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only inspection.",
+                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
+            }
+        });
+        let chat = Arc::new(SequenceTransport::new([
+            "Inspection completed successfully.",
+        ]));
+        let root = tempfile::tempdir().unwrap().keep();
+        let checkpoint_path = root.join("transport-checkpoints.json");
+        let (initial_gateway, raw_key) =
+            gateway_with_chat_and_oauth_at_root(chat.clone(), oauth(), root.clone(), None);
+        let owner = initial_gateway
+            .api_keys
+            .authenticate(&raw_key)
+            .expect("initial test API key");
+        let prefix = [
+            OpenAiMessage::text("user", "Inspect service-a."),
+            OpenAiMessage {
+                role: "assistant".to_owned(),
+                tool_calls: vec![json!({
+                    "id":"call-1",
+                    "type":"function",
+                    "function":{
+                        "name":"inspect",
+                        "arguments":"{\"target\":\"service-a\"}"
+                    }
+                })],
+                ..OpenAiMessage::default()
+            },
+            OpenAiMessage {
+                role: "tool".to_owned(),
+                content: Value::String(
+                    r#"{"output":"ok","exit_code":0,"status":"completed"}"#.to_owned(),
+                ),
+                tool_call_id: "call-1".to_owned(),
+                ..OpenAiMessage::default()
+            },
+        ];
+        let checkpoint_messages = prefix
+            .iter()
+            .cloned()
+            .map(CheckpointMessage::from)
+            .collect::<Vec<_>>();
+        let mut turn = initial_gateway
+            .checkpoints
+            .begin_full(
+                "hermes",
+                &owner,
+                "restarted-recovery",
+                &checkpoint_messages,
+                false,
+            )
+            .unwrap();
+        turn.mark_upstream_started().unwrap();
+        drop(turn);
+        drop(initial_gateway);
+
+        let reopened = CheckpointStore::open(&checkpoint_path).unwrap();
+        let (gateway, _new_raw_key) =
+            gateway_with_chat_and_oauth_at_root(chat.clone(), oauth(), root, Some(reopened));
+        let app = Gateway::router(gateway.clone());
+        let recovery_messages = [
+            prefix[0].clone(),
+            prefix[1].clone(),
+            prefix[2].clone(),
+            synthetic_empty_recovery_assistant(),
+            synthetic_empty_recovery_user(),
+        ];
+        let control = signed_execution_control_provenance_for_session(
+            &recovery_messages,
+            &[(2, 3, 4)],
+            "restarted-recovery",
+        );
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":"restarted-recovery",
+                            "messages":recovery_messages,
+                            "m365_execution_control_provenance":control,
+                            "tools":[tool],
+                            "tool_choice":"auto"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
         let body = String::from_utf8(
             to_bytes(response.into_body(), 1024 * 1024)
                 .await
@@ -6542,14 +7166,165 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(
-            body.contains(crate::agent_ledger::UNCONFIRMED_TOOL_OUTCOME),
-            "body={body}"
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.contains("Inspection completed successfully."));
+        assert_eq!(chat.0.lock().unwrap().len(), 0);
+        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hermes_keyed_empty_recovery_is_single_flight_at_public_seam() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only inspection.",
+                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
+            }
+        });
+        let chat = Arc::new(RecoveryRaceTransport::new([
+            "```inspect\n{\"target\":\"service-a\"}\n```",
+            "",
+            "Inspection completed successfully.",
+            "Duplicate recovery completed successfully.",
+        ]));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(Arc::clone(&gateway));
+        let session_key = "recovery-single-flight";
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":session_key,
+                            "messages":[{"role":"user","content":"Inspect service-a."}],
+                            "tools":[tool.clone()],
+                            "tool_choice":"auto"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = String::from_utf8(
+            to_bytes(first.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let assistant: Value =
+            serde_json::from_str::<Value>(&first_body).unwrap()["choices"][0]["message"].clone();
+        let tool_call_id = assistant["tool_calls"][0]["id"]
+            .as_str()
+            .expect("tool call id")
+            .to_owned();
+        let prefix = vec![
+            OpenAiMessage::text("user", "Inspect service-a."),
+            serde_json::from_value(assistant).unwrap(),
+            OpenAiMessage {
+                role: "tool".to_owned(),
+                content: Value::String(r#"{"output":"ok","exit_code":0}"#.to_owned()),
+                tool_call_id,
+                ..OpenAiMessage::default()
+            },
+        ];
+        let second = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":session_key,
+                            "messages":prefix.clone(),
+                            "tools":[tool.clone()],
+                            "tool_choice":"auto"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+        drop(second);
+
+        let recovery_messages = [
+            prefix[0].clone(),
+            prefix[1].clone(),
+            prefix[2].clone(),
+            synthetic_empty_recovery_assistant(),
+            synthetic_empty_recovery_user(),
+        ];
+        let control = signed_execution_control_provenance_for_session(
+            &recovery_messages,
+            &[(2, 3, 4)],
+            session_key,
         );
-        assert!(
-            !body.contains(text),
-            "policy-denied upstream text leaked: {body}"
-        );
+        let recovery_request = serde_json::to_vec(&json!({
+            "model":"gpt-5.6-terra",
+            "session_key":session_key,
+            "messages":recovery_messages,
+            "m365_execution_control_provenance":control,
+            "tools":[tool],
+            "tool_choice":"auto"
+        }))
+        .unwrap();
+
+        let entered = chat.entered.clone();
+        let release = chat.release.clone();
+        let first_recovery = tokio::spawn({
+            let app = app.clone();
+            let raw_key = raw_key.clone();
+            let recovery_request = recovery_request.clone();
+            async move {
+                app.oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(recovery_request))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("first recovery must reach the upstream seam");
+
+        let second_recovery = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.clone().oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(recovery_request))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("second recovery must not wait for the upstream call")
+        .unwrap();
+        release.notify_one();
+        let first_recovery = tokio::time::timeout(Duration::from_secs(1), first_recovery)
+            .await
+            .expect("first recovery must finish after release")
+            .unwrap();
+
+        assert_eq!(second_recovery.status(), StatusCode::CONFLICT);
+        assert_eq!(first_recovery.status(), StatusCode::OK);
+        assert_eq!(chat.request_count(), 3);
     }
 
     #[tokio::test]
@@ -6604,7 +7379,7 @@ mod tests {
         let chat = Arc::new(RecordingTransport(Mutex::new(None)));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
         let telemetry_path = gateway.debug.path_for_test().unwrap();
-        let app = Gateway::router(gateway);
+        let app = Gateway::router(Arc::clone(&gateway));
         let response = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
@@ -6625,9 +7400,11 @@ mod tests {
         assert_eq!(body["error"]["code"], "invalid_message_role");
         assert!(chat.0.lock().unwrap().is_none());
         let raw = std::fs::read_to_string(telemetry_path).unwrap();
-        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
-        assert_eq!(record["upstreamResultClass"], "not_attempted");
-        assert_eq!(record["callerDelivery"], "failed");
+        let durable: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(durable["upstreamResultClass"], "not_attempted");
+        let live = gateway.debug.records_for_test();
+        let record = live.first().unwrap();
+        assert_eq!(record["callerDelivery"], "sent");
     }
 
     #[tokio::test]
@@ -6692,7 +7469,7 @@ mod tests {
         let (gateway, raw_key) =
             gateway_with_chat_and_oauth(Arc::new(SensitiveProtocolFailureTransport), oauth());
         let telemetry_path = gateway.debug.path_for_test().unwrap();
-        let response = Gateway::router(gateway)
+        let response = Gateway::router(Arc::clone(&gateway))
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
@@ -6709,10 +7486,12 @@ mod tests {
         assert!(!raw.contains("RAW-UPSTREAM-SENTINEL"));
         assert!(!raw.contains("token=SECRET"));
         assert!(!raw.contains("private.example.invalid"));
-        let record: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
-        assert_eq!(record["upstreamAttemptClass"], "retried");
-        assert_eq!(record["upstreamResultClass"], "json_decode");
-        assert_eq!(record["callerDelivery"], "failed");
+        let durable: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(durable["upstreamAttemptClass"], "retried");
+        assert_eq!(durable["upstreamResultClass"], "json_decode");
+        let live = gateway.debug.records_for_test();
+        let record = live.first().unwrap();
+        assert_eq!(record["callerDelivery"], "sent");
     }
 
     #[tokio::test]
@@ -6954,7 +7733,6 @@ mod tests {
 
         let (oauth, token_server) = oauth_with_graph_token_server().await;
         let chat = Arc::new(RecordingTransport(Mutex::new(None)));
-        let (app, raw_key) = app_with_chat_and_oauth(chat.clone(), oauth);
         let tool_bulk = format!("TOOL-BULK-{}", "T".repeat(40_000));
         let current_user = format!("CURRENT-CONTROL-{}", "L".repeat(100_000));
         let messages = vec![
@@ -6991,6 +7769,12 @@ mod tests {
             synthetic_empty_recovery_assistant(),
             synthetic_empty_recovery_user(),
         ];
+        let (app, raw_key) = app_with_durable_inflight_recovery(
+            chat.clone(),
+            oauth,
+            TEST_HERMES_SESSION_KEY,
+            &messages,
+        );
         let control = signed_execution_control_provenance_for_session(
             &messages,
             &[(5, 6, 7)],
@@ -7482,6 +8266,15 @@ mod tests {
         .await
         .unwrap();
 
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping a keyed stream must leave the checkpoint for reconciliation");
+
         let second = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
@@ -7503,131 +8296,58 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("in-flight"))
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_keyed_stream_before_upstream_poll_rolls_back_reservation() {
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(
+            Arc::new(HangingTransport {
+                started: started.clone(),
+                dropped,
+            }),
+            oauth(),
+        );
+        let app = Gateway::router(gateway.clone());
+        let request_body = r#"{"model":"gpt-5.6-terra","stream":true,"session_key":"pre-poll-session","messages":[{"role":"user","content":"cancel before polling"}]}"#;
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
         drop(first);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(!started.load(Ordering::Acquire));
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+
+        let retry = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        drop(retry);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!started.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn hermes_rejects_success_claim_without_tool_evidence_but_v1_does_not() {
-        for (path, expected) in [
-            (
-                "/hermes/v1/chat/completions",
-                "I cannot confirm completion because no matching tool results were returned. No external action has been verified.",
-            ),
-            ("/v1/chat/completions", "Deployment completed successfully."),
-        ] {
-            let (app, raw_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
-            let response = app
-                .oneshot(
-                    Request::post(path)
-                        .header("x-api-key", raw_key)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"Report deployment status"}]}"#,
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "path={path}");
-            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-            let value: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                value["choices"][0]["message"]["content"], expected,
-                "path={path}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn hermes_completion_policy_composition_matrix_keeps_claims_bound_to_results() {
-        let unconfirmed = "I cannot confirm completion because no matching tool results were returned. No external action has been verified.";
-        let cases: Vec<(Value, &'static str, &'static str)> = vec![
-            (
-                json!([{"role":"user","content":"Explain the word success."}]),
-                "The word success is a noun.",
-                "The word success is a noun.",
-            ),
-            (
-                json!([{"role":"user","content":"Did I deploy anything?"}]),
-                "I have not deployed anything.",
-                "I have not deployed anything.",
-            ),
-            (
-                json!([{"role":"user","content":"回報部署狀態"}]),
-                "已完成部署，服務已啟動。",
-                unconfirmed,
-            ),
-            (
-                json!([
-                    {"role":"user","content":"Report deployment status"},
-                    {"role":"assistant","content":null,"tool_calls":[{
-                        "id":"read-1","type":"function",
-                        "function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
-                    }]},
-                    {"role":"tool","tool_call_id":"read-1","content":"Documentation: error handling and timeout recovery"}
-                ]),
-                "Deployment completed successfully.",
-                unconfirmed,
-            ),
-            (
-                json!([
-                    {"role":"user","content":"Report deployment status"},
-                    {"role":"assistant","content":null,"tool_calls":[{
-                        "id":"read-1","type":"function",
-                        "function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
-                    }]},
-                    {"role":"tool","tool_call_id":"read-1","content":"{\"output\":\"documentation\",\"exit_code\":0}"},
-                    {"role":"assistant","content":null,"tool_calls":[{
-                        "id":"deploy-1","type":"function",
-                        "function":{"name":"terminal","arguments":"{\"command\":\"deploy\"}"}
-                    }]},
-                    {"role":"tool","tool_call_id":"deploy-1","content":"{\"output\":\"failed\",\"exit_code\":1}"}
-                ]),
-                "Deployment completed successfully.",
-                unconfirmed,
-            ),
-            (
-                json!([
-                    {"role":"user","content":"Read the file."},
-                    {"role":"assistant","content":null,"tool_calls":[{
-                        "id":"read-1","type":"function",
-                        "function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
-                    }]},
-                    {"role":"tool","tool_call_id":"read-1","content":"{\"output\":\"documentation\",\"exit_code\":0}"}
-                ]),
-                "Reading completed successfully.",
-                "Reading completed successfully.",
-            ),
-        ];
-
-        for (messages, upstream, expected) in cases {
-            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([upstream])));
-            let response = app
-                .oneshot(
-                    Request::post("/hermes/v1/chat/completions")
-                        .header("x-api-key", raw_key)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            serde_json::to_vec(&json!({
-                                "model":"gpt-5.6-terra",
-                                "messages":messages
-                            }))
-                            .unwrap(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "upstream={upstream}");
-            let body: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                    .unwrap();
-            assert_eq!(body["choices"][0]["message"]["content"], expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn completion_policy_telemetry_separates_upstream_success_from_local_rewrite() {
+    async fn transport_telemetry_preserves_provider_output() {
         let (gateway, raw_key) = gateway_with_chat_and_oauth(
             Arc::new(SequenceTransport::new([
                 "The word success is a noun.",
@@ -7635,13 +8355,12 @@ mod tests {
             ])),
             oauth(),
         );
-        let telemetry_path = gateway.debug.path_for_test().unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         for (prompt, expected) in [
             ("Explain the word success.", "The word success is a noun."),
             (
                 "Report deployment status",
-                "I cannot confirm completion because no matching tool results were returned. No external action has been verified.",
+                "Deployment completed successfully.",
             ),
         ] {
             let response = app
@@ -7668,25 +8387,16 @@ mod tests {
             assert_eq!(body["choices"][0]["message"]["content"], expected);
         }
 
-        let raw = std::fs::read_to_string(telemetry_path).unwrap();
-        let records = raw
-            .lines()
-            .map(serde_json::from_str::<Value>)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = gateway.debug.records_for_test();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["upstreamResultClass"], "success");
-        assert_eq!(records[0]["postPolicyDisposition"], "allowed");
-        assert_eq!(records[0]["postPolicyReason"], "no_external_claim");
         assert_eq!(records[0]["callerDelivery"], "sent");
         assert_eq!(records[1]["upstreamResultClass"], "success");
-        assert_eq!(records[1]["postPolicyDisposition"], "rewritten");
-        assert_eq!(records[1]["postPolicyReason"], "missing_evidence");
         assert_eq!(records[1]["callerDelivery"], "sent");
     }
 
     #[tokio::test]
-    async fn memory_json_schema_output_survives_post_qualification_agent_policy() {
+    async fn memory_json_schema_output_survives_response_qualification() {
         let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
             r#"{"status":"completed"}"#,
         ])));
@@ -7720,10 +8430,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
+        let status = response.status();
+        let body_bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
         assert_eq!(
             body["choices"][0]["message"]["content"],
             r#"{"status":"completed"}"#
@@ -7731,7 +8441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_responses_and_anthropic_surfaces_do_not_inherit_hermes_evidence_rewrite() {
+    async fn generic_responses_and_anthropic_surfaces_preserve_provider_output() {
         let (responses_app, responses_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
         let responses = responses_app
             .oneshot(
@@ -7845,48 +8555,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hermes_json_schema_cannot_return_policy_rewrite_as_http_200() {
-        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
-            r#"{"status":"completed"}"#,
-        ])));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model":"gpt-5.6-terra",
-                            "messages":[{"role":"user","content":"Return the structured status."}],
-                            "response_format":{
-                                "type":"json_schema",
-                                "json_schema":{
-                                    "name":"memory_status",
-                                    "strict":true,
-                                    "schema":{
-                                        "type":"object",
-                                        "properties":{"status":{"const":"completed"}},
-                                        "required":["status"],
-                                        "additionalProperties":false
-                                    }
-                                }
-                            }
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(body["error"]["code"], "response_format_validation_failed");
-    }
-
-    #[tokio::test]
     async fn memory_non_json_reask_still_returns_schema_valid_output() {
         let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
             "temporarily unstructured",
@@ -7932,45 +8600,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hermes_accepts_success_claim_with_matching_completed_tool_evidence() {
-        let (app, raw_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model":"gpt-5.6-terra",
-                            "messages":[
-                                {"role":"user","content":"Deploy the service."},
-                                {"role":"assistant","content":null,"tool_calls":[{
-                                    "id":"call_1","type":"function",
-                                    "function":{"name":"terminal","arguments":"{\"command\":\"deploy service-a\"}"}
-                                }]},
-                                {"role":"tool","tool_call_id":"call_1","content":"{\"output\":\"deployed\",\"exit_code\":0}"}
-                            ]
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            body["choices"][0]["message"]["content"],
-            "Deployment completed successfully."
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_synthetic_empty_recovery_nudge_keeps_matching_completed_tool_evidence() {
-        let (app, raw_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
+    async fn hermes_synthetic_empty_recovery_preserves_completed_transport_ledger() {
+        let chat = Arc::new(UnsupportedSuccessTransport);
         let messages = vec![
             OpenAiMessage::text("user", "Deploy the service."),
             OpenAiMessage {
@@ -7984,7 +8615,9 @@ mod tests {
             },
             OpenAiMessage {
                 role: "tool".to_owned(),
-                content: Value::String(r#"{"output":"ok","exit_code":0}"#.to_owned()),
+                content: Value::String(
+                    r#"{"output":"ok","exit_code":0,"status":"completed"}"#.to_owned(),
+                ),
                 tool_call_id: "call_1".to_owned(),
                 ..OpenAiMessage::default()
             },
@@ -7992,6 +8625,8 @@ mod tests {
             synthetic_empty_recovery_user(),
         ];
         let session_key = "issue95-synthetic-recovery";
+        let (app, raw_key) =
+            app_with_durable_inflight_recovery(chat, oauth(), session_key, &messages);
         let control =
             signed_execution_control_provenance_for_session(&messages, &[(2, 3, 4)], session_key);
         let response = app
@@ -8013,21 +8648,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
+        let status = response.status();
+        let body_bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
         assert_eq!(
             body["choices"][0]["message"]["content"], "Deployment completed successfully.",
-            "synthetic recovery nudge must not erase matching completed evidence"
+            "synthetic recovery nudge must not erase completed transport evidence"
         );
     }
 
     #[tokio::test]
-    async fn hermes_multiple_empty_recoveries_keep_completed_tool_evidence_in_one_turn() {
-        let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+    async fn hermes_multiple_empty_recoveries_keep_completed_transport_evidence_in_one_turn() {
+        let chat = Arc::new(SequenceTransport::new([
             "Deployments completed successfully for service-one and service-two.",
-        ])));
+        ]));
         let messages = vec![
             OpenAiMessage::text("user", "Deploy the service."),
             OpenAiMessage {
@@ -8041,7 +8676,9 @@ mod tests {
             },
             OpenAiMessage {
                 role: "tool".to_owned(),
-                content: Value::String(r#"{"output":"ok-1","exit_code":0}"#.to_owned()),
+                content: Value::String(
+                    r#"{"output":"ok-1","exit_code":0,"status":"completed"}"#.to_owned(),
+                ),
                 tool_call_id: "call_1".to_owned(),
                 ..OpenAiMessage::default()
             },
@@ -8058,7 +8695,9 @@ mod tests {
             },
             OpenAiMessage {
                 role: "tool".to_owned(),
-                content: Value::String(r#"{"output":"ok-2","exit_code":0}"#.to_owned()),
+                content: Value::String(
+                    r#"{"output":"ok-2","exit_code":0,"status":"completed"}"#.to_owned(),
+                ),
                 tool_call_id: "call_2".to_owned(),
                 ..OpenAiMessage::default()
             },
@@ -8066,6 +8705,8 @@ mod tests {
             synthetic_empty_recovery_user(),
         ];
         let session_key = "issue95-multiple-synthetic-recoveries";
+        let (app, raw_key) =
+            app_with_durable_inflight_recovery(chat, oauth(), session_key, &messages);
         let control = signed_execution_control_provenance_for_session(
             &messages,
             &[(2, 3, 4), (6, 7, 8)],
@@ -8097,7 +8738,7 @@ mod tests {
         assert_eq!(
             body["choices"][0]["message"]["content"],
             "Deployments completed successfully for service-one and service-two.",
-            "each authenticated recovery in the same real user turn must preserve completed evidence"
+            "each authenticated recovery in the same real user turn must preserve completed transport evidence"
         );
     }
 
@@ -8108,7 +8749,6 @@ mod tests {
             "No. The task is still blocked and has no active worker.",
         ]));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let telemetry_path = gateway.debug.path_for_test().unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
             .oneshot(
@@ -8153,16 +8793,8 @@ mod tests {
         assert!(requests[1].tools.is_empty());
         assert_eq!(requests[1].tool_choice, Value::String("none".to_owned()));
 
-        let record: Value = serde_json::from_str(
-            std::fs::read_to_string(telemetry_path)
-                .unwrap()
-                .lines()
-                .last()
-                .unwrap(),
-        )
-        .unwrap();
+        let record = gateway.debug.records_for_test().pop().unwrap();
         assert_eq!(record["toolCallSuppressed"], true);
-        assert_eq!(record["postPolicyDisposition"], "allowed");
     }
 
     #[tokio::test]
@@ -8218,7 +8850,7 @@ mod tests {
                             "messages":[
                                 first_user,
                                 assistant,
-                                {"role":"tool","tool_call_id":call_id,"content":"{\"output\":\"ok\",\"exit_code\":0}"}
+                                {"role":"tool","tool_call_id":call_id,"content":"{\"output\":\"ok\",\"exit_code\":0,\"status\":\"completed\"}"}
                             ],
                             "tools":[tool],
                             "tool_choice":"auto"
@@ -8683,6 +9315,68 @@ mod tests {
                 .all(|value| value["choices"].as_array().unwrap().is_empty()
                     || value.get("usage") == Some(&Value::Null))
         );
+    }
+
+    #[tokio::test]
+    async fn json_and_sse_tool_call_usage_match_for_the_same_projection() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only inspection.",
+                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
+            }
+        });
+        let mut usages = Vec::new();
+        for stream in [false, true] {
+            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([r#"```inspect
+{"target":"service-a"}
+```"#])));
+            let mut request = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "messages":[{"role":"user","content":"Inspect service-a."}],
+                "tools":[tool.clone()],
+                "tool_choice":"auto"
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage":true});
+            }
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            let usage = if stream {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find_map(|value| {
+                        value
+                            .get("usage")
+                            .filter(|value| value.is_object())
+                            .cloned()
+                    })
+                    .expect("stream usage frame")
+            } else {
+                serde_json::from_str::<Value>(&body).unwrap()["usage"].clone()
+            };
+            usages.push(usage);
+        }
+        assert_eq!(usages[0], usages[1]);
     }
 
     #[tokio::test]

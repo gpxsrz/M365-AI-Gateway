@@ -25,7 +25,7 @@ It translates API shapes, keeps short-lived continuation state, protects files, 
 | Goal | Endpoint | Plain explanation |
 |---|---|---|
 | Auxiliary/control work such as Goal Judge | `/v1/chat/completions` | Starts fresh and does not inherit Agent execution evidence |
-| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | Keeps tool continuation and completion evidence |
+| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | Keeps tool continuation and transport evidence; ACP decides Task/Run completion |
 | Hindsight Memory | `/memory/v1/chat/completions` | Uses the background Memory priority class |
 | OpenAI Responses shape | `/v1/responses` | Converts a Responses request onto the shared chat core |
 | Anthropic Messages shape | `/v1/messages` | Returns Anthropic-shaped data; streaming is adapted after completion |
@@ -42,9 +42,9 @@ The corresponding model catalogs are `/v1/models`, `/hermes/v1/models`, and `/me
 4. When needed, read a short-lived checkpoint and attach the next tool result.
 5. Open a new Microsoft ChatHub connection. Private mode reapplies `disableMemory=1` every time.
 6. Convert the Microsoft response into the caller's requested format.
-7. Mark the request complete and save continuation state only after terminal evidence is present.
+7. Save continuation state only after a complete transport result; the gateway does not declare an Agent Task/Run complete.
 
-General `/v1/chat/completions` does not inherit the Hermes execution ledger and does not rewrite a valid `done` or `verified` verdict as unconfirmed work.
+General `/v1/chat/completions` does not inherit the Hermes transport ledger and does not rewrite provider `done` or `verified` content into a Task/Run verdict.
 
 ## Streaming and tools
 

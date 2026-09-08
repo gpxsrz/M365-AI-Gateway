@@ -18,12 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
 
-use crate::{
-    agent_ledger::{CompletionPolicyDisposition, CompletionPolicyReason},
-    error::openai_error,
-    private_file,
-    web::Gateway,
-};
+use crate::{error::openai_error, private_file, web::Gateway};
 
 const MAX_RECORDS: usize = 1_000;
 const COMPACT_EVERY: usize = 100;
@@ -127,6 +122,8 @@ pub(crate) enum UpstreamResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CallerDelivery {
     NotEvaluated,
+    /// The internal JSON/SSE response producer accepted the body/frame.
+    /// This is not an acknowledgement that the network client received it.
     Sent,
     Failed,
     Cancelled,
@@ -252,13 +249,27 @@ struct Record {
     provenance_class: String,
     upstream_attempt_class: String,
     upstream_result_class: String,
-    #[serde(default = "default_not_evaluated")]
+    // These fields are a live projection. Keeping them out of the v1 JSONL
+    // record preserves readback by an older rollback binary.
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
     post_policy_disposition: String,
-    #[serde(default = "default_not_evaluated")]
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
     post_policy_reason: String,
-    #[serde(default = "default_not_evaluated")]
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
     caller_delivery: String,
-    #[serde(default)]
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_false")]
     tool_call_suppressed: bool,
     request_id: String,
     error_code: String,
@@ -274,6 +285,22 @@ struct Record {
 
 fn default_not_evaluated() -> String {
     "not_evaluated".to_owned()
+}
+
+fn deserialize_not_evaluated<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(default_not_evaluated())
+}
+
+fn deserialize_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(false)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -617,27 +644,8 @@ impl Record {
                     | "context_length"
                     | "json_decode"
             )
-            && matches!(
-                self.post_policy_disposition.as_str(),
-                "not_evaluated" | "not_applicable" | "allowed" | "rewritten" | "suppressed"
-            )
-            && matches!(
-                self.post_policy_reason.as_str(),
-                "not_evaluated"
-                    | "policy_disabled"
-                    | "tool_calls"
-                    | "no_external_claim"
-                    | "matching_evidence"
-                    | "pending_evidence"
-                    | "missing_evidence"
-                    | "no_matching_operation"
-                    | "ambiguous_claim"
-                    | "ambiguous_evidence"
-                    | "failed_or_unknown_evidence"
-                    | "missing_target_binding"
-                    | "target_mismatch"
-                    | "completed_call_suppressed"
-            )
+            && self.post_policy_disposition == "not_evaluated"
+            && self.post_policy_reason == "not_evaluated"
             && matches!(
                 self.caller_delivery.as_str(),
                 "not_evaluated" | "sent" | "failed" | "cancelled"
@@ -805,17 +813,6 @@ impl Trace {
         self.update(|record| record.upstream_result_class = class.as_str().to_owned());
     }
 
-    pub(crate) fn post_policy(
-        &self,
-        disposition: CompletionPolicyDisposition,
-        reason: CompletionPolicyReason,
-    ) {
-        self.update(|record| {
-            record.post_policy_disposition = disposition.as_str().to_owned();
-            record.post_policy_reason = reason.as_str().to_owned();
-        });
-    }
-
     pub(crate) fn caller_delivery(&self, delivery: CallerDelivery) {
         self.update(|record| record.caller_delivery = delivery.as_str().to_owned());
     }
@@ -843,6 +840,11 @@ impl Trace {
 impl Store {
     pub(crate) fn path_for_test(&self) -> Option<PathBuf> {
         self.path.as_deref().cloned()
+    }
+
+    pub(crate) fn records_for_test(&self) -> Vec<serde_json::Value> {
+        let inner = self.inner.lock().expect("debug store poisoned");
+        inner.records.iter().rev().map(public_record).collect()
     }
 }
 
@@ -934,8 +936,6 @@ pub(crate) async fn detail(
         "provenanceClass": record.provenance_class,
         "upstreamAttemptClass": record.upstream_attempt_class,
         "upstreamResultClass": record.upstream_result_class,
-        "postPolicyDisposition": record.post_policy_disposition,
-        "postPolicyReason": record.post_policy_reason,
         "callerDelivery": record.caller_delivery,
         "toolCallSuppressed": record.tool_call_suppressed,
         "requestId": record.request_id,
@@ -1013,6 +1013,8 @@ pub(crate) async fn export(State(gateway): State<Arc<Gateway>>) -> Response {
 
 fn public_record(record: &Record) -> serde_json::Value {
     let mut value = serde_json::to_value(record).expect("typed telemetry is serializable");
+    value["callerDelivery"] = serde_json::Value::String(record.caller_delivery.clone());
+    value["toolCallSuppressed"] = serde_json::Value::Bool(record.tool_call_suppressed);
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
     value
 }
@@ -1245,6 +1247,62 @@ mod tests {
         let encoded = serde_json::to_string(&record).unwrap();
         assert_eq!(record.path, "/v1/artifacts/{capability}/content");
         assert!(!encoded.contains(capability));
+    }
+
+    #[test]
+    fn live_outcome_projection_does_not_extend_the_v1_durable_record() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug-telemetry.jsonl");
+        let store = Store::open(path.clone(), "test").unwrap();
+        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
+        trace.caller_delivery(CallerDelivery::Failed);
+        trace.tool_call_suppressed();
+        drop(trace);
+        drop(store);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(value["schema"], SURFACE_ID);
+        assert!(value.get("callerDelivery").is_none());
+        assert!(value.get("toolCallSuppressed").is_none());
+
+        // This is the exact v1 record shape an older rollback reader sees.
+        let reopened = Store::open(path, "test").unwrap();
+        let record = reopened
+            .inner
+            .lock()
+            .unwrap()
+            .records
+            .front()
+            .unwrap()
+            .clone();
+        assert_eq!(record.caller_delivery, "not_evaluated");
+        assert!(!record.tool_call_suppressed);
+    }
+
+    #[test]
+    fn reader_accepts_frozen_v1_live_projection_fields_but_resets_them() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug-telemetry.jsonl");
+        let mut legacy =
+            serde_json::to_value(Record::new("POST", "/hermes/v1/chat/completions")).unwrap();
+        legacy["postPolicyDisposition"] = serde_json::json!("allowed");
+        legacy["postPolicyReason"] = serde_json::json!("matching_evidence");
+        legacy["callerDelivery"] = serde_json::json!("sent");
+        legacy["toolCallSuppressed"] = serde_json::json!(true);
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
+
+        let reopened = Store::open(path, "test").unwrap();
+        let inner = reopened.inner.lock().unwrap();
+        let record = inner.records.front().unwrap();
+        assert_eq!(record.post_policy_disposition, "not_evaluated");
+        assert_eq!(record.post_policy_reason, "not_evaluated");
+        assert_eq!(record.caller_delivery, "not_evaluated");
+        assert!(!record.tool_call_suppressed);
     }
 
     #[test]

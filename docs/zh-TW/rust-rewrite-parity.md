@@ -38,7 +38,7 @@ Rust 是唯一 release／container 建置來源。原 Go 基準不再保留在 c
 | OpenAI Chat Completions | non-stream／SSE、tools、usage、單一 `[DONE]`、斷線取消 | adapter 與 route tests |
 | Responses | parent、tool result、parallel calls、reasoning／media events | continuation tests |
 | Anthropic Messages | error、tool／image round trip、posthoc stream | adapter tests |
-| Hermes | provenance、ledger、completion guard、多輪 tools、排程 | full continuation tests |
+| Hermes | provenance、transport ledger、多輪 tools、排程；歷史 completion-guard corpus 僅供 salvage | full continuation tests |
 | Hindsight | retain／recall／reflect、breaker、webhook、barrier | Memory profile tests |
 | OAuth | 一次登入、帳號綁定、refresh rotation | browser + auth lifecycle tests |
 | Code Interpreter | 私有暫存、短效下載、stream holdback、重啟續取 | deterministic + isolated live |

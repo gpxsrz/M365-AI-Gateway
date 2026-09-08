@@ -9,6 +9,8 @@
 - `GET /api/admin/settings`：看目前設定。
 - `PUT /api/admin/settings`：只更新送出的欄位。
 - `GET /api/admin/traffic`：看排隊、限流與 recovery 狀態。
+- `GET /api/admin/checkpoints/recovery`：用 opaque checkpoint ID 列出尚未核對的 upstream outcome。
+- `POST /api/admin/checkpoints/reconcile`：把未知 outcome 明確標成 terminal unknown；永遠不授權 replay。
 
 管理頁必須同時顯示「現在生效的值」和「值從哪裡來」。灰掉或標示 environment-controlled 的欄位，不能假裝被 UI 覆蓋。Secret 永遠不回顯明文。
 
@@ -35,7 +37,7 @@
 
 Telemetry path 必須是 `.jsonl`；舊 Synology `log.db` 明確不是 current truth，也不會被 reader 接受。Writer 使用 private `0600` append，記憶體只保留最新 1000 筆，並週期性把同一份 bounded projection 做 atomic compaction。`GET /api/admin/debug/logs`、detail 與 export 都從這個 `m365-privacy-telemetry/v1` surface 讀取，回傳 `surfaceId`、path class 與 reader/writer state，不暴露實際 private path。
 
-每筆 request 只記錄封閉分類或 bounded metadata：route/class、queue admission、breaker state/projection、spill decision/reason、UTF-16 前後值與 size class、recall provenance class、upstream attempt/result，以及獨立隨機 correlation ID。管理 API 會從這些既有封閉欄位推導 `throttleKind`：`hard_http_429`、`soft_bot_notice`、`projected_breaker` 或 `none`；這個欄位只存在 reader projection，**不改動 durable `m365-privacy-telemetry/v1` JSONL schema**，因此舊 binary rollback 仍能讀取既有 telemetry。Dynamic route segment 一律寫成封閉 template；例如 artifact capability 只會記成 `/v1/artifacts/{capability}/content`。不得記錄 prompt/transcript、memory/attachment body、token/cookie/header、tenant/account/user identity、conversation/session identity、private URL 或 raw upstream body。這是 forensic projection，不是 durable lifecycle authority。
+每筆 request 只記錄封閉分類或 bounded metadata：route/class、queue admission、breaker state/projection、spill decision/reason、UTF-16 前後值與 size class、recall provenance class、upstream attempt/result，以及獨立隨機 correlation ID。管理 API 會從這些既有封閉欄位推導 `throttleKind`：`hard_http_429`、`soft_bot_notice`、`projected_breaker` 或 `none`；這個欄位只存在 reader projection，**不改動 durable `m365-privacy-telemetry/v1` JSONL schema**，因此舊 binary rollback 仍能讀取既有 telemetry。Caller delivery 與 exact duplicate-tool suppression 只保留為 live transport projection，刻意不寫進 durable v1 record，以維持相同 rollback 相容保證；process restart 後，歷史 record 會顯示 `not_evaluated`／`false`。Legacy post-policy 欄位只作 read-and-reset 相容資料；M365 不再產生 governance decision。Dynamic route segment 一律寫成封閉 template；例如 artifact capability 只會記成 `/v1/artifacts/{capability}/content`。不得記錄 prompt/transcript、memory/attachment body、token/cookie/header、tenant/account/user identity、conversation/session identity、private URL 或 raw upstream body。這是 forensic projection，不是 durable lifecycle authority。
 
 ## 值的優先順序
 

@@ -38,7 +38,7 @@ The corrected shared path is:
 | OpenAI Chat Completions | non-stream/SSE, tools, usage, one `[DONE]`, disconnect cancellation | adapter and route tests |
 | Responses | parents, tool results, parallel calls, reasoning/media events | continuation tests |
 | Anthropic Messages | errors, tool/image round trips, posthoc stream | adapter tests |
-| Hermes | provenance, ledger, completion guard, multi-round tools, scheduling | full continuation tests |
+| Hermes | provenance, transport ledger, multi-round tools, scheduling; historical completion-guard corpus is salvage-only | full continuation tests |
 | Hindsight | retain/recall/reflect, breaker, webhooks, barriers | Memory-profile tests |
 | OAuth | one sign-in, account binding, refresh rotation | browser + auth-lifecycle tests |
 | Code Interpreter | private storage, short-lived downloads, stream holdback, restart reuse | deterministic + isolated live |

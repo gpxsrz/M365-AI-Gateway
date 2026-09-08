@@ -5,7 +5,7 @@
 > AI Agent：先做這五步。只有改到特定 surface 時，才讀對應文件與測試；不要先載入全部歷史。
 
 1. 若尚未讀過適用於目前執行環境的全域 `AGENTS.md`，先讀全域規則，再讀 repo `AGENTS.md`。
-2. 先經 Gabriel Skill Router 依本次實質作業目的挑選最小且適合的 Skill；advertised Skills 只是目前 scope 的快照，不是完整清單。沒有直接匹配但任務需要專用能力時，依 Router 動態解析 exact hidden / plugin Skill；作業類別改變時重新 route / 選 Skill。
+2. 本機 Codex 使用原生工具與 Skill discovery；Web ChatGPT 才經 Gabriel Skill Router / DevSpace。Web 的 advertised Skills 只是目前 scope 的快照，不是完整清單；沒有直接匹配但任務需要專用能力時，依 Router 動態解析 exact hidden / plugin Skill。作業類別改變時，依目前執行環境重新 route / 選 Skill。
 3. 只從公開 `gpxsrz/M365-AI-Gateway` 的 `main` 開發，先重現問題，再找共同根因。
 4. 改最少的程式，留下會抓到退步的測試並跑完正確 validation gate。
 5. 用精確 source identity、CI／測試與實際讀回證明完成。
@@ -64,7 +64,7 @@ git diff --check
 > AI agents: start with these five steps. Open only the topic and tests for the surface being changed; do not preload the full history.
 
 1. If the applicable global `AGENTS.md` has not been read in the current execution context, read it first, then read repository `AGENTS.md`.
-2. Route through Gabriel Skill Router and select the smallest suitable Skill for the current material work unit. Advertised Skills are only the current scope snapshot, not an exhaustive inventory. When no direct match is advertised but the task clearly needs a specialized capability, dynamically resolve the exact hidden / plugin Skill through the Router. Re-route when the work category changes.
+2. Local Codex uses native tools and Skill discovery; only Web ChatGPT routes through Gabriel Skill Router / DevSpace. For Web work, advertised Skills are only the current scope snapshot, not an exhaustive inventory; when no direct match is advertised but the task clearly needs a specialized capability, dynamically resolve the exact hidden / plugin Skill through the Router. Re-route for the current execution environment when the work category changes.
 3. Develop only from public `gpxsrz/M365-AI-Gateway` `main`, reproduce the problem, and identify the shared cause.
 4. Make the smallest correct change, leave a regression test, and run the correct validation gate.
 5. Prove completion with exact source identity, CI/tests, and required readback.
