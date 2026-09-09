@@ -2,22 +2,11 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: this section is enough to decide whether deployment may start. For execution, read **Safe deployment order** and the completion table; private host details are intentionally absent.
+> This page defines the public deployment contract, not the SOP for one private NAS. For actual Production mutation, use local `m365-ops` to preflight the exact target. Private hosts, paths, and credentials do not belong in the repository.
 
-A deployment is more than replacing one executable. Treat the Rust executable and the three management pages as one release. They must come from one public commit and roll back together. Durable M365 transport-checkpoint state is not a release artifact, but a rollback must restore the exact predeploy checkpoint state that the old binary will read.
+Deploy one coherent runtime release unit from the same source identity instead of replacing only one binary.
 
-Deployment is complete only when:
-
-1. GitHub `main` reads back the intended commit and CI is green for that exact commit.
-2. The complete old release was saved and the quiesced M365 checkpoint state needed by rollback was captured.
-3. Post-deploy file identities, service state, and health checks are correct.
-4. Hermes, Hindsight, and other unauthorized services did not change.
-
-This page contains only public, reproducible rules. NAS hostnames, Production paths, credentials, and mutation steps stay outside the repository; operators use the local `m365-ops` skill.
-
-## Files in one release
-
-The complete runtime set is:
+Current public release unit:
 
 ```text
 m365-native
@@ -26,68 +15,104 @@ web/login.html
 web/debug.html
 ```
 
-Rust also embeds the page content in the binary, while the Docker image still carries `web/`. Build the whole release from one commit. Never mix files from different versions.
+Transport checkpoint/integrity state is private durable runtime state, **not** a public release artifact. A rollback still has to respect its schema and exact predeploy presence/bytes.
 
-The data directory can also contain the private recovery pair `transport-checkpoints.json` and `.transport-checkpoints.json.key`. These files are **not** published in the release archive. The deployment helper snapshots their exact presence and bytes only after the service is stopped. If a failed candidate created files that did not exist before deployment, rollback restores the predeploy absence. The checkpoint pair is M365 adapter recovery state; restoring it does not rewind ACP authority, Hermes state, or unrelated external effects.
+## Prerequisites before deployment
 
-Rollback has the same quiescence requirement. The helper must successfully stop the candidate service before restoring any runtime or checkpoint file. If that rollback stop fails, it restores nothing, does not restart the service, retains the private backup, and reports incomplete rollback for manual recovery.
+At minimum, pin:
+
+1. intended source commit / tree;
+2. applicable local validation;
+3. publication target and expected-old ref;
+4. exact-head CI / container build when required by the release flow;
+5. candidate artifact identity;
+6. rollback runtime and durable-state recovery plan.
+
+Local PASS, GitHub publication, CI, NAS copy, VM source, and Production deployment are separate gates and cannot substitute for one another.
 
 ## Safe deployment order
 
-1. Pin the exact commit and tree read from public `main`.
-2. Wait for CI to succeed on that exact head.
-3. Build the candidate and record every file's SHA-256.
-4. Snapshot the static current runtime/rollback files and prove they can be restored.
-5. Stop the service, then snapshot the exact checkpoint JSON + integrity-key presence/bytes while that state is quiescent.
-6. Switch the complete candidate set in that stopped-service window.
-7. Read back file hashes, service PID, restart count, listener, and health probes.
-8. If any check fails, stop the candidate, restore the old runtime plus the exact predeploy checkpoint state, and only then restart and verify the old service.
+General sequence:
 
-NAS state, VM state, a dirty worktree, and an unpublished commit are not deployment authority.
+1. Freeze source commit / tree.
+2. Run the build/test gates required by that source.
+3. Build the candidate and record release-file SHA-256 identities.
+4. Read back the existing Production runtime and recovery baseline.
+5. Quiesce the service, then snapshot private state required for rollback.
+6. Switch the candidate release unit within that stopped-service window.
+7. After startup, read back binary / Web assets, service state, restart count, listener, and health.
+8. If any required readback fails, use the verified recovery plan. A process merely starting does not prove rollback success.
+
+Deployment should not mutate unrelated Hermes, Hindsight, Semantica, or ACP runtime as a side effect.
+
+## Transport checkpoint rollback
+
+The data directory may contain:
+
+```text
+transport-checkpoints.json
+.transport-checkpoints.json.key
+```
+
+They are not release-archive files.
+
+When deployment automation supports binary rollback, it must snapshot exact presence and bytes only after the service is truly stopped. If a file did not exist before deployment, rollback must be able to restore the “absent” state too.
+
+An old binary starting does not prove it can safely read a newer checkpoint schema. Runtime-byte compatibility and durable-state compatibility are separate proofs.
+
+If rollback cannot safely quiesce the candidate, stop restoring files and preserve the recovery material for manual handling instead of overwriting checkpoint state under a live process.
 
 ## Repository deployment helper
 
-`scripts/deploy-nas-production.sh` packages the four release files into a reproducible archive. Its manifest binds the exact commit, tree, and SHA-256 of every release file. The remote side verifies the archive, manifest, and payload before switching anything. Its private temporary rollback set additionally covers Compose, settings, and the quiesced checkpoint JSON/integrity-key presence; those private state bytes never enter the public release archive.
+`scripts/deploy-nas-production.sh` is one reproducible release/deployment automation path. Its public contract is to:
 
-The script accepts only non-interactive `sudo -n`. It stops safely when:
+- bind an exact commit / tree;
+- package the complete release unit with manifest/SHA verification;
+- validate the remote payload before switching;
+- use a non-interactive privilege path;
+- fail closed and apply the rollback contract when candidate readback does not match.
 
-- a required file is missing;
-- a source is a symlink;
-- archive, manifest, or hash identity differs;
-- post-deploy readback differs from the candidate.
+Private NAS hostnames, volume paths, credentials, and concrete Production commands do not belong here.
 
-## Timeout ordering
+## Containers and bind mounts
 
-A request may wait in a queue before it waits for Microsoft. Outer timeouts must therefore exceed the total inner waiting budget.
+A Docker image may contain both the binary and `web/`, but a runtime bind mount can replace files from the image.
 
-Example:
+Acceptance must therefore inspect the bytes actually executed/read by the running service, not just an image tag or successful build.
 
-| Waiting layer | Example value |
-|---|---:|
-| `interactiveQueueTimeoutSeconds` | 300 seconds |
-| `chatTimeoutSeconds` | 1800 seconds |
-| Hermes stale detector | about 2200 seconds |
-| Hermes request timeout | about 2300 seconds |
-| reverse-proxy read/send timeout | about 2400 seconds |
+## Timeout relationship
 
-These values show ordering, not permanent defaults. Recalculate the chain whenever one layer changes. `proxy_connect_timeout` covers connection setup only and does not need to match long reasoning timeouts.
+One request may experience:
 
-`textInputLimitUTF16` controls text size, not time.
+```text
+queue wait
+→ ChatHub / model wait
+→ caller / Hermes timeout
+→ reverse-proxy timeout
+```
 
-## Settings and containers
+Each outer timeout must exceed the worst-case waiting it encloses. Do not copy one Production instance's values into permanent defaults. Read current effective queue/chat timeouts from management settings.
 
-Different setting classes have different sources of truth. Do not assume that environment variables or `settings.json` always win. The management page should show the effective value and source; an environment-controlled value cannot be overwritten by a saved UI value.
+`textInputLimitUTF16` is text-size policy and is unrelated to timeout.
 
-The repository `Dockerfile` includes both the binary and `web/`. If Production bind-mounts an external directory onto `/app`, the mounted files become the real runtime. Qualification must inspect the mount rather than trusting the image contents.
+## Completion readback
 
-## Machine-checkable completion table
-
-| Check | Required result |
+| Gate | Must prove |
 |---|---|
-| Public source | exact commit / tree equals intended source |
-| CI | exact-head success |
-| Candidate | artifact identities are pinned |
-| Recovery | snapshot covers the runtime/rollback files plus exact quiesced checkpoint JSON + integrity-key presence/bytes |
-| Production | binary and all Web identities match |
-| Service | state, restart count, listener, and health are correct |
-| Boundaries | unauthorized runtime identities did not drift |
+| Source | intended commit / tree |
+| Build | candidate artifact identity |
+| Publication | exact public ref when this release publishes |
+| CI | exact candidate head when required |
+| Recovery | identifiable usable predeploy rollback bytes/state |
+| Production | binary and Web bytes belong to one candidate |
+| Service | state / restart / listener / health meets contract |
+| Scope | unrelated runtime was not mutated |
+
+Only gates actually in scope need verification. A documentation-only change does not require a Production deployment.
+
+## Read next
+
+- Runtime settings: [`runtime-settings.md`](runtime-settings.md)
+- Compatibility / evidence: [`compatibility.md`](compatibility.md), [`research-evidence.md`](research-evidence.md)
+- Security: [`../../SECURITY.md`](../../SECURITY.md)
+- Private Production operations: local `m365-ops`

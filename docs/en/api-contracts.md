@@ -2,144 +2,192 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: ordinary clients should stop after these four rules. Continue only into the matching section when implementing an adapter, diagnosing an error, or checking compatibility.
+> General clients can remember these six rules and stop. Read the matching section only when implementing an adapter, diagnosing an error, or validating continuation behavior.
 
-Most clients need four rules first:
+1. Text input is governed by the effective `textInputLimitUTF16` transport limit, not by a model-token limit. The exact current default/value is maintained in [`runtime-settings.md`](runtime-settings.md).
+2. Streaming ends with at most one usage-only chunk followed by one `[DONE]`.
+3. A request that may already have reached Microsoft is not replayed blindly.
+4. `/v1/chat/completions` is auxiliary/control transport; Hermes execution uses `/hermes/v1`.
+5. Tool/checkpoint evidence proves transport facts only, not Task / Run semantic completion.
+6. Protected artifacts expose only a short-lived local capability, never the Microsoft private URL.
 
-1. A stream ends with one usage chunk and then one `[DONE]`.
-2. `128000` is a UTF-16 text-size limit, not a token limit.
-3. A request already sent to Microsoft is never blindly replayed after a network error.
-4. `/v1/chat/completions` is P2 control-plane traffic; real Hermes Agent traffic uses `/hermes/v1`.
+## Public surfaces
 
-The rest of this page is the exact wire contract for implementers and AI agents.
-
-## Common endpoints
-
-| Use | Route |
+| Purpose | Route |
 |---|---|
-| OpenAI chat control-plane | `POST /v1/chat/completions` |
+| Chat Completions control / auxiliary | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | Anthropic Messages | `POST /v1/messages` |
-| Hermes Agent | `/hermes/v1/*` |
+| Hermes | `/hermes/v1/*` |
 | Hindsight Memory | `/memory/v1/*` |
+| Images | `POST /v1/images/generations` |
+| MCP | `/v1/mcp`; legacy `GET /v1/mcp/sse` + `POST /v1/mcp/message` |
 | Model catalogs | `GET /v1/models`, `GET /hermes/v1/models`, `GET /memory/v1/models` |
+| Protected artifact | `GET /v1/artifacts/{capability}/content` |
 
-Catalog `context_window` / `max_input_tokens` values are token-oriented metadata. They are not `textInputLimitUTF16`.
+Catalog `context_window` / `max_input_tokens` metadata is token-oriented and is separate from `textInputLimitUTF16`.
+
+`POST /v1/images/generations` is a separate image surface. With `response_format=url`, it may return an upstream image URL; the local `/v1/artifacts/{capability}/content` protection used for Code Interpreter artifacts does not apply to image URLs.
 
 ## Streaming and usage
 
-Request:
+A request may ask for:
 
 ```json
 {"stream":true,"stream_options":{"include_usage":true}}
 ```
 
-Response order:
+The ending order is fixed:
 
-1. Ordinary SSE chunks carry `usage:null`.
-2. Exactly one `choices:[]` usage-only chunk appears before the end.
-3. Exactly one `[DONE]` appears last.
+1. normal SSE chunks;
+2. when usage is requested, at most one `choices:[]` usage-only chunk;
+3. one `[DONE]`.
 
-`include_usage=false` adds no usage chunk. `stream_options.include_obfuscation` is recognized but ignored. An external request with `stream=false` plus `stream_options` is invalid. An internal adapter forcing non-stream mode must first remove stream-only fields.
+An external `stream=false` request with stream-only options is invalid. An internal adapter that converts a request to non-stream must remove stream-only fields first.
 
-If the caller closes a stream early, the gateway cancels that ChatHub job and releases account capacity immediately. It does not leave detached work running until `chatTimeoutSeconds`.
+When the caller drops a streaming response, the gateway cancels the corresponding upstream work and releases account capacity rather than letting it run indefinitely in the background.
 
-Usage uses `prompt_tokens` / `completion_tokens`. Sidecar estimates are marked with:
+Visible usage is an estimate of caller-visible input/output. It is not complete token accounting for Microsoft-internal grounding context.
 
-```text
-m365.usage_source
-usage_values_are_estimates=true
-usage_estimate_scope=visible_request_and_completion
-```
+## Input size and auto-spill
 
-## Oversized text and exhausted tool rounds
+The effective text limit is `textInputLimitUTF16`, measured in UTF-16 code units. Its exact current default/value is maintained in [`runtime-settings.md`](runtime-settings.md).
 
-Generic compatibility endpoints return:
+For non-Memory requests, when bulk text can be moved without moving system/developer/assistant control, tool identity, or the true current user ask, the gateway may convert older user evidence, tool results, or trusted integration-bound source-material ranges into a deterministic UTF-8 `.txt` attachment and then re-measure inline text.
+
+When safe spill is impossible:
 
 ```text
 HTTP 400
+type=invalid_request_error
 code=text_input_too_large
 limit_type=caller_text_utf16
-limit=128000
-received=<actual>
+limit=<effective UTF-16 limit>
+received=<measured UTF-16 units>
 retryable_after_reduction=true
 spill_attempted=<true|false>
-spill_reason=<attachment_slots_full|no_safe_candidate|cannot_fit_inline|generated_file_too_large|graph_authorization_unavailable|document_upload_failed|...>
-input_sha256=<deterministic request identity>
+spill_reason=<typed reason>
+input_sha256=<64-hex digest>
+recommended_action=reduce_input_or_retry_when_document_spill_is_available
 ```
 
-Memory does not participate in auto-spill. When caller text exceeds the limit it keeps the Hindsight-compatible recovery contract: HTTP 400, `code=context_length_exceeded`, a message containing `input is too long`, truthful UTF-16 metadata, `spill_attempted=false`, `spill_reason=memory_spill_disabled`, a deterministic `input_sha256`, and `recommended_action=compact_or_split_and_retry`. This does not imply that `128000 UTF-16` is a model-token context limit.
+Typical `spill_reason` values cover full attachment slots, no safe candidate, inability to fit inline, generated-file size, or document authorization/upload failure.
 
-For non-Memory chat, when oversized content can be moved without relocating system/developer/assistant control semantics, the gateway first spills large `user` / `tool` text into one deterministic, sectioned UTF-8 `.txt` attachment, then re-validates that the remaining inline text is below `128000`. A single oversized user message may be spilled as a whole. In a multi-message conversation the **real current user ask, instructions, and control always stay inline**; only older user bulk evidence, tool results, and an ephemeral recall/source-material range signed by the trusted Hermes integration boundary are eligible. The gateway binds that signature to the original request message, clean prefix, and source range, then relocates only the same message/source identity after checkpoint projection. Text containing `<memory-context>`, caller markers, self-claimed hashes/provenance, and invalid signatures do not establish ownership. It fails closed if all three attachment slots are already used, no text can be safely spilled, the generated file exceeds 512 MiB, Graph document authorization is unavailable, or document upload fails. Original text is never truncated and the hard limit is not removed. Generated spill file/section hashes and the Microsoft transport filename are deterministic so identical retries can recognize the same document semantics.
-
-Attachments use Microsoft's long-file grounding/search path. This does not mean their model-context cost is zero: the gateway's visible usage estimate does not include Microsoft's internal grounding context, and very large high-entropy files are not guaranteed to support exact retrieval at arbitrary byte positions.
-
-Exhausting tool rounds returns terminal HTTP `409` and is not replayed:
+Memory traffic does not auto-spill. Oversized input preserves:
 
 ```text
-code=tool_round_limit
-profile=<generic|hermes|memory>
-limit_type=tool_rounds
-limit=<configured ceiling>
-completed_rounds=<count>
-terminal=true
-retryable=false
-recommended_action=<consumer guidance>
+HTTP 400
+type=invalid_request_error
+code=context_length_exceeded
+limit_type=caller_text_utf16
+limit=<effective UTF-16 limit>
+received=<measured UTF-16 units>
+retryable_after_reduction=true
+spill_attempted=false
+spill_reason=memory_spill_disabled
+input_sha256=<64-hex digest>
+recommended_action=compact_or_split_and_retry
 ```
 
-If the router-repair input itself is too large, processing stops before a second upstream call with `code=tool_router_repair_input_too_large` and `limit_type=repair_prompt_utf16`. Large structured arguments are never truncated and guessed.
+Spill does not remove the hard limit. Attachment grounding is also neither zero model-context cost nor guaranteed arbitrary-byte retrieval.
 
 ## Tools and structured output
 
-- Multiple calls are allowed only when every selectable tool has `annotations.readOnlyHint=true` and no mutation/destructive signal. `tool_choice` is part of the selectable set.
-- `tool_calls[].id` must exactly match the later `tool_call_id`.
-- `arguments` cannot be cut mid-value or have facts invented during transport, repair, or checkpoint handling.
-- Checkpoint state is persisted before an upstream turn starts, including the exact non-synthetic message-digest sequence of an unresolved request. If a process boundary finds a valid unresolved in-flight turn, opening the data directory loads it in a recovery-required state; ordinary retry and destructive checkpoint mutations still fail closed with `RecoveryRequired` until the external outcome has been independently reconciled. Authenticated recovery must match that durable in-flight transcript. A successful process restart alone is not proof that replay is safe.
-- Destructive checkpoint operations (`delete`, `clear`, logout/account replacement, and chat-mode changes) refuse while any in-flight turn remains, returning `409 transport_checkpoint_recovery_required` without running the dependent mutation. After an uncertain outcome is explicitly reconciled to terminal-unknown, ordinary list/UI projection hides that tombstone; `clear`, logout/account replacement, and chat-mode changes may remove ordinary checkpoints while retaining the tombstone. Exact same-key replay and direct deletion of that tombstone remain fail-closed.
-- Once an upstream call has started, timeout, cancellation, response-drop, or other uncertain outcome retains the in-flight checkpoint for reconciliation; TTL pruning does not remove it. Recovery must present the same non-synthetic in-flight transcript; a changed unresolved suffix returns `ConversationDrift` instead of retargeting the external outcome, and only one recovery attempt for a checkpoint can be active at a time. A full-history retry with the same key that is not an accepted prefix returns `ConversationDrift` instead of deleting accepted state.
-- The durable phase distinguishes a pre-upstream reservation from an uncertain started request. A process boundary may roll back only a reservation that was durably recorded as not yet started; once the upstream phase is marked started, the record remains recovery-required. Recovery and reconciliation use an OS-level per-record lease plus the checkpoint file lock, so separate Gateway processes cannot concurrently admit the same recovery.
-- `GET /api/admin/checkpoints/recovery` lists only opaque checkpoint IDs and update times. `POST /api/admin/checkpoints/reconcile` accepts `{"id":"...","action":"acknowledge_unknown"}` and returns `status=unknown_external_outcome` with `replayAllowed=false`; it does not claim success or authorize replay. The reconciled tombstone is hidden from ordinary conversation/recovery projection but permanently fences that exact execution key; a genuinely new execution must use a new execution identity rather than replaying the uncertain key. A keyless request does not inherit a keyed record's in-flight or tombstone fence.
-- Persisted tool evidence is integrity-bound inside the checkpoint data directory. The checkpoint writer uses schema `rust-v2`; a `rust-v1` file is conservatively migrated, while an older binary rejects the v2 schema instead of silently ignoring recovery fields. A legacy record without integrity binding is migrated by demoting result bytes to unknown; a changed current record is rejected before it can authorize replay or be treated as successful transport evidence. Binary rollback alone is therefore insufficient after a checkpoint schema migration: the shipped deploy helper stops the service, snapshots `transport-checkpoints.json` together with `.transport-checkpoints.json.key` (including predeploy absence), and restores that exact pair before restarting the old binary on failed deployment. Rollback itself must also stop the candidate successfully; if that stop fails, the helper restores nothing, performs no restart, and retains the backup for manual recovery.
-- Internal `calls/answer` envelopes are not public API. Only a strict direct-answer shape may be unwrapped at the final boundary.
-- `response_format` / `json_schema` is a structured-output contract. Ordinary JSON is not stripped merely because it resembles a router envelope; invalid internal envelopes fail closed.
-- Hermes caller-tool duplicate-call suppression is owned only by `/hermes/...` execution surfaces. Generic Chat Completions, Responses, Anthropic Messages, and `/memory/...` compatibility traffic do not inherit Hermes-only continuation metadata merely because they share the same transport core.
-- Hermes post-tool empty-response recovery remains in the same execution turn only when the versioned integration binds the exact tool/result → synthetic assistant → synthetic user continuation with content-free HMAC provenance. Plugin v1.2+ obtains the stable execution subject from Hermes' stock `session_id`; inherited `HERMES_SESSION_KEY` routing context is not a checkpoint identity. M365 independently recomputes the signed subject from the canonical `/hermes` `session_key` plus the normalized full transcript. A valid HMAC by itself is therefore insufficient to retarget a claim. Replaying the exact envelope can only re-verify the same session/transcript subject; changing the session, user transcript, tool call, tool result, error bit, or recovery sequence invalidates it. Repeated authenticated recovery cycles inside one real-user turn remain synthetic only when each earlier recovery user was itself structurally validated before the next cycle is signed; an unverified look-alike nudge still forms a real user boundary. Caller-supplied `_empty_recovery_synthetic`, look-alike text, or forged metadata never creates authority. The derived recovery scaffolding is execution-time state and is excluded from durable checkpoint message identity, so Hermes removing that ephemeral pair before the next normal continuation does not create checkpoint-prefix drift.
-- M365 does not classify natural-language task completion, parse operation/target/environment claims, or rewrite a provider answer into a governance verdict. The Hermes transport seam may suppress an exact duplicate tool call using persisted call identity and may request a continuation without tools; it does not decide whether an Agent Task or Run is complete. ACP owns that semantic authority. Typed tool result status, result length, result digest, argument digest, checkpoint integrity, and caller delivery remain transport-local evidence. Legacy ledgers remain readable and are migrated conservatively by demoting opaque result bytes to unknown. The live telemetry projection reports transport outcomes only; it is not lifecycle authority.
-- `callerDelivery=sent` means only that the internal JSON response producer or SSE channel accepted the body/frame; it is not a network receipt acknowledgement. A client disconnect can therefore leave `failed`/`cancelled` delivery while checkpoint acceptance and reconciliation remain separate safety decisions.
-- Structured tool results with `partial`, `cancelled`/`canceled`, `incomplete`, or `complete=false` are unknown rather than successful, even when `exit_code=0`; this is a transport result classification, not an Agent completion decision.
-- Structured-output validity is checked again after transport projection. The Gateway fails closed instead of returning HTTP 200 with non-schema prose.
-- A transport-successful ChatHub result that still has no visible text after qualification and artifact materialization is not a successful empty completion. Non-stream returns `502 upstream_empty_response`; streaming emits an `upstream_empty_response` SSE error and then `[DONE]`, without an empty `finish_reason=stop`. Valid generated artifacts are materialized first; an artifact-only result becomes a public download-link response before the empty check. Privacy telemetry classifies a genuinely semantic-empty result as `upstreamResultClass=empty_response`.
+- Parallel tool calls are allowed only when every selectable tool is explicitly `annotations.readOnlyHint=true` and there is no mutating/destructive signal.
+- `tool_calls[].id` must match the later `tool_call_id` exactly.
+- Arguments, result bytes, and digests must not be guessed or silently truncated/reconstructed across repair or checkpoints.
+- A structured tool result explicitly marked partial, cancelled/canceled, incomplete, or `complete=false` does not become success merely because `exit_code=0`.
+- `response_format` / `json_schema` is a caller contract. The final transport projection is validated again, so the gateway does not return schema-invalid prose with HTTP 200.
+- If ChatHub transport completes but qualification/artifact materialization leaves no legal visible output, non-stream returns `502 upstream_empty_response`; stream emits an error then `[DONE]` instead of a fake empty success.
 
-Router, repair, and required-tool retry scratch phases each use a new `ConversationId` / `SessionId`. Private mode reapplies `disableMemory=1` to every new WebSocket, but that field is not a context reset.
+Tool-round exhaustion is a terminal safety condition:
 
-## Code Interpreter files
+```text
+HTTP 409
+type=tool_round_limit
+code=tool_round_limit
+profile=<effective profile>
+limit_type=tool_rounds
+limit=<effective round limit>
+completed_rounds=<durable completed rounds>
+completed_calls=<durable completed calls>
+terminal=true
+retryable=false
+recommended_action=start_new_user_turn_or_raise_profile_limit_after_review
+```
 
-- A successful response exposes only a local `GET /v1/artifacts/{capability}/content` link, never a protected Microsoft URL.
-- `{capability}` is the short-lived download authority. Keep it out of logs, Issues, and public docs; downloading does not require another API key.
-- The gateway accepts only approved Microsoft HTTPS hosts and artifact paths, then obtains a short-lived IC3 token from the same Microsoft sign-in.
-- Materialization fails closed. A stream cannot report normal completion and then append an artifact error.
-- Raw `semanticEvents` are projected to safe progress fields. Artifact URLs, file tokens, and replayable values are excluded from compatibility metadata.
+The effective round ceiling comes from runtime settings.
 
-## `/v1/chat/completions` control plane
+## Transport checkpoints and unknown outcomes
 
-This route is fixed P2 auxiliary/control-plane traffic:
+Checkpoints provide safe transport continuation. They are not Agent lifecycle storage.
 
-- It uses the shared scheduler, breaker, and `MEMORY_YIELD`; P0 users and eligible P1 Memory take priority.
-- P2 concurrency is 1 and shared total concurrency is 2.
-- Checkpoints use `Namespace=auxiliary-control-plane`, `ForceNew=true`, and `Untracked=true`.
-- OpenAI message/tool validation, text policy, and tool safety remain active.
-- Hermes Agent `EVIDENCE_LEDGER` and final-answer completion rules are not injected.
-- Provider `done` content in non-stream or SSE responses is not rewritten into a task-completion verdict by M365.
+Core invariants:
 
-Hermes / Atlas execution still uses `/hermes/v1`. `profile=generic` in `tool_round_limit` remains only for wire/runtime compatibility; it does not make `/v1/chat/completions` user-facing chat.
+- history prefix, role, tool ID, arguments, and transcript identity must match;
+- a reservation before upstream starts may be reclaimed safely;
+- once upstream starts and outcome is uncertain, recovery-required state must remain;
+- process restart alone does not prove replay safety;
+- only one recovery attempt may own a checkpoint at a time;
+- destructive checkpoint operations fail closed while unresolved in-flight work exists.
 
-Forward-compatible extension observability may record field names or counts, never sensitive payload values.
+The current durable schema is `wp6-transport-checkpoints/rust-v2` and includes integrity binding. Legacy `rust-v1` records migrate conservatively; an unprovable legacy result is downgraded to unknown instead of being invented as success.
 
-## Queues, 429, and retry
+### Admin recovery
 
-Local queue full/timeout errors use HTTP `503` with `Retry-After`. They are different from Microsoft 429 and do not make every 5xx safe to replay.
+`GET /api/admin/checkpoints/recovery` projects opaque IDs and required metadata only; it does not expose private transcripts.
 
-A Microsoft hard WebSocket HTTP 429 and a verified ChatHub soft-throttle are both normalized to HTTP `429 rate_limit_error` for the caller, but only the hard HTTP 429 is shared-account pressure authority that opens or escalates the shared breaker. A soft `BotConnection` notice proves only that the current ChatHub conversation/turn cannot continue; it ends the current request and leaves retry/backoff to the caller without changing shared cooldown from one preserved Hermes conversation. If a soft notice occurs on an existing recovery probe, the breaker returns to `HALF_OPEN_READY` for another eligible probe rather than escalating cooldown or claiming recovery. A non-empty `item.throttling` may still be ordinary quota/metering metadata and is not enough to classify a soft throttle or open the breaker. A valid upstream `Retry-After` on a hard 429 is preserved. Once a throttle response is established, repair, re-ask, and required-tool/router retry stop.
+`POST /api/admin/checkpoints/reconcile` may acknowledge an unknown external outcome as terminal unknown:
+
+```json
+{"id":"<opaque-id>","action":"acknowledge_unknown"}
+```
+
+This does not assert upstream success and does not authorize replay. The reconciled tombstone fences that exact execution identity; genuinely new work needs a new execution identity.
+
+## Hermes continuation and provenance
+
+Hermes-only continuation metadata is active only on `/hermes/...`.
+
+- Versioned integration obtains identity from a trusted Hermes execution/session seam.
+- HMAC provenance binds the exact session, normalized transcript, tool call/result, and recovery sequence.
+- Drift in session, transcript, or tool result prevents previous provenance from being retargeted.
+- Generic `/v1`, Responses, Anthropic, and `/memory/...` do not inherit Hermes-only authority merely because transport code is shared.
+- Caller text claiming synthetic/done/verified status or caller-provided metadata grants no authority.
+
+M365 may suppress an exact duplicate transport effect. It cannot use that fact to decide whether a Task / Run is complete. Semantic authority belongs to ACP.
+
+## Code Interpreter artifacts
+
+Successful materialization exposes only:
+
+```text
+GET /v1/artifacts/{capability}/content
+```
+
+Rules:
+
+- `{capability}` itself is short-lived download authority; do not place it in logs, Issues, or public docs.
+- The gateway accepts only allowlisted Microsoft HTTPS hosts/paths.
+- Upstream private URLs/tokens are not projected into caller-compatible metadata.
+- Materialization failure fails closed; a stream must not announce normal completion first and append failure later.
+
+## `/v1/chat/completions` control transport
+
+This route is auxiliary/control transport:
+
+- it uses the shared scheduler/breaker;
+- checkpoint behavior is ForceNew / untracked and does not inherit the Hermes execution ledger;
+- OpenAI message/tool/input safety still applies;
+- provider content remains content and is not rewritten by M365 into a Task / Run verdict.
+
+Use `/hermes/v1` for actual Hermes execution.
+
+## Queues, 429, breaker, and retry
+
+Local queue full/timeout is `503`, which is separate from Microsoft throttling.
+
+A hard upstream HTTP 429 is shared-account pressure evidence and opens/escalates the shared breaker. A verified soft conversation throttle may terminate the current request, but one bot notice does not by itself escalate shared cooldown. Ordinary quota/metering metadata is not a throttle merely because it is non-empty.
 
 Breaker states:
 
@@ -147,40 +195,61 @@ Breaker states:
 CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 ```
 
-- `OPEN` expiry only makes a probe possible; it does not close the breaker.
-- While the breaker is definitively `OPEN`, all interactive classes fail fast with the existing local `429 upstream_throttle` projection and `Retry-After`. A request that was already queued when another in-flight request opens the breaker is awakened and receives the same projection instead of waiting for its ordinary queue deadline. This local projection creates no ChatHub round and does not advance breaker counters, level, or source.
-- External-user traffic always has probe priority. If cooldown expires with no external user waiting, one Hermes continuation already classified by the gateway as `Autonomous` may take the single probe. Control-plane traffic (including Goal Judge, even when Hermes falls back from `/v1` to the main `/hermes/v1` provider), `AsyncCompletion`, and Memory still cannot probe; another 429 reopens the circuit at the next cooldown level.
-- A probe receiving a hard HTTP 429 returns to `OPEN` at a higher cooldown; a soft `BotConnection` notice returns the probe to `HALF_OPEN_READY` without escalating shared cooldown.
-- A successful probe enters `RECOVERY`.
-- `RECOVERY` keeps shared concurrency at 1 and still blocks Memory upstream.
-- After a successful request, the Gateway observes 60 quiet seconds. With no running or queued work, the next admission/snapshot returns to `CLOSED` automatically.
+- `OPEN` projects `429 upstream_throttle` with `Retry-After` locally without contacting Microsoft.
+- Cooldown expiry makes a probe eligible; it does not mean recovery completed.
+- External users get probe priority. An eligible autonomous transport may probe only when no external user is waiting.
+- A hard 429 during a probe reopens the breaker; success enters RECOVERY.
+- RECOVERY lowers shared concurrency and returns to CLOSED only after the required quiet observation.
 
-Memory admission errors:
-
-| HTTP / code | Meaning |
-|---|---|
-| `503 interactive_capacity_busy` | user traffic/capacity has not yielded |
-| `503 memory_capacity_deferred` | active 1 + waiting 8 is already full |
-| `429 upstream_throttle` + `Retry-After` | shared breaker is not `CLOSED`; defer until reset time |
-
-A projected 429 never touches Microsoft and does not increment breaker counters or levels.
+WebSocket retry is limited to transient dial/upgrade failure before payload send. After payload send, an uncertain outcome follows checkpoint/reconciliation rules instead of blind replay.
 
 ## Hindsight webhook
 
-`POST /internal/hindsight/webhook` uses machine authentication, not an admin session or caller API key. Runtime must set `M365_HINDSIGHT_WEBHOOK_SECRET`.
+`POST /internal/hindsight/webhook` uses machine HMAC authentication; a caller API key is not a substitute. The secret is `M365_HINDSIGHT_WEBHOOK_SECRET`.
 
-Hindsight computes HMAC-SHA256 over the raw JSON body and sends:
+Wire contract:
 
-```text
-X-Hindsight-Signature: sha256=<hex>
+```http
+X-Hindsight-Signature: sha256=<HMAC-SHA256(raw JSON body)>
+X-Hindsight-Event: <optional event name>
 ```
 
-Optional `X-Hindsight-Event`, when present, must equal payload `event`. The Gateway accepts only `retain.completed` and `consolidation.completed`, with required `operation_id` / `timestamp`. Only `retain.completed` can pass the milestone durability barrier; `consolidation.completed` is observability only. Delivery is at-least-once, so bounded deduplication uses `event + operation_id`. The secret never appears in UI, logs, or error bodies.
+`X-Hindsight-Signature` is verified over the raw body. `X-Hindsight-Event` may be omitted; when present, it must exactly equal JSON `event`. The body limit is 64 KiB.
 
-## Manual recovery and WebSocket retry
+The payload contains at least:
 
-While the shared breaker is in `RECOVERY`, an administrator may call `POST /api/admin/traffic/recovery` with `{"action":"complete"}`. Other states return `409 recovery_not_ready`. `GET /api/admin/traffic` reports observation time and whether the last completion was `manual` or `automatic`.
+```json
+{
+  "event": "retain.completed",
+  "operation_id": "<non-empty id>",
+  "status": "completed",
+  "timestamp": "<RFC3339>"
+}
+```
 
-ChatHub WebSocket retry is bounded to pre-payload HTTP `500` / `502` / `503` / `504` upgrade failures and transient network dial errors with no HTTP response. Once the payload is sent, the same retry rule cannot be used.
+Only `retain.completed` and `consolidation.completed` are accepted. `operation_id` must be non-empty, `timestamp` must be RFC3339, and `status` must be present; only the exact value `completed` is treated as a completed event. Success returns `204 No Content`.
 
-See [`compatibility.md`](compatibility.md) for current verification status.
+Main rejection surfaces: missing configured secret -> `503 configuration_error`; bad HMAC -> `401 auth_error`; malformed JSON, header/event mismatch, unsupported event, or invalid required identity/timestamp -> `400 invalid_request_error`.
+
+Current events:
+
+- `retain.completed`: may complete the Memory durability barrier;
+- `consolidation.completed`: observation only; does not unlock the barrier.
+
+Delivery is treated as at-least-once, so consumers need bounded deduplication by event/operation identity.
+
+## Common error classes
+
+| HTTP / code | Meaning |
+|---|---|
+| `400 text_input_too_large` | non-Memory caller text cannot safely fit the UTF-16 policy |
+| `400 context_length_exceeded` | Memory input needs compact/split recovery |
+| `409 tool_round_limit` | tool continuation safety ceiling exhausted |
+| `409 transport_checkpoint_recovery_required` | unknown external outcome must be reconciled first |
+| `409 hermes_execution_identity_error` | safe Hermes execution identity/provenance cannot be established |
+| `429 upstream_throttle` | shared-breaker projection or upstream rate limit |
+| `502 upstream_empty_response` | transport completed without legal visible output |
+| `503 interactive_capacity_busy` | local shared-account admission has no current capacity |
+| `503 memory_capacity_deferred` | Memory waiting capacity is exhausted/deferred |
+
+Read [`compatibility.md`](compatibility.md) for evidence strength and [`runtime-settings.md`](runtime-settings.md) for setting sources.

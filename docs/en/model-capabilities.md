@@ -2,62 +2,91 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: follow **Decision order** before enabling any capability. Open field tables and privacy limits only when creating or reviewing evidence.
+> Plainly: seeing a model or toggle in the Web UI does **not** mean the API can safely use it. Treat it as an observed candidate. It enters a usable model route only after the current Rust evidence contract validates and the candidate is explicitly `enabled=true`. If that principle is all you need, read this section and **Model catalog authority**, then stop.
 
-Seeing a model or field in Microsoft Web does not mean that the API supports it forever. M365 AI Gateway first records the observation as a candidate. It exposes the capability to API callers only after a reproducible test passes.
+Current Rust flow:
 
-This prevents two common failures:
+```text
+observe
+→ record a verifiable evidence identity
+→ keep Web request drift observe_only
+→ validate optionalModelCapabilities evidence
+→ only an enabled candidate joins the route catalog
+```
 
-- a hard-coded model name breaks when Microsoft changes a rollout;
-- a login, plugin, or confirmation flow owned by the Web app is mistaken for a regular API feature.
+This prevents a Microsoft rollout change or Web-app-owned stateful behavior from being mistaken for a gateway API capability.
 
-## Decision order for AI agents
+## Model catalog authority
 
-1. Capture a privacy-safe observation.
-2. Pin its source, schema, capture time, and SHA-256.
-3. Mark it `observe_only`; do not enable it automatically.
-4. Verify the complete API contract with deterministic or isolated live tests.
-5. Promote only after success, and allow rollback after drift or regression.
+Current model routing has one canonical registry: the Rust catalog/runtime mapping path.
 
-## Optional model capabilities
+Public model ID, canonical route, upstream tone, visibility, reasoning metadata, and compatibility aliases should all project from the same registry into:
 
-`settings.json` and the management API can store `optionalModelCapabilities`. Every item must point to real evidence identity. A string that merely looks like a model ID is not evidence.
+- `/v1/models`;
+- `/hermes/v1/models`;
+- `/memory/v1/models`;
+- request resolution;
+- management projection.
 
-Common fields:
+Do not create a second static model table in a protocol handler.
 
-| Field group | Examples |
+## Optional capability evidence
+
+`optionalModelCapabilities` accepts only candidates with complete evidence identity. A model-ID-looking string alone is not evidence.
+
+Evidence should answer at least:
+
+| Category | Required information |
 |---|---|
-| Public display | model ID, display name |
-| Upstream mapping | `selectorChoiceId`, `wireTone` / `upstreamTone` |
-| Behavior | reasoning, `streamingMode`, `optionsSets`, `allowedMessageTypes` |
-| Evidence identity | schema, SHA-256, `capturedAt` |
-| State | enabled, rollout, `projectionPolicy`, `usabilityVerified` |
-| Privacy hints | `temporaryChat` and non-sensitive disable-memory metadata |
+| Public identity | public model / display name |
+| Upstream mapping | selector choice / wire tone / canonical route |
+| Behavior | observable reasoning / streaming / allowed-message contract |
+| Evidence identity | schema, capture time, SHA-256 |
+| Usability | whether the required API contract was exercised |
+| Current projection | request-capability drift uses `projectionPolicy=observe_only`; optional model routing uses `enabled` plus catalog evidence fields |
 
-Field presence does not prove API support. Request-side observations default to `observe_only`.
+Current Rust does **not** project a general `SUPPORTED / DEGRADED / UNSUPPORTED / INCOMPATIBLE / UNKNOWN` status field in the model catalog. The actual surfaces are:
 
-## Request-capability snapshots
+- Web request capability evidence: `projectionPolicy=observe_only`; observations are compared with the sidecar baseline and do not enable capability by themselves.
+- Optional model routes: evidence schema/mapping/usability/digests must validate, and only `enabled=true` candidates join routes.
+- Model catalog: projects `operational_status=enabled`, `mapping_evidence`, `identity_status`, and `x_m365_*` evidence metadata.
 
-`webRequestCapabilityEvidence` records one observation of the Web surface. It is not a transport setting. It may store tone, streaming mode, options, allowed message types, and non-sensitive Private Chat metadata.
+If another governance layer uses `SUPPORTED / DEGRADED / ...` vocabulary, that is the integration/ACP contract's classification vocabulary, not a current M365 model-catalog wire field.
 
-Do not expose these capabilities merely because the Web app displays them:
+## Limits of Web request observation
+
+The Web surface may expose observations such as:
+
+- model selector;
+- tone / reasoning mode;
+- streaming mode;
+- options / allowed message types;
+- non-sensitive Private Chat metadata.
+
+But stateful capabilities must not be exposed to API callers merely because the Web app shows them, including:
 
 - authentication lifecycle;
 - plugin lifecycle;
-- stateful memory;
 - user confirmation;
-- other message types whose state belongs to the Web app.
+- Web-owned stateful memory;
+- other message types that require Web-app session/state ownership.
 
-Each capability needs a proven owner and safe transport contract first.
+First prove who owns the state, how it is transported safely, and how failures close safely.
+
+## Evidence drift
+
+When Web observation, current source mapping, or live usability changes, old promotion evidence may become stale.
+
+Requalify the affected candidate instead of using an old snapshot to keep a vanished model route alive artificially.
 
 ## Data that must never be stored
 
-The evidence registry does not store:
+Capability evidence does not store:
 
 - tokens, cookies, passwords, or API keys;
-- account or tenant identifiers;
-- chat content or full request/response bodies;
-- private file URLs;
-- replayable authentication material.
+- account / tenant / user identifiers;
+- chat content or complete request/response bodies;
+- private file URLs / artifact capabilities;
+- replayable OAuth/session material.
 
-See [`compatibility.md`](compatibility.md) for current feature status.
+Read [`compatibility.md`](compatibility.md) for current evidence levels and [`research-evidence.md`](research-evidence.md) for evidence methodology.

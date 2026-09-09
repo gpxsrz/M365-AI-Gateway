@@ -2,46 +2,65 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: start with the status table. Read the last section only to judge evidence strength; never turn one live pass into a permanent guarantee.
+> Start with **Reading evidence**. This page describes current-source contracts and evidence classes; it does not turn one successful live run into a permanent support guarantee.
 
-Rust covers the public API and main execution paths of the former Go gateway. One Microsoft sign-in, text chat, file/vision input, Code Interpreter files, and modern MCP all have real-path evidence.
+M365 AI Gateway current source is Rust-only. Major compatibility surfaces are protected by deterministic tests and release gates. Microsoft capabilities, account rollouts, external-client versions, and Production runtime can still change, so keep evidence layers separate.
 
-“Live pass” means one isolated check succeeded. Microsoft capabilities can vary by account and rollout, so every release must still bind an exact commit, CI run, binary, and runtime readback.
+## Reading evidence
 
-## Status labels
-
-| Status | Plain meaning |
-|---|---|
-| Automated | Repeatable fixed-input checks; the best regression signal |
-| Local runtime | A real local release-binary path passed |
-| Live passed once | One account, route, and point in time passed; not a permanent promise |
-| Recheck every release | The result depends on an external environment and needs fresh readback |
-
-## Feature table
-
-| Feature | Current evidence | Boundary |
+| Evidence | Proves | Does not prove |
 |---|---|---|
-| `/v1/chat/completions` | Automated + local runtime | regular replies, SSE, tools, usage, and one `[DONE]` |
-| `/v1/responses` | Automated | parents, tool results, reasoning, and media events |
-| `/v1/messages` | Automated | Anthropic adapter; streaming is converted after completion |
-| Hermes `/hermes/v1` | Automated | implicit checkpoints require a non-empty `session_key`; without a reliable key the gateway does not guess continuation across sessions; multi-round tools, transport evidence, scheduling |
-| Hindsight `/memory/v1` | Automated | retain, recall, reflect, webhooks, and barriers |
-| MCP modern HTTP | Live passed once | official Python SDK completed initialize, list, call, and close |
-| MCP legacy SSE | Automated | other legacy clients and versions still need individual checks |
-| File and vision input | Live passed once | documents and images use separate transports |
-| Code Interpreter files | Live passed once | one sign-in; protected URLs stayed private; fetch and post-restart refetch passed |
-| Automatic Microsoft sign-in | Live passed once | real button, controlled Chrome, completion state, and online-account readback passed |
-| Image generation | Recheck every release | one `no_image_resource` result means only that the account lacked an image resource then |
-| Admin and API keys | Automated + local runtime | bootstrap, password change, re-login, key creation, authorized models |
-| Release / container | Recheck every release | local gates do not replace exact-head CI and container build |
-| Production | Recheck every release | read back GitHub, NAS, VM, recovery, deployment, and health separately |
+| Deterministic test | source contract holds for fixed input | Microsoft behaves the same now |
+| Local runtime | candidate artifact can use the local route | OAuth / ChatHub / Production passed |
+| Isolated live | one account/route/time really worked | permanent support or every account |
+| Exact-head CI | published candidate passed CI environment | Production is deployed |
+| Production readback | exact artifact is running at one target | every mirror / VM is synchronized |
 
-## Boundaries that do not move
+“HTTP 200” and “tests passed” are meaningful only when bound to the applicable source / route / runtime identity.
 
-- `128000` means UTF-16 text units, not model tokens.
-- Private mode sends `disableMemory=1`; it does not promise zero Microsoft retention.
-- Caller tools run in parallel only when every selected tool is explicitly read-only.
-- WebSocket retry is allowed only before the payload is sent.
-- Image, model-catalog, and Web capabilities may vary by account or rollout.
+## Current capability matrix
 
-For the Rust comparison, read [`rust-rewrite-parity.md`](rust-rewrite-parity.md). For risks, read [`known-limitations.md`](known-limitations.md). For evidence rules, read [`research-evidence.md`](research-evidence.md).
+| Surface | Current contract evidence | Still needs external readback for |
+|---|---|---|
+| `/v1/chat/completions` | deterministic route / validation / stream / tools / checkpoint tests | Microsoft live behavior |
+| `/v1/responses` | deterministic adapter / continuation tests | client / upstream-version differences |
+| `/v1/messages` | deterministic Anthropic projection tests | client / upstream-version differences |
+| `/hermes/v1` | deterministic execution-identity, provenance, tool-continuation, checkpoint tests | exact Hermes plugin/profile/runtime identity |
+| `/memory/v1` | deterministic Memory queue / overflow / webhook / barrier tests | exact Hindsight/runtime state |
+| Model catalog | deterministic catalog / mapping / evidence validation | Microsoft Web rollout changes |
+| MCP | route / session / authorization tests | each SDK / client version still needs its own validation |
+| Files / Vision | transport and validation tests | Microsoft file-service / account capability |
+| Code Interpreter artifact | protected URL, materialization, capability, restart-safe storage contract | account / upstream artifact availability |
+| Images | request / error contract | Microsoft image-resource availability |
+| Admin / API key | deterministic auth/settings/route tests | actual network/reverse-proxy environment |
+| Release / rollback | script / architecture tests | exact publication / CI / Production candidate |
+
+## Boundaries that never move
+
+- The configured M365 UTF-16 transport limit is not a model-token hard limit; its exact current value is maintained in [`runtime-settings.md`](runtime-settings.md).
+- Private mode is not a Microsoft zero-retention guarantee.
+- A Microsoft Web selector/capability observation is not permanent API support.
+- Transport final / tool success is not Task / Run semantic completion.
+- Local tests do not prove Production; Production readback does not prove every remote/mirror is synchronized.
+- An unknown external outcome must not be rewritten as failure or success just to make retry convenient.
+
+## When to requalify
+
+Reacquire affected evidence when a controlling identity changes, including:
+
+- source / contract;
+- model routing / capability evidence;
+- Hermes integration plugin;
+- checkpoint schema;
+- build artifact;
+- major upstream/client version;
+- Production config / release unit.
+
+A docs-only wording change does not automatically invalidate runtime bytes, but the new public documentation identity still needs its own review/validation.
+
+## Read next
+
+- Evidence rules: [`research-evidence.md`](research-evidence.md)
+- Current limitations: [`known-limitations.md`](known-limitations.md)
+- Rust historical parity: [`rust-rewrite-parity.md`](rust-rewrite-parity.md)
+- Exact API contract: [`api-contracts.md`](api-contracts.md)

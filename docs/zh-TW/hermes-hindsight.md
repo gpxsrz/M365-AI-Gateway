@@ -1,184 +1,108 @@
-# Hermes 與 Hindsight
+# Hermes 與 Hindsight 整合
 
 ## 30 秒看懂
 
-> AI Agent：只接服務時，讀本節和「建議設定」就停。只有在排隊、memory freshness 或 webhook 出問題時，才讀後半契約。
+> 只要把服務接起來，讀本節和「Route 怎麼分」就停。只有遇到 queue、checkpoint、Memory barrier 或 provenance 問題，才往下讀對應小節。
 
-- Hermes Agent 用 `/hermes/v1`。
-- Hindsight Memory 用 `/memory/v1`。
-- Goal Judge 等控制工作用 `/v1/chat/completions`，不要走 Hermes Agent route。
-- 同一 Microsoft 帳號同時最多跑 2 筆；使用者優先，Memory 第二，背景／控制工作第三。
-- Hermes、Hindsight、Semantica 與其他 upstream core 都是 immutable upstream。Canonical lifecycle governance 只在 standalone ACP；versioned adapter、plugin / hook、gateway 或 sidecar只能承載 integration enforcement / evidence / projection，不得形成第二 authority。M365 integration contract 見 [`agent-governance.md`](agent-governance.md)。
+- Hermes Agent transport 用 `/hermes/v1`。
+- Hindsight Memory transport 用 `/memory/v1`。
+- Goal Judge 等 auxiliary / control work 用 `/v1/chat/completions`。
+- 三者可以共用一個 Microsoft 365 帳號，但 queue / breaker 是 shared-account policy。
+- Hermes、Hindsight、Semantica core 不因 M365 相容問題修改。
+- M365 只提供 transport / adapter evidence；Task / Run completion authority 屬於 ACP。
 
-若只是在接服務，先照下一節設定。排程、barrier 與 webhook 的精確規則放在後半。
+## Route 怎麼分
 
-## 建議設定
-
-### Hermes：正確性優先
-
-```text
-model-specific context_length=64000
-compression.proactive_prune_tokens=30000
-compression.max_attempts=3
-compression.protect_first_n=3
-compression.protect_last_n=8
-compression.min_tail_user_messages=1
-compression.tail_mode=legacy
-global compression.threshold_tokens=null  # 使用 stock resolver，不設 absolute cap
-```
-
-64K 仍是目前 provider 的 context override。#89 auto-spill 上線後，M365 `128000 UTF-16` transport wall 由 adapter 處理，不再用它逼 Hermes 提前 compression。現行長任務基線在 30K 做 deterministic 舊 tool-output prune，完整 compression 不設 absolute token cap；以 stock v0.20.5 的 64K small-context resolver 計算，目前約在 54.4K 才觸發。實際 runtime policy 仍以 default／manager live profile config 為權威。
-
-可以保留內建 memory 與 user profile，同時關掉週期背景 reviewer，減少和前景 agent 搶同一帳號：
-
-```yaml
-memory:
-  memory_enabled: true
-  user_profile_enabled: true
-  nudge_interval: 0
-skills:
-  creation_nudge_interval: 0
-agent:
-  intent_ack_continuation: true
-```
-
-這不會關掉 `MEMORY.md`、`USER.md` 或 memory tool。
-
-### Hindsight：背景工作可以等
-
-```text
-memory_mode=hybrid
-auto_recall=true
-auto_retain=true
-retain_every_n_turns=1
-recall_prefetch_method=recall
-recall_types=observation
-recall_max_tokens=2048
-recall_max_input_chars=800
-prefetch_waits_for_retain=true
-prefetch_retain_drain_timeout=600
-
-HINDSIGHT_API_WORKER_MAX_SLOTS=1
-HINDSIGHT_API_SKIP_LLM_VERIFICATION=true
-HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=0
-HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
-HINDSIGHT_API_WORKER_MAX_RETRIES=12
-HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=60
-HINDSIGHT_API_LLM_TIMEOUT=120
-HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
-HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
-```
-
-`observation` 適合自動注入；要跨整個 bank 深度整理時用 `hindsight_reflect`。Worker 只留 1 slot，不另留 consolidation slot。跳過的是啟動時的 LLM connection verification；真正 retain/recall/reflect 仍會回報 provider failure。
-
-### Tool rounds
-
-| Route | 預設上限 |
-|---|---:|
-| `/v1/chat/completions` | 16 |
-| `/memory/v1` | 16 |
-| `/hermes/v1` | 128 |
-
-耗盡上限是 terminal safety condition，不會自動重播或重新綁 checkpoint。
-
-## Goal Judge 要怎麼接
-
-Hermes 0.20.4 要建立「同一 Gateway 的第二個 named provider」。不要只在 `auxiliary.goal_judge` 塞 `base_url`；匿名 `custom` route 不保證繼承主 provider credential。
-
-Coordinator 與 Atlas/manager 都使用原有的 `M365_COPILOT2API_KEY` environment source：
-
-```yaml
-providers:
-  m365-copilot-control-plane:
-    base_url: https://<same-m365-gateway>/v1
-    key_env: M365_COPILOT2API_KEY
-    model: gpt-5.6-reasoning
-    models:
-      gpt-5.6-reasoning:
-        context_length: 64000
-auxiliary:
-  goal_judge:
-    provider: m365-copilot-control-plane
-    model: gpt-5.6-reasoning
-```
-
-兩個 provider 名稱仍指向同一 Gateway、credential 與 model；名稱只把 Hermes transport continuation 和 control-plane `/v1` transport handling 分開。
-
-為什麼要分開：control-plane 的 `{"verdict":"done"}` 等 JSON 必須原樣作為 provider content 傳遞。M365 不解析它、不把它轉成 Task/Run completion authority，也不改寫它；治理語意由 ACP 在自己的 canonical seam 消費。
-
-Hermes 0.20.4 的 `judge_goal()` 仍固定 `timeout=30s`；task-level timeout 無法延長。正常 canary 約 5–6 秒，但 P2 若等待 Memory 超過 30 秒，Judge 可能安全失敗並延後本次完成。不能因此提高 `/v1` priority 或繞過 scheduler。
-
-## 同帳號排程
-
-正常 Production baseline：
-
-```text
-interactiveMaxConcurrent=2
-interactiveQueueTimeoutSeconds=120
-memoryMaxConcurrent=1
-memoryQueueTimeoutSeconds=120
-chatTimeoutSeconds=1800
-interactivePriorityHoldoffSeconds=10  # legacy compatibility only
-```
-
-實際硬規則：
-
-| Class | 工作 | 規則 |
+| 工作 | Route | 續接語意 |
 |---|---|---|
-| P0 | `EXTERNAL_USER` | 最高優先，可取消未完成 milestone yield |
-| P1 | `/memory/v1` | 沒有 P0 waiter 時先於新 P2 |
-| P2 | 背景 Hermes/Atlas、Goal Judge 等 control-plane | 同時最多 1 |
+| 一般 auxiliary / control work | `/v1/chat/completions` | ForceNew / untracked transport，不繼承 Hermes execution evidence |
+| Hermes / Atlas | `/hermes/v1/chat/completions` | 可使用 Hermes execution identity、checkpoint、duplicate-effect protection |
+| Hindsight | `/memory/v1/chat/completions` | Memory class queue；不使用 Hermes checkpoint authority |
 
-Shared total 最多 2，Memory 最多 1，Memory waiting buffer 為 8 且 FIFO。已開始的工作不會被搶占。若已有一筆 Memory 在跑，後面的 Memory 因 class limit 等待，P2 可使用另一個空位，不會白白閒置。
+模型清單也分成 `/v1/models`、`/hermes/v1/models`、`/memory/v1/models`，讓 consumer 不必猜 profile。
 
-Breaker 詳細狀態與 error 請讀 [`api-contracts.md`](api-contracts.md)。Cooldown 固定為 `1125 → 2250 → 4500 → 9000 → 18000` 秒；不再使用舊的 `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 決定。
+## 設定原則
 
-## Milestone Memory barrier
+不要把 M365 configured UTF-16 transport policy 當成 Hermes token context window。這是兩個不同的量；M365 的精確 current value 只在 [`runtime-settings.md`](runtime-settings.md) 維護：
 
-Gateway 只依 Hermes framework marker 分類，不用 LLM 猜意圖：
+- M365 `textInputLimitUTF16`：送往 transport 前的文字政策。
+- Hermes / model context：token-based context quality / compression policy。
 
-| 類型 | 如何辨識 | 效果 |
-|---|---|---|
-| `EXTERNAL_USER` | 一般 user turn，沒有可信 delegated-child provenance | 優先服務使用者，取消未完成 yield |
-| `ASYNC_COMPLETION` | `[ASYNC DELEGATION BATCH COMPLETE — ...]` 或 `[ASYNC DELEGATION COMPLETE — ...]` | 成功後建立 Memory barrier |
-| `AUTONOMOUS_CONTINUATION` | Hermes 固定 continuation marker，或通過嚴格 provenance 的 child request | 等待 barrier，再走一般 admission |
+非 Memory chat 遇到過長、且能安全外移的 bulk `user` / `tool` text 時，M365 可以轉成 deterministic `.txt` attachment；真正 current user ask、system/developer control 與 tool identity 必須留 inline。Memory route 不做這種 auto-spill。
 
-Delegated child 必須同時符合：
+因此 Hermes compression 應依 model context quality 設計，不要只為了躲 M365 UTF-16 wall 提前壓縮。實際 context/compression 值由目前 Hermes profile 自己管理，不在 M365 public docs 固定某個上游版本數字。
 
-1. Leading `role=system` 或 `role=developer` block 有 Hermes runtime identity。
-2. `Model: ...` 等於 request model，且有 `Provider: ...`、`Platform: subagent`。
-3. 下一段緊接固定文字 `You are a focused subagent working on a specific delegated task.`。
+## Shared-account 排程
 
-Plugin/system data 裡長得像 identity 的文字不能冒充 child。Async-completion marker 的優先權高於 child provenance，所以巢狀 child completion 仍可建立 barrier。
+白話：Hermes、Hindsight 和 foreground caller 共用同一個 Microsoft 帳號，所以 M365 會限制同時執行與排隊數量，避免背景工作把真人擠掉。
 
-成功 `ASYNC_COMPLETION` 會建立最多 300 秒的 lease。下一個 autonomous continuation 等到：
+這裡只記排程語意，不複製數字：External user 優先；沒有 user waiter 時，Memory 可先於新的 background/control work；Memory queue 維持 FIFO。**精確 current concurrency / queue 上限只在 [`runtime-settings.md`](runtime-settings.md) 維護。**
 
-1. 經 HMAC 驗證的 `retain.completed`，代表 server-side durable；或
-2. 300 秒到期，記錄 `timeout`；或
-3. 新的 external user 到達，記錄 `preempted_by_interactive`。
+已開始的 upstream request 不會因新高優先 work 被強制中斷。真正 admission timeout 要看 effective runtime setting；不要用文件裡的舊 profile 值當 current runtime truth。
 
-只有真的被 `MEMORY_YIELD` 擋住的 autonomous request，可在普通 120 秒 queue deadline 到後繼續等既有 `memoryYieldDeadline`。Barrier 結束後立即恢復一般 admission，已花掉的普通 queue budget 不會重設，caller context cancellation 也不會延長。
+Breaker 不同於普通 queue timeout。Breaker `OPEN` 時會直接投影本地 `429 upstream_throttle` + `Retry-After`，不先把普通 queue timeout 用完。
 
-`/memory/v1` HTTP 200、queued、claimed、processing 都不等於 durable。`consolidation.completed` 只做觀測，不是 barrier。只有 HMAC 驗證過的 `retain.completed` 可以通過。
+精確 breaker state 與 retry 規則見 [`api-contracts.md`](api-contracts.md)。
 
-Gateway 不刪 Hermes working context，也不能把稍後完成的 recall 反向塞進已組好的 HTTP body。「retain durable」不代表同一筆舊 request 已讀到新記憶；需要 fresh memory 時，要用下一次正常 recall/readback 確認。
+## Hermes execution identity 與 provenance
 
-## Overflow 與 upstream bank mission
+Hermes integration 使用 repo 內 versioned `integrations/hermes/m365_recall_provenance` plugin，而不是修改 Hermes core。
 
-- `128000` 是 UTF-16 transport policy，不是 Hermes/Hindsight token context。
-- 非 Memory chat 若超限部分是可安全移出的 `user` / `tool` bulk text，M365 會先自動 spill 成單一結構化 `.txt` attachment；system/developer/assistant 控制語意、tool identity 與真正 current ask 仍留 inline，最後仍重新套用 `128000` hard guard。單一 user 超限仍保留 #89 的整包 spill；多訊息最新 user 只允許可信 integration 簽章綁定的 ephemeral recall/source-material range 局部 spill。
-- Hermes 要啟用本 repo 的 versioned `integrations/hermes/m365_recall_provenance` plugin（v1.2+）。它只使用 Hermes stock 的 hook/middleware seam：`pre_llm_call`、`post_llm_call`、`on_session_end` 與 `llm_request`，不修改 Hermes core。除了既有 recall/source-material range，也會為 Hermes 官方 post-tool empty-response recovery建立 content-free HMAC provenance。Plugin 從 Hermes stock execution `session_id` 取得穩定 execution identity；繼承來的 task-local `HERMES_SESSION_KEY` routing context 不是 checkpoint identity。只有 request 沒有衝突值時，才把可信 execution identity 投影到既有 M365 `session_key` checkpoint seam；host execution identity 缺失、wire key 衝突、present wire key 為非字串或空白字串，或 stock `extra_body` 不是 mapping 時，plugin 會移除或取代不可信 wire identity／provenance，只投影有界的 `m365_execution_identity_error` schema+reason marker。M365 `/hermes/...` 會在建立 checkpoint 或呼叫 Microsoft upstream 前消費該 marker，回 `409 hermes_execution_identity_error`；因此 fail closed 不依賴 Hermes middleware exception 是否向外傳播。Canonical identity 會清掉 stale marker；generic `/v1` 與 `/memory/v1` 會丟棄這個 Hermes-only marker，維持隔離。Gateway 仍會用 canonical `session_key` 與 normalized full transcript自行重算 recovery provenance，HMAC通過後才在記憶體中 derive synthetic recovery marker。Gateway與 Hermes共用 `M365_HERMES_RECALL_PROVENANCE_SECRET`，Hermes另以 `M365_HERMES_PROVIDER`限定 named provider。Secret、raw session subject、tool result與 user text都不進 provenance metadata或 privacy telemetry。Caller自稱 `_empty_recovery_synthetic`、相同 recovery文字、cross-session/transcript replay、secret/provider不符、hash/index漂移或錯誤簽章都不建立 authority。不修改 Hindsight core。
-- 只有無法安全 spill、附件 slot 已滿、generated file 過大或文件授權不可用時，Hermes 才需要收到可恢復的 overflow signal。`128000` 不應再單獨驅動 Hermes 提前 compression/rotation；Hermes 的正常 compression/protected-tail/rotation 仍依 model token/context quality 決定。
-- Attachment grounding 不是零 context cost，也不是任意 byte-addressable storage；大型高熵檔可能有 retrieval miss。
-- Hindsight 會收到 `context_length_exceeded` / `input is too long`；Reflect baseline 是 40K / retry 1。
+核心規則：
 
-Hermes upstream #18774 修好前，`bank_mission` / `bank_retain_mission` 可能沒有同步到 live Hindsight `reflect_mission` / `retain_mission`。請直接設定 Banks Config API，並用 GET 讀回：
+1. 穩定 execution identity 要來自 Hermes stock execution/session seam。
+2. M365 wire `session_key` 只是 transport checkpoint input，不能由 caller 任意自稱可信。
+3. Plugin 與 Gateway 共同使用 `M365_HERMES_RECALL_PROVENANCE_SECRET` 驗證 content-free provenance。
+4. `M365_HERMES_PROVIDER` 可把 plugin 限定在指定 named provider。
+5. session、transcript、tool call、tool result 或 recovery sequence 漂移時，舊簽章不能 retarget。
+6. Generic `/v1` 與 `/memory/v1` 會隔離 Hermes-only metadata。
 
-```text
-PATCH /v1/default/banks/{bank_id}/config
-GET   /v1/default/banks/{bank_id}/config
-```
+Execution identity 缺失、wire key 衝突或 provenance 無法證明時，應在 Microsoft upstream 前 fail closed，而不是讓 middleware 例外或文字 marker 猜測決定安全性。
 
-使用正常 `HINDSIGHT_API_KEY` Bearer credential；文件與 evidence 只能記錄讀回結果，不能保存 key。這是 upstream 邊界，不要修改 Hermes/Hindsight core 來繞過。
+## Tool continuation 與 duplicate effect
 
-歷史 canary 與 Issues #42–#44 請讀 [`../history/README.md`](../history/README.md)。
+Hermes transport ledger 可以辨識已完成的 exact tool call，避免同一 transport effect 被重送，並在需要時要求一次沒有 tools 的 continuation。
+
+這只回答「這個 transport tool effect 是否已經有證據」，不回答「Agent 工作是否完成」。Task / Run semantic completion 仍由 ACP 的 acceptance contract 判定。
+
+Hermes 使用獨立於 generic / Memory 的 tool-round safety ceiling；精確 default / effective value 只在 [`runtime-settings.md`](runtime-settings.md) 維護。耗盡上限回 terminal `tool_round_limit`，不自動 replay。
+
+## Memory durability barrier
+
+特定 Hermes async-completion 之後，Gateway 可以建立最多 300 秒的 Memory yield lease。下一個需要 fresh Memory 的 autonomous/control continuation 等待：
+
+1. HMAC 驗證成功的 `retain.completed`；或
+2. 300 秒 lease 到期；或
+3. 新 external user 到達並 preempt pending yield。
+
+`queued`、`processing`、`/memory/v1` HTTP 200 與 `consolidation.completed` 都不等於 retain durable。
+
+Barrier 只控制「何時允許下一筆 transport admission」，不會反向改寫一筆已經組好的舊 HTTP request body。需要確認新記憶真的被讀到，仍要在下一個正常 recall/readback 證明。
+
+## Hindsight webhook
+
+`POST /internal/hindsight/webhook` 是 machine-auth surface。`M365_HINDSIGHT_WEBHOOK_SECRET` 用來驗證 raw JSON 的 HMAC-SHA256。
+
+Gateway 接受的 current event family：
+
+- `retain.completed`：可以完成 Memory durability barrier；
+- `consolidation.completed`：只作觀測，不解鎖 barrier。
+
+Webhook secret、raw Memory content 與帳號 identity 不得進 UI、log 或 public docs。
+
+## Overflow 與 Memory
+
+- M365 configured UTF-16 transport policy 不是 model token context；精確 current value 只在 [`runtime-settings.md`](runtime-settings.md) 維護。
+- 非 Memory bulk text 可以在 safety 條件成立時 spill 成 attachment。
+- Memory route 維持 Hindsight-compatible `context_length_exceeded` recovery，不 auto-spill。
+- Attachment grounding 不是零 context cost，也不是任意 byte-addressable storage。
+- M365 只保護 transport；Hindsight bank mission / retain mission 等上游語意以 Hindsight 自己的 current API/config 為準。
+
+不要把某個上游版本的 bug、Issue 編號或一次 live workaround 寫成 M365 current contract；需要追舊行為時進 [`../history/README.md`](../history/README.md)。
+
+## 接著讀哪裡
+
+- Exact wire/error/checkpoint contract：[`api-contracts.md`](api-contracts.md)
+- Runtime 設定來源：[`runtime-settings.md`](runtime-settings.md)
+- M365 ↔ ACP authority：[`agent-governance.md`](agent-governance.md)
+- Evidence 強度：[`research-evidence.md`](research-evidence.md)

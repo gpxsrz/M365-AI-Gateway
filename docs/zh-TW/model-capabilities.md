@@ -2,62 +2,91 @@
 
 ## 30 秒看懂
 
-> AI Agent：先做「判斷順序」，不要先開啟 capability。只有在建立或審查 evidence 時，才讀欄位表與隱私限制。
+> 白話：Web UI 看得到某個模型或開關，**不代表 API 已經能安全使用**。先把它當成「觀察到的候選能力」；只有 current Rust 要求的證據欄位驗證通過，而且候選明確 `enabled=true`，才會進入可用 model route。只想知道這個原則，讀完本節和「Model catalog 的 authority」就停。
 
-Microsoft Web 顯示某個模型或欄位，不代表 API 永遠支援它。M365 AI Gateway 只會把「看過」記成候選資料；通過可重現測試後，才會真的開放給 API caller。
+Current Rust 流程：
 
-這樣做可以避免兩種錯誤：
+```text
+observe
+→ 記錄可核對的 evidence identity
+→ Web request drift 只做 observe_only
+→ 驗證 optionalModelCapabilities evidence
+→ enabled candidate 才加入 route catalog
+```
 
-- Microsoft rollout 一變，硬編碼的 model 名稱就壞掉。
-- Web app 自己管理的登入、plugin 或確認流程，被誤當成普通 API 功能。
+這避免 Microsoft rollout 變動或 Web app 自己維持的狀態，被誤當成 Gateway 已支援的 API 能力。
 
-## AI Agent 判斷順序
+## Model catalog 的authority
 
-1. 找到 privacy-safe observation。
-2. 固定來源、schema、capture time 與 SHA-256。
-3. 先標成 `observe_only`，不要自動啟用。
-4. 用 deterministic 或隔離的 live test 驗證完整 API contract。
-5. 通過才 promotion；發生 drift 或 regression 時可以 rollback。
+Current model routing只有一份canonical registry：Rust `catalog` / runtime mapping path。
 
-## Optional model capability
+Public model ID、canonical route、upstream tone、visibility、reasoning metadata與compatibility alias都應從同一registry投影到：
 
-`settings.json` 與管理 API 可以保存 `optionalModelCapabilities`。每一筆都必須連到真實 evidence identity。只有一個看起來像 model ID 的字串，不算證據。
+- `/v1/models`；
+- `/hermes/v1/models`；
+- `/memory/v1/models`；
+- request resolution；
+- management projection。
 
-常用欄位：
+不要在protocol handler再複製第二份static model table。
 
-| 欄位類型 | 例子 |
+## Optional capability evidence
+
+`optionalModelCapabilities`只接受有完整evidence identity的candidate。只有一個model ID字串不算證據。
+
+Evidence至少要回答：
+
+| 類型 | 要知道什麼 |
 |---|---|
-| 公開顯示 | model ID、display name |
-| 上游對應 | `selectorChoiceId`、`wireTone` / `upstreamTone` |
-| 行為 | reasoning、`streamingMode`、`optionsSets`、`allowedMessageTypes` |
-| 證據 identity | schema、SHA-256、`capturedAt` |
-| 狀態 | enabled、rollout、`projectionPolicy`、`usabilityVerified` |
-| 隱私提示 | `temporaryChat` 與非敏感 disable-memory metadata |
+| Public identity | public model / display name |
+| Upstream mapping | selector choice / wire tone / canonical route |
+| Behavior | reasoning / streaming / allowed message family等可觀測contract |
+| Evidence identity | schema、capture time、SHA-256 |
+| Usability | 是否完成指定API contract驗證 |
+| Current projection | request-capability drift 使用 `projectionPolicy=observe_only`；optional model route 由 `enabled` 與 catalog evidence fields 決定是否進 catalog |
 
-欄位存在本身不代表 API 已支援。Request-side observation 預設保持 `observe_only`。
+Current Rust **沒有**在 model catalog 投影一套通用的 `SUPPORTED / DEGRADED / UNSUPPORTED / INCOMPATIBLE / UNKNOWN` 狀態欄位。實際可讀到的是：
 
-## Request capability snapshot
+- Web request capability evidence：`projectionPolicy=observe_only`，只比較 observation 與 sidecar baseline，不會自動開能力。
+- Optional model route：evidence schema / mapping / usability / digest 驗證通過後，只有 `enabled=true` 才加入 routes。
+- Model catalog：投影 `operational_status=enabled`、`mapping_evidence`、`identity_status` 與 `x_m365_*` evidence metadata。
 
-`webRequestCapabilityEvidence` 只記錄某次 Web surface 觀察，不是 transport 設定。它可以保存 tone、streaming mode、options、allowed message types 與 Private Chat 相關的非敏感 metadata。
+若其他治理層使用 `SUPPORTED / DEGRADED / ...` 詞彙，那是該 integration / ACP contract 的判定語彙，不是目前 M365 model catalog 的 wire field。
 
-以下能力不能只因 Web 上看得到就直接給 API caller：
+## Web request observation 的限制
+
+Web surface可能暴露這些資訊：
+
+- model selector；
+- tone / reasoning mode；
+- streaming mode；
+- options / allowed message types；
+- Private Chat相關非敏感metadata。
+
+但以下stateful能力不能只因Web上看得到就交給API caller：
 
 - auth lifecycle；
 - plugin lifecycle；
-- stateful memory；
 - user confirmation；
-- 其他由 Web app 擁有狀態的 message type。
+- Web-owned stateful memory；
+- 其他需要Web app自己維持session/state的message type。
 
-每一項都要先證明「誰負責狀態」和「如何安全傳輸」。
+先證明「誰擁有狀態、如何安全transport、如何fail closed」。
 
-## 絕對不能保存的資料
+## Evidence drift
 
-Evidence registry 不保存：
+當Web observation、current source mapping或live usability其中一個改變時，舊promotion evidence可能變stale。
 
-- token、cookie、密碼或 API key；
-- account / tenant identifier；
-- chat content 或完整 request / response body；
-- private file URL；
-- 任何可重放的登入材料。
+正確處理是重新驗證受影響candidate，不是用舊snapshot硬撐一個已消失的model route。
 
-目前功能狀態請讀 [`compatibility.md`](compatibility.md)。
+## 絕對不能保存
+
+Capability evidence不保存：
+
+- token、cookie、password、API key；
+- account / tenant / user identifier；
+- chat content或完整request/response body；
+- private file URL / artifact capability；
+- 任何可重播OAuth/session材料。
+
+目前驗證層級讀 [`compatibility.md`](compatibility.md)，證據方法讀 [`research-evidence.md`](research-evidence.md)。

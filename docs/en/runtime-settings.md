@@ -2,101 +2,124 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: select one group under **Which setting group do I need?** Do not load the whole page for one setting, and never read back or print secret values.
+> Most users should use the management UI. Read the rest only for automation, restart-bound settings, or effective-value diagnosis. Never read secrets back into output.
 
-Most users should use the management page and leave environment variables alone. The management APIs are:
+Common management surfaces:
 
-- `GET /api/admin/settings`: read current settings.
-- `PUT /api/admin/settings`: update only the fields you send.
-- `GET /api/admin/traffic`: inspect queues, throttling, and recovery.
-- `GET /api/admin/checkpoints/recovery`: list unresolved upstream outcomes by opaque checkpoint ID.
-- `POST /api/admin/checkpoints/reconcile`: explicitly acknowledge an unresolved outcome as terminal unknown; it never authorizes replay.
+- `GET /api/admin/settings`: current settings and their sources;
+- `PUT /api/admin/settings`: update only supplied fields;
+- `GET /api/admin/traffic`: queue / breaker / recovery projection;
+- `GET /api/admin/checkpoints/recovery`: opaque unresolved checkpoints;
+- `POST /api/admin/checkpoints/reconcile`: acknowledge unknown external outcome without authorizing replay.
 
-The UI must show both the effective value and its source. A disabled or environment-controlled field must not pretend that a saved UI value won. Secrets are never echoed in plaintext.
+The management UI should show both the effective value and where it came from. Environment-controlled values must not pretend to be overwritten by UI state, and secrets must never be echoed in plaintext.
 
-## Which setting group do I need?
+## Setting groups
 
-| Need | Settings |
+| Need | Main setting family |
 |---|---|
-| Compatibility modes | `chatMode`, `hermesCompatibilityEnabled`, `memoryCompatibilityEnabled` |
-| Ordinary waiting | `interactiveQueueTimeoutSeconds`, `memoryQueueTimeoutSeconds`, `chatTimeoutSeconds` |
-| Tools | `toolPlanningMode`, `maxToolCallsPerTurn`, `maxToolRounds`, `hermesMaxToolRounds` |
-| Text and output size | `textInputLimitUTF16`, `contextWindow`, `maxOutputTokens` |
-| Models | `modelMappings`, `optionalModelCapabilities` |
-| Process and files | `listenAddress`, `configPath`, `tokenCachePath`, `sessionCachePath`, `debugLogPath` |
-| Network and OAuth | `outboundProxy`, `clientId`, `authority`, `redirectUri`, `scope` |
+| Compatibility surfaces | `chatMode`, Hermes / Memory compatibility flags |
+| Queue / request timeout | interactive / memory queue timeout, chat / image timeout |
+| Tools | planning mode, tool-call ceiling, generic / Hermes tool-round ceiling |
+| Text and model metadata | `textInputLimitUTF16`, `contextWindow`, `maxOutputTokens` |
+| Model routing | `modelMappings`, `optionalModelCapabilities` |
+| Listener / data paths | listen, config, cache, telemetry paths |
+| Network / OAuth | proxy, client, authority, redirect, scope |
 
-`interactiveQueueTimeoutSeconds` and `memoryQueueTimeoutSeconds` are the effective ordinary admission-wait budgets used by the shared scheduler. Both default to `120` seconds and accept `1..=600`. They do not replace the breaker cooldown ladder: while the shared breaker is definitively `OPEN`, interactive traffic is projected immediately as `429 upstream_throttle` with `Retry-After` instead of spending the ordinary queue timeout.
+Use `GET /api/admin/settings` and the current source schema as the exact field inventory instead of copying a second stale settings catalog into documentation.
 
-## First startup
+## Effective-value precedence
 
-1. Point `M365_DATA_DIR` to writable persistent storage.
-2. Optionally use one-time `M365_ADMIN_PASSWORD` for the first login.
-3. Replace it with a persistent administrator password after the first successful login.
-4. If `M365_DEBUG_LOG` is set, privacy telemetry uses that path. Otherwise a saved `debugLogPath` is used, then `debug-telemetry.jsonl` under the data directory is the fallback.
+Not all settings use the same precedence:
 
-The telemetry path must end in `.jsonl`. The old Synology `log.db` is explicitly not current truth and is rejected by the reader. The writer uses private `0600` append, retains the newest 1000 records in memory, and periodically atomically compacts that same bounded projection. `GET /api/admin/debug/logs`, detail, and export all read this `m365-privacy-telemetry/v1` surface and report its surface ID, path class, and reader/writer state without exposing the private path.
+1. **General runtime policy**: environment may provide startup defaults; persisted settings may become the current effective value.
+2. **Restart-bound settings**: listener, cache paths, OAuth, proxy, and similar settings may be controlled by process environment and require restart.
+3. **Direct overrides**: selected safety-ceiling environment values override persisted UI state directly.
 
-Each request stores closed classifications or bounded metadata only: route/class, queue admission, breaker state/projection, spill decision/reason, before/after UTF-16 values and size classes, recall provenance class, upstream attempt/result, and an independent random correlation ID. The management reader derives `throttleKind` from those existing closed fields as `hard_http_429`, `soft_bot_notice`, `projected_breaker`, or `none`; this field exists only in the reader projection and **does not change the durable `m365-privacy-telemetry/v1` JSONL schema**, so an older rollback binary can still read existing telemetry. Caller delivery and exact duplicate-tool suppression are live-only transport projections and are intentionally omitted from the durable v1 record for the same rollback compatibility guarantee; a restarted process reports them as `not_evaluated`/`false` for historical records. Legacy post-policy fields are read-and-reset compatibility data only; M365 no longer produces governance decisions. Dynamic route segments are always stored as closed templates; for example, an artifact capability is recorded only as `/v1/artifacts/{capability}/content`. Prompt/transcript text, memory or attachment bodies, tokens/cookies/headers, tenant/account/user identity, conversation/session identity, private URLs, and raw upstream bodies are forbidden. This is a forensic projection, not a durable lifecycle authority.
+When diagnosing current behavior, read the management API effective/source projection instead of trusting only `.env` or only `settings.json`.
 
-## Value precedence
+## Stable safety invariants
 
-Settings do not all follow one rule:
+These are current Rust transport-safety constraints, not tuning suggestions that callers may arbitrarily raise:
 
-| Class | Effective-value rule |
-|---|---|
-| General runtime, such as chat/image timeout | environment supplies the startup default; a saved `settings.json` field becomes the current effective value |
-| Restart-required, such as listen address, cache paths, OAuth, and proxy | explicit process environment wins; saved value is used only when the environment is absent |
-| Direct override, such as tool-call / tool-round environment fields | process environment always overrides the saved UI value |
+| Item | Current invariant |
+|---|---:|
+| Shared in-flight | 2 |
+| Memory in-flight | 1 |
+| Background/control in-flight | 1 |
+| Memory waiting buffer | 8 FIFO |
+| Interactive waiting buffer | bounded |
 
-Common environment variables:
+Legacy compatibility fields, even when still accepted, cannot bypass these hard safety invariants.
 
-- `M365_CHAT_TIMEOUT_SECONDS`
-- `M365_IMAGE_TIMEOUT_SECONDS`
-- `M365_MAX_TOOL_CALLS_PER_TURN`
-- `M365_MAX_TOOL_ROUNDS`
-- `M365_HERMES_MAX_TOOL_ROUNDS`
-- `M365_DATA_DIR`
-- `M365_PUBLIC_ORIGIN`
-- `M365_DEBUG_LOG`
+The default ordinary queue timeout is 120 seconds; effective values are runtime settings. An `OPEN` breaker does not wait for that queue deadline and instead projects `429 upstream_throttle` immediately.
 
-`M365_READY_TIMEOUT` controls deployment automation, not an API product setting.
+## Text and tool ceilings
 
-## Same-account traffic: fixed hard limits
+Current defaults:
 
-One Microsoft account always follows:
+| Setting | Default |
+|---|---:|
+| `textInputLimitUTF16` | `128000` UTF-16 code units |
+| generic / Memory tool rounds | `16` |
+| Hermes tool rounds | `128` |
 
-| Item | Limit / order |
-|---|---|
-| Total running requests | 2 |
-| Memory | 1 |
-| P2 autonomous / control-plane | 1 |
-| Priority | P0 user > P1 Memory > P2 background/control-plane |
-| Memory waiting buffer | 8, FIFO |
+`contextWindow` is token-oriented model metadata and is not the same limit as `textInputLimitUTF16`.
 
-`interactiveMaxConcurrent`, `memoryMaxConcurrent`, and `interactivePriorityHoldoffSeconds` remain for old API compatibility. They cannot raise these hard limits. Ordinary Memory priority is enforced directly by queue policy.
+The tool-round ceiling is runaway protection. Exhaustion returns terminal `tool_round_limit`; it does not instruct the gateway to create a new execution.
 
-`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` are also compatibility-only. The shared breaker uses a fixed cooldown ladder:
+## Telemetry and privacy
 
-```text
-1125 → 2250 → 4500 → 9000 → 18000 seconds
-```
+Current privacy telemetry uses a closed schema with bounded classifications and non-sensitive metadata such as:
 
-A successful probe is followed by a separate fixed 60-second quiet observation. This is not the first cooldown level and adds no setting. `compatibilityTraffic` reports `recoveryObservationSeconds`, `recoveryObservationRemainingSeconds`, `lastRecoveryMode`, `lastRecoveryReason`, and `lastRecoveryAt`.
+- route template / workload class;
+- queue admission and breaker projection;
+- spill decision, size class, UTF-16 before/after values;
+- provenance class;
+- upstream attempt / result class;
+- random correlation ID.
 
-During recovery an administrator may still call:
+It must not store:
 
-```http
-POST /api/admin/traffic/recovery
-Content-Type: application/json
+- prompt / transcript / Memory body;
+- attachment body;
+- token, cookie, authorization header;
+- account / tenant / user identity;
+- raw conversation / session identity;
+- private URL / raw upstream body.
 
-{"action":"complete"}
-```
+Dynamic URLs are projected as templates such as `/v1/artifacts/{capability}/content`; the capability value itself must not enter telemetry.
 
-This is a manual fallback. Automatic completion still requires a successful probe, quiet observation, and no conflicting traffic.
+Telemetry is a forensic projection, not Task / Run lifecycle authority.
 
-## Hindsight webhook secret
+## Breaker and recovery
 
-`M365_HINDSIGHT_WEBHOOK_SECRET` verifies Hindsight callback HMACs. It is secret and never appears in the management UI, handoff records, logs, or error bodies.
+Shared-breaker policy is product transport logic and should not be weakened by arbitrary caller cooldown tuning.
 
-The single source for complete Hermes / Hindsight baselines is [`hermes-hindsight.md`](hermes-hindsight.md).
+`GET /api/admin/traffic` may expose:
+
+- circuit state;
+- `Retry-After` / remaining cooldown;
+- recovery observation;
+- queue / in-flight projection;
+- last recovery mode / reason.
+
+Only a legal `RECOVERY` state accepts `POST /api/admin/traffic/recovery` with `{"action":"complete"}` as a manual fallback. This operation does not convert an unknown request outcome into success.
+
+## Secrets
+
+Common machine secrets include:
+
+- `M365_HINDSIGHT_WEBHOOK_SECRET`: Hindsight webhook HMAC;
+- `M365_HERMES_RECALL_PROVENANCE_SECRET`: Hermes ↔ M365 provenance HMAC.
+
+Secrets must not appear in management UI plaintext, logs, handoffs, Issues, or error bodies.
+
+Other environment-variable names can be inspected in current config/source when needed, but public docs should not list private values or treat one Production environment as a product default.
+
+## Read the matching topic
+
+- Hermes / Hindsight integration policy: [`hermes-hindsight.md`](hermes-hindsight.md)
+- 429 / breaker / checkpoint errors: [`api-contracts.md`](api-contracts.md)
+- Web model capability evidence: [`model-capabilities.md`](model-capabilities.md)
+- Private Production operations: local `m365-ops`, not public repository documentation

@@ -1,8 +1,9 @@
-# Memory Provider compatibility — legacy link
+# Memory Provider compatibility — legacy route
 
-這個計畫已完成。本頁只保留舊網址；不要把它當成 current 設定或狀態。
+這個舊 plan 已不再是 current authority。請依目的讀 canonical page：
 
-- 台灣繁中：[`zh-TW/hermes-hindsight.md`](zh-TW/hermes-hindsight.md)
-- English: [`en/hermes-hindsight.md`](en/hermes-hindsight.md)
+- Hermes / Hindsight current integration：[`zh-TW/hermes-hindsight.md`](zh-TW/hermes-hindsight.md) / [`en/hermes-hindsight.md`](en/hermes-hindsight.md)
+- Runtime settings：[`zh-TW/runtime-settings.md`](zh-TW/runtime-settings.md) / [`en/runtime-settings.md`](en/runtime-settings.md)
+- Historical Memory-provider Issues / canaries：[`history/README.md`](history/README.md)
 
-只有追 Issues #42–#44 才讀唯讀 archive：[`history/memory-provider-compatibility-issues-42-44.md`](history/memory-provider-compatibility-issues-42-44.md)。
+Do not add new current behavior to this legacy plan. Keep current truth in the routed topic pages.

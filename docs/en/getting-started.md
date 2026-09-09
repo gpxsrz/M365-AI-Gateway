@@ -2,93 +2,103 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: for first-time setup, stop after **Step 3**. Open troubleshooting only after a failure; do not preload deployment or protocol internals.
+> For a first installation, stop after **Verify API access**. Open the deployment, Hermes, Hindsight, or exact-API topic only when that surface becomes relevant.
 
-You need four steps: start the gateway, replace the one-time administrator password, sign in to Microsoft, and create an API key.
+You need to:
 
-The default address is `http://127.0.0.1:4141`, which accepts connections from the same computer only.
+1. start the gateway;
+2. replace the one-time administrator password;
+3. complete one Microsoft sign-in;
+4. create an API key;
+5. run a local `/v1/models` smoke check.
+
+The default management URL is `http://127.0.0.1:4141` and is intended for the same machine only.
 
 ## Before you start
 
-- Install the Rust version declared in `Cargo.toml`.
+- Install the Rust toolchain declared by `Cargo.toml`.
 - Use a Microsoft 365 Copilot account you are authorized to access.
-- Make sure this computer can open a browser for Microsoft sign-in.
+- Make sure this computer can open a browser to complete Microsoft sign-in.
+- Never copy passwords, API keys, tokens, callbacks, or cookies into chat, Issues, or the repository.
 
-## Step 1: start the service
+## 1. Start the gateway
 
-Set a one-time administrator password:
+Provide a one-time administrator password:
 
 ```bash
 export M365_ADMIN_PASSWORD='replace-with-a-one-time-admin-password'
 cargo run --locked --bin m365-native
 ```
 
-When the service reports that it is listening on `127.0.0.1:4141`, open `http://127.0.0.1:4141`.
+When the service is running, open:
 
-## Step 2: finish setup
+```text
+http://127.0.0.1:4141
+```
+
+## 2. Finish management setup
 
 1. Sign in with the one-time password.
-2. Replace it when prompted, then sign in again with the new password.
-3. Select **Automatically Sign in to Microsoft Account** and finish sign-in in the controlled Chrome window.
-4. Create an API key. The raw key is shown once, so store it safely immediately.
+2. Replace it with a persistent administrator password when prompted, then sign in again.
+3. Start Microsoft sign-in from the management page.
+4. Complete one Microsoft account sign-in in the controlled browser.
+5. Return to the management page and confirm that account state is usable.
+6. Create an API key. The raw key is displayed only once; store it securely immediately.
 
-### Choose a Microsoft sign-in path
+### Microsoft sign-in boundary
 
-Start with **Automatic Sign-in**. One click opens controlled Chrome and captures one Microsoft sign-in result. There is no second Teams authorization step.
+The normal flow has one primary Microsoft sign-in. When a Code Interpreter file is needed, the gateway obtains a short-lived resource token from that same sign-in instead of creating a second long-lived Teams/browser credential.
 
-The window may briefly show a Microsoft completion or error page. Keep it open until the management page reports completion. Automatic mode captures the one-time result before useful page state disappears; the gateway does not store the complete error page.
+The controlled browser has its own sign-in state. On first use you may still need to enter credentials or complete MFA even if your ordinary browser is already signed in.
 
-On first use, you may still need to sign in once inside that window. It then keeps its own browser session.
+If the management UI offers a compatibility fallback sign-in, follow the UI. Do not copy a callback, authorization code, referrer, or complete Microsoft error page into another tool.
 
-Your regular Chrome session is not copied into the controlled Chrome. If you are already signed in to regular Chrome, expand **Use compatibility fallback**:
+## 3. Verify API access
 
-1. Select **Use Current Browser Session**.
-2. Microsoft may show “This isn't the right page.” The authorization result is still available.
-3. A trusted local AI agent can read the error page's `referrer` without displaying it and submit it directly to the local gateway.
-
-This fallback completes the same primary sign-in. When a Code Interpreter file is needed, the gateway uses that refresh credential to obtain a short-lived IC3 token automatically. It does not ask for a second Teams sign-in.
-
-Never paste the callback URL, authorization code, or complete error page into chat, logs, or documentation.
-
-## Step 3: verify local access
-
-Put the API key in the current shell. Do not write it into the repository:
+Put the API key into the current shell, not the repository:
 
 ```bash
-export M365_API_KEY='replace-with-the-new-api-key'
+export M365_API_KEY='replace-with-the-created-api-key'
 curl -sS http://127.0.0.1:4141/v1/models \
   -H "Authorization: Bearer ${M365_API_KEY}"
 ```
 
-A model list proves that the local gateway, administrator flow, and API key work. It does not prove live chat yet; that requires a separate low-rate chat request.
+A model list proves only that:
 
-## Use a container
+- the gateway listener is reachable;
+- API-key authentication succeeded;
+- the current model catalog can be projected.
+
+It does **not** prove real chat, images, Code Interpreter, every Web capability, or Production.
+
+## Containers
+
+Build the repository Dockerfile with:
 
 ```bash
 docker build -t m365-ai-gateway .
 ```
 
-Point `M365_DATA_DIR` at writable persistent storage. The `Dockerfile` is a safe build base, not a universal Production configuration.
+At runtime, point `M365_DATA_DIR` at a writable persistent volume. The Dockerfile is a reproducible build base, not a complete Production SOP for every environment.
 
-First-use administrator bootstrap trusts real loopback only. A container bridge or NAT connection does not automatically count as local. Read [Deployment and reverse proxy](deployment.md) before allowing another computer to connect.
+If another computer must reach the service, do not stop at changing the listener to `0.0.0.0`. Read [`deployment.md`](deployment.md) and [`../../SECURITY.md`](../../SECURITY.md) first.
 
-## If you get stuck
+## Troubleshooting first checks
 
 | Symptom | Check first |
 |---|---|
-| The management page does not open | The process is still running and the address is `127.0.0.1:4141` |
-| Sign-in returns 403 | The request has exactly one correct `Origin`, and proxy trust is configured correctly |
-| The one-time password no longer works | This is expected; use the persistent password you created |
-| The API returns 401 | `Authorization: Bearer ...` contains a valid API key |
-| Automatic sign-in stops at a Microsoft sign-in field | First use requires a separate sign-in in the controlled Chrome; the regular Chrome session is not copied |
-| The sign-in button appears to do nothing | Wait for controlled Chrome to open; if it is already open, complete Microsoft sign-in there, then check the management-page status |
-| Sign-in completed but an artifact download fails | Do not repeat a second Teams authorization; confirm the account is online, then inspect the gateway's safe error code |
-| Microsoft shows an error page | Return to the management page for status; automatic mode captures before the error page, while a trusted local agent may securely submit the `referrer` for the compatibility fallback |
-| Microsoft sign-in did not finish | Close any controlled Chrome window that is still waiting, then start again; never share callbacks, tokens, or full error bodies |
+| Management page does not open | the process is still running and the URL is `127.0.0.1:4141` |
+| Management login returns 403 | management origin / host matches the trusted configuration |
+| One-time password no longer works | successful bootstrap intentionally consumes it |
+| API returns 401 | Bearer API key is valid and not revoked |
+| Microsoft sign-in appears stuck | controlled browser is still waiting for sign-in/MFA; do not start overlapping sign-in flows |
+| Sign-in works but a protected file fails | do not perform a second Teams OAuth; inspect artifact/resource-token transport errors |
+| `/v1/models` succeeds but chat fails | model-list smoke proves only the local API surface; inspect the API error contract next |
 
-## Next page
+## Read next
 
-- Understand the data flow: [`architecture.md`](architecture.md)
-- Connect Hermes / Hindsight: [`hermes-hindsight.md`](hermes-hindsight.md)
-- Deploy: [`deployment.md`](deployment.md)
-- Look up settings: [`runtime-settings.md`](runtime-settings.md)
+- How the system works: [`architecture.md`](architecture.md)
+- Hermes / Hindsight: [`hermes-hindsight.md`](hermes-hindsight.md)
+- Exact API errors: [`api-contracts.md`](api-contracts.md)
+- Deployment: [`deployment.md`](deployment.md)
+- Runtime settings: [`runtime-settings.md`](runtime-settings.md)

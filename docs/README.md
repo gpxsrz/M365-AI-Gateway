@@ -1,57 +1,59 @@
 # 文件路由 / Documentation router
 
-## 先選一條路（30 秒）
+## 30 秒看懂 / Understand it in 30 seconds
 
-不要一次讀完全部文件。先選語言，再只讀一個符合目前任務的主題。
+本目錄只負責 **progressive loading 路由**：先判斷任務，再只讀一個 current topic 與需要的語言；不要一次載入整棵 `docs/`。
 
-AI Agent 的順序固定為：
+This page is only a **progressive-loading router**: identify the task, choose one current topic and one language, and do not preload the whole documentation tree.
 
-1. 先讀 repo 根目錄的 `AGENTS.md`。
-2. 回到本頁選一個主題。
-3. 先讀每頁的「30 秒看懂」與 AI Agent 停止提示；夠用就停。
-4. 只有追舊問題時才進 `history/`。
+AI Agent 固定順序 / Agent order:
 
-Do not load every document at once. Choose one language and one topic. Obey the page's stop hint, and open deeper sections only when the task needs them.
+1. 先讀 repo root `AGENTS.md`。
+2. 回到本頁選目前任務的一個 topic。
+3. 先讀該頁「30 秒看懂」與 stop hint。
+4. 資訊夠做下一個安全決策就停止展開；不夠才讀同頁下一節或直接相鄰 contract。
+5. 只有追 regression、舊決策或 evidence provenance 時才進 [`history/`](history/README.md) / open history only for regressions, old decisions, or evidence provenance.
+
+Current docs 回答「現在怎麼用」。History 回答「以前某個固定版本發生過什麼」。Runtime readback 回答「現在這個 target 真正是什麼狀態」。三者不能互相取代。
+
+Current docs answer “how it works now.” History answers “what happened at a pinned past identity.” Runtime readback answers “what this target is doing now.” They are not interchangeable.
 
 ## 台灣繁中
 
-| 你的任務 | 只讀這份 |
-|---|---|
-| 安裝、第一次登入、建立 API key | [`zh-TW/getting-started.md`](zh-TW/getting-started.md) |
-| 了解系統、入口與資料邊界 | [`zh-TW/architecture.md`](zh-TW/architecture.md) |
-| 整合 M365 與 ACP、檢查 adapter/projection governance contract | [`zh-TW/agent-governance.md`](zh-TW/agent-governance.md)；ACP core 請切到 standalone Agent-Control-Plane repo |
-| 設定 Hermes 或 Hindsight | [`zh-TW/hermes-hindsight.md`](zh-TW/hermes-hindsight.md) |
-| 部署、反向代理、回滾 | [`zh-TW/deployment.md`](zh-TW/deployment.md) |
-| 判斷功能是否真的驗證過 | [`zh-TW/compatibility.md`](zh-TW/compatibility.md) |
-| 看目前限制 | [`zh-TW/known-limitations.md`](zh-TW/known-limitations.md) |
-| 查精確 request、錯誤或 streaming 行為 | [`zh-TW/api-contracts.md`](zh-TW/api-contracts.md) |
-| 查設定鍵與環境變數 | [`zh-TW/runtime-settings.md`](zh-TW/runtime-settings.md) |
-| 了解模型能力怎麼加入 | [`zh-TW/model-capabilities.md`](zh-TW/model-capabilities.md) |
-| 看 Rust 搬移與外部驗收狀態 | [`zh-TW/rust-rewrite-parity.md`](zh-TW/rust-rewrite-parity.md) |
-| 了解結論從哪裡來 | [`zh-TW/research-evidence.md`](zh-TW/research-evidence.md) |
-| 追舊 Issue 或 canary | [`history/README.md`](history/README.md) |
+| 任務 | 先讀 | 不要先載入 |
+|---|---|---|
+| 安裝、首次登入、建立 API key | [`zh-TW/getting-started.md`](zh-TW/getting-started.md) | 部署、治理、歷史 evidence |
+| 理解 M365 的責任與資料邊界 | [`zh-TW/architecture.md`](zh-TW/architecture.md) | 歷史 Issue、Production SOP |
+| 理解 M365 ↔ ACP integration boundary | [`zh-TW/agent-governance.md`](zh-TW/agent-governance.md) | ACP core 內部規格；請切 standalone ACP repo |
+| 接 Hermes / Hindsight | [`zh-TW/hermes-hindsight.md`](zh-TW/hermes-hindsight.md) | 全部 runtime 歷史與 canary |
+| 查精確 request / stream / error / checkpoint | [`zh-TW/api-contracts.md`](zh-TW/api-contracts.md) | 研究歷史 |
+| 查設定與 effective value 規則 | [`zh-TW/runtime-settings.md`](zh-TW/runtime-settings.md) | 私人 host / credential |
+| 部署、rollback、release unit | [`zh-TW/deployment.md`](zh-TW/deployment.md) | 私人 NAS / Production path |
+| 判斷某功能目前證據到哪一層 | [`zh-TW/compatibility.md`](zh-TW/compatibility.md) | 全部歷史 evidence |
+| 看目前仍存在的產品限制 | [`zh-TW/known-limitations.md`](zh-TW/known-limitations.md) | 已解問題的開發歷史 |
+| Web model / capability evidence | [`zh-TW/model-capabilities.md`](zh-TW/model-capabilities.md) | Hermes/Hindsight 全文 |
+| 理解 verification / evidence 分級 | [`zh-TW/research-evidence.md`](zh-TW/research-evidence.md) | 不相關 SOP |
+| 查 Rust 與歷史 Go parity 邊界 | [`zh-TW/rust-rewrite-parity.md`](zh-TW/rust-rewrite-parity.md) | 舊 Go source 全文 |
+| 追舊 Issue / canary / regression | [`history/README.md`](history/README.md) | 其他 current topic |
 
 ## English
 
-| Your task | Read only this page |
-|---|---|
-| Install, first sign-in, create an API key | [`en/getting-started.md`](en/getting-started.md) |
-| Understand the system, endpoints, and data boundaries | [`en/architecture.md`](en/architecture.md) |
-| Integrate M365 with ACP or inspect the adapter/projection governance contract | [`en/agent-governance.md`](en/agent-governance.md); change ACP core in the standalone Agent-Control-Plane repo |
-| Configure Hermes or Hindsight | [`en/hermes-hindsight.md`](en/hermes-hindsight.md) |
-| Deploy, proxy, and roll back | [`en/deployment.md`](en/deployment.md) |
-| Check whether behavior is verified | [`en/compatibility.md`](en/compatibility.md) |
-| Check current limits | [`en/known-limitations.md`](en/known-limitations.md) |
-| Look up exact request, error, or streaming behavior | [`en/api-contracts.md`](en/api-contracts.md) |
-| Look up settings and environment variables | [`en/runtime-settings.md`](en/runtime-settings.md) |
-| Understand how model capabilities are admitted | [`en/model-capabilities.md`](en/model-capabilities.md) |
-| Check Rust migration and external acceptance status | [`en/rust-rewrite-parity.md`](en/rust-rewrite-parity.md) |
-| Understand the evidence behind a conclusion | [`en/research-evidence.md`](en/research-evidence.md) |
-| Trace an old Issue or canary | [`history/README.md`](history/README.md) |
+| Task | Read first | Do not preload |
+|---|---|---|
+| Install, sign in, create an API key | [`en/getting-started.md`](en/getting-started.md) | deployment, governance, historical evidence |
+| Understand M365 responsibilities and data boundaries | [`en/architecture.md`](en/architecture.md) | historical Issues, Production SOPs |
+| Understand the M365 ↔ ACP integration boundary | [`en/agent-governance.md`](en/agent-governance.md) | ACP-core internals; switch to the standalone ACP repo |
+| Connect Hermes / Hindsight | [`en/hermes-hindsight.md`](en/hermes-hindsight.md) | full runtime history and canaries |
+| Exact request / stream / error / checkpoint contract | [`en/api-contracts.md`](en/api-contracts.md) | research history |
+| Settings and effective-value rules | [`en/runtime-settings.md`](en/runtime-settings.md) | private hosts or credentials |
+| Deployment, rollback, and release unit | [`en/deployment.md`](en/deployment.md) | private NAS / Production paths |
+| Check the current evidence level of a feature | [`en/compatibility.md`](en/compatibility.md) | all historical evidence |
+| Check current product limitations | [`en/known-limitations.md`](en/known-limitations.md) | development history of resolved defects |
+| Web model / capability evidence | [`en/model-capabilities.md`](en/model-capabilities.md) | full Hermes/Hindsight docs |
+| Understand verification / evidence levels | [`en/research-evidence.md`](en/research-evidence.md) | unrelated SOPs |
+| Understand Rust vs historical Go parity | [`en/rust-rewrite-parity.md`](en/rust-rewrite-parity.md) | full historical Go source |
+| Historical Issue / canary / regression | [`history/README.md`](history/README.md) | unrelated current topics |
 
-## 維護規則 / Maintenance rules
+文件怎麼寫、current/history 怎麼分、legacy route 怎麼維護，統一以 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) 為準；本頁不保存第二份維護規範。
 
-- Current 頁面說明現在怎麼用；歷史證據留在 `history/`。
-- 台灣繁中與英文頁面要表達相同事實，但不需要逐字翻譯。
-- 每頁依序放：短摘要 → 使用者操作 → 精確查表／證據。
-- 私人 GitHub、NAS、VM、OAuth 或 Production 操作不放在公開文件。
+For documentation-writing rules, current/history separation, and legacy-route maintenance, use [`../CONTRIBUTING.md`](../CONTRIBUTING.md). This router does not duplicate that maintenance contract.

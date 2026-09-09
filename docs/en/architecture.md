@@ -2,76 +2,114 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: read this section and **The most important boundaries** first. Open the endpoint table only to choose an API, and open `api-contracts.md` only for exact wire behavior.
-
-The gateway is a translation and safety layer between a caller and Microsoft 365 Copilot.
+> If you only need to know what M365 owns, read this section and the responsibility table. Open `api-contracts.md` for wire details and the standalone ACP repository for lifecycle governance.
 
 ```text
-Your tool → M365 AI Gateway → Microsoft 365 Copilot
+OpenAI / Anthropic / MCP caller
+            │
+            ▼
+     M365 AI Gateway
+ provider / transport / safety adapter
+            │
+            ▼
+   Microsoft 365 Copilot / ChatHub
 ```
 
-It translates API shapes, keeps short-lived continuation state, protects files, and prevents too much work from hitting one account at once.
+M365 AI Gateway has four core jobs:
 
-## The most important boundaries
+1. API-format and model-route translation;
+2. transport admission, throttling, and retry for one Microsoft account;
+3. attachment / artifact / private-URL protection;
+4. transport checkpoints, identity, and provenance required for safe continuation.
 
-- One running gateway serves one Microsoft 365 account.
-- Durable conversations and memory belong to the caller, Hermes, or Hindsight. The gateway keeps only short-lived state needed to continue transport and tools.
-- Authoritative Agent governance lifecycle state belongs only to the standalone Agent Control Plane (ACP). M365 Gateway is an adapter / transport / projection surface and does not own a second Task/Run authority. Hermes, Hindsight, Semantica, and other upstream cores are immutable upstreams. See [`agent-governance.md`](agent-governance.md) for the M365 integration seam.
-- The gateway is a Rust program. The `m365-native` executable name remains for compatibility and does not imply the old product name.
-- This is a community project, not an official Microsoft product.
+It does not own Task / Run semantic lifecycle authority. That belongs to standalone ACP.
 
-## Choose an endpoint
+## Responsibility boundary
 
-| Goal | Endpoint | Plain explanation |
+| Category | M365 responsibility |
+|---|---|
+| Provider | model catalog, reasoning/tone mapping, ChatHub request/response transport |
+| Auth | Microsoft sign-in, resource tokens, API/admin auth boundary |
+| Files | upload/grounding, Vision input, protected artifact materialization |
+| Safety | input limits, tool validation, structured-output validation, private telemetry |
+| Scheduling | shared-account queues, Memory priority, breaker, retry-before-send |
+| Continuation | transport checkpoints, tool evidence, replay fences, Hermes provenance |
+| Governance | intent/evidence/projection seam only; no Task/Run canonical state |
+
+Hermes, Hindsight, and Semantica are external upstreams. M365 compatibility must not depend on patching their core.
+
+## API surface separation
+
+| Need | Surface | Key behavior |
 |---|---|---|
-| Auxiliary/control work such as Goal Judge | `/v1/chat/completions` | Starts fresh and does not inherit Agent execution evidence |
-| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | Keeps tool continuation and transport evidence; ACP decides Task/Run completion |
-| Hindsight Memory | `/memory/v1/chat/completions` | Uses the background Memory priority class |
-| OpenAI Responses shape | `/v1/responses` | Converts a Responses request onto the shared chat core |
-| Anthropic Messages shape | `/v1/messages` | Returns Anthropic-shaped data; streaming is adapted after completion |
-| Image generation | `/v1/images/generations` | Uses the Microsoft image path and protects result URLs |
-| MCP | `/v1/mcp` | Lets MCP clients list and call gateway tools |
+| Auxiliary / control Chat Completions | `/v1/chat/completions` | ForceNew / untracked transport |
+| Hermes / Atlas | `/hermes/v1/chat/completions` | Hermes execution identity / checkpoint seam |
+| Hindsight Memory | `/memory/v1/chat/completions` | Memory queue class; no Hermes authority |
+| Responses | `/v1/responses` | compatible projection over the same transport core |
+| Anthropic Messages | `/v1/messages` | Anthropic-compatible projection |
+| Images | `/v1/images/generations` | Microsoft image capability; availability may vary |
+| MCP | `/v1/mcp` | modern HTTP; legacy clients use paired `GET /v1/mcp/sse` + `POST /v1/mcp/message` |
 
-The corresponding model catalogs are `/v1/models`, `/hermes/v1/models`, and `/memory/v1/models`.
+Model catalogs are available as `/v1/models`, `/hermes/v1/models`, and `/memory/v1/models`.
 
 ## How one request moves through the gateway
 
-1. Validate the administrator session or API key.
-2. Check input size, roles, and tool data.
-3. Order shared-account work across users, Memory, and background Agents.
-4. When needed, read a short-lived checkpoint and attach the next tool result.
-5. Open a new Microsoft ChatHub connection. Private mode reapplies `disableMemory=1` every time.
-6. Convert the Microsoft response into the caller's requested format.
-7. Save continuation state only after a complete transport result; the gateway does not declare an Agent Task/Run complete.
+A typical request:
 
-General `/v1/chat/completions` does not inherit the Hermes transport ledger and does not rewrite provider `done` or `verified` content into a Task/Run verdict.
+1. validates API-key / management authentication boundaries;
+2. validates roles, tools, stream options, structured output, and input size;
+3. establishes or verifies transport identity/provenance for the execution surface;
+4. passes shared-account scheduler admission;
+5. reuses a checkpoint only when history/tool evidence proves safe continuation;
+6. creates ChatHub transport, carrying the appropriate disable-memory intent for Private mode;
+7. projects upstream events into the caller's requested API shape;
+8. validates checkpoint, delivery, and artifact consistency at the final transport boundary.
 
-## Streaming and tools
+A provider final is still only a transport-final event. It does not prove an ACP acceptance contract.
 
-- A partial streaming sentence is not completion; the terminal event is.
-- When usage is requested, one usage-only chunk appears before the single `[DONE]`.
-- Tool continuation preserves role, tool-call ID, and arguments. It must not guess or rebuild them.
-- Parallel caller tools are allowed only when every selectable tool is explicitly read-only. Any mutation risk reduces the limit to one.
+## Transport identity and checkpoints
 
-## Data stays in separate boundaries
+Checkpoints keep only the identity/digest/typed evidence needed for safe continuation. They are not a long-term user-memory store.
 
-| Data | Gateway behavior |
+When an upstream request has started but its result is unknown, the gateway treats it as potentially applied:
+
+- no blind replay;
+- destructive checkpoint mutation cannot skip it;
+- reconciliation or authenticated recovery is required;
+- after terminal-unknown fencing, genuinely new work must use a new execution identity.
+
+This durable domain is separate from ACP Task / Run state.
+
+## Data boundaries
+
+| Data | Handling |
 |---|---|
-| Ordinary chat | Private mode requests no ordinary history, but does not promise zero Microsoft retention |
-| Documents and images | May use OneDrive or SharePoint staging, separate from chat history |
-| Sign-in permissions | Microsoft sign-in happens once; short-lived IC3 file tokens come from the same primary refresh credential |
-| Code Interpreter files | Fetched with authenticated state and materialized into private local storage |
-| Download URLs | Callers receive short-lived capability URLs, not protected Microsoft temporary URLs |
-| Checkpoints | Store only continuation summaries and identifiers, not complete private content |
+| Ordinary chat | Private mode asks for no ordinary history; it does not guarantee zero Microsoft retention |
+| Documents | may use Microsoft file/grounding transport; separate from chat history |
+| Images | image transport; `response_format=url` may return an upstream image URL, so the Code Interpreter local-capability guarantee does not apply |
+| Code Interpreter artifacts | fetched into a private local store, then exposed through a short-lived capability |
+| Protected document / Code Interpreter upstream URLs | never projected directly to callers |
+| Transport checkpoints | continuation identity/evidence only; not a user memory store |
+| Privacy telemetry | bounded classifications; no prompt, credential, or raw private URL |
 
-## Two size limits that are often confused
+## Shared-account scheduling
 
-`textInputLimitUTF16=128000` limits outgoing text length in UTF-16 units. A model context window limits tokens. They are different measurements and must not be treated as the same number.
+One gateway represents one Microsoft 365 account. Current transport has fixed safety ceilings for shared, Memory, background/control, and waiting work; **the exact current numbers are maintained only in [`runtime-settings.md`](runtime-settings.md)**.
 
-## Read deeper only when needed
+This is provider-transport protection, not ACP Agent scheduling authority.
 
-- Exact requests, streaming, and errors: [`api-contracts.md`](api-contracts.md)
-- Agent lifecycle, blockers, completion, handoff, and policy: [`agent-governance.md`](agent-governance.md)
+## Do not mix size concepts
+
+`textInputLimitUTF16` is pre-transport text policy measured in UTF-16 code units. Its exact current default/effective value is maintained in [`runtime-settings.md`](runtime-settings.md).
+
+`context_window` / `max_input_tokens` is token-oriented model metadata.
+
+Attachment storage/grounding is a third quantity with its own retrieval cost. These values are not interchangeable.
+
+## Read next
+
+- M365 ↔ ACP: [`agent-governance.md`](agent-governance.md)
+- Exact wire / errors / retry: [`api-contracts.md`](api-contracts.md)
 - Hermes / Hindsight: [`hermes-hindsight.md`](hermes-hindsight.md)
-- Settings: [`runtime-settings.md`](runtime-settings.md)
-- Security and retention limits: [`../../SECURITY.md`](../../SECURITY.md)
+- Runtime settings: [`runtime-settings.md`](runtime-settings.md)
+- Security: [`../../SECURITY.md`](../../SECURITY.md)

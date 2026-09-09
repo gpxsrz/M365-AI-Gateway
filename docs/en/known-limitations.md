@@ -2,37 +2,65 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: read these three points first. Continue only into the section that names the feature in scope; do not load unrelated limits.
+> This page lists limitations that still hold now. Old-version defects, closed Issues, historical canaries, and one-time workarounds belong in history, not on the current page.
 
-Know these three things first:
+Remember these six points:
 
-1. Private Chat does not mean that Microsoft retains nothing.
-2. Large tool results may still be flattened or shortened upstream.
-3. One live pass does not qualify every Microsoft rollout, MCP client, or Production environment.
+1. Microsoft capabilities can vary by account, rollout, and time.
+2. Private mode does not mean zero Microsoft retention.
+3. Attachment grounding is neither arbitrary byte-addressable storage nor zero context cost.
+4. One gateway represents one Microsoft account and intentionally limits throughput.
+5. Unknown upstream outcomes fence replay and may require manual reconciliation.
+6. M365 does not provide Task / Run semantic completion authority.
 
-The rest of this page lists current limits without replaying implementation history.
+## Input and context
 
-## Input, tools, and streaming
+- The configured M365 UTF-16 transport text limit is not a model-token ceiling; its exact current value is maintained in [`runtime-settings.md`](runtime-settings.md).
+- Non-Memory bulk text auto-spills only when current ask, control, and tool identity can remain safe; otherwise the gateway fails closed.
+- Memory traffic does not auto-spill and asks the consumer to compact/split oversized input.
+- After Microsoft grounding, the gateway cannot guarantee exact retrieval of arbitrary high-entropy byte positions from a large attachment.
 
-1. **Text size**: the default `128000` is measured in UTF-16 code units for Web compatibility. It is not a model-token hard limit.
-2. **Large tool results**: Microsoft upstream may compress, flatten, or truncate a result. This remains an open hardening item.
-3. **Multiple caller tools**: they may run together only when every selectable tool is explicitly read-only and has no mutation or destructive signal. Other cases are serialized first.
-4. **Bing plus caller tools**: they can coexist, but prompt wording and upstream routing still affect actual selection.
-5. **Tool-round limits**: general/Memory and Hermes use different ceilings. Hermes's 128-round limit prevents runaway work; it is not unlimited execution.
-6. **WebSocket retry**: only connection or upgrade failures before payload send are retried. A sent ChatHub request is never blindly replayed.
+## Tools and continuation
 
-## Privacy, files, and external clients
+- Parallel tools are enabled only when all selectable tools are explicitly read-only; tool names alone are not trusted.
+- Tool rounds have a bounded safety ceiling, not an infinite agent loop.
+- An already-sent transport outcome that is unknown cannot be replayed blindly; checkpoint/durable evidence must be reconciled first.
+- Hermes duplicate-effect protection protects a transport effect, not Task acceptance.
 
-7. **Private mode**: `disableMemory=1` prevents ordinary chat history. It does not promise zero Microsoft retention. Files, images, and artifacts have separate boundaries.
-8. **MCP**: modern HTTP passed with the official Python SDK. Other SDKs, legacy SSE clients, and versions still need separate qualification.
-9. **The controlled browser has separate sign-in state**: first automatic use may still require entering the Microsoft account inside controlled Chrome. Sign-in itself happens once; the gateway later obtains Code Interpreter file tokens automatically. The regular-Chrome compatibility fallback can complete the same primary sign-in.
-10. **Images and Web capabilities drift**: Microsoft's model selector, image resources, and request capabilities vary by account or rollout. One `no_image_resource` result or evidence snapshot is not a permanent contract.
+## Microsoft surface variability
 
-## Hermes and Hindsight
+- Model selector, reasoning route, image resources, and other Web capabilities may change with Microsoft rollout.
+- Web observations become capability candidates only; evidence/validation is required before enablement.
+- One `no_image_resource` or one successful live run describes that account/route/time, not a permanent product guarantee.
 
-11. **Shared account throughput**: Hermes and Hindsight keep separate profiles and checkpoints, but still share real Microsoft-account capacity. Running Memory work is not preempted.
-12. **Bank mission**: until Hermes upstream #18774 is fixed, `bank_mission` / `bank_retain_mission` may not reach the live bank. Confirm through a Banks API readback.
-13. **Durable does not mean an old request saw new memory**: the Gateway can wait for `retain.completed` before admitting autonomous work, but cannot rewrite an HTTP body Hermes already built. Confirm fresh memory through a later normal recall/readback.
-14. **Goal Judge has a fixed 30-second caller timeout**: Hermes 0.20.4 `judge_goal()` explicitly uses `timeout=30s`, so a task-level auxiliary timeout cannot override it. If P2 waits too long behind Memory or `MEMORY_YIELD`, the Judge may fail safe and defer completion. Do not promote `/v1/chat/completions` to P0/P1 or bypass the shared scheduler to avoid this limit.
+## Privacy and files
 
-See [`compatibility.md`](compatibility.md) for current verification status.
+- Private mode covers ordinary chat-history intent only; documents, images, and artifacts have separate lifecycles.
+- A protected artifact capability is itself short-lived download authority and must not be treated as an ordinary URL if leaked.
+- The gateway protects upstream private URLs for documents and Code Interpreter artifacts. An image-generation `url` response may still be an upstream image URL and should be treated as sensitive/ephemeral. The gateway also cannot promise Microsoft zero retention.
+
+## External clients
+
+- OpenAI / Anthropic / MCP compatibility defines public contracts; it does not mean every SDK version has been exercised live.
+- Legacy MCP SSE remains a compatibility surface; new clients should prefer modern MCP HTTP.
+- Caller, proxy, and upstream timeouts compose. An outer timeout that is too short can cancel an otherwise valid long request.
+
+## Shared account
+
+Shared-account transport deliberately limits in-flight and queued work so Hermes, Hindsight, and foreground callers do not overwhelm one Microsoft account.
+
+High throughput is therefore not the design target for one gateway/account. Scale by using independently authorized accounts/gateways rather than raising single-account hard safety limits.
+
+An already-started Memory upstream request is not forcibly cancelled by a newly arrived user request; priority primarily affects admission and waiting order.
+
+## Memory freshness
+
+`retain.completed` proves that a specific retain became durable. It does not retroactively place new Memory into an HTTP request body that was already assembled. Fresh Memory still needs to be proven by a later normal recall/readback.
+
+## Governance boundary
+
+M365 may provide transport evidence, checkpoints, provenance, and typed result classification. It must not turn model text saying “done” or tool exit 0 into canonical Task / Run completion.
+
+Use standalone ACP for semantic lifecycle governance.
+
+Read [`compatibility.md`](compatibility.md) for current evidence levels and [`../history/README.md`](../history/README.md) for historical defects.

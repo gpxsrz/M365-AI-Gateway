@@ -2,42 +2,67 @@
 
 ## 30 秒版本
 
-> AI Agent：先做這五步。只有改到特定 surface 時，才讀對應文件與測試；不要先載入全部歷史。
+> 先確認問題與責任邊界，再只讀目前主題。不要從舊 Issue、舊 handoff 或歷史 runtime 狀態直接開始改 current source。
 
-1. 若尚未讀過適用於目前執行環境的全域 `AGENTS.md`，先讀全域規則，再讀 repo `AGENTS.md`。
-2. 本機 Codex 使用原生工具與 Skill discovery；Web ChatGPT 才經 Gabriel Skill Router / DevSpace。Web 的 advertised Skills 只是目前 scope 的快照，不是完整清單；沒有直接匹配但任務需要專用能力時，依 Router 動態解析 exact hidden / plugin Skill。作業類別改變時，依目前執行環境重新 route / 選 Skill。
-3. 只從公開 `gpxsrz/M365-AI-Gateway` 的 `main` 開發，先重現問題，再找共同根因。
-4. 改最少的程式，留下會抓到退步的測試並跑完正確 validation gate。
-5. 用精確 source identity、CI／測試與實際讀回證明完成。
+1. 公開 `gpxsrz/M365-AI-Gateway` 的 `main` 是 M365 產品與 M365/ACP adapter 的開發權威。
+2. 先固定可觀察問題、重現方式與完成條件，再追真正 execution path、callers 與 shared state。
+3. 修共同根因，做最小正確 diff；不要為假想未來新增 abstraction、設定、依賴或第二份 authority。
+4. 非平凡行為變更要留下可執行 regression test，再跑對應 validation gate。
+5. 完成要靠 exact source identity、測試／CI 與必要 readback，不靠 Agent 自述或命令 exit 0。
 
-`HEXUXIU/M365-Copilot2API` 只能閱讀比較，不可推送或建立 Issue。
+`HEXUXIU/M365-Copilot2API` 只供唯讀比較，不可推送或建立 Issue。
+
+## 先守住產品邊界
+
+M365 AI Gateway 是 **Model Provider / Transport Gateway**。它可以負責：
+
+- Microsoft / ChatHub transport；
+- OAuth、token、附件與 artifact transport；
+- text spill、queue、throttle、breaker、retry；
+- request / session transport identity；
+- Hermes adapter 相容、provenance / HMAC、checkpoint / replay protection；
+- privacy-safe telemetry 與 M365 release / rollback。
+
+它不能建立第二份 Agent governance authority。Task / Run lifecycle、blocker、completion、policy、approval、handoff 與 canonical governance state 屬於 standalone Agent Control Plane（ACP）。
+
+Hermes、Hindsight、Semantica 與其他 upstream core 都視為 immutable upstream。相容問題應修 adapter、plugin、gateway、設定或 sidecar，不修改 upstream core。
 
 ## 寫程式時
 
-- 一個 Gateway 仍只對應一個 Microsoft 365 帳號。
-- Hermes、Hindsight、Semantica 與其他 external upstream core 都是 immutable upstream；相容與治理問題不得靠修改 upstream core 解決。
-- Canonical lifecycle governance 只能由獨立 ACP 持有；versioned adapter、plugin / hook、gateway 或 sidecar只負責 integration enforcement、capability evidence與 projection，不得另存第二份 Task/Run authority。不得使用私有 fork、monkey patch/runtime function replacement，或把 undocumented upstream DB/private function 當 canonical authority。
-- Adapter 必須做 typed semantic capability probe；surface 存在不等於 supported。能力缺失或不相容時 fail closed / typed degraded，runtime/UI/context projection 必須保留 authority revision / provenance，不得靜默放寬 policy、approval、blocker、completion 或 handoff gate。本 repo 的 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md) 是 M365 integration contract mirror；ACP core 開發、ADR 與 durable authority 歸 `gpxsrz/Agent-Control-Plane`。
-- 所有工程工作預設遵循 Ponytail full：先刪不必要工作、優先重用既有 seam/helper、維持最小正確 diff，不因假想的未來需求增加 abstraction、依賴、設定或第二份 authority。
-- 不為「以後可能用到」增加抽象層、設定或依賴。
-- 非平凡修改先 trace execution path / callers / sibling paths / shared authority，再進 TDD；不要用一個很小的 failing test 取代結構分析。
-- 非平凡程式／runtime 行為修改在 TDD / implementation 前，預設同時用 code-review-graph 與 Serena 做 current-source trace：code-review-graph 必須先確認 exact current HEAD 並跑有意義的結構 query；Serena 必須取得 terminal health PASS，再用 symbol/reference（必要時 declaration/implementation）核對 callers 與 authority seam。enabled、built-at HEAD、`0 impacted`、空 graph 或單純 health green 都不能單獨證明 blast radius。
-- 若其中一個工具在當前 route unavailable、stale、索引不完整或 deterministic failure，記錄限制並用 direct source / LSP / Git 補完同等 trace；前提未改變時不原樣重試，也不得在 execution path / shared authority 尚未能被證明前開始 TDD。
-- timeout、502 或 observer 無輸出不證明 worker 已停止；重派前先讀回原 Run/process/lease。Deterministic failure 在前提未改變時不原樣重試。
-- 改到串流、工具續接、checkpoint、並發或生命週期時，要測完整路徑，不只測輸入格式。
-- 新增或修改 Rust 行為時，至少留一個能實際執行的 regression test。
+- 先 trace，再 TDD，再 implementation。小型 failing test 不能取代結構分析。
+- 優先重用現有 seam/helper；刪除重複邏輯優先於再加一層相容碼。
+- Static graph、LSP、Serena、Code Review Graph 都是 evidence，不是 authority。`0 impacted` 或 health green 不能單獨證明沒有 blast radius。
+- Unknown transport outcome 視為可能已執行；先對帳 durable receipt/checkpoint/poststate，再決定是否可 retry。
+- Streaming、tool continuation、checkpoint、concurrency 或 lifecycle transport 變更，要測完整 composition，不只測單一輸入。
+- 不把 private runtime path、secret、帳號／租戶 identity、可重播資料或暫時 URL 寫進 source、fixture、log 或文件。
 
 ## 寫文件時
 
-- 台灣繁中用白話、短句與台灣用語；英文內容要對稱。
-- 每頁先放「30 秒看懂」，再放操作步驟，最後才放精確查表。
-- 一頁只處理一個主題。AI Agent 應先讀 `docs/README.md`，不要一次載入全部文件。
-- M365 的 ACP adapter / projection 開發也遵守同一套分層揭露；若工作會改變 ACP core lifecycle semantics，先切到 standalone Agent-Control-Plane repo，不得在 M365 repo 直接實作。M365 integration 讀取規則見 [`docs/zh-TW/agent-governance.md`](docs/zh-TW/agent-governance.md#12-agent-開發作業規則分層揭露與最小讀取)。
-- Current 文件只描述現在怎麼用；舊 Issue、舊 canary 與過去 Production 證據放 `docs/history/`。
-- Persistent structured `CURRENT` / handoff 的行數預算與 pruning policy 是執行環境治理，不是 M365 repo 的產品設定。Repo 可以定義專案 schema / evidence 語義，但不得把 host-local 的行數上限複製進 source、測試或 canonical 文件；有共用 handoff policy 時直接遵循它。
-- 不用大量縮寫或技術名詞堆砌。無法避免的名詞，第一次出現就用一句白話解釋。
+Public current docs 使用同一套 progressive disclosure：
+
+```text
+core invariant
+→ 30 秒摘要 / stop hint
+→ 使用者要做的事
+→ 精確 contract / reference
+→ evidence boundary
+→ history pointer
+```
+
+規則：
+
+- 台灣繁中使用白話、短句與台灣用語；English page 表達相同事實，不必逐字翻譯。
+- 一頁只處理一個主題；AI Agent 先經 [`docs/README.md`](docs/README.md) routing，不 bulk-read 整棵 docs。
+- Current pages 只描述「現在怎麼用／現在的契約」。舊 Issue、canary、過去 Production evidence 放 [`docs/history/`](docs/history/README.md)。
+- 舊中文根目錄文件只保留短 routing page，不再複製 canonical current truth。
+- ACP core semantics 不複製進 M365 文件；M365 只文件化自己的 integration / transport boundary，ACP core 請讀 standalone repo。
+- 私人 GitHub、NAS、VM、OAuth、Production、DevSpace 操作不放 public docs，由本機 `m365-ops` 處理。
+- 會過期的 PID、container ID、私人 path、單次帳號 rollout、舊版本號或單次 canary 結果不寫成 current contract。
+- 不硬編碼 host-local CURRENT/handoff 行數或 pruning policy；那是執行環境治理。
 
 ## 提交前檢查
+
+Rust source 變更至少執行：
 
 ```bash
 cargo fmt --all --check
@@ -47,13 +72,11 @@ cargo build --locked --release
 git diff --check
 ```
 
-- 改到串流、並發、checkpoint 或生命週期時，完整測試至少再跑一次。
-- 改管理頁面時，實際檢查登入頁、主頁、診斷頁與 browser console。
-- Current source tree 是 Rust-only。需要追原 Go 行為時，從 Git history 的固定歷史 commit 唯讀比較，不把 Go 原碼恢復到 current tree。
+純文件變更跑與文件真正相關的檢查：link／router／中英結構一致性、受文件影響的 targeted regression，以及 `git diff --check`。不要為 docs-only 變更虛構 Production 或 live qualification。
 
 ## 安全底線
 
-不得提交或輸出密碼、API key、token、cookie、token cache、HAR、帳號／租戶識別、私有檔案網址或產出檔案內容。安全問題請依 [`SECURITY.md`](SECURITY.md) 私下回報。
+不得提交或輸出密碼、API key、token、cookie、token cache、HAR、帳號／租戶識別、私有檔案網址、artifact 內容或其他可重播材料。安全問題請依 [`SECURITY.md`](SECURITY.md) 私下回報。
 
 ---
 
@@ -61,42 +84,67 @@ git diff --check
 
 ## 30-second version
 
-> AI agents: start with these five steps. Open only the topic and tests for the surface being changed; do not preload the full history.
+> Establish the problem and responsibility boundary first, then read only the current topic. Do not start changing current source from an old Issue, handoff, or historical runtime state.
 
-1. If the applicable global `AGENTS.md` has not been read in the current execution context, read it first, then read repository `AGENTS.md`.
-2. Local Codex uses native tools and Skill discovery; only Web ChatGPT routes through Gabriel Skill Router / DevSpace. For Web work, advertised Skills are only the current scope snapshot, not an exhaustive inventory; when no direct match is advertised but the task clearly needs a specialized capability, dynamically resolve the exact hidden / plugin Skill through the Router. Re-route for the current execution environment when the work category changes.
-3. Develop only from public `gpxsrz/M365-AI-Gateway` `main`, reproduce the problem, and identify the shared cause.
-4. Make the smallest correct change, leave a regression test, and run the correct validation gate.
-5. Prove completion with exact source identity, CI/tests, and required readback.
+1. Public `gpxsrz/M365-AI-Gateway` `main` is the development authority for the M365 product and M365/ACP adapter.
+2. Pin observable behavior, reproduction, and acceptance criteria, then trace the real execution path, callers, and shared state.
+3. Fix the shared cause with the smallest correct diff; do not add speculative abstractions, settings, dependencies, or a second authority.
+4. Non-trivial behavior changes need an executable regression test and the applicable validation gate.
+5. Completion requires exact source identity, tests/CI, and required readback—not an agent claim or command exit code.
 
 `HEXUXIU/M365-Copilot2API` is read-only comparison material. Do not push to it or open Issues there.
 
+## Preserve the product boundary
+
+M365 AI Gateway is a **Model Provider / Transport Gateway**. It may own:
+
+- Microsoft / ChatHub transport;
+- OAuth, tokens, attachments, and artifact transport;
+- text spill, queues, throttling, breaker behavior, and retry;
+- request / session transport identity;
+- Hermes adapter compatibility, provenance / HMAC, and checkpoint / replay protection;
+- privacy-safe telemetry and M365 release / rollback.
+
+It must not create a second Agent-governance authority. Task / Run lifecycle, blockers, completion, policy, approval, handoff, and canonical governance state belong to the standalone Agent Control Plane (ACP).
+
+Hermes, Hindsight, Semantica, and other upstream cores are immutable upstreams. Compatibility belongs in adapters, plugins, the gateway, settings, or sidecars—not upstream core patches.
+
 ## When changing code
 
-- One gateway still maps to one Microsoft 365 account.
-- Hermes, Hindsight, Semantica, and every other external upstream core are immutable upstreams. Compatibility and governance must not be implemented by patching upstream core.
-- Canonical lifecycle governance belongs only to the standalone ACP. Versioned adapters, plugins / hooks, gateways, and sidecars may enforce integration rules, collect capability evidence, and expose projections, but they must not persist a second Task/Run authority. Do not use a private fork, monkey patch/runtime function replacement, or undocumented upstream DB/private function as canonical authority.
-- Adapters must use typed semantic capability probes; surface existence does not mean supported. Missing or incompatible capabilities fail closed / typed degraded, runtime/UI/context projections preserve authority revision / provenance, and policy, approval, blocker, completion, or handoff gates must not be silently weakened. [`docs/en/agent-governance.md`](docs/en/agent-governance.md) is the M365 integration-contract mirror; ACP core development, ADRs, and durable authority belong to `gpxsrz/Agent-Control-Plane`.
-- All engineering work defaults to Ponytail full: delete unnecessary work first, reuse existing seams/helpers, keep the smallest correct diff, and do not add abstractions, dependencies, settings, or a second authority for hypothetical future needs.
-- Do not add abstractions, settings, or dependencies for hypothetical future needs.
-- For non-trivial changes, trace the execution path, callers, sibling paths, and shared authority before TDD. A tiny failing test does not replace structural analysis.
-- Before TDD / implementation for a non-trivial code or runtime-behavior change, use both code-review-graph and Serena for current-source tracing by default: code-review-graph must be refreshed/verified against exact current HEAD and run a meaningful structural query for the target seam; Serena must reach terminal health PASS and then use symbol/reference (plus declaration/implementation where needed) queries to verify callers and the authority seam. Enabled status, built-at HEAD, `0 impacted`, an empty graph, or health green alone is not blast-radius proof.
-- If either tool is unavailable on the current route, stale, incompletely indexed, or deterministically failing, record the limitation and complete the equivalent trace with direct source / LSP / Git evidence. Do not retry unchanged prerequisites, and do not enter TDD until the execution path and shared authority can still be demonstrated.
-- A timeout, 502, or quiet observer does not prove a worker stopped; reread the original Run/process/lease before retrying. Do not repeat deterministic failures unchanged while their prerequisites are unchanged.
-- Changes to streaming, tool continuation, checkpoints, concurrency, or lifecycle must test the full path, not only request validation.
-- Every non-trivial Rust behavior change needs at least one runnable regression test.
+- Trace first, then TDD, then implementation. A tiny failing test does not replace structural analysis.
+- Reuse existing seams/helpers. Removing duplicate logic is preferred over adding another compatibility layer.
+- Static graphs, LSP, Serena, and Code Review Graph are evidence, not authority. `0 impacted` or a green health check alone does not prove zero blast radius.
+- Treat an unknown transport outcome as potentially applied. Reconcile durable receipts/checkpoints/poststate before retrying.
+- Streaming, tool continuation, checkpoint, concurrency, or lifecycle-transport changes must exercise complete compositions, not only one input shape.
+- Never put private runtime paths, secrets, account/tenant identity, replayable material, or temporary private URLs into source, fixtures, logs, or docs.
 
 ## When changing documentation
 
-- Use plain, short Traditional Chinese with Taiwan wording. Keep the English page equivalent.
-- Start each page with a 30-second summary, then actions, then exact reference details.
-- Keep one topic per page. AI agents should route through `docs/README.md` instead of loading every document.
-- M365 ACP-adapter / projection development follows the same disclosure chain. If work changes ACP core lifecycle semantics, switch to the standalone Agent-Control-Plane repository instead of implementing it here. See [`docs/en/agent-governance.md`](docs/en/agent-governance.md#12-agent-development-operating-rules-progressive-disclosure-and-minimum-reads) for the M365 integration reading path.
-- Current pages describe current behavior. Old Issues, canaries, and Production evidence belong under `docs/history/`.
-- Persistent structured `CURRENT` / handoff line budgets and pruning policy are execution-environment governance, not an M365 repository product setting. The repository may define project schema / evidence semantics, but must not copy a host-local line limit into source, tests, or canonical documentation; consume the shared handoff policy when one is available.
-- Avoid acronym and jargon stacks. Explain an unavoidable term in plain language when it first appears.
+Public current docs use the same progressive-disclosure structure:
+
+```text
+core invariant
+→ 30-second summary / stop hint
+→ user action
+→ exact contract / reference
+→ evidence boundary
+→ history pointer
+```
+
+Rules:
+
+- Use plain Taiwan Traditional Chinese and an equivalent English page; equivalence matters more than literal translation.
+- Keep one topic per page. AI agents route through [`docs/README.md`](docs/README.md) and do not bulk-read the documentation tree.
+- Current pages describe how the system works now. Old Issues, canaries, and Production evidence belong under [`docs/history/`](docs/history/README.md).
+- Legacy root-level Chinese documents remain short routing pages instead of copying canonical current truth.
+- Do not copy ACP core semantics into M365 docs. Document only the M365 integration / transport boundary and send ACP-core readers to the standalone repository.
+- Private GitHub, NAS, VM, OAuth, Production, and DevSpace procedures stay out of public docs and belong to local `m365-ops` guidance.
+- Expiring PIDs, container IDs, private paths, account-specific rollouts, old versions, and one-time canary results are not current contracts.
+- Do not hard-code host-local CURRENT/handoff size or pruning policy into the product docs.
 
 ## Checks before commit
+
+Rust source changes must at least run:
 
 ```bash
 cargo fmt --all --check
@@ -106,10 +154,8 @@ cargo build --locked --release
 git diff --check
 ```
 
-- Repeat the full test suite after streaming, concurrency, checkpoint, or lifecycle changes.
-- For management UI changes, inspect the login, main, and debug pages plus the browser console.
-- The current source tree is Rust-only. When historical Go behavior is needed for parity review, inspect the pinned historical commit from Git without restoring Go source into the current tree.
+Documentation-only changes should run the checks that actually cover documentation: links/router/bilingual structure, targeted regressions affected by documentation contracts, and `git diff --check`. Do not manufacture Production or live qualification for docs-only changes.
 
 ## Security boundary
 
-Never commit or print passwords, API keys, tokens, cookies, token caches, HAR files, account or tenant identifiers, private file URLs, or generated file contents. Follow [`SECURITY.md`](SECURITY.md) for private security reports.
+Never commit or print passwords, API keys, tokens, cookies, token caches, HAR files, account or tenant identifiers, private file URLs, artifact contents, or other replayable material. Report security issues privately as described in [`SECURITY.md`](SECURITY.md).

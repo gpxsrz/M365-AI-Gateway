@@ -2,78 +2,85 @@
 
 ## Understand it in 30 seconds
 
-> AI agents: decide which evidence class you need, then read only the matching section. Never replace commit, route, and readback scope with the phrase “tests passed.”
+> Plainly: first ask whether you are proving source, a deterministic test, a real account, CI, or Production. Each layer proves only its own claim; one PASS does not make every layer PASS. Here, **evidence** means something you can independently read back, and **identity** means the exact version/route/target it belongs to. If you only need to classify evidence strength, read this section and the table, then stop.
 
-“Tests passed” must name the kind of test:
+Evidence layers:
 
-| Level | What it proves | What it does not prove |
+| Evidence class | Proves | Does not automatically prove |
 |---|---|---|
-| Deterministic test | code follows a contract for fixed input | a real Microsoft rollout behaves identically |
-| Local runtime smoke | the release binary starts and completes a local flow | OAuth, ChatHub, or Production passed |
-| Live canary | real behavior for one account, route, and time | permanent support or identical behavior for every account |
-| Production readback | one commit/artifact is active on one runtime | every remote and backup is synchronized |
-| Inference | the most likely explanation from evidence | a directly observed fact |
+| Source / static trace | current code path / contract | runtime actually executed it |
+| Deterministic test | fixed-input contract | Microsoft live behavior matches now |
+| Local runtime | candidate artifact can use a local seam | OAuth / upstream / Production passed |
+| Isolated live | one account/route/time real behavior | permanent support or every environment |
+| Exact-head CI | published source passes CI environment | Production is deployed |
+| Production readback | exact artifact is running at one target | every other mirror is synchronized |
+| Inference | most reasonable explanation from evidence | directly observed fact |
 
-Every PASS should bind source commit, tree, binary, settings, artifacts, and evidence identity. Command exit zero is not completion; independently read back the target surface.
+## A useful evidence record answers
 
-## Current conclusions
+1. **Subject**: which source / artifact / route / behavior is being tested?
+2. **Identity**: which commit / tree / binary / config / input / evidence SHA?
+3. **Environment**: local, isolated live, CI, or Production?
+4. **Expected**: what does the contract require?
+5. **Observed**: what independent target readback occurred?
+6. **Boundary**: which layers were not tested?
+7. **Privacy**: does the evidence contain secrets, private URLs, or replayable data? If yes, it does not belong in the public repository.
 
-### Text and checkpoints
+## Keep completion layers separate
 
-- The `128000` UTF-16 boundary has Web-compatibility evidence but is not model-token context.
-- Checkpoint reuse accepts only a strictly identical history prefix. Tool-call IDs, arguments, and roles cannot be silently rebound.
+These outcomes are not interchangeable:
 
-### Private mode
+```text
+command exit 0
+≠ request accepted
+≠ upstream effect durable
+≠ caller received it
+≠ semantic acceptance
+≠ Production deployed
+```
 
-- Every new ChatHub WebSocket reapplies `disableMemory=1`, preventing ordinary chat history.
-- This does not remove OneDrive / SharePoint staging or artifact side effects.
+M365 transport can prove its request, tool, checkpoint, and delivery projections. ACP decides Task / Run semantic lifecycle.
 
-### Files, images, and Code Interpreter
+## How current docs use evidence
 
-- Ordinary documents obtain Microsoft file identity / annotation before ChatHub grounding.
-- Images use a separate transport and must not be collapsed into document upload.
-- A protected artifact must be fetched with authenticated Gateway state, placed in private storage, and exposed through an authorized download. Its upstream private URL cannot be leaked first.
-- An isolated Rust release binary passed real file-plus-vision input. Image generation returned `no_image_resource`, which proves only that no image resource was available in that run.
-- A real Code Interpreter check read back complete bytes. Non-stream, stream, and post-restart downloads passed, and no protected URL appeared in the API response.
-- Both original Go and earlier Rust fetched the artifact URL with its display filename, which returned 404 live. A first-party browser comparison proved that keeping the query and removing only the one display-name segment after `/views/original` fetches the same object.
-- Microsoft sign-in happens once. When a file is needed, the gateway uses the primary refresh credential to obtain a short-lived IC3 token; there is no second Teams OAuth leg.
+Current documentation should contain stable contracts and conclusions supported by sufficient current evidence.
 
-### Tools, routing, and streaming
+Do not load current pages with:
 
-- A multi-tool ceiling is decided before generation. Generating first and truncating later would split caller and checkpoint state.
-- Router repair no longer truncates at a fixed 6000 characters. It stops when the UTF-16 budget is exceeded and never guesses missing content.
-- Router, repair, and final-answer phases use separate scratch conversations.
-- An internal non-stream adapter must remove `stream_options`; outer SSE still ends with one usage chunk and one `[DONE]`.
-- The official Python MCP SDK completed modern HTTP initialize, tool listing, `wp6_echo`, and clean close against an isolated release binary. This evidence is specific to that SDK/version/route, not every client.
+- expiring PIDs / container IDs;
+- private hosts/paths;
+- detailed one-account canary timelines;
+- complete histories of closed Issues;
+- temporary workarounds for an old version.
 
-### Hermes and Hindsight
+When those records remain useful, store them in:
 
-- A historical 80K/41K canary passed, while later long work supports the current 64K/41K correctness-first baseline.
-- Hindsight retain/recall/reflect have historical live PoC evidence. Reflect's current baseline is 40K with one retry.
-- Memory admission and breaker behavior are mainly tested deterministically to avoid deliberately forcing 429 on a real account.
+- [`../history/`](../history/README.md);
+- public Issue timelines;
+- Git history;
+- an authorized private evidence store.
 
-### Deployment
+## Evidence invalidation
 
-A Production runtime once had a current binary with three older Web files. That mixed-source observation is why the binary and all three Web assets now form one release, snapshot, rollback, and identity-readback unit. See [`deployment.md`](deployment.md).
+When a controlling input changes, only the affected evidence becomes stale, including changes to:
 
-### Goal Judge control plane
+- source / contract;
+- test oracle / fixture;
+- model mapping / capability evidence;
+- integration plugin;
+- binary / config;
+- upstream/client version;
+- Production release unit.
 
-Historical live traces showed that a valid Goal Judge `done` JSON response could be rewritten as prose by the former Agent completion-evidence prototype when sent through `/hermes/v1`. That trace is retained in the external ACP salvage bundle as failure-corpus evidence. The current M365 source no longer owns that semantic guard: Goal Judge uses P2 `/v1/chat/completions` with ForceNew / Untracked checkpoint policy, while `/hermes/v1` retains only provider transport, typed evidence, and duplicate-effect protections. ACP owns any Task/Run completion semantics.
+Do not invent a live canary for a docs-only wording change. Also do not use an old runtime PASS to skip review/validation for a new source identity.
 
-Exact identities from the old Go implementation, CI, NAS, Production, and live canaries are historical evidence. They cannot be inherited as Rust PASS. See [`rust-rewrite-parity.md`](rust-rewrite-parity.md); every new live or Production check must pin the Rust commit and artifact again.
+## Keep history and current truth separate
 
-## How to record evidence
+- **Current docs**: how the system works now.
+- **History**: what happened at a fixed source/time.
+- **Runtime readback**: actual current target state.
+- **ACP authority**: canonical Agent-governance state/decision.
 
-A useful verification record answers:
+When they disagree, current canonical source/authority and exact readback control the decision; history becomes background evidence.
 
-1. Which source commit / tree was tested?
-2. Which route, isolated account, or runtime performed it?
-3. What were the input, settings, and artifact identities?
-4. What was expected and what was independently read back?
-5. Which boundaries were not tested?
-6. Does it contain secrets or replayable material? If so, it cannot enter the repository.
-
-## Historical entry points
-
-- Memory Provider Issues #42–#44: [`../history/memory-provider-compatibility-issues-42-44.md`](../history/memory-provider-compatibility-issues-42-44.md)
-- Other step-by-step records: [`../history/README.md`](../history/README.md), public Issues, and Git history.
+Read [`compatibility.md`](compatibility.md) for current surface evidence levels.

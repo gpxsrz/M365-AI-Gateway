@@ -1,61 +1,77 @@
-# Rust rewrite comparison
+# Rust and historical Go parity
 
 ## Understand it in 30 seconds
 
-> AI agents: start with **Drift found during qualification**. Open the feature table only for one surface, and open the final gates only for a release. The current source tree is Rust-only.
+> The current source tree is Rust-only. Read historical Go only when you need to answer whether original Go behavior differed; do not restore Go source into the current build tree.
 
-Rust is the only release and container build source. The original Go baseline is no longer kept in the current tree; when historical behavior matters, inspect the pinned Git-history commit `f038c86e62c7390c442f30043715255576db4e19` read-only instead of filling gaps from memory.
+Rust is the only current release/container source.
 
-Core parity rules now confirmed:
+Historical Go is a fixed parity reference only:
 
-- One gateway maps to one Microsoft 365 account.
-- Browser-based Microsoft sign-in happens once.
-- IC3 file tokens come from the same primary refresh credential.
-- Tests bind ChatHub payloads, streams, tools, checkpoints, and error shapes.
-- Local PASS, live PASS, CI, and Production are four separate gates.
+```text
+f038c86e62c7390c442f30043715255576db4e19
+```
 
-## Drift found during qualification
+It can answer “what did Go do at that commit?” It does not automatically prove current Rust, Microsoft live behavior, or Production.
 
-An earlier Rust version added a second Teams OAuth leg that did not exist in Go. One button click could therefore wait silently for a second permission flow.
+## Parity is not line-by-line translation
 
-Artifact tests also proved only that metadata was found, not that file bytes were fetched. Real Microsoft output appended one display filename after `/views/original`. Fetching that full URL returned 404; the usable download endpoint keeps the query and removes that display-filename segment.
+Preserve observable contracts and safety invariants such as:
 
-Streaming had a lifecycle drift too: Rust once detached upstream work in its own task, so a disconnected caller could keep account capacity occupied. The original Go request context followed client cancellation. Rust now cancels upstream work when the response body is dropped.
+- one gateway maps to one Microsoft account;
+- Microsoft sign-in has one primary credential lifecycle;
+- document, image, and artifact boundaries stay separate;
+- dropping a caller stream does not leave upstream work running indefinitely;
+- tool IDs / arguments / checkpoint identity are not guessed or reconstructed;
+- each new Private-mode ChatHub transport carries the required disable-memory intent;
+- protected upstream URLs are not exposed directly to callers;
+- unknown external outcomes are not replayed blindly.
 
-The corrected shared path is:
+Rust may implement the same contract more safely or clearly without copying Go internals.
 
-1. Store only the primary Microsoft refresh credential.
-2. Use it to obtain a short-lived IC3 access token for the same account when a file is needed.
-3. Accept only approved HTTPS hosts and artifact paths.
-4. Remove at most one display filename; reject deeper or unknown paths.
-5. Never return protected upstream URLs or raw artifact events to API callers.
-6. Serialize normal refresh and resource-token refresh around the same credential so rotations cannot race.
+## When historical Go is worth reading
 
-## Feature comparison
+Open the fixed historical commit only when:
 
-| Surface | Contract retained in Rust | Smallest useful evidence |
-|---|---|---|
-| OpenAI Chat Completions | non-stream/SSE, tools, usage, one `[DONE]`, disconnect cancellation | adapter and route tests |
-| Responses | parents, tool results, parallel calls, reasoning/media events | continuation tests |
-| Anthropic Messages | errors, tool/image round trips, posthoc stream | adapter tests |
-| Hermes | provenance, transport ledger, multi-round tools, scheduling; historical completion-guard corpus is salvage-only | full continuation tests |
-| Hindsight | retain/recall/reflect, breaker, webhooks, barriers | Memory-profile tests |
-| OAuth | one sign-in, account binding, refresh rotation | browser + auth-lifecycle tests |
-| Code Interpreter | private storage, short-lived downloads, stream holdback, restart reuse | deterministic + isolated live |
-| MCP | modern HTTP and legacy SSE boundaries | route tests + official Python client |
-| Admin | bootstrap, passwords, API keys, setting sources, redaction | HTTP tests + browser path |
-| Release | pinned toolchain, locked build, Rust container | local release gate + exact-head CI |
+1. current Rust conflicts with a known user-facing contract;
+2. an upstream interaction lacks a clear spec and original product behavior is relevant;
+3. a migration regression may have dropped an earlier safety boundary.
 
-## Release gates
+After learning historical behavior, prove the conclusion again with current Rust test/runtime evidence. A Go PASS is never inherited automatically.
 
-Every candidate follows this order:
+## Current Rust surface
 
-1. Rust formatting, full tests, Clippy, release build, and diff check.
-2. When parity needs original Go behavior, inspect only the pinned historical commit; do not restore Go source into the current tree.
-3. Review affected paths with Serena and Code Review Graph; zero graph impact never replaces source search.
-4. After commit, run exact-head GitHub CI and container build.
-5. Read back the public ref, NAS, VM, and release artifact separately.
-6. Create verified recovery evidence before Production deployment.
-7. Close with a low-rate live request, service state, binary/Web hashes, and rollback evidence.
+| Surface | Current Rust contract |
+|---|---|
+| Chat Completions | non-stream / SSE, tools, usage, input policy, checkpoints |
+| Responses | Responses request/continuation projection |
+| Anthropic | Messages / tools / media projection |
+| Hermes | execution provenance, transport ledger, checkpoint / replay safety |
+| Hindsight | Memory queue, overflow, webhook, durability barrier |
+| OAuth | single-account credential lifecycle |
+| Files / Vision | validated transport and grounding |
+| Code Interpreter | protected artifact materialization / local capability |
+| MCP | modern HTTP and legacy compatibility boundary |
+| Admin | bootstrap, API key, settings, privacy-safe diagnostics |
+| Release | locked Rust build, release unit, rollback contract |
 
-If any step fails, report partial completion. Exact results belong in CI, Git history, and deployment readback; current docs do not carry expiring PIDs, container IDs, or account data.
+Task / Run governance is not in this table; it belongs to standalone ACP.
+
+## Release evidence
+
+A current Rust candidate acquires evidence appropriate to its change scope:
+
+1. source / formatting / tests / clippy / release build;
+2. architecture / contract regression;
+3. independent review when controlling behavior changes;
+4. publication / exact-head CI when the release publishes;
+5. artifact / Production readback when the release deploys;
+6. live provider checks only when the accepted scope requires them.
+
+Local, CI, live, and Production are separate evidence layers.
+
+## Keep migration history out of current guidance
+
+Past Rust-rewrite defects, failed canaries, and old Production binaries belong in Git/history evidence instead of current usage guidance.
+
+Read [`compatibility.md`](compatibility.md) for current capability and [`../history/README.md`](../history/README.md) for historical entry points.

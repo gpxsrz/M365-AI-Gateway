@@ -2,78 +2,85 @@
 
 ## 30 秒看懂
 
-> AI Agent：先判斷你需要哪一種證據，再只讀同名小節。不要用「測試通過」四個字代替 commit、route 與讀回範圍。
+> 白話：先問「我現在是在證明程式碼、測試、真實帳號、CI，還是 Production？」每一層只能證明自己的事，不能看到一個 PASS 就當全部都 PASS。這裡的 **evidence** 就是可回頭核對的證據，**identity** 就是它對應的確切版本／route／target。只要判斷證據層級，讀完本節和下表就停。
 
-「測試通過」要說清楚是哪一種測試：
+證據（evidence）分層：
 
-| 等級 | 能證明什麼 | 不能推定什麼 |
+| Evidence class | 能證明 | 不能自動推定 |
 |---|---|---|
-| Deterministic test | 程式在固定輸入下遵守契約 | 真實 Microsoft rollout 一定相同 |
-| 本機 runtime smoke | Release binary 能啟動並完成本機流程 | OAuth、ChatHub 或 Production 已通過 |
-| Live canary | 某帳號、某時間、某 route 的真實行為 | 永久支援、所有帳號都相同 |
-| Production readback | 指定 commit/artifact 確實在指定 runtime 運作 | 其他 remote 或備份也已同步 |
-| Inference | 根據證據最合理的判斷 | 已直接觀察到的事實 |
+| Source / static trace | code path / contract目前長什麼樣 | runtime真的走到它 |
+| Deterministic test | 固定輸入下contract成立 | Microsoft live一定一樣 |
+| Local runtime | candidate artifact能啟動並走local seam | OAuth / upstream / Production已通過 |
+| Isolated live | 特定account/route/time真實行為 | 永久支援或所有帳號相同 |
+| Exact-head CI | published source在CI環境通過 | Production已部署 |
+| Production readback | exact artifact真的在target runtime | 其他mirror也同步 |
+| Inference | 目前evidence最合理的解釋 | 直接觀察事實 |
 
-任何 PASS 都要綁定 source commit、tree、binary、settings、artifact 與 evidence identity。執行命令 exit 0 不算完成；要從目標表面獨立讀回。
+## 一筆可用evidence至少要回答
 
-## 現在採用的結論
+1. **Subject**：測哪個source / artifact / route / behavior？
+2. **Identity**：commit / tree / binary / config / input / evidence SHA是什麼？
+3. **Environment**：local、isolated live、CI還是Production？
+4. **Expected**：contract要求什麼？
+5. **Observed**：從target獨立readback看到什麼？
+6. **Boundary**：哪些層沒有測？
+7. **Privacy**：是否包含secret、private URL或可重播資料？若有就不能進public repo。
 
-### 文字與 checkpoint
+## Completion要分層
 
-- `128000` UTF-16 boundary 有 Web 相容證據，但不是 model token context。
-- Checkpoint reuse 只接受嚴格相同的 history prefix；tool call ID、arguments 與 role 不能被偷偷重綁。
+下列結果不能互相偷換：
 
-### Private mode
+```text
+command exit 0
+≠ request accepted
+≠ upstream effect durable
+≠ caller received
+≠ semantic acceptance
+≠ Production deployed
+```
 
-- 每條新 ChatHub WebSocket 都重送 `disableMemory=1`，可避免一般聊天歷史。
-- 這不等於沒有 OneDrive / SharePoint 暫存或 artifact side effect。
+M365 transport可以證明自己的request、tool、checkpoint與delivery projection；ACP才判斷Task / Run semantic lifecycle。
 
-### 檔案、圖片與 Code Interpreter
+## Current docs怎麼引用evidence
 
-- 一般文件先取得 Microsoft file identity / annotation，再做 ChatHub grounding。
-- 圖片使用另一條 transport，不能和文件 upload 混成一種流程。
-- Protected artifact 必須由 Gateway 用登入狀態抓回、放進私有暫存，再提供有權限的下載；上游私有 URL 不可先漏出。
-- 隔離 Rust release binary 已用真實帳號通過 file+Vision input。圖片生成回 `no_image_resource`，只能判定該次沒有 image resource。
-- 真實 Code Interpreter 測試已讀回完整 bytes。non-stream、stream 與服務重啟後再下載都成功，且 API 回應沒有出現受保護網址。
-- 原 Go 與先前 Rust 都會直接抓含顯示檔名的 artifact URL，真實端點回 404。第一方瀏覽器對照證明：保留 query、只移除 `/views/original` 後的一段顯示檔名即可讀取同一物件。
-- Microsoft 登入只有一次。Gateway 需要檔案時，使用同一份主要更新憑證換取短效 IC3 token；沒有第二段 Teams OAuth。
+Current documentation只應寫穩定contract與目前有足夠evidence支持的結論。
 
-### Tools、routing 與串流
+不要在current page塞：
 
-- 多 tool 上限要在 generation 前決定，不能先生成再截掉，否則 caller 與 checkpoint state 會分叉。
-- Router repair 不再固定截 6000 字元；超過 UTF-16 budget 時停止，不猜內容。
-- Router、repair 與 final-answer phase 使用分開的 scratch conversation。
-- 內部 non-stream adapter 必須移除 `stream_options`；外層 SSE 仍保留一個 usage chunk 與一個 `[DONE]`。
-- 官方 Python MCP SDK 已對隔離 release binary 完成 modern HTTP initialize、tool list、`wp6_echo` 與正常關閉。這只證明該 SDK／版本／route，不自動涵蓋所有 client。
+- 過期PID / container ID；
+- private host/path；
+- 單次帳號canary逐步紀錄；
+- 已關Issue的整段timeline；
+- 某個舊版本的temporary workaround。
 
-### Hermes 與 Hindsight
+這些資料若仍有調查價值，放到：
 
-- 歷史 80K/41K canary 曾成功，後續長任務支持現在的 64K/41K correctness-first baseline。
-- Hindsight retain/recall/reflect 有過 live PoC；Reflect 現行基線是 40K、retry 1。
-- Memory admission 與 breaker 主要用 deterministic test 驗證，避免刻意對真實帳號製造 429。
+- [`../history/`](../history/README.md)；
+- public Issue timeline；
+- Git history；
+- 授權的private evidence store。
 
-### 部署
+## Evidence失效規則
 
-Production runtime 曾出現 binary 已更新、三個 Web 檔仍是舊版的 mixed-source 狀態。這是為什麼現在把 binary 與三個 Web assets 綁成同一 release、snapshot、rollback 與 identity readback 單位。詳見 [`deployment.md`](deployment.md)。
+任何controlling input改變，都只讓受影響的evidence stale：
 
-### Goal Judge control-plane
+- source / contract；
+- test oracle / fixture；
+- model mapping / capability evidence；
+- integration plugin；
+- binary / config；
+- upstream/client版本；
+- Production release unit。
 
-歷史 live trace 證明：Goal Judge 經 `/hermes/v1` 時，合法 `done` JSON 曾被舊的 Agent completion-evidence prototype 改成自然語言。該 trace 已保存在 repo 外 ACP salvage bundle，作為 failure corpus；不是 current runtime authority。現在的 M365 source 已移除這個 semantic guard：Goal Judge 走 P2 `/v1/chat/completions`，使用 ForceNew / Untracked checkpoint policy；`/hermes/v1` 只保留 provider transport、typed evidence 與 duplicate-effect protection。Task/Run completion semantics 由 ACP 負責。
+不要因一個docs-only wording change就假裝runtime需要live canary；也不要因runtime曾經PASS就跳過新source identity需要的review / validation。
 
-舊 Go implementation、CI、NAS、Production 與 live canary 的 exact identities 是歷史證據，不可直接當成 Rust PASS。Rust 對照請讀 [`rust-rewrite-parity.md`](rust-rewrite-parity.md)；每次新的 live／Production 驗證都要重新固定 Rust commit 與 artifact。
+## 歷史與current分開
 
-## 證據寫法
+- **Current docs**：現在怎麼用、現在的contract。
+- **History**：某個固定source / time發生過什麼。
+- **Runtime readback**：現在target的實際狀態。
+- **ACP authority**：Agent governance canonical state / decision。
 
-一筆可用的驗證紀錄至少回答：
+遇到衝突，以當前canonical source / authority與exact readback為準；history降級成背景證據。
 
-1. 測的是哪個 source commit / tree？
-2. 從哪條 route、哪個隔離帳號或 runtime 執行？
-3. 輸入、設定與 artifact identity 是什麼？
-4. 預期結果與實際讀回是什麼？
-5. 哪些邊界沒有測？
-6. 是否含 secret 或可重放材料？若有，就不能進 repo。
-
-## 歷史入口
-
-- Memory Provider Issues #42–#44：[`../history/memory-provider-compatibility-issues-42-44.md`](../history/memory-provider-compatibility-issues-42-44.md)
-- 其他逐步紀錄：[`../history/README.md`](../history/README.md)、public Issues 與 Git history。
+目前surface驗證狀態讀 [`compatibility.md`](compatibility.md)。

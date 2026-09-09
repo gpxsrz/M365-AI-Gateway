@@ -1,184 +1,108 @@
-# Hermes and Hindsight
+# Hermes and Hindsight integration
 
 ## Understand it in 30 seconds
 
-> AI agents: for basic integration, stop after **Recommended settings**. Read the later contracts only for scheduling, memory freshness, or webhook work.
+> If you only need to connect the services, read this section and **Route separation**, then stop. Read the queue, checkpoint, Memory barrier, or provenance section only when that surface is relevant.
 
-- Hermes Agent uses `/hermes/v1`.
-- Hindsight Memory uses `/memory/v1`.
-- Goal Judge and similar control work use `/v1/chat/completions`, not the Hermes Agent route.
-- One Microsoft account runs at most two requests. Users come first, Memory second, and background/control work third.
-- Hermes, Hindsight, Semantica, and other upstream cores are immutable upstreams. Canonical lifecycle governance lives only in the standalone ACP; versioned adapters, plugins / hooks, gateways, and sidecars may carry integration enforcement, evidence, and projections but not a second authority. See [`agent-governance.md`](agent-governance.md) for the M365 integration contract.
+- Hermes Agent transport uses `/hermes/v1`.
+- Hindsight Memory transport uses `/memory/v1`.
+- Goal Judge and other auxiliary/control work uses `/v1/chat/completions`.
+- They may share one Microsoft 365 account, so queues and breaker behavior are shared-account transport policy.
+- Do not patch Hermes, Hindsight, or Semantica core for M365 compatibility.
+- M365 provides transport / adapter evidence only; Task / Run completion authority belongs to ACP.
 
-If you only need to connect the services, use the next section. Exact scheduler, barrier, and webhook rules follow later.
+## Route separation
 
-## Recommended settings
-
-### Hermes: correctness first
-
-```text
-model-specific context_length=64000
-compression.proactive_prune_tokens=30000
-compression.max_attempts=3
-compression.protect_first_n=3
-compression.protect_last_n=8
-compression.min_tail_user_messages=1
-compression.tail_mode=legacy
-global compression.threshold_tokens=null  # use the stock resolver; no absolute cap
-```
-
-64K remains the provider context override. After #89 auto-spill, the M365 `128000 UTF-16` transport wall is handled by the adapter instead of forcing early Hermes compression. The current long-task baseline performs deterministic old tool-output pruning at 30K and leaves full compression without an absolute token cap; with stock v0.20.5's 64K small-context resolver this currently triggers at about 54.4K. The live default/manager profile config remains the runtime authority.
-
-Built-in memory and user profile can remain enabled while periodic background reviewers are disabled, reducing competition with the foreground agent:
-
-```yaml
-memory:
-  memory_enabled: true
-  user_profile_enabled: true
-  nudge_interval: 0
-skills:
-  creation_nudge_interval: 0
-agent:
-  intent_ack_continuation: true
-```
-
-This does not disable `MEMORY.md`, `USER.md`, or the memory tool.
-
-### Hindsight: background work may wait
-
-```text
-memory_mode=hybrid
-auto_recall=true
-auto_retain=true
-retain_every_n_turns=1
-recall_prefetch_method=recall
-recall_types=observation
-recall_max_tokens=2048
-recall_max_input_chars=800
-prefetch_waits_for_retain=true
-prefetch_retain_drain_timeout=600
-
-HINDSIGHT_API_WORKER_MAX_SLOTS=1
-HINDSIGHT_API_SKIP_LLM_VERIFICATION=true
-HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=0
-HINDSIGHT_API_RETAIN_MAX_CONCURRENT=1
-HINDSIGHT_API_WORKER_MAX_RETRIES=12
-HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS=60
-HINDSIGHT_API_LLM_TIMEOUT=120
-HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=40000
-HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES=1
-```
-
-`observation` is suitable for automatic injection. Use `hindsight_reflect` for deeper synthesis across a bank. Run one worker slot and reserve no separate consolidation slot. Only startup LLM connection verification is skipped; real retain/recall/reflect calls still report provider failures.
-
-### Tool rounds
-
-| Route | Default ceiling |
-|---|---:|
-| `/v1/chat/completions` | 16 |
-| `/memory/v1` | 16 |
-| `/hermes/v1` | 128 |
-
-Exhausting a ceiling is a terminal safety condition. It does not replay work or rebind a checkpoint.
-
-## Connecting Goal Judge
-
-Hermes 0.20.4 needs a second named provider for the same Gateway. Do not place only a `base_url` under `auxiliary.goal_judge`; an anonymous `custom` route is not guaranteed to inherit the main provider credential.
-
-Coordinator and Atlas/manager reuse the existing `M365_COPILOT2API_KEY` environment source:
-
-```yaml
-providers:
-  m365-copilot-control-plane:
-    base_url: https://<same-m365-gateway>/v1
-    key_env: M365_COPILOT2API_KEY
-    model: gpt-5.6-reasoning
-    models:
-      gpt-5.6-reasoning:
-        context_length: 64000
-auxiliary:
-  goal_judge:
-    provider: m365-copilot-control-plane
-    model: gpt-5.6-reasoning
-```
-
-Both provider names still point to the same Gateway, credential, and model. The names only separate Hermes transport continuation from control-plane `/v1` transport handling.
-
-Why this matters: control-plane JSON such as `{"verdict":"done"}` must pass through as provider content. M365 does not parse it into Task/Run completion authority or rewrite it; ACP consumes any governance semantics at its own canonical seam.
-
-Hermes 0.20.4 `judge_goal()` still fixes `timeout=30s`; a task-level timeout cannot extend it. Normal canaries took about 5–6 seconds, but P2 may wait behind Memory long enough for the Judge to fail safe and defer completion. Do not raise `/v1` priority or bypass the scheduler.
-
-## Same-account scheduling
-
-Normal Production baseline:
-
-```text
-interactiveMaxConcurrent=2
-interactiveQueueTimeoutSeconds=120
-memoryMaxConcurrent=1
-memoryQueueTimeoutSeconds=120
-chatTimeoutSeconds=1800
-interactivePriorityHoldoffSeconds=10  # legacy compatibility only
-```
-
-Actual hard rules:
-
-| Class | Work | Rule |
+| Work | Route | Continuation semantics |
 |---|---|---|
-| P0 | `EXTERNAL_USER` | highest priority; may cancel an unfinished milestone yield |
-| P1 | `/memory/v1` | outranks new P2 work when no P0 waiter exists |
-| P2 | background Hermes/Atlas and control-plane work such as Goal Judge | at most one running |
+| General auxiliary / control work | `/v1/chat/completions` | ForceNew / untracked transport; no Hermes execution evidence inheritance |
+| Hermes / Atlas | `/hermes/v1/chat/completions` | may use Hermes execution identity, checkpoints, and duplicate-effect protection |
+| Hindsight | `/memory/v1/chat/completions` | Memory queue class; no Hermes checkpoint authority |
 
-Shared total is 2, Memory is 1, and the Memory waiting buffer is 8 FIFO. Running work is never preempted. If one Memory request is running, later Memory work waits at its class limit while P2 may use the other free slot.
+Model catalogs are also separated as `/v1/models`, `/hermes/v1/models`, and `/memory/v1/models` so consumers do not have to infer the profile.
 
-See [`api-contracts.md`](api-contracts.md) for breaker states and errors. Cooldown is fixed at `1125 → 2250 → 4500 → 9000 → 18000` seconds and no longer derives from legacy `memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds`.
+## Configuration principles
 
-## Milestone Memory barrier
+Do not confuse M365's configured UTF-16 transport policy with the Hermes/model token context window. They are different quantities; the exact current M365 value is maintained in [`runtime-settings.md`](runtime-settings.md):
 
-The Gateway classifies stable Hermes framework markers; it does not ask an LLM to guess intent:
+- M365 `textInputLimitUTF16`: text policy before transport;
+- Hermes/model context: token-based context quality and compression policy.
 
-| Type | Recognition | Effect |
-|---|---|---|
-| `EXTERNAL_USER` | ordinary user turn without trusted delegated-child provenance | serves the user first and cancels unfinished yield |
-| `ASYNC_COMPLETION` | `[ASYNC DELEGATION BATCH COMPLETE — ...]` or `[ASYNC DELEGATION COMPLETE — ...]` | creates a Memory barrier after success |
-| `AUTONOMOUS_CONTINUATION` | fixed Hermes continuation marker or a strictly proven child request | waits for the barrier, then uses normal admission |
+For non-Memory chat, M365 may convert safely movable bulk `user` / `tool` text into a deterministic `.txt` attachment. The current user ask, system/developer control, and tool identity must remain inline. Memory traffic does not use this auto-spill behavior.
 
-A delegated child must satisfy all of these:
+Hermes compression should therefore be driven by model-context quality rather than by an old M365 transport threshold. Effective context/compression values belong to the current Hermes profile and are not pinned to one upstream version in M365 public docs.
 
-1. A leading `role=system` or `role=developer` block contains Hermes runtime identity.
-2. `Model: ...` matches the request model and the block includes `Provider: ...` plus `Platform: subagent`.
-3. The next paragraph is exactly `You are a focused subagent working on a specific delegated task.`.
+## Shared-account scheduling
 
-Look-alike identity text in plugin/system data cannot impersonate a child. An async-completion marker outranks child provenance, so nested child completion can still create a barrier.
+Plainly: Hermes, Hindsight, and foreground callers share one Microsoft account, so M365 bounds concurrent and queued work to prevent background work from crowding out users.
 
-A successful `ASYNC_COMPLETION` creates a lease of at most 300 seconds. The next autonomous continuation waits until:
+This page keeps only scheduling semantics, not a second numeric registry: external users have priority; when no external user is waiting, Memory may precede new background/control work; the Memory queue is FIFO. **Exact current concurrency and queue ceilings are maintained only in [`runtime-settings.md`](runtime-settings.md).**
 
-1. an HMAC-verified `retain.completed` proves server-side durability; or
-2. 300 seconds expires and records `timeout`; or
-3. a new external user arrives and records `preempted_by_interactive`.
+An already-started upstream request is not forcibly interrupted by a newly arrived higher-priority request. Read effective runtime settings for admission timeout values instead of treating an old profile value as current truth.
 
-Only an autonomous request actually blocked by `MEMORY_YIELD` may continue waiting on the existing `memoryYieldDeadline` after the ordinary 120-second queue deadline. Normal admission resumes as soon as the barrier ends. Consumed queue budget is not reset, and caller context cancellation is never extended.
+Breaker behavior is separate from ordinary queue timeout. When the breaker is `OPEN`, interactive traffic is projected immediately as local `429 upstream_throttle` with `Retry-After`.
 
-`/memory/v1` HTTP 200, queued, claimed, and processing do not mean durable. `consolidation.completed` is observability only. Only an HMAC-verified `retain.completed` passes the barrier.
+See [`api-contracts.md`](api-contracts.md) for exact breaker and retry semantics.
 
-The Gateway does not delete Hermes working context and cannot insert a later recall into an already-built HTTP body. "Retain durable" does not mean the same old request saw new memory. Confirm fresh memory through the next normal recall/readback.
+## Hermes execution identity and provenance
 
-## Overflow and upstream bank mission
+Hermes integration uses the versioned repository plugin under `integrations/hermes/m365_recall_provenance` instead of modifying Hermes core.
 
-- `128000` is a UTF-16 transport policy, not Hermes/Hindsight token context.
-- For non-Memory chat, when the oversized portion is safely movable `user` / `tool` bulk text, M365 first spills it into one structured `.txt` attachment. System/developer/assistant control semantics, tool identity, and the real current ask remain inline, and the final inline payload is still checked against the `128000` hard guard. #89 whole-message spill remains available for one oversized user message. For the latest user in a multi-message conversation, only an ephemeral recall/source-material range bound by the trusted integration signature may spill partially.
-- Enable this repository's versioned `integrations/hermes/m365_recall_provenance` plugin in Hermes (v1.2+). It uses only stock Hermes hook/middleware seams: `pre_llm_call`, `post_llm_call`, `on_session_end`, and `llm_request`; it does not modify Hermes core. In addition to the existing recall/source-material range, it emits content-free HMAC provenance for Hermes' official post-tool empty-response recovery. The plugin uses Hermes' stock execution `session_id`; inherited task-local `HERMES_SESSION_KEY` routing context is not a checkpoint identity. It projects the trusted execution identity onto the existing M365 `session_key` checkpoint seam only when no conflicting request value exists. If host execution identity is missing, a supplied wire key conflicts, a present wire key is non-string or blank/whitespace, or stock `extra_body` is not a mapping, the plugin strips or replaces untrusted wire identity/provenance and projects only a bounded `m365_execution_identity_error` schema+reason marker. M365 `/hermes/...` consumes that marker before checkpoint creation or Microsoft upstream and returns `409 hermes_execution_identity_error`; this fail-closed path does not depend on Hermes middleware exceptions propagating. Canonical identity removes stale markers. Generic `/v1` and `/memory/v1` discard this Hermes-only marker and remain isolated. The Gateway independently recomputes recovery provenance from the canonical `session_key` plus normalized full transcript before accepting the HMAC, then derives synthetic recovery markers only in memory. Gateway and Hermes share `M365_HERMES_RECALL_PROVENANCE_SECRET`, while `M365_HERMES_PROVIDER` restricts the named provider. Secret, raw session subject, tool result, and user text never enter provenance metadata or privacy telemetry. Caller-supplied `_empty_recovery_synthetic`, look-alike recovery text, cross-session/transcript replay, a secret/provider mismatch, hash/index drift, or an invalid signature never creates authority. Hindsight core remains unchanged.
-- Hermes needs a recoverable overflow signal only when safe spill is impossible, attachment slots are full, the generated file is too large, or document authorization is unavailable. The `128000` transport wall should no longer by itself force early Hermes compression/rotation; normal compression, protected-tail, and rotation policy remains driven by model-token/context quality.
-- Attachment grounding is not zero-context-cost and is not arbitrary byte-addressable storage; very large high-entropy files can miss retrieval targets.
-- Hindsight receives `context_length_exceeded` / `input is too long`; Reflect baseline is 40K / retry 1.
+Core rules:
 
-Until Hermes upstream #18774 is fixed, `bank_mission` / `bank_retain_mission` may not reach live Hindsight `reflect_mission` / `retain_mission`. Apply them through the Banks Config API and require a GET readback:
+1. Stable execution identity comes from a trusted Hermes stock execution/session seam.
+2. The M365 wire `session_key` is transport checkpoint input, not caller-declared authority.
+3. Plugin and gateway share `M365_HERMES_RECALL_PROVENANCE_SECRET` for content-free provenance verification.
+4. `M365_HERMES_PROVIDER` may scope the plugin to the intended named provider.
+5. Session, transcript, tool call, tool result, or recovery-sequence drift invalidates previous provenance for retargeting.
+6. Generic `/v1` and `/memory/v1` isolate Hermes-only metadata.
 
-```text
-PATCH /v1/default/banks/{bank_id}/config
-GET   /v1/default/banks/{bank_id}/config
-```
+Missing execution identity, conflicting wire identity, or unprovable provenance should fail closed before Microsoft upstream rather than relying on middleware exceptions or text markers.
 
-Use the normal `HINDSIGHT_API_KEY` Bearer credential. Documentation and evidence may record the readback result, never the key. This is an upstream boundary; do not patch Hermes/Hindsight core to work around it.
+## Tool continuation and duplicate effects
 
-Historical canaries and Issues #42–#44 are indexed by [`../history/README.md`](../history/README.md).
+The Hermes transport ledger may recognize an already completed exact tool call, suppress the same transport effect, and request a no-tools continuation when needed.
+
+This answers “do we already have evidence for this transport tool effect?” It does not answer “is the Agent task complete?” Task / Run semantic completion remains an ACP acceptance decision.
+
+Hermes has a separate tool-round safety ceiling from generic/Memory traffic. Exact defaults and effective values are maintained only in [`runtime-settings.md`](runtime-settings.md). Exhaustion returns terminal `tool_round_limit`; it does not create a new execution automatically.
+
+## Memory durability barrier
+
+After a qualifying Hermes async-completion, the gateway may create a Memory-yield lease of up to 300 seconds. A following autonomous/control continuation that requires fresh Memory waits for:
+
+1. HMAC-verified `retain.completed`; or
+2. expiration of the 300-second lease; or
+3. a new external user that preempts the pending yield.
+
+`queued`, `processing`, `/memory/v1` HTTP 200, and `consolidation.completed` do not prove retain durability.
+
+The barrier controls when the next transport admission may proceed. It cannot retroactively rewrite a request body that was already assembled. Fresh Memory still has to be demonstrated by a later normal recall/readback.
+
+## Hindsight webhook
+
+`POST /internal/hindsight/webhook` is a machine-auth surface. `M365_HINDSIGHT_WEBHOOK_SECRET` authenticates the raw JSON payload with HMAC-SHA256.
+
+Current event family:
+
+- `retain.completed`: may complete the Memory durability barrier;
+- `consolidation.completed`: observation only; does not unlock the barrier.
+
+Webhook secrets, raw Memory content, and account identity must not appear in UI, logs, or public docs.
+
+## Overflow and Memory
+
+- M365's configured UTF-16 transport policy is not the model token context; its exact current value is maintained in [`runtime-settings.md`](runtime-settings.md).
+- Non-Memory bulk text may spill into an attachment only when safety constraints hold.
+- Memory traffic preserves Hindsight-compatible `context_length_exceeded` recovery and does not auto-spill.
+- Attachment grounding is neither zero context cost nor arbitrary byte-addressable storage.
+- M365 protects transport only. Hindsight bank/mission semantics remain governed by current Hindsight APIs and configuration.
+
+Do not write an upstream-version bug, old Issue number, or one-time live workaround as an M365 current contract. Use [`../history/README.md`](../history/README.md) for historical behavior.
+
+## Read next
+
+- Exact wire/error/checkpoint contract: [`api-contracts.md`](api-contracts.md)
+- Runtime setting sources: [`runtime-settings.md`](runtime-settings.md)
+- M365 ↔ ACP authority: [`agent-governance.md`](agent-governance.md)
+- Evidence strength: [`research-evidence.md`](research-evidence.md)

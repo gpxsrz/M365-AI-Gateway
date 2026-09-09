@@ -2,21 +2,30 @@
 
 ## 30 秒看懂
 
-> 第一次使用先讀本節和「最快啟動方式」即可。AI Agent 請改走[文件路由](docs/README.md)，一次只載入一個主題。
+> 第一次使用先讀本節和「快速開始」即可。AI Agent 與貢獻者請從 [`docs/README.md`](docs/README.md) 選一個主題，不要一次載入整棵文件樹。
 
-M365 AI Gateway 是一個自己架設的小型服務。它讓支援 OpenAI、Anthropic 或 MCP 的工具，可以使用你自己的 Microsoft 365 Copilot 帳號。
+M365 AI Gateway 是一個自架的 **Microsoft 365 Copilot model provider / transport gateway**。它讓支援 OpenAI、Anthropic 或 MCP 介面的工具，透過你自己的 Microsoft 365 Copilot 帳號使用模型、工具、圖片與檔案能力。
 
-- 核心程式以 Rust 編寫，執行檔叫 `m365-native`。
-- 一個執行中的 Gateway 只服務一個 Microsoft 365 帳號。
-- 預設只接受本機連線。
+它的責任很明確：
+
+- 把相容 API 轉成 Microsoft 365 ChatHub transport。
+- 管理一個 Microsoft 365 帳號的登入、排隊、限流與重試。
+- 保護文件與 Code Interpreter artifact，不把這些受保護產物的上游私密網址直接交給 caller；圖片生成是獨立 surface，可能回 upstream image URL。
+- 保存「安全續接 transport」需要的短期 checkpoint 與 provenance。
+
+它**不負責** Agent Task / Run 的 semantic completion、blocker、approval、handoff 或 lifecycle authority。這些治理語意屬於獨立的 Agent Control Plane（ACP）。
+
+其他重要邊界：
+
+- 核心程式是 Rust，執行檔名稱保留為 `m365-native`。
+- 一個 Gateway 執行個體只服務一個 Microsoft 365 帳號。
+- 預設只監聽本機 `127.0.0.1`。
+- Private mode 會要求上游不要建立一般聊天歷史，但不代表 Microsoft 零保留。
 - 這是社群專案，不是 Microsoft 官方產品。
-- Private mode 會關閉一般聊天記錄，但不代表 Microsoft 完全不保留資料。
 
-如果你只想安裝，直接看[快速開始](docs/zh-TW/getting-started.md)。AI Agent 或貢獻者應先看[文件路由](docs/README.md)，一次只載入目前需要的主題。
+## 快速開始
 
-## 最快啟動方式
-
-需求：使用 `Cargo.toml` 指定的 Rust 版本，以及一個你有權使用的 Microsoft 365 Copilot 帳號。
+使用 `Cargo.toml` 指定的 Rust 版本，先設定一次性管理密碼：
 
 ```bash
 export M365_ADMIN_PASSWORD='請換成只用一次的管理密碼'
@@ -25,43 +34,57 @@ cargo run --locked --bin m365-native
 
 接著開啟 `http://127.0.0.1:4141`：
 
-1. 用剛才的一次性密碼登入。
+1. 用一次性管理密碼登入。
 2. 依畫面要求換成正式管理密碼。
-3. 按「自動登入 Microsoft 帳號」，在受控視窗完成一次 Microsoft 登入。
-4. 建立 API key。
+3. 完成一次 Microsoft 帳號登入。
+4. 建立 API key；原始 key 只會顯示一次。
 
-不要把真實密碼、API key、token 或 cookie 貼進指令紀錄、Issue 或文件。
+最小 API smoke：
 
-## 它提供什麼
+```bash
+export M365_API_KEY='請換成剛建立的 API key'
+curl -sS http://127.0.0.1:4141/v1/models \
+  -H "Authorization: Bearer ${M365_API_KEY}"
+```
 
-| 你要做的事 | 使用的入口 |
+看到模型清單只代表 Gateway 與 API key 可用，不代表所有 Microsoft capability 或 Production 路徑都已驗證。
+
+## API 入口
+
+| 需求 | 入口 |
 |---|---|
-| OpenAI 相容的輔助／控制工作 | `/v1/chat/completions` |
-| Hermes / Atlas Agent 工作 | `/hermes/v1/chat/completions` |
-| Hindsight Memory 工作 | `/memory/v1/chat/completions` |
-| OpenAI Responses 格式 | `/v1/responses` |
-| Anthropic Messages 格式 | `/v1/messages` |
+| OpenAI Chat Completions 輔助／控制工作 | `/v1/chat/completions` |
+| Hermes / Atlas transport | `/hermes/v1/chat/completions` |
+| Hindsight Memory transport | `/memory/v1/chat/completions` |
+| OpenAI Responses | `/v1/responses` |
+| Anthropic Messages | `/v1/messages` |
 | 圖片生成 | `/v1/images/generations` |
-| MCP | `/v1/mcp`；舊客戶端可用 `/v1/mcp/sse` |
-| 模型清單 | `/v1/models` |
+| MCP | `/v1/mcp`；舊 client 配對使用 `GET /v1/mcp/sse` + `POST /v1/mcp/message` |
+| 模型清單 | `/v1/models`、`/hermes/v1/models`、`/memory/v1/models` |
 
-Gateway 也會處理工具呼叫、圖片與文件輸入、Code Interpreter 產出檔案、短期續接狀態，以及同一帳號下的流量排序。
+精確 request、stream、error、tool 與 checkpoint 契約請讀 [`docs/zh-TW/api-contracts.md`](docs/zh-TW/api-contracts.md)。
 
 ## 文件入口
 
 | 我現在要做什麼 | 台灣繁中 | English |
 |---|---|---|
 | 安裝與第一次登入 | [快速開始](docs/zh-TW/getting-started.md) | [Getting started](docs/en/getting-started.md) |
-| 理解系統怎麼運作 | [架構](docs/zh-TW/architecture.md) | [Architecture](docs/en/architecture.md) |
-| 設定 Hermes / Hindsight | [整合指南](docs/zh-TW/hermes-hindsight.md) | [Integration guide](docs/en/hermes-hindsight.md) |
-| 部署與回滾 | [部署](docs/zh-TW/deployment.md) | [Deployment](docs/en/deployment.md) |
-| 查功能是否真的驗過 | [相容性](docs/zh-TW/compatibility.md) | [Compatibility](docs/en/compatibility.md) |
-| 查已知限制 | [已知限制](docs/zh-TW/known-limitations.md) | [Known limitations](docs/en/known-limitations.md) |
-| 查精確 API 或設定 | [API 契約](docs/zh-TW/api-contracts.md)／[設定](docs/zh-TW/runtime-settings.md) | [API contracts](docs/en/api-contracts.md) / [Settings](docs/en/runtime-settings.md) |
+| 理解系統與資料邊界 | [架構](docs/zh-TW/architecture.md) | [Architecture](docs/en/architecture.md) |
+| 理解 M365 與 ACP 的責任分界 | [ACP 整合邊界](docs/zh-TW/agent-governance.md) | [ACP integration boundary](docs/en/agent-governance.md) |
+| 接 Hermes / Hindsight | [整合指南](docs/zh-TW/hermes-hindsight.md) | [Integration guide](docs/en/hermes-hindsight.md) |
+| 部署與回復 | [部署](docs/zh-TW/deployment.md) | [Deployment](docs/en/deployment.md) |
+| 查 API 精確契約 | [API 契約](docs/zh-TW/api-contracts.md) | [API contracts](docs/en/api-contracts.md) |
+| 查設定 | [Runtime 設定](docs/zh-TW/runtime-settings.md) | [Runtime settings](docs/en/runtime-settings.md) |
+| 查目前驗證狀態 | [相容性](docs/zh-TW/compatibility.md) | [Compatibility](docs/en/compatibility.md) |
+| 查目前限制 | [已知限制](docs/zh-TW/known-limitations.md) | [Known limitations](docs/en/known-limitations.md) |
+| 查模型 capability evidence | [模型能力](docs/zh-TW/model-capabilities.md) | [Model capabilities](docs/en/model-capabilities.md) |
+| 看證據怎麼分級 | [驗證證據](docs/zh-TW/research-evidence.md) | [Verification evidence](docs/en/research-evidence.md) |
 
-完整路由與 AI Agent 的分層讀取規則在 [`docs/README.md`](docs/README.md)。
+完整 task router 在 [`docs/README.md`](docs/README.md)。舊 Issue、canary 與過去 Production 證據只放在 [`docs/history/`](docs/history/README.md)。
 
 ## 開發者最小檢查
+
+Rust source 變更至少執行：
 
 ```bash
 cargo fmt --all --check
@@ -71,7 +94,7 @@ cargo build --locked --release
 git diff --check
 ```
 
-詳細規則見 [`CONTRIBUTING.md`](CONTRIBUTING.md)；安全問題見 [`SECURITY.md`](SECURITY.md)。
+文件、貢獻與安全規則請讀 [`CONTRIBUTING.md`](CONTRIBUTING.md) 與 [`SECURITY.md`](SECURITY.md)。
 
 ---
 
@@ -79,66 +102,89 @@ git diff --check
 
 ## Understand it in 30 seconds
 
-> First-time users can stop after this section and **Fastest local start**. AI agents should use the [documentation router](docs/README.md) and load one topic at a time.
+> First-time users can stop after this section and **Quick start**. AI agents and contributors should choose one topic from [`docs/README.md`](docs/README.md) instead of loading the entire documentation tree.
 
-M365 AI Gateway is a small self-hosted service. It lets tools that speak OpenAI, Anthropic, or MCP use your own Microsoft 365 Copilot account.
+M365 AI Gateway is a self-hosted **Microsoft 365 Copilot model provider / transport gateway**. It lets tools that speak OpenAI, Anthropic, or MCP APIs use models, tools, images, and files through your own Microsoft 365 Copilot account.
 
-- The core is written in Rust. The executable is named `m365-native`.
-- One running gateway serves one Microsoft 365 account.
-- It listens on the local machine by default.
-- This is a community project, not an official Microsoft product.
-- Private mode disables ordinary chat history. It does not promise that Microsoft retains nothing.
+Its responsibilities are deliberately narrow:
 
-If you only want to install it, open [Getting started](docs/en/getting-started.md). AI agents and contributors should start from the [documentation router](docs/README.md) and load one topic at a time.
+- translate compatible APIs to Microsoft 365 ChatHub transport;
+- manage sign-in, scheduling, throttling, and retry for one Microsoft 365 account;
+- protect document and Code Interpreter artifact URLs instead of exposing those protected upstream URLs; image generation is a separate surface and may return an upstream image URL;
+- keep only the short-lived checkpoint and provenance state needed for safe transport continuation.
 
-## Fastest local start
+It does **not** own Agent Task / Run semantic completion, blockers, approvals, handoffs, or lifecycle authority. Those governance semantics belong to the standalone Agent Control Plane (ACP).
 
-Use the Rust version in `Cargo.toml` and an authorized Microsoft 365 Copilot account.
+Other important boundaries:
+
+- the core is Rust; the executable keeps the compatibility name `m365-native`;
+- one gateway instance serves one Microsoft 365 account;
+- the default listener is local-only on `127.0.0.1`;
+- Private mode asks the upstream not to create ordinary chat history, but does not promise zero Microsoft retention;
+- this is a community project, not an official Microsoft product.
+
+## Quick start
+
+Use the Rust version declared by `Cargo.toml` and set a one-time administrator password:
 
 ```bash
 export M365_ADMIN_PASSWORD='replace-with-a-one-time-admin-password'
 cargo run --locked --bin m365-native
 ```
 
-Then open `http://127.0.0.1:4141`:
+Open `http://127.0.0.1:4141`, then:
 
-1. Sign in with the one-time password.
-2. Change it when prompted.
-3. Select **Automatically Sign in to Microsoft Account** and complete one Microsoft sign-in in the controlled window.
-4. Create an API key.
+1. sign in with the one-time administrator password;
+2. replace it with a persistent administrator password when prompted;
+3. complete one Microsoft account sign-in;
+4. create an API key; the raw key is shown only once.
 
-Never put real passwords, API keys, tokens, or cookies in command logs, Issues, or documentation.
+Minimal API smoke:
 
-## What it provides
+```bash
+export M365_API_KEY='replace-with-the-created-api-key'
+curl -sS http://127.0.0.1:4141/v1/models \
+  -H "Authorization: Bearer ${M365_API_KEY}"
+```
 
-| Goal | Endpoint |
+A model list proves local gateway and API-key access only. It does not prove every Microsoft capability or Production path.
+
+## API surfaces
+
+| Need | Endpoint |
 |---|---|
-| OpenAI-compatible auxiliary/control work | `/v1/chat/completions` |
-| Hermes / Atlas Agent work | `/hermes/v1/chat/completions` |
-| Hindsight Memory work | `/memory/v1/chat/completions` |
-| OpenAI Responses shape | `/v1/responses` |
-| Anthropic Messages shape | `/v1/messages` |
+| OpenAI Chat Completions auxiliary/control work | `/v1/chat/completions` |
+| Hermes / Atlas transport | `/hermes/v1/chat/completions` |
+| Hindsight Memory transport | `/memory/v1/chat/completions` |
+| OpenAI Responses | `/v1/responses` |
+| Anthropic Messages | `/v1/messages` |
 | Image generation | `/v1/images/generations` |
-| MCP | `/v1/mcp`; older clients can use `/v1/mcp/sse` |
-| Model catalog | `/v1/models` |
+| MCP | `/v1/mcp`; older clients use the paired `GET /v1/mcp/sse` + `POST /v1/mcp/message` flow |
+| Model catalogs | `/v1/models`, `/hermes/v1/models`, `/memory/v1/models` |
 
-The gateway also handles tool calls, image and document input, Code Interpreter files, short-lived continuation state, and fair use of the shared account.
+For exact request, streaming, error, tool, and checkpoint contracts, read [`docs/en/api-contracts.md`](docs/en/api-contracts.md).
 
 ## Documentation
 
 | What you need | Traditional Chinese | English |
 |---|---|---|
-| Install and first sign-in | [快速開始](docs/zh-TW/getting-started.md) | [Getting started](docs/en/getting-started.md) |
-| Understand the system | [架構](docs/zh-TW/architecture.md) | [Architecture](docs/en/architecture.md) |
-| Configure Hermes / Hindsight | [整合指南](docs/zh-TW/hermes-hindsight.md) | [Integration guide](docs/en/hermes-hindsight.md) |
-| Deploy and roll back | [部署](docs/zh-TW/deployment.md) | [Deployment](docs/en/deployment.md) |
-| Check verified behavior | [相容性](docs/zh-TW/compatibility.md) | [Compatibility](docs/en/compatibility.md) |
-| Check known limits | [已知限制](docs/zh-TW/known-limitations.md) | [Known limitations](docs/en/known-limitations.md) |
-| Look up exact API or settings | [API 契約](docs/zh-TW/api-contracts.md)／[設定](docs/zh-TW/runtime-settings.md) | [API contracts](docs/en/api-contracts.md) / [Settings](docs/en/runtime-settings.md) |
+| Install and sign in | [快速開始](docs/zh-TW/getting-started.md) | [Getting started](docs/en/getting-started.md) |
+| Understand the system and data boundaries | [架構](docs/zh-TW/architecture.md) | [Architecture](docs/en/architecture.md) |
+| Understand the M365 / ACP responsibility boundary | [ACP 整合邊界](docs/zh-TW/agent-governance.md) | [ACP integration boundary](docs/en/agent-governance.md) |
+| Connect Hermes / Hindsight | [整合指南](docs/zh-TW/hermes-hindsight.md) | [Integration guide](docs/en/hermes-hindsight.md) |
+| Deploy and recover | [部署](docs/zh-TW/deployment.md) | [Deployment](docs/en/deployment.md) |
+| Look up exact API contracts | [API 契約](docs/zh-TW/api-contracts.md) | [API contracts](docs/en/api-contracts.md) |
+| Look up settings | [Runtime 設定](docs/zh-TW/runtime-settings.md) | [Runtime settings](docs/en/runtime-settings.md) |
+| Check current verification status | [相容性](docs/zh-TW/compatibility.md) | [Compatibility](docs/en/compatibility.md) |
+| Check current limitations | [已知限制](docs/zh-TW/known-limitations.md) | [Known limitations](docs/en/known-limitations.md) |
+| Understand model capability evidence | [模型能力](docs/zh-TW/model-capabilities.md) | [Model capabilities](docs/en/model-capabilities.md) |
+| Understand evidence levels | [驗證證據](docs/zh-TW/research-evidence.md) | [Verification evidence](docs/en/research-evidence.md) |
 
-The full topic map and progressive-loading rules are in [`docs/README.md`](docs/README.md).
+The full task router is [`docs/README.md`](docs/README.md). Historical Issues, canaries, and Production evidence belong under [`docs/history/`](docs/history/README.md).
 
 ## Minimum developer checks
+
+Rust source changes must at least run:
 
 ```bash
 cargo fmt --all --check
@@ -148,4 +194,4 @@ cargo build --locked --release
 git diff --check
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development rules and [`SECURITY.md`](SECURITY.md) for security reports.
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md) for contribution and security rules.

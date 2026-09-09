@@ -2,101 +2,124 @@
 
 ## 30 秒看懂
 
-> AI Agent：先從「我該改哪一組」選一組。不要為了回答單一設定問題載入整頁，也不要把 secret 值讀回或列印。
+> 一般使用者先用管理頁。只有你需要 automation、restart-only 設定或排查 effective value 時，才讀後半；secret 永遠不要讀回或列印。
 
-大多數使用者只需要管理頁，不需要碰環境變數。管理 API 是：
+常用管理 surface：
 
-- `GET /api/admin/settings`：看目前設定。
+- `GET /api/admin/settings`：看目前設定與來源。
 - `PUT /api/admin/settings`：只更新送出的欄位。
-- `GET /api/admin/traffic`：看排隊、限流與 recovery 狀態。
-- `GET /api/admin/checkpoints/recovery`：用 opaque checkpoint ID 列出尚未核對的 upstream outcome。
-- `POST /api/admin/checkpoints/reconcile`：把未知 outcome 明確標成 terminal unknown；永遠不授權 replay。
+- `GET /api/admin/traffic`：看 queue / breaker / recovery projection。
+- `GET /api/admin/checkpoints/recovery`：列出 opaque unresolved checkpoint。
+- `POST /api/admin/checkpoints/reconcile`：acknowledge unknown external outcome，不授權 replay。
 
-管理頁必須同時顯示「現在生效的值」和「值從哪裡來」。灰掉或標示 environment-controlled 的欄位，不能假裝被 UI 覆蓋。Secret 永遠不回顯明文。
+管理 UI 應顯示「effective value」和「來源」。Environment-controlled 值不能假裝已被 UI 覆蓋；secret 不回顯明文。
 
-## 我該改哪一組
+## 設定分組
 
-| 需求 | 設定 |
+| 需求 | 主要設定 family |
 |---|---|
-| 開關相容模式 | `chatMode`、`hermesCompatibilityEnabled`、`memoryCompatibilityEnabled` |
-| 一般等待時間 | `interactiveQueueTimeoutSeconds`、`memoryQueueTimeoutSeconds`、`chatTimeoutSeconds` |
-| tools | `toolPlanningMode`、`maxToolCallsPerTurn`、`maxToolRounds`、`hermesMaxToolRounds` |
-| 文字與輸出大小 | `textInputLimitUTF16`、`contextWindow`、`maxOutputTokens` |
-| 模型 | `modelMappings`、`optionalModelCapabilities` |
-| 程序與檔案 | `listenAddress`、`configPath`、`tokenCachePath`、`sessionCachePath`、`debugLogPath` |
-| 網路與 OAuth | `outboundProxy`、`clientId`、`authority`、`redirectUri`、`scope` |
+| 相容入口 | `chatMode`、Hermes / Memory compatibility flags |
+| Queue / request timeout | interactive / memory queue timeout、chat / image timeout |
+| Tools | planning mode、tool-call ceiling、generic / Hermes tool-round ceiling |
+| 文字與模型 metadata | `textInputLimitUTF16`、`contextWindow`、`maxOutputTokens` |
+| Model routing | `modelMappings`、`optionalModelCapabilities` |
+| Listener / data path | listen、config、cache、telemetry path |
+| Network / OAuth | proxy、client、authority、redirect、scope |
 
-`interactiveQueueTimeoutSeconds` 與 `memoryQueueTimeoutSeconds` 是 shared scheduler 真正使用的一般 admission 等待預算。兩者預設都是 `120` 秒，合法範圍為 `1..=600`。它們不會取代 breaker cooldown：shared breaker 明確處於 `OPEN` 時，interactive traffic 會立即投影成 `429 upstream_throttle` 並附 `Retry-After`，不會先耗掉一般 queue timeout。
+Exact field list 以 `GET /api/admin/settings` 與 current source schema 為準；不要從舊文件複製一份 stale settings catalog。
 
-## 首次啟動
+## Effective value 怎麼決定
 
-1. 讓 `M365_DATA_DIR` 指向可寫、可持久保存的資料夾。
-2. 可用一次性 `M365_ADMIN_PASSWORD` 建立首次登入。
-3. 第一次成功登入後，立即換成持久管理員密碼。
-4. 若設定 `M365_DEBUG_LOG`，privacy telemetry 寫到該路徑；否則先使用已保存的 `debugLogPath`，再 fallback 到 data directory 下的 `debug-telemetry.jsonl`。
+設定不是全部同一 precedence：
 
-Telemetry path 必須是 `.jsonl`；舊 Synology `log.db` 明確不是 current truth，也不會被 reader 接受。Writer 使用 private `0600` append，記憶體只保留最新 1000 筆，並週期性把同一份 bounded projection 做 atomic compaction。`GET /api/admin/debug/logs`、detail 與 export 都從這個 `m365-privacy-telemetry/v1` surface 讀取，回傳 `surfaceId`、path class 與 reader/writer state，不暴露實際 private path。
+1. **一般 runtime policy**：environment 可以提供啟動預設；已持久保存的 settings 可能成為目前 effective value。
+2. **restart-bound 設定**：listener、cache path、OAuth、proxy 等可能由 process environment 控制，修改後需 restart 才生效。
+3. **direct override**：部分 safety ceiling 的 environment override 會直接覆蓋 UI 保存值。
 
-每筆 request 只記錄封閉分類或 bounded metadata：route/class、queue admission、breaker state/projection、spill decision/reason、UTF-16 前後值與 size class、recall provenance class、upstream attempt/result，以及獨立隨機 correlation ID。管理 API 會從這些既有封閉欄位推導 `throttleKind`：`hard_http_429`、`soft_bot_notice`、`projected_breaker` 或 `none`；這個欄位只存在 reader projection，**不改動 durable `m365-privacy-telemetry/v1` JSONL schema**，因此舊 binary rollback 仍能讀取既有 telemetry。Caller delivery 與 exact duplicate-tool suppression 只保留為 live transport projection，刻意不寫進 durable v1 record，以維持相同 rollback 相容保證；process restart 後，歷史 record 會顯示 `not_evaluated`／`false`。Legacy post-policy 欄位只作 read-and-reset 相容資料；M365 不再產生 governance decision。Dynamic route segment 一律寫成封閉 template；例如 artifact capability 只會記成 `/v1/artifacts/{capability}/content`。不得記錄 prompt/transcript、memory/attachment body、token/cookie/header、tenant/account/user identity、conversation/session identity、private URL 或 raw upstream body。這是 forensic projection，不是 durable lifecycle authority。
+因此判斷 current behavior 時，看管理 API 的 effective/source projection，不只看 `.env` 或 `settings.json` 其中一份。
 
-## 值的優先順序
+## Stable safety invariants
 
-設定不是全部用同一套規則：
+以下是 current Rust source 的 transport safety contract，不是可任意調大的 tuning suggestion：
 
-| 類型 | 生效規則 |
-|---|---|
-| 一般 runtime，例如 chat/image timeout | environment 提供啟動預設；`settings.json` 已保存時，保存值是 current effective value |
-| 需要重啟，例如 listen、cache path、OAuth、proxy | 明確 process environment 優先；沒有 env 才用保存值 |
-| 直接 override，例如 tool-call / tool-round env | process environment 永遠蓋過 UI 保存值 |
+| 項目 | Current invariant |
+|---|---:|
+| Shared in-flight | 2 |
+| Memory in-flight | 1 |
+| Background/control in-flight | 1 |
+| Memory waiting buffer | 8 FIFO |
+| Interactive waiting buffer | bounded |
 
-常見環境變數：
+舊相容欄位即使仍可讀，也不能繞過這些 hard safety invariants。
 
-- `M365_CHAT_TIMEOUT_SECONDS`
-- `M365_IMAGE_TIMEOUT_SECONDS`
-- `M365_MAX_TOOL_CALLS_PER_TURN`
-- `M365_MAX_TOOL_ROUNDS`
-- `M365_HERMES_MAX_TOOL_ROUNDS`
-- `M365_DATA_DIR`
-- `M365_PUBLIC_ORIGIN`
-- `M365_DEBUG_LOG`
+預設普通 queue timeout 是 120 秒；effective value 可由 runtime settings 調整。Breaker `OPEN` 時不等普通 queue deadline，直接投影 `429 upstream_throttle`。
 
-`M365_READY_TIMEOUT` 只控制部署腳本，不是 API 產品設定。
+## 文字與 tool ceilings
 
-## 同帳號流量：不可調高的硬限制
+Current defaults：
 
-同一 Microsoft 帳號固定遵守：
+| 設定 | 預設 |
+|---|---:|
+| `textInputLimitUTF16` | `128000` UTF-16 code units |
+| generic / Memory tool rounds | `16` |
+| Hermes tool rounds | `128` |
 
-| 項目 | 上限／順序 |
-|---|---|
-| 總執行中請求 | 2 |
-| Memory | 1 |
-| P2 autonomous / control-plane | 1 |
-| 優先順序 | P0 使用者 > P1 Memory > P2 背景／控制面 |
-| Memory 等待 buffer | 8，FIFO |
+`contextWindow` 是 token-oriented model metadata，不能和 `textInputLimitUTF16` 混為同一限制。
 
-`interactiveMaxConcurrent`、`memoryMaxConcurrent` 與 `interactivePriorityHoldoffSeconds` 為舊 API 相容欄位，不能把上述硬限制拉高。普通 Memory priority 直接由 queue policy 決定。
+Tool round ceiling 是 runaway protection。耗盡時回 terminal `tool_round_limit`，不是要求 Gateway 自動開新 execution。
 
-`memoryBackoffInitialSeconds` / `memoryBackoffMaxSeconds` 也只保留相容性。Shared breaker 使用固定 cooldown：
+## Telemetry 與 privacy
 
-```text
-1125 → 2250 → 4500 → 9000 → 18000 秒
-```
+Current privacy telemetry 使用封閉 schema，只保存 bounded 分類與不可逆／非敏感 metadata，例如：
 
-成功 probe 後另有固定 60 秒安靜觀察。這不是第一階 cooldown，也沒有對應的新設定。`compatibilityTraffic` 會顯示 `recoveryObservationSeconds`、`recoveryObservationRemainingSeconds`、`lastRecoveryMode`、`lastRecoveryReason` 與 `lastRecoveryAt`。
+- route template / workload class；
+- queue admission 與 breaker projection；
+- spill decision、size class、UTF-16 前後值；
+- provenance class；
+- upstream attempt / result class；
+- 隨機 correlation ID。
 
-Recovery 期間管理員仍可呼叫：
+它不能保存：
 
-```http
-POST /api/admin/traffic/recovery
-Content-Type: application/json
+- prompt / transcript / Memory body；
+- attachment body；
+- token、cookie、authorization header；
+- account / tenant / user identity；
+- raw conversation / session identity；
+- private URL / raw upstream body。
 
-{"action":"complete"}
-```
+Dynamic URL 必須投影成 template，例如 `/v1/artifacts/{capability}/content`，不能把 capability 寫進 telemetry。
 
-這是人工 fallback；自動完成仍必須先有成功 probe、安靜觀察與零衝突流量。
+Telemetry 是 forensic projection，不是 Task / Run lifecycle authority。
 
-## Hindsight webhook secret
+## Breaker 與 recovery
 
-`M365_HINDSIGHT_WEBHOOK_SECRET` 用來驗證 Hindsight callback 的 HMAC。它是 secret：不出現在管理 UI、handoff、log 或 error body。
+Shared breaker policy 是產品 transport 邏輯，不應靠 caller 自訂 arbitrary cooldown 破壞。
 
-Hermes / Hindsight 的完整基線只放在 [`hermes-hindsight.md`](hermes-hindsight.md)，避免兩份設定互相漂移。
+管理員可以從 `GET /api/admin/traffic` 讀：
+
+- circuit state；
+- `Retry-After` / remaining cooldown；
+- recovery observation；
+- queue / in-flight projection；
+- last recovery mode / reason。
+
+只有在 `RECOVERY` 合法狀態時，`POST /api/admin/traffic/recovery` 的 `{"action":"complete"}` 才能作人工 fallback。這不會把未知 request outcome 宣告成功。
+
+## Secrets
+
+常見 machine secret：
+
+- `M365_HINDSIGHT_WEBHOOK_SECRET`：Hindsight webhook HMAC；
+- `M365_HERMES_RECALL_PROVENANCE_SECRET`：Hermes ↔ M365 provenance HMAC。
+
+Secret 不進管理 UI明文、log、handoff、Issue 或 error body。
+
+其他 environment variable 名稱可以從 current config/source查，但 public docs 不應列 private value，也不應把某台 Production 的環境當成產品預設。
+
+## 哪些設定要去哪裡看
+
+- Hermes / Hindsight integration policy：[`hermes-hindsight.md`](hermes-hindsight.md)
+- 429 / breaker / checkpoint errors：[`api-contracts.md`](api-contracts.md)
+- Web model capability evidence：[`model-capabilities.md`](model-capabilities.md)
+- 私人 Production 操作：本機 `m365-ops`，不在 public repo 文件

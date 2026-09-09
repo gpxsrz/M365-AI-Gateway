@@ -2,76 +2,114 @@
 
 ## 30 秒看懂
 
-> AI Agent：先讀本節和「最重要的邊界」。只有要選 API 時才讀入口表；只有要查精確格式時才前往 `api-contracts.md`。
-
-Gateway 是呼叫端與 Microsoft 365 Copilot 中間的翻譯與安全層。
+> 只想知道「M365 負責什麼」就讀本節和責任表。要查 wire shape 才去 `api-contracts.md`；要查 ACP lifecycle 才切 standalone ACP repo。
 
 ```text
-你的工具 → M365 AI Gateway → Microsoft 365 Copilot
+OpenAI / Anthropic / MCP caller
+            │
+            ▼
+     M365 AI Gateway
+ provider / transport / safety adapter
+            │
+            ▼
+   Microsoft 365 Copilot / ChatHub
 ```
 
-它做四件事：轉換 API 格式、管理短期續接、保護檔案、避免同一帳號被太多工作同時壓垮。
+M365 AI Gateway 做四件核心工作：
 
-## 最重要的邊界
+1. API format / model route 轉接；
+2. 單一 Microsoft 帳號的 transport admission、throttle、retry；
+3. attachment / artifact / private URL 保護；
+4. 安全 continuation 需要的 transport checkpoint、identity 與 provenance。
 
-- 一個執行中的 Gateway 只服務一個 Microsoft 365 帳號。
-- 長期對話與記憶由呼叫端、Hermes 或 Hindsight 保存。Gateway 只留必要的短期續接資料。
-- Agent governance 的 authoritative lifecycle state 只由 standalone Agent Control Plane（ACP）持有；M365 Gateway 是 adapter / transport / projection surface，不持有第二份 Task/Run authority。Hermes、Hindsight、Semantica 與其他 upstream core 都是 immutable upstream。M365 integration seam 見 [`agent-governance.md`](agent-governance.md)。
-- Gateway 是 Rust 程式。`m365-native` 舊名稱為了相容性保留，不代表產品仍使用舊品牌。
-- 這是社群專案，不是 Microsoft 官方產品。
+它不持有 Task / Run semantic lifecycle authority；那是 standalone ACP。
 
-## 入口怎麼選
+## 責任邊界
 
-| 你要做的事 | 入口 | 白話說明 |
-|---|---|---|
-| Goal Judge 等輔助／控制工作 | `/v1/chat/completions` | 每次都是新的，不沿用 Agent 的執行證據 |
-| Hermes / Atlas Agent | `/hermes/v1/chat/completions` | 會保存工具續接與 transport evidence；Task/Run completion 由 ACP 判定 |
-| Hindsight Memory | `/memory/v1/chat/completions` | 走背景 Memory 優先順序 |
-| OpenAI Responses 格式 | `/v1/responses` | 把 Responses request 轉到同一聊天核心 |
-| Anthropic Messages 格式 | `/v1/messages` | 回傳 Anthropic 形狀；串流是完成後再轉成事件 |
-| 圖片生成 | `/v1/images/generations` | 使用 Microsoft 圖片能力並保護結果網址 |
-| MCP | `/v1/mcp` | 讓 MCP client 列出與呼叫 Gateway 工具 |
-
-各 profile 的模型清單分別在 `/v1/models`、`/hermes/v1/models`、`/memory/v1/models`。
-
-## 一筆請求怎麼走
-
-1. 驗證管理 session 或 API key。
-2. 檢查輸入大小、角色與工具資料。
-3. 依「使用者、Memory、背景 Agent」安排共享帳號的順序。
-4. 必要時讀取短期 checkpoint，接回上一輪工具結果。
-5. 建立新的 Microsoft ChatHub 連線；Private mode 每次都重新帶上 `disableMemory=1`。
-6. 把 Microsoft 回應轉成呼叫端要求的格式。
-7. 只有看到完整 transport result，才保存可續接狀態；Gateway 不宣告 Agent Task/Run 完成。
-
-一般 `/v1/chat/completions` 不會沿用 Hermes 的 transport ledger，也不會把 provider 的 `done` 或 `verified` content 改寫成 Task/Run verdict。
-
-## 串流與工具
-
-- 串流中的半句話不是完成；最後事件才算。
-- 要求 usage 時，最後會在唯一的 `[DONE]` 前多一個只有 usage 的 chunk。
-- 工具續接必須保留角色、tool call ID 與 arguments，不能猜測重建。
-- 多工具平行呼叫只允許明確標示為唯讀的工具；有修改風險時降回一次一個。
-
-## 資料不會混在一起
-
-| 資料 | Gateway 的處理方式 |
+| 類型 | M365 的責任 |
 |---|---|
-| 一般聊天 | Private mode 要求不建立一般歷史，但不保證 Microsoft 零保留 |
-| 文件與圖片 | 可能使用 OneDrive／SharePoint 暫存，和聊天歷史是不同邊界 |
-| 登入權限 | 只做一次 Microsoft 登入；檔案需要的短效 IC3 token 由同一份主要更新憑證取得 |
-| Code Interpreter 檔案 | 先由 Gateway 以已登入狀態取回，再存入本機私有區域 |
-| 下載網址 | 對外只給短效 capability URL，不直接洩漏 Microsoft 暫時網址 |
-| Checkpoint | 只保存續接需要的摘要與識別，不保存完整私密內容 |
+| Provider | model catalog、reasoning/tone mapping、ChatHub request/response transport |
+| Auth | Microsoft sign-in、resource token、API/admin auth boundary |
+| Files | upload/grounding、Vision input、protected artifact materialization |
+| Safety | input limit、tool validation、structured-output validation、private telemetry |
+| Scheduling | shared-account queue、Memory priority、breaker、retry-before-send |
+| Continuation | transport checkpoint、tool evidence、replay fence、Hermes provenance |
+| Governance | 只提供 intent/evidence/projection seam；不持有 Task/Run canonical state |
 
-## 兩種常被混淆的大小
+Hermes、Hindsight、Semantica 是 external upstream；M365 相容性不能靠修改它們的 core 成立。
 
-`textInputLimitUTF16=128000` 是送出文字的長度上限，用 UTF-16 單位計算。模型的 context window 是 token 上限。兩者不是同一個數字，也不能直接互換。
+## API surface 怎麼分
 
-## 需要更多細節時
+| 需求 | Surface | 重點 |
+|---|---|---|
+| Auxiliary / control Chat Completions | `/v1/chat/completions` | ForceNew / untracked transport |
+| Hermes / Atlas | `/hermes/v1/chat/completions` | Hermes execution identity / checkpoint seam |
+| Hindsight Memory | `/memory/v1/chat/completions` | Memory queue class；無 Hermes authority |
+| Responses | `/v1/responses` | 轉到相同 transport core，保留 Responses shape |
+| Anthropic Messages | `/v1/messages` | Anthropic-compatible projection |
+| Images | `/v1/images/generations` | Microsoft image capability，availability 可變 |
+| MCP | `/v1/mcp` | modern HTTP；legacy client 配對使用 `GET /v1/mcp/sse` + `POST /v1/mcp/message` |
 
-- 精確 request、stream 與錯誤：[`api-contracts.md`](api-contracts.md)
-- Agent lifecycle、blocker、completion、handoff 與 policy：[`agent-governance.md`](agent-governance.md)
+Model catalog 依 surface 提供 `/v1/models`、`/hermes/v1/models`、`/memory/v1/models`。
+
+## 一筆 request 怎麼走
+
+典型流程：
+
+1. 驗證 API key / management auth boundary。
+2. 驗證 role、tool、stream option、structured-output 與輸入大小。
+3. 對需要的 execution surface建立／驗證 transport identity與 provenance。
+4. 經 shared-account scheduler admission。
+5. 若有合法 checkpoint，確認 history / tool evidence可以安全 continuation。
+6. 建立 ChatHub transport；Private mode request帶上對應 disable-memory要求。
+7. 將 upstream event 投影成 caller要求的 API shape。
+8. 在 final transport boundary完成 checkpoint / delivery / artifact一致性檢查。
+
+任何「provider final」都只代表 transport 進到 final boundary，不代表 ACP acceptance contract成立。
+
+## Transport identity 與 checkpoint
+
+Checkpoint 只保存安全續接需要的 identity / digest / typed evidence，不應保存完整私密 transcript當長期 memory。
+
+如果 upstream request 已開始而結果未知，Gateway 會把它視為可能已執行：
+
+- 不盲目 replay；
+- 不讓 destructive checkpoint mutation跳過它；
+- 要求 reconciliation或 authenticated recovery；
+- exact execution identity被 terminal-unknown fence 後，新工作必須用新 identity。
+
+這和 ACP Task / Run state 是兩個不同 durable domain。
+
+## 資料邊界
+
+| 資料 | 處理方式 |
+|---|---|
+| 一般聊天 | Private mode要求不上一般 history；不保證 Microsoft零保留 |
+| 文件 | 可經 Microsoft file/grounding transport；與聊天 history不同 |
+| 圖片 | image transport；`response_format=url` 可能回 upstream image URL，不能套用 Code Interpreter artifact 的本機 capability 保證 |
+| Code Interpreter artifact | Gateway先取回本機 private store，再給短效 capability |
+| 受保護文件／Code Interpreter upstream URL | 不直接投影給 caller |
+| Transport checkpoint | 保存 continuation identity/evidence，不是 user memory store |
+| Privacy telemetry | bounded分類；不保存 prompt、credential、raw private URL |
+
+## Shared-account scheduling
+
+一個 Gateway 對一個 Microsoft 365 帳號。Current transport 對 shared、Memory、background/control 與 waiting queue 都有固定安全上限；**精確 current 數字只在 [`runtime-settings.md`](runtime-settings.md) 維護**。
+
+這是避免同一帳號被並行工作壓垮的 transport policy，不是 ACP agent scheduling authority。
+
+## 大小不要混在一起
+
+`textInputLimitUTF16` 是 transport 前的文字長度政策，單位是 UTF-16 code units；精確 current default/effective value 只在 [`runtime-settings.md`](runtime-settings.md) 維護。
+
+`context_window` / `max_input_tokens` 是 model token-oriented metadata。
+
+Attachment storage / grounding又是第三種大小與 retrieval cost。三者不能互換。
+
+## 接著讀哪裡
+
+- M365 ↔ ACP：[`agent-governance.md`](agent-governance.md)
+- Exact wire / errors / retry：[`api-contracts.md`](api-contracts.md)
 - Hermes / Hindsight：[`hermes-hindsight.md`](hermes-hindsight.md)
-- 設定：[`runtime-settings.md`](runtime-settings.md)
-- 安全與保留限制：[`../../SECURITY.md`](../../SECURITY.md)
+- Runtime settings：[`runtime-settings.md`](runtime-settings.md)
+- Security：[`../../SECURITY.md`](../../SECURITY.md)

@@ -1,61 +1,77 @@
-# Rust 改寫對照
+# Rust 與歷史 Go parity
 
 ## 30 秒看懂
 
-> AI Agent：先讀「這次抓到的偏差」。要查單一功能才讀對照表；要發布才讀最後的 gate。Current source tree 已是 Rust-only。
+> Current source tree是Rust-only。只有你需要回答「原Go行為是否有不同」時，才讀歷史Go commit；不要把Go source恢復回current build tree。
 
-Rust 是唯一 release／container 建置來源。原 Go 基準不再保留在 current tree；需要回答「原本真的怎麼做」時，唯讀查 Git history 的固定歷史 commit `f038c86e62c7390c442f30043715255576db4e19`，不能憑印象補流程。
+Rust是目前唯一release / container source。
 
-目前已對到的核心原則：
+歷史Go實作只是一個固定parity reference：
 
-- 一個 Gateway 只對一個 Microsoft 365 帳號。
-- Microsoft 瀏覽器登入只有一次。
-- 檔案需要的 IC3 token 由同一份主要更新憑證取得。
-- ChatHub payload、stream、tools、checkpoint 與錯誤形狀要由測試鎖住。
-- 本機 PASS、live PASS、CI 與 Production 是四個不同 gate。
+```text
+f038c86e62c7390c442f30043715255576db4e19
+```
 
-## 這次抓到的偏差
+它可以回答「當時Go怎麼做」，不能自動證明current Rust / Microsoft live / Production現在怎麼做。
 
-先前 Rust 版本自行加入第二段 Teams OAuth。這不在原 Go 流程裡，因此使用者按一次登入後，畫面會無聲等待第二段授權。
+## Parity不是逐行翻譯
 
-另一個問題是 artifact 測試只證明「找到 metadata」，沒有證明「真的讀到檔案 bytes」。真實 Microsoft 回傳的網址在 `/views/original` 後多一個顯示檔名；直接抓整條網址會 404，下載端點要保留 query、移除那一段顯示檔名。
+要保留的是observable contract與安全invariant，例如：
 
-串流還有一個生命週期偏差：Rust 曾把上游工作放進獨立 task，呼叫端斷線後仍會占住帳號容量；原 Go request context 會跟著客戶端取消。Rust 現在也會在 response body 被丟棄時取消上游工作。
+- 一個Gateway對一個Microsoft 365帳號；
+- Microsoft登入只有一份主要credential lifecycle；
+- document / image / artifact data boundary分開；
+- caller取消stream時不要讓upstream work無限留在背景；
+- tool ID / arguments / checkpoint identity不能猜測重建；
+- Private mode每個新ChatHub transport都帶必要disable-memory intent；
+- protected upstream URL不能直接洩漏給caller；
+- unknown external outcome不能盲目replay。
 
-修正後的共同路徑是：
+Rust可以用更安全或更清楚的implementation實現同一contract；不需要複製Go內部結構。
 
-1. 只保存主要 Microsoft refresh credential。
-2. 需要檔案時，用它換取同帳號的短效 IC3 access token。
-3. 只接受核准的 HTTPS host 與 artifact path。
-4. 只移除一個顯示檔名；更深或不明路徑一律拒絕。
-5. 私密上游網址與原始 artifact event 不交給 API 呼叫端。
-6. 同一份 refresh credential 的一般更新與資源 token 更新共用鎖，避免旋轉憑證互撞。
+## 什麼時候才查歷史Go
 
-## 功能對照
+只有這些情況值得打開固定historical commit：
 
-| Surface | Rust 保留的契約 | 最小證據 |
-|---|---|---|
-| OpenAI Chat Completions | non-stream／SSE、tools、usage、單一 `[DONE]`、斷線取消 | adapter 與 route tests |
-| Responses | parent、tool result、parallel calls、reasoning／media events | continuation tests |
-| Anthropic Messages | error、tool／image round trip、posthoc stream | adapter tests |
-| Hermes | provenance、transport ledger、多輪 tools、排程；歷史 completion-guard corpus 僅供 salvage | full continuation tests |
-| Hindsight | retain／recall／reflect、breaker、webhook、barrier | Memory profile tests |
-| OAuth | 一次登入、帳號綁定、refresh rotation | browser + auth lifecycle tests |
-| Code Interpreter | 私有暫存、短效下載、stream holdback、重啟續取 | deterministic + isolated live |
-| MCP | modern HTTP 與 legacy SSE 邊界 | route tests + official Python client |
-| Admin | bootstrap、密碼、API key、設定來源、redaction | HTTP tests + browser path |
-| Release | pinned toolchain、locked build、Rust container | local release gate + exact-head CI |
+1. current Rust行為和已知user-facing contract衝突；
+2. upstream interaction缺少明確spec，需要確認舊產品行為；
+3. migration regression需要判斷Rust是否漏掉原有安全邊界。
 
-## 發布 gate
+查到historical behavior後，仍要用current Rust test / runtime evidence重新證明，不把Go PASS直接繼承。
 
-每個候選版本都要依序完成：
+## Current Rust surface
 
-1. Rust format、完整 tests、Clippy、release build、diff check。
-2. 若 parity 判斷需要原 Go 行為，只從固定歷史 commit 唯讀查證，不恢復 Go 原碼到 current tree。
-3. Serena 與 Code Review Graph 檢查受影響路徑；graph 的零影響不能取代原碼搜尋。
-4. Commit 後，以 exact head 跑 GitHub CI 與 container build。
-5. 分別讀回 public ref、NAS、VM 與 release artifact。
-6. 建立可驗證 recovery，再部署 Production。
-7. 以低頻 live request、服務狀態、binary／Web hash 與 rollback 證據收尾。
+| Surface | Current Rust contract |
+|---|---|
+| Chat Completions | non-stream / SSE、tools、usage、input policy、checkpoint |
+| Responses | Responses request/continuation projection |
+| Anthropic | Messages / tools / media projection |
+| Hermes | execution provenance、transport ledger、checkpoint / replay safety |
+| Hindsight | Memory queue、overflow、webhook、durability barrier |
+| OAuth | single-account credential lifecycle |
+| Files / Vision | validated transport與grounding |
+| Code Interpreter | protected artifact materialization / local capability |
+| MCP | modern HTTP與legacy compatibility boundary |
+| Admin | bootstrap、API key、settings、privacy-safe diagnostics |
+| Release | locked Rust build、release unit、rollback contract |
 
-任何一步失敗，都只能回報部分完成。精確結果放在 CI、Git history 與部署讀回，不把會過期的 PID、container ID 或帳號資料寫進 current 文件。
+Task / Run governance不在這張表；它屬於standalone ACP。
+
+## Release evidence
+
+Current Rust candidate要依變更範圍取得適用evidence：
+
+1. source / formatting / tests / clippy / release build；
+2. architecture / contract regression；
+3. independent review（若controlling behavior改變）；
+4. publication / exact-head CI（若本輪發布）；
+5. artifact / Production readback（若本輪部署）；
+6. live provider check只在accepted scope需要時執行。
+
+Local、CI、live與Production是不同evidence layers。
+
+## 不要把migration history留在current page
+
+過去Rust rewrite曾抓到哪些bug、哪次canary失敗、哪個舊binary在Production，都應留在Git/history evidence，不再當current usage guide的一部分。
+
+Current capability讀 [`compatibility.md`](compatibility.md)，歷史入口讀 [`../history/README.md`](../history/README.md)。
