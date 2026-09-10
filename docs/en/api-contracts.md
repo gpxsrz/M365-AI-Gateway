@@ -94,6 +94,8 @@ Spill does not remove the hard limit. Attachment grounding is also neither zero 
 ## Tools and structured output
 
 - Parallel tool calls are allowed only when every selectable tool is explicitly `annotations.readOnlyHint=true` and there is no mutating/destructive signal.
+- The multi-message role envelope marks caller-managed tool calls/results with `execution_surface=caller_tool`. This is transport provenance, not proof of Microsoft native execution or Task completion; native events must not replace caller-tool evidence.
+- A completed identical read-only caller call may be issued again with a new call identity when the current tool contract explicitly proves it safe; pending/unknown, not-explicitly-read-only, and same-batch duplicates remain fail closed.
 - `tool_calls[].id` must match the later `tool_call_id` exactly.
 - Arguments, result bytes, and digests must not be guessed or silently truncated/reconstructed across repair or checkpoints.
 - A structured tool result explicitly marked partial, cancelled/canceled, incomplete, or `complete=false` does not become success merely because `exit_code=0`.

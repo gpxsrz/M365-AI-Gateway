@@ -142,10 +142,14 @@ impl AgentLedger {
             .map(|evidence| evidence.id.as_str())
     }
 
-    pub(crate) fn filter_known_calls(
+    pub(crate) fn filter_known_calls<F>(
         &self,
         calls: Vec<DetectedToolCall>,
-    ) -> (Vec<DetectedToolCall>, bool) {
+        allow_completed_reissue: F,
+    ) -> (Vec<DetectedToolCall>, bool)
+    where
+        F: Fn(&str) -> bool,
+    {
         let mut batch = HashSet::new();
         let mut suppressed = false;
         let calls = calls
@@ -161,13 +165,25 @@ impl AgentLedger {
                     .get("arguments")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let identity = format!("{name}\0{}", arguments_digest(arguments));
-                let duplicate = !batch.insert(identity)
-                    || self.completed.iter().chain(&self.pending).any(|evidence| {
-                        is_digest(&evidence.arguments_digest)
-                            && evidence.name == name
-                            && evidence.arguments_digest == arguments_digest(arguments)
-                    });
+                let argument_digest = arguments_digest(arguments);
+                let identity = format!("{name}\0{argument_digest}");
+                let duplicate_in_batch = !batch.insert(identity);
+                // A pending effect is never safe to replay. A completed read-only
+                // effect may be a new observation, but only its caller contract
+                // can authorize that distinction.
+                let duplicate_pending = self.pending.iter().any(|evidence| {
+                    is_digest(&evidence.arguments_digest)
+                        && evidence.name == name
+                        && evidence.arguments_digest == argument_digest
+                });
+                let duplicate_completed = self.completed.iter().any(|evidence| {
+                    is_digest(&evidence.arguments_digest)
+                        && evidence.name == name
+                        && evidence.arguments_digest == argument_digest
+                });
+                let duplicate = duplicate_in_batch
+                    || duplicate_pending
+                    || (duplicate_completed && !allow_completed_reissue(name));
                 suppressed |= duplicate;
                 !duplicate
             })
@@ -182,7 +198,7 @@ impl AgentLedger {
             "repeated_call": self.repeated_call,
         });
         format!(
-            "Use only this compact transport evidence. Completed tool responses are retained evidence; pending calls have unknown outcomes because no matching tool result was returned. Do not automatically issue the same name and arguments as any completed or pending call. This ledger does not decide whether an agent task is complete.\nEVIDENCE_LEDGER: {evidence}"
+            "Use only this compact transport evidence. Completed tool responses are retained evidence; pending calls have unknown outcomes because no matching tool result was returned. Do not automatically reissue the same name and arguments as a completed or pending call unless the current caller tool contract explicitly marks it read-only and this is a new readback. This ledger does not decide whether an agent task is complete.\nEVIDENCE_LEDGER: {evidence}"
         )
     }
 
@@ -619,7 +635,7 @@ mod tests {
             kind: "function".to_owned(),
             function: json!({"name": "read", "arguments": " { \"path\" : \"a\" } "}),
         };
-        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate]);
+        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate], |_| false);
         assert!(calls.is_empty());
         assert!(suppressed);
     }
@@ -899,7 +915,7 @@ mod tests {
             kind: "function".to_owned(),
             function: json!({"name": "deploy", "arguments": "{}"}),
         };
-        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate]);
+        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate], |_| false);
         assert!(calls.is_empty());
         assert!(suppressed);
     }
@@ -921,9 +937,46 @@ mod tests {
                 "arguments": "{\"task_id\":\"t_c3de88aa\"}"
             }),
         };
-        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate]);
+        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate], |_| false);
         assert_eq!(calls.len(), 1);
         assert!(!suppressed);
+    }
+
+    #[test]
+    fn read_only_completed_call_can_be_reissued_but_pending_and_batch_duplicates_cannot() {
+        let completed = execution_ledger(
+            &AgentLedger::default(),
+            &[
+                OpenAiMessage::text("user", "Read the current file."),
+                call("c1", "read_file", r#"{"path":"report.txt"}"#),
+                result("c1", "report-v1"),
+            ],
+        );
+        let candidate = DetectedToolCall {
+            id: "c2".to_owned(),
+            kind: "function".to_owned(),
+            function: json!({
+                "name": "read_file",
+                "arguments": "{\"path\":\"report.txt\"}"
+            }),
+        };
+        let (calls, suppressed) =
+            completed.filter_known_calls(vec![candidate.clone()], |name| name == "read_file");
+        assert_eq!(calls.len(), 1);
+        assert!(!suppressed);
+
+        let pending = build(&[call("c1", "read_file", r#"{"path":"report.txt"}"#)]);
+        let (calls, suppressed) =
+            pending.filter_known_calls(vec![candidate.clone()], |name| name == "read_file");
+        assert!(calls.is_empty());
+        assert!(suppressed);
+
+        let (calls, suppressed) = completed
+            .filter_known_calls(vec![candidate.clone(), candidate], |name| {
+                name == "read_file"
+            });
+        assert_eq!(calls.len(), 1);
+        assert!(suppressed);
     }
 
     #[test]

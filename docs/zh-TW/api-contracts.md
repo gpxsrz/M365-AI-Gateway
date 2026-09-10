@@ -94,6 +94,8 @@ Spill 不移除 hard limit。Attachment grounding 也不代表 model-context cos
 ## Tools 與 structured output
 
 - 只有所有可選 tools 都明確 `annotations.readOnlyHint=true`，且沒有 mutating/destructive 訊號時，才允許 parallel tool calls。
+- 多訊息 role envelope 會在 caller-managed tool call/result 上標示 `execution_surface=caller_tool`。這是 transport provenance，不是 Microsoft native execution 或 Task completion 的證明；native event 不得取代 caller tool evidence。
+- 已有完成證據的相同 read-only caller call，在目前 tool contract 明確安全時可以用新的 call identity 做合法 readback；pending/unknown、未明確 read-only 或同一批次重複仍會 fail closed。
 - `tool_calls[].id` 與後續 `tool_call_id` 必須一致。
 - Arguments、result bytes 與 digest 不能在 repair / checkpoint 中被猜測或截半後補造。
 - Structured tool result 若明確標示 partial、cancelled/canceled、incomplete 或 `complete=false`，不能因 `exit_code=0` 就升格成成功。
