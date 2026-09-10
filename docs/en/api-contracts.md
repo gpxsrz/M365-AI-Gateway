@@ -85,7 +85,7 @@ Typical `spill_reason` values cover full attachment slots, no safe candidate, in
 
 When bulk spill was attempted but the following full-context fallback also fails, the public error preserves the existing first-stage `spill_reason` for compatibility and adds `fallback_reason` when the second-stage result is available. These fields must not be conflated.
 
-Generated fallback attachments use content identity and conversation binding. A retry of identical content has a predictable identity; changed content or conversation requires a new version or revalidation. A generated TXT cannot masquerade as an ordinary user attachment or be recursively packed into the next document. Existing user attachments are not discarded to free a slot; full slots, missing/expired files, cancellation, and upload failure remain typed reduction/attachment errors.
+Generated fallback attachments use content identity plus conversation-and-session binding. A retry of identical content has a predictable identity; changed content, conversation, or session requires a new version or revalidation. A generated TXT cannot masquerade as an ordinary user attachment or be recursively packed into the next document. Existing user attachments are not discarded to free a slot; full slots, missing/expired files, cancellation, and upload failure remain typed reduction/attachment errors.
 
 Memory traffic does not auto-spill. Oversized input preserves:
 
@@ -107,7 +107,7 @@ Spill does not remove the hard limit. Attachment grounding is also neither zero 
 
 The full-context TXT is a transport projection. It does not prove that the model read or correctly used the document, and HTTP 200, upload success, or a model self-report is not semantic acceptance. Deterministic qualification and real-user acceptance remain separate.
 
-The admin diagnostic surface exposes bounded live fields such as `transportProjection`, `wireBeforeUtf16`, `inlineCoreUtf16`, `wireAfterUtf16`, generated-document bytes/message count/state, and `fallbackFailure`. Durable v1 JSONL retains compatible fields such as `spillReason=full_context_document` but never stores the document body. After a process restart, missing live projection must not be treated as model acceptance evidence.
+The admin diagnostic surface exposes bounded live fields such as `transportProjection`, `wireBeforeUtf16`, `inlineCoreUtf16`, `wireAfterUtf16`, generated-document bytes/message count/state, and `fallbackFailure`. The frozen v1 JSONL keeps its old spill taxonomy for rollback-reader compatibility; a full-context decision is exposed as `spillReason=full_context_document` only in the live diagnostic projection and never stores the document body. After a process restart, missing live projection must not be treated as model acceptance evidence.
 
 ## Tools and structured output
 

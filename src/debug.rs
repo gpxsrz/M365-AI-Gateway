@@ -893,12 +893,25 @@ impl Trace {
         utf16_after: usize,
     ) {
         self.update(|record| {
-            record.spill_decision = decision.as_str().to_owned();
-            record.spill_reason = reason.as_str().to_owned();
-            record.utf16_before = utf16_before.min(MAX_RECORDED_UTF16);
-            record.utf16_after = utf16_after.min(MAX_RECORDED_UTF16);
-            record.utf16_before_class = utf16_class(utf16_before).to_owned();
-            record.utf16_after_class = utf16_class(utf16_after).to_owned();
+            if reason == SpillReason::FullContextDocument {
+                // spillDecision/spillReason/utf16* are the frozen v1 durable
+                // fields.  The v1 rollback reader rejects a new taxonomy, so
+                // keep those fields neutral and expose the new route through
+                // the bounded live transport projection below.
+                record.spill_decision = SpillDecision::None.as_str().to_owned();
+                record.spill_reason = SpillReason::NotApplicable.as_str().to_owned();
+                record.utf16_before = 0;
+                record.utf16_after = 0;
+                record.utf16_before_class = "unknown".to_owned();
+                record.utf16_after_class = "unknown".to_owned();
+            } else {
+                record.spill_decision = decision.as_str().to_owned();
+                record.spill_reason = reason.as_str().to_owned();
+                record.utf16_before = utf16_before.min(MAX_RECORDED_UTF16);
+                record.utf16_after = utf16_after.min(MAX_RECORDED_UTF16);
+                record.utf16_before_class = utf16_class(utf16_before).to_owned();
+                record.utf16_after_class = utf16_class(utf16_after).to_owned();
+            }
         });
     }
 
@@ -923,6 +936,19 @@ impl Trace {
             record.generated_document_message_count =
                 generated_document_message_count.min(MAX_RECORDED_UTF16);
             record.generated_document_state = generated_document_state.to_owned();
+            record.fallback_failure = fallback_failure.to_owned();
+        });
+    }
+
+    pub(crate) fn transport_failed(
+        &self,
+        projection: &str,
+        wire_after_utf16: usize,
+        fallback_failure: &str,
+    ) {
+        self.update(|record| {
+            record.transport_projection = projection.to_owned();
+            record.wire_after_utf16 = wire_after_utf16.min(MAX_RECORDED_UTF16);
             record.fallback_failure = fallback_failure.to_owned();
         });
     }
@@ -1069,8 +1095,8 @@ pub(crate) async fn detail(
         "breakerState": record.breaker_state,
         "breakerProjection": record.breaker_projection,
         "throttleKind": throttle_kind(record),
-        "spillDecision": record.spill_decision,
-        "spillReason": record.spill_reason,
+        "spillDecision": public_spill_decision(record),
+        "spillReason": public_spill_reason(record),
         "utf16Before": record.utf16_before,
         "utf16After": record.utf16_after,
         "utf16BeforeClass": record.utf16_before_class,
@@ -1163,6 +1189,8 @@ pub(crate) async fn export(State(gateway): State<Arc<Gateway>>) -> Response {
 
 fn public_record(record: &Record) -> serde_json::Value {
     let mut value = serde_json::to_value(record).expect("typed telemetry is serializable");
+    value["spillDecision"] = serde_json::Value::String(public_spill_decision(record).to_owned());
+    value["spillReason"] = serde_json::Value::String(public_spill_reason(record).to_owned());
     value["callerDelivery"] = serde_json::Value::String(record.caller_delivery.clone());
     value["toolCallSuppressed"] = serde_json::Value::Bool(record.tool_call_suppressed);
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
@@ -1177,6 +1205,22 @@ fn public_record(record: &Record) -> serde_json::Value {
         serde_json::Value::String(record.generated_document_state.clone());
     value["fallbackFailure"] = serde_json::Value::String(record.fallback_failure.clone());
     value
+}
+
+fn public_spill_decision(record: &Record) -> &str {
+    if record.transport_projection == "full_context_document" {
+        SpillDecision::Performed.as_str()
+    } else {
+        &record.spill_decision
+    }
+}
+
+fn public_spill_reason(record: &Record) -> &str {
+    if record.transport_projection == "full_context_document" {
+        SpillReason::FullContextDocument.as_str()
+    } else {
+        &record.spill_reason
+    }
 }
 
 fn throttle_kind(record: &Record) -> &'static str {
@@ -1469,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_projection_is_visible_live_but_does_not_extend_v1_jsonl() {
+    fn transport_projection_is_visible_live_without_breaking_v1_jsonl() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("debug-telemetry.jsonl");
         let store = Store::open(path.clone(), "test").unwrap();
@@ -1500,6 +1544,10 @@ mod tests {
         let durable: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert!(durable.get("transportProjection").is_none());
         assert!(durable.get("wireBeforeUtf16").is_none());
+        assert_eq!(durable["spillDecision"], "none");
+        assert_eq!(durable["spillReason"], "not_applicable");
+        assert_eq!(durable["utf16Before"], 0);
+        assert_eq!(durable["utf16After"], 0);
 
         let live = store.records_for_test().pop().unwrap();
         assert_eq!(live["transportProjection"], "full_context_document");
@@ -1514,7 +1562,7 @@ mod tests {
         let durable = reopened.inner.lock().unwrap();
         assert_eq!(
             durable.records.front().unwrap().spill_reason,
-            "full_context_document"
+            "not_applicable"
         );
         drop(durable);
         let reopened = reopened.records_for_test().pop().unwrap();

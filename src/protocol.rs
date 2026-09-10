@@ -1,7 +1,7 @@
 use std::{
     convert::Infallible,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -718,6 +718,7 @@ async fn execute_chat_request_inner(
         prepared_attachments: Arc::new(std::sync::Mutex::new(
             crate::chathub::PreparedAttachmentState::default(),
         )),
+        upstream_start: None,
     };
     trace.upstream_attempt(UpstreamAttempt::Initial);
     if body.stream {
@@ -782,6 +783,39 @@ fn admission_result(code: &str) -> AdmissionResult {
     }
 }
 
+fn checkpoint_start_hook(
+    checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
+) -> crate::chathub::UpstreamStartHook {
+    let checkpoint = Arc::clone(checkpoint);
+    crate::chathub::UpstreamStartHook::new(move || {
+        let mut checkpoint = checkpoint
+            .lock()
+            .map_err(|_| ChatError::Protocol("checkpoint handle poisoned".to_owned()))?;
+        let Some(turn) = checkpoint.as_mut() else {
+            return Err(ChatError::Protocol(
+                "checkpoint start handle is unavailable".to_owned(),
+            ));
+        };
+        turn.mark_upstream_started()
+            .map_err(|error| ChatError::Protocol(format!("checkpoint start failed: {error}")))
+    })
+}
+
+fn take_checkpoint(checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>) -> Option<CheckpointTurn> {
+    checkpoint
+        .lock()
+        .expect("checkpoint handle poisoned")
+        .take()
+}
+
+struct CheckpointCleanup(Arc<Mutex<Option<CheckpointTurn>>>);
+
+impl Drop for CheckpointCleanup {
+    fn drop(&mut self) {
+        let _ = self.0.lock().expect("checkpoint handle poisoned").take();
+    }
+}
+
 // These are the already-resolved request parts consumed by this one terminal
 // execution seam; keeping them explicit makes accidental cross-profile reuse
 // visible at the call site.
@@ -795,7 +829,7 @@ async fn complete_chat(
     route_metadata: Value,
     artifact_origin: String,
     permit: crate::traffic::Permit,
-    mut checkpoint: Option<CheckpointTurn>,
+    checkpoint: Option<CheckpointTurn>,
     response_format: Option<ResponseFormat>,
     memory_caller_evidence: Option<String>,
     checkpoint_response_id: String,
@@ -805,6 +839,16 @@ async fn complete_chat(
     trace: crate::debug::Trace,
 ) -> Response {
     trace.caller_delivery(CallerDelivery::Failed);
+    let checkpoint = Arc::new(Mutex::new(checkpoint));
+    let _checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
+    let mut request = request;
+    if checkpoint
+        .lock()
+        .expect("checkpoint handle poisoned")
+        .is_some()
+    {
+        request.upstream_start = Some(checkpoint_start_hook(&checkpoint));
+    }
     let input_units = utf16_units(&request.text);
     let tools = request.tools.clone();
     let tool_choice = request.tool_choice.clone();
@@ -817,10 +861,10 @@ async fn complete_chat(
     let upstream_attempt_count = reset_upstream_attempts(&request);
     let mut sink = |_: StreamEvent| Ok(());
     let upstream = async {
-        if let Some(turn) = checkpoint.as_mut() {
-            turn.mark_upstream_started().map_err(|error| {
-                ChatError::Protocol(format!("checkpoint start failed: {error}"))
-            })?;
+        if !gateway.chat.upstream_start_after_preparation()
+            && let Some(start) = request.upstream_start.as_ref()
+        {
+            start.call()?;
         }
         gateway.chat.chat(account, request, &mut sink).await
     };
@@ -915,8 +959,22 @@ async fn complete_chat(
             }
             if transport.completed_call_suppressed {
                 trace.tool_call_suppressed();
-                let mut answer_request =
-                    completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
+                let mut answer_request = match completed_tool_answer_request(
+                    &fallback_request,
+                    &result,
+                    &agent_ledger,
+                    gateway.settings.current().text_input_limit_utf16,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return continuation_overflow_response(
+                            &trace,
+                            permit,
+                            overflow_context.as_ref(),
+                            error,
+                        );
+                    }
+                };
                 crate::chathub::inherit_prepared_attachments(&mut answer_request);
                 let answer_attempt_count = reset_upstream_attempts(&answer_request);
                 let mut answer_sink = |_: StreamEvent| Ok(());
@@ -1042,7 +1100,7 @@ async fn complete_chat(
                     })
                 })
                 .collect::<Vec<_>>();
-            if let Some(turn) = checkpoint
+            if let Some(turn) = take_checkpoint(&checkpoint)
                 && let Err(error) = accept_checkpoint(
                     turn,
                     &result,
@@ -1127,7 +1185,7 @@ async fn stream_chat(
     route_metadata: Value,
     artifact_origin: String,
     permit: crate::traffic::Permit,
-    mut checkpoint: Option<CheckpointTurn>,
+    checkpoint: Option<CheckpointTurn>,
     stream_options: StreamOptions,
     response_format: Option<ResponseFormat>,
     memory_caller_evidence: Option<String>,
@@ -1140,9 +1198,20 @@ async fn stream_chat(
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, Infallible>>();
     let id = format!("chatcmpl-{}", random_id());
     let created = OffsetDateTime::now_utc().unix_timestamp();
+    let checkpoint = Arc::new(Mutex::new(checkpoint));
+    let checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
+    let mut request = request;
+    if checkpoint
+        .lock()
+        .expect("checkpoint handle poisoned")
+        .is_some()
+    {
+        request.upstream_start = Some(checkpoint_start_hook(&checkpoint));
+    }
     let input_units = utf16_units(&request.text);
     let include_usage = stream_options.include_usage;
     tokio::spawn(async move {
+        let _checkpoint_cleanup = checkpoint_cleanup;
         let tools = request.tools.clone();
         let tool_choice = request.tool_choice.clone();
         let tool_limit = request.tool_call_limit;
@@ -1152,7 +1221,10 @@ async fn stream_chat(
         let fallback_request = request.clone();
         let generated_attachment_reused = request.generated_attachment_reused.clone();
         let upstream_attempt_count = reset_upstream_attempts(&request);
-        let buffer_for_tools = checkpoint.is_some()
+        let buffer_for_tools = checkpoint
+            .lock()
+            .expect("checkpoint handle poisoned")
+            .is_some()
             || !tools.is_empty()
             || response_format.is_some()
             || suppress_duplicate_tool_calls;
@@ -1195,10 +1267,10 @@ async fn stream_chat(
             Ok(())
         };
         let upstream = async {
-            if let Some(turn) = checkpoint.as_mut() {
-                turn.mark_upstream_started().map_err(|error| {
-                    ChatError::Protocol(format!("checkpoint start failed: {error}"))
-                })?;
+            if !gateway.chat.upstream_start_after_preparation()
+                && let Some(start) = request.upstream_start.as_ref()
+            {
+                start.call()?;
             }
             gateway.chat.chat(account, request, &mut sink).await
         };
@@ -1313,8 +1385,24 @@ async fn stream_chat(
                 }
                 if transport.completed_call_suppressed {
                     trace.tool_call_suppressed();
-                    let mut answer_request =
-                        completed_tool_answer_request(&fallback_request, &result, &agent_ledger);
+                    let mut answer_request = match completed_tool_answer_request(
+                        &fallback_request,
+                        &result,
+                        &agent_ledger,
+                        gateway.settings.current().text_input_limit_utf16,
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            let (wire_units, limit) = continuation_overflow_details(&error);
+                            trace.transport_failed("overflow", wire_units, "cannot_fit_inline");
+                            permit.finish(StatusCode::BAD_REQUEST, None);
+                            let sent =
+                                send_sse(&sender, continuation_overflow_value(wire_units, limit));
+                            trace.caller_delivery(stream_error_delivery(&sender, sent));
+                            let _ = send_sse_done(&trace, &sender);
+                            return;
+                        }
+                    };
                     crate::chathub::inherit_prepared_attachments(&mut answer_request);
                     let answer_attempt_count = reset_upstream_attempts(&answer_request);
                     let mut answer_sink = |_: StreamEvent| Ok(());
@@ -1556,12 +1644,17 @@ async fn stream_chat(
                         }
                     }));
                 }
-                if checkpoint.is_some() && sender.is_closed() {
+                if checkpoint
+                    .lock()
+                    .expect("checkpoint handle poisoned")
+                    .is_some()
+                    && sender.is_closed()
+                {
                     permit.finish(StatusCode::REQUEST_TIMEOUT, None);
                     trace.caller_delivery(CallerDelivery::Cancelled);
                     return;
                 }
-                if let Some(turn) = checkpoint
+                if let Some(turn) = take_checkpoint(&checkpoint)
                     && let Err(error) = accept_checkpoint(
                         turn,
                         &result,
@@ -1981,11 +2074,64 @@ fn apply_transport_projection(
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ContinuationProjectionError {
+    CannotFitInline { wire_units: usize, limit: usize },
+}
+
+fn continuation_overflow_details(error: &ContinuationProjectionError) -> (usize, usize) {
+    match error {
+        ContinuationProjectionError::CannotFitInline { wire_units, limit } => (*wire_units, *limit),
+    }
+}
+
+fn continuation_overflow_value(wire_units: usize, limit: usize) -> Value {
+    json!({
+        "error": {
+            "message": "the final-answer continuation exceeds the UTF-16 outbound message limit",
+            "type": "invalid_request_error",
+            "code": "text_input_too_large",
+            "limit_type": "outbound_message_text_utf16",
+            "limit": limit,
+            "received": wire_units,
+            "retryable_after_reduction": true,
+            "spill_attempted": false,
+            "spill_reason": "cannot_fit_inline",
+            "recommended_action": "reduce_input_or_start_a_new_user_turn"
+        }
+    })
+}
+
+fn continuation_overflow_response(
+    trace: &crate::debug::Trace,
+    permit: crate::traffic::Permit,
+    overflow_context: Option<&OverflowContext>,
+    error: ContinuationProjectionError,
+) -> Response {
+    let (wire_units, limit) = continuation_overflow_details(&error);
+    trace.transport_failed("overflow", wire_units, "cannot_fit_inline");
+    permit.finish(StatusCode::BAD_REQUEST, None);
+    if let Some(context) = overflow_context {
+        text_overflow_response(
+            context,
+            "cannot_fit_inline",
+            "輸入文字超過目前上限，且最終工具續接仍無法安全容納",
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(continuation_overflow_value(wire_units, limit)),
+        )
+            .into_response()
+    }
+}
+
 fn completed_tool_answer_request(
     request: &ChatRequest,
     result: &ChatResult,
     ledger: &crate::agent_ledger::AgentLedger,
-) -> ChatRequest {
+    text_input_limit: usize,
+) -> Result<ChatRequest, ContinuationProjectionError> {
     let mut answer = request.clone();
     answer.text = format!(
         "{}\n\n{}\n\nTRANSPORT CONTINUATION RULE: A caller tool with the same name and arguments is already represented in the conversation above. Do not reissue it. Continue the user's request using the retained tool evidence; if it is insufficient, state that plainly.",
@@ -2002,7 +2148,19 @@ fn completed_tool_answer_request(
     answer.tools.clear();
     answer.tool_choice = Value::String("none".to_owned());
     answer.tool_call_limit = 1;
-    answer
+    let wire_units = outbound_text_units(
+        &answer.text,
+        &answer.tools,
+        &answer.tool_choice,
+        answer.tool_call_limit,
+    );
+    if wire_units > text_input_limit {
+        return Err(ContinuationProjectionError::CannotFitInline {
+            wire_units,
+            limit: text_input_limit,
+        });
+    }
+    Ok(answer)
 }
 
 fn tool_round_limit_response(
@@ -2397,6 +2555,7 @@ fn internal_qualification_request(
         upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
         generated_attachment_reused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         prepared_attachments: base.prepared_attachments.clone(),
+        upstream_start: base.upstream_start.clone(),
     }
 }
 
@@ -8028,9 +8187,130 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(durable["spillReason"], "full_context_document");
+        assert_eq!(durable["spillReason"], "not_applicable");
+        assert_eq!(durable["spillDecision"], "none");
         assert!(durable.get("transportProjection").is_none());
         token_server.abort();
+    }
+
+    #[test]
+    fn completed_tool_answer_request_is_fit_checked_after_router_context() {
+        let limit = 128_000;
+        let request = ChatRequest {
+            text: "x".repeat(limit - 100),
+            ..ChatRequest::default()
+        };
+        let answer = completed_tool_answer_request(
+            &request,
+            &ChatResult::default(),
+            &crate::agent_ledger::AgentLedger::default(),
+            limit,
+        );
+        match answer {
+            Err(ContinuationProjectionError::CannotFitInline {
+                wire_units,
+                limit: actual_limit,
+            }) => {
+                assert!(wire_units > actual_limit);
+                assert_eq!(actual_limit, limit);
+            }
+            Ok(_) => panic!("over-limit follow-up was not rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_preparation_failure_aborts_before_checkpoint_upstream_start() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoints =
+            CheckpointStore::open(root.path().join("transport-checkpoints.json")).unwrap();
+        let config = Config::for_test(root.path().to_path_buf());
+        let settings = crate::runtime_settings::Store::open(root.path(), &config).unwrap();
+        let messages = vec![CheckpointMessage {
+            role: "user".to_owned(),
+            content: Value::String("prompt".to_owned()),
+            empty_recovery_synthetic: false,
+            name: String::new(),
+            tool_call_id: String::new(),
+            tool_calls: Vec::new(),
+            tool_result_is_error: false,
+        }];
+        let turn = checkpoints
+            .begin_full("hermes", "owner", "session-key", &messages, false)
+            .unwrap();
+        let holder = Arc::new(Mutex::new(Some(turn)));
+        let request = ChatRequest {
+            text: "prompt".to_owned(),
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                url: "data:text/plain;base64,YQ==".to_owned(),
+                name: "context.txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                generated_oversize_text: true,
+                ..Attachment::default()
+            }],
+            upstream_start: Some(crate::chathub::UpstreamStartHook::new({
+                let holder = Arc::clone(&holder);
+                move || {
+                    let mut holder = holder.lock().expect("checkpoint handle poisoned");
+                    holder
+                        .as_mut()
+                        .expect("checkpoint handle missing")
+                        .mark_upstream_started()
+                        .map_err(|error| ChatError::Protocol(error.to_string()))
+                }
+            })),
+            ..ChatRequest::default()
+        };
+        let hub = crate::chathub::LiveChatHub::new(settings);
+        let account = Account {
+            access_token: "access".to_owned(),
+            graph_access_token: String::new(),
+            oid: "oid".to_owned(),
+            tid: "tid".to_owned(),
+        };
+        let mut sink = |_: StreamEvent| Ok(());
+        let result = hub.chat(account, request, &mut sink).await;
+        assert!(matches!(result, Err(ChatError::Attachment { .. })));
+        drop(holder);
+        assert!(checkpoints.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upstream_start_hook_runs_after_local_payload_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::for_test(root.path().to_path_buf());
+        let settings = crate::runtime_settings::Store::open(root.path(), &config).unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let hook = crate::chathub::UpstreamStartHook::new({
+            let called = Arc::clone(&called);
+            move || {
+                called.store(true, Ordering::Release);
+                Err(ChatError::Protocol("test upstream start stop".to_owned()))
+            }
+        });
+        let request = ChatRequest {
+            text: "prompt".to_owned(),
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            upstream_start: Some(hook),
+            ..ChatRequest::default()
+        };
+        let hub = crate::chathub::LiveChatHub::new(settings);
+        let account = Account {
+            access_token: "access".to_owned(),
+            graph_access_token: String::new(),
+            oid: "oid".to_owned(),
+            tid: "tid".to_owned(),
+        };
+        let mut sink = |_: StreamEvent| Ok(());
+        let result = hub.chat(account, request, &mut sink).await;
+        assert!(called.load(Ordering::Acquire));
+        assert!(matches!(
+            result,
+            Err(ChatError::Protocol(message)) if message == "test upstream start stop"
+        ));
     }
 
     #[tokio::test]

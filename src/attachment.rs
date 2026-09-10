@@ -24,6 +24,7 @@ const DOCUMENT_CHUNK: usize = 983_040;
 pub async fn prepare(
     account: &Account,
     conversation_id: &str,
+    session_id: &str,
     attachments: &mut [Attachment],
 ) -> Result<(), ChatError> {
     if attachments.len() > MAX_ATTACHMENTS {
@@ -35,18 +36,21 @@ pub async fn prepare(
             "image" => {
                 if !attachment.doc_id.is_empty()
                     && attachment.uploaded_conversation_id == conversation_id
+                    && attachment.uploaded_session_id == session_id
                 {
                     continue;
                 }
                 attachment.doc_id.clear();
                 attachment.file_type.clear();
                 attachment.uploaded_conversation_id.clear();
-                upload_image(account, conversation_id, index, attachment).await
+                attachment.uploaded_session_id.clear();
+                upload_image(account, conversation_id, session_id, index, attachment).await
             }
             "file" => {
                 if !attachment.doc_id.is_empty()
                     && !attachment.reference_url.is_empty()
                     && attachment.uploaded_conversation_id == conversation_id
+                    && attachment.uploaded_session_id == session_id
                 {
                     continue;
                 }
@@ -54,7 +58,8 @@ pub async fn prepare(
                 attachment.reference_url.clear();
                 attachment.transport_name.clear();
                 attachment.uploaded_conversation_id.clear();
-                upload_document(account, conversation_id, attachment).await
+                attachment.uploaded_session_id.clear();
+                upload_document(account, conversation_id, session_id, attachment).await
             }
             _ => return Err(protocol("unsupported attachment type")),
         };
@@ -71,6 +76,7 @@ pub async fn prepare(
 async fn upload_document(
     account: &Account,
     conversation_id: &str,
+    session_id: &str,
     attachment: &mut Attachment,
 ) -> Result<(), ChatError> {
     if account.graph_access_token.trim().is_empty() {
@@ -172,12 +178,14 @@ async fn upload_document(
     attachment.transport_name = transport_name;
     attachment.reference_url = reference.to_string();
     attachment.uploaded_conversation_id = conversation_id.to_owned();
+    attachment.uploaded_session_id = session_id.to_owned();
     Ok(())
 }
 
 async fn upload_image(
     account: &Account,
     conversation_id: &str,
+    session_id: &str,
     index: usize,
     attachment: &mut Attachment,
 ) -> Result<(), ChatError> {
@@ -249,6 +257,7 @@ async fn upload_image(
     attachment.file_type = normalize_image_extension(&ready.file_type, detected);
     attachment.mime_type = detected.to_owned();
     attachment.uploaded_conversation_id = conversation_id.to_owned();
+    attachment.uploaded_session_id = session_id.to_owned();
     Ok(())
 }
 
@@ -861,6 +870,7 @@ mod tests {
                 transport_name: "ready.txt".to_owned(),
                 reference_url: "https://tenant.sharepoint.com/ready".to_owned(),
                 uploaded_conversation_id: "same".to_owned(),
+                uploaded_session_id: "same-session".to_owned(),
                 ..Attachment::default()
             },
             Attachment {
@@ -868,18 +878,44 @@ mod tests {
                 doc_id: "IMG_ready".to_owned(),
                 file_type: "png".to_owned(),
                 uploaded_conversation_id: "same".to_owned(),
+                uploaded_session_id: "same-session".to_owned(),
                 ..Attachment::default()
             },
         ];
-        prepare(&account, "same", &mut ready).await.unwrap();
+        prepare(&account, "same", "same-session", &mut ready)
+            .await
+            .unwrap();
         assert_eq!(ready[0].doc_id, "SPO_ready");
         assert_eq!(ready[1].doc_id, "IMG_ready");
 
-        let error = prepare(&account, "new", &mut ready).await.unwrap_err();
+        let error = prepare(&account, "new", "same-session", &mut ready)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("Graph authorization"));
         assert!(ready[0].doc_id.is_empty());
         assert!(ready[0].reference_url.is_empty());
         assert!(ready[0].uploaded_conversation_id.is_empty());
+        assert!(ready[0].uploaded_session_id.is_empty());
+
+        let mut same_conversation_other_session = vec![Attachment {
+            kind: "file".to_owned(),
+            doc_id: "SPO_ready".to_owned(),
+            transport_name: "ready.txt".to_owned(),
+            reference_url: "https://tenant.sharepoint.com/ready".to_owned(),
+            uploaded_conversation_id: "same".to_owned(),
+            uploaded_session_id: "same-session".to_owned(),
+            ..Attachment::default()
+        }];
+        let error = prepare(
+            &account,
+            "same",
+            "other-session",
+            &mut same_conversation_other_session,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Graph authorization"));
+        assert!(same_conversation_other_session[0].doc_id.is_empty());
     }
 
     #[tokio::test]
@@ -896,7 +932,7 @@ mod tests {
             oid: String::new(),
             tid: String::new(),
         };
-        let error = prepare(&account, "conversation", &mut attachments)
+        let error = prepare(&account, "conversation", "session", &mut attachments)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("shared limit of 3"));

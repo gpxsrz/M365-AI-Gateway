@@ -85,7 +85,7 @@ recommended_action=reduce_input_or_retry_when_document_spill_is_available
 
 若 bulk 已嘗試但接續的 full-context fallback 也失敗，公開錯誤保留既有 `spill_reason` 的第一階段相容語意，並在有第二階段結果時增加 `fallback_reason`；這兩者不可混看成同一個量。
 
-Fallback 建立的 generated attachment 使用內容 identity 與 conversation binding；同一內容可重試而得到可預期名稱，內容或 conversation 改變時必須產生／重新驗證新版本，不能把 generated TXT 當普通 user attachment 或再包進下一份文件。既有 user attachment 不會為了騰 slot 被丟棄；slot 滿、缺檔、過期、取消或 upload 失敗都會走 typed reduction / attachment error。
+Fallback 建立的 generated attachment 使用內容 identity，以及 conversation＋session binding；同一內容可重試而得到可預期名稱，內容、conversation 或 session 改變時必須產生／重新驗證新版本，不能把 generated TXT 當普通 user attachment 或再包進下一份文件。既有 user attachment 不會為了騰 slot 被丟棄；slot 滿、缺檔、過期、取消或 upload 失敗都會走 typed reduction / attachment error。
 
 Memory route 不 auto-spill；超限時維持：
 
@@ -107,7 +107,7 @@ Spill 不移除 hard limit。Attachment grounding 也不代表 model-context cos
 
 Full-context TXT 是 transport projection，不保證模型已讀完、正確使用文件或能取回任意位置；HTTP 200、upload 成功或模型自稱理解都不是 semantic acceptance。真實使用者驗收與 deterministic qualification 分開。
 
-管理員診斷 surface 會以 bounded live 欄位顯示 `transportProjection`、`wireBeforeUtf16`、`inlineCoreUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`；durable v1 JSONL 保留 `spillReason=full_context_document` 等相容欄位，不保存文件內容。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
+管理員診斷 surface 會以 bounded live 欄位顯示 `transportProjection`、`wireBeforeUtf16`、`inlineCoreUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`。凍結的 v1 JSONL 為了 rollback reader 相容性保留舊 spill taxonomy；full-context 決策只在 live diagnostic projection 顯示為 `spillReason=full_context_document`，且不保存文件內容。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
 
 ## Tools 與 structured output
 

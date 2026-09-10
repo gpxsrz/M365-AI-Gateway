@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    fmt,
     future::Future,
     pin::Pin,
     sync::{
@@ -133,6 +134,8 @@ pub struct Attachment {
     #[serde(skip)]
     pub uploaded_conversation_id: String,
     #[serde(skip)]
+    pub uploaded_session_id: String,
+    #[serde(skip)]
     pub transport_name: String,
     #[serde(skip)]
     pub reference_url: String,
@@ -165,6 +168,8 @@ pub struct ChatRequest {
     pub generated_attachment_reused: Arc<AtomicBool>,
     #[doc(hidden)]
     pub prepared_attachments: Arc<Mutex<PreparedAttachmentState>>,
+    #[doc(hidden)]
+    pub(crate) upstream_start: Option<UpstreamStartHook>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -184,6 +189,12 @@ pub(crate) fn inherit_prepared_attachments(request: &mut ChatRequest) {
         return;
     }
     if !request.conversation_id.is_empty() && request.conversation_id != state.conversation_id {
+        return;
+    }
+    if !request.session_id.is_empty()
+        && !state.session_id.is_empty()
+        && request.session_id != state.session_id
+    {
         return;
     }
     if !same_attachment_sources(&request.attachments, &state.attachments) {
@@ -282,6 +293,28 @@ pub enum ChatError {
     Protocol(String),
 }
 
+#[derive(Clone)]
+pub(crate) struct UpstreamStartHook(Arc<dyn Fn() -> Result<(), ChatError> + Send + Sync + 'static>);
+
+impl UpstreamStartHook {
+    pub(crate) fn new<F>(callback: F) -> Self
+    where
+        F: Fn() -> Result<(), ChatError> + Send + Sync + 'static,
+    {
+        Self(Arc::new(callback))
+    }
+
+    pub(crate) fn call(&self) -> Result<(), ChatError> {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for UpstreamStartHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UpstreamStartHook(..)")
+    }
+}
+
 pub trait EventSink {
     fn send(&mut self, event: StreamEvent) -> Result<(), ChatError>;
 }
@@ -298,6 +331,10 @@ where
 pub type ChatFuture<'a> = Pin<Box<dyn Future<Output = Result<ChatResult, ChatError>> + Send + 'a>>;
 
 pub trait ChatHubTransport: Send + Sync {
+    fn upstream_start_after_preparation(&self) -> bool {
+        false
+    }
+
     fn chat<'a>(
         &'a self,
         account: Account,
@@ -317,6 +354,10 @@ impl LiveChatHub {
 }
 
 impl ChatHubTransport for LiveChatHub {
+    fn upstream_start_after_preparation(&self) -> bool {
+        true
+    }
+
     fn chat<'a>(
         &'a self,
         account: Account,
@@ -351,9 +392,19 @@ async fn live_chat(
     }
     inherit_prepared_attachments(&mut request);
     let reuses_generated_attachment = request.attachments.iter().any(|attachment| {
-        generated_attachment_ready_for_reuse(attachment, &request.conversation_id)
+        generated_attachment_ready_for_reuse(
+            attachment,
+            &request.conversation_id,
+            &request.session_id,
+        )
     });
-    attachment::prepare(&account, &request.conversation_id, &mut request.attachments).await?;
+    attachment::prepare(
+        &account,
+        &request.conversation_id,
+        &request.session_id,
+        &mut request.attachments,
+    )
+    .await?;
     record_prepared_attachments(&request);
     if reuses_generated_attachment {
         request
@@ -363,6 +414,9 @@ async fn live_chat(
     let request_id = uuid_v4();
     let url = websocket_url(&account, &request, &request_id, private_mode)?;
     let payload = chat_payload(&request, &request_id)?;
+    if let Some(start) = request.upstream_start.as_ref() {
+        start.call()?;
+    }
 
     let mut socket = None;
     for attempt in 0..2 {
@@ -477,11 +531,16 @@ async fn live_chat(
     .await
 }
 
-fn generated_attachment_ready_for_reuse(attachment: &Attachment, conversation_id: &str) -> bool {
+fn generated_attachment_ready_for_reuse(
+    attachment: &Attachment,
+    conversation_id: &str,
+    session_id: &str,
+) -> bool {
     attachment.generated_oversize_text
         && !attachment.doc_id.is_empty()
         && !attachment.reference_url.is_empty()
         && attachment.uploaded_conversation_id == conversation_id
+        && attachment.uploaded_session_id == session_id
 }
 
 struct SignalRCollector {
@@ -984,6 +1043,7 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
         .filter_map(|attachment| {
             if attachment.doc_id.is_empty()
                 || attachment.uploaded_conversation_id != request.conversation_id
+                || attachment.uploaded_session_id != request.session_id
             {
                 return None;
             }
@@ -1930,6 +1990,7 @@ mod tests {
                 transport_name: "report-random.txt".to_owned(),
                 reference_url: "https://tenant.sharepoint.com/report".to_owned(),
                 uploaded_conversation_id: "conversation".to_owned(),
+                uploaded_session_id: "session".to_owned(),
                 ..Attachment::default()
             }],
             ..ChatRequest::default()
@@ -1961,6 +2022,7 @@ mod tests {
         prepared.reference_url = "https://tenant.sharepoint.com/context".to_owned();
         prepared.transport_name = "context.txt".to_owned();
         prepared.uploaded_conversation_id = "conversation".to_owned();
+        prepared.uploaded_session_id = "session".to_owned();
         request.attachments[0] = prepared;
         record_prepared_attachments(&request);
 
@@ -1968,11 +2030,13 @@ mod tests {
         followup.attachments[0].doc_id.clear();
         followup.attachments[0].reference_url.clear();
         followup.attachments[0].uploaded_conversation_id.clear();
+        followup.attachments[0].uploaded_session_id.clear();
         inherit_prepared_attachments(&mut followup);
         assert_eq!(followup.attachments[0].doc_id, "SPO_ready");
         assert!(generated_attachment_ready_for_reuse(
             &followup.attachments[0],
-            "conversation"
+            "conversation",
+            "session",
         ));
 
         let mut other_conversation = followup.clone();
@@ -1981,11 +2045,18 @@ mod tests {
         inherit_prepared_attachments(&mut other_conversation);
         assert!(other_conversation.attachments[0].doc_id.is_empty());
 
+        let mut other_session = followup.clone();
+        other_session.session_id = "other-session".to_owned();
+        other_session.attachments[0].doc_id.clear();
+        inherit_prepared_attachments(&mut other_session);
+        assert!(other_session.attachments[0].doc_id.is_empty());
+
         let mut missing_reference = followup.attachments[0].clone();
         missing_reference.reference_url.clear();
         assert!(!generated_attachment_ready_for_reuse(
             &missing_reference,
-            "conversation"
+            "conversation",
+            "session",
         ));
     }
 }
