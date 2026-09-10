@@ -858,8 +858,10 @@ async fn complete_chat(
     let tool_limit = request.tool_call_limit;
     let qualification_account = account.clone();
     let mut qualification_request = request.clone();
+    qualification_request.upstream_start = None;
     let fallback_account = account.clone();
-    let fallback_request = request.clone();
+    let mut fallback_request = request.clone();
+    fallback_request.upstream_start = None;
     let generated_attachment_reused = request.generated_attachment_reused.clone();
     let upstream_attempt_count = reset_upstream_attempts(&request);
     let mut sink = |_: StreamEvent| Ok(());
@@ -1218,8 +1220,10 @@ async fn stream_chat(
         let tool_limit = request.tool_call_limit;
         let qualification_account = account.clone();
         let mut qualification_request = request.clone();
+        qualification_request.upstream_start = None;
         let fallback_account = account.clone();
-        let fallback_request = request.clone();
+        let mut fallback_request = request.clone();
+        fallback_request.upstream_start = None;
         let generated_attachment_reused = request.generated_attachment_reused.clone();
         let upstream_attempt_count = reset_upstream_attempts(&request);
         let buffer_for_tools = checkpoint
@@ -2263,6 +2267,7 @@ fn completed_tool_answer_request(
     text_input_limit: usize,
 ) -> Result<ChatRequest, ContinuationProjectionError> {
     let mut answer = request.clone();
+    answer.upstream_start = None;
     answer.text = format!(
         "{}\n\n{}\n\nTRANSPORT CONTINUATION RULE: A caller tool with the same name and arguments is already represented in the conversation above. Do not reissue it. Continue the user's request using the retained tool evidence; if it is insufficient, state that plainly.",
         request.text,
@@ -2682,7 +2687,7 @@ fn internal_qualification_request(
         generated_attachment_reused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         prepared_attachments: base.prepared_attachments.clone(),
         outbound_text_limit_utf16: base.outbound_text_limit_utf16,
-        upstream_start: base.upstream_start.clone(),
+        upstream_start: None,
     }
 }
 
@@ -5614,6 +5619,59 @@ mod tests {
         }
     }
 
+    struct HookAwareDuplicateFallbackTransport {
+        results: Mutex<VecDeque<String>>,
+        requests: Mutex<Vec<ChatRequest>>,
+        upstream_start_calls: AtomicUsize,
+    }
+
+    impl HookAwareDuplicateFallbackTransport {
+        fn new(results: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().map(str::to_owned).collect()),
+                requests: Mutex::new(Vec::new()),
+                upstream_start_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ChatHubTransport for HookAwareDuplicateFallbackTransport {
+        fn upstream_start_after_preparation(&self) -> bool {
+            true
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                if let Some(start) = request.upstream_start.as_ref() {
+                    if self.upstream_start_calls.fetch_add(1, Ordering::AcqRel) != 0 {
+                        return Err(ChatError::Protocol(
+                            "duplicate upstream start hook".to_owned(),
+                        ));
+                    }
+                    start.call()?;
+                }
+                self.requests.lock().unwrap().push(request);
+                let text = self
+                    .results
+                    .lock()
+                    .expect("hook-aware fallback sequence poisoned")
+                    .pop_front()
+                    .expect("unexpected upstream request");
+                Ok(ChatResult {
+                    text,
+                    conversation_id: "conversation-hook-aware".to_owned(),
+                    session_id: "session-hook-aware".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
     impl ChatHubTransport for DuplicateFallbackTransport {
         fn chat<'a>(
             &'a self,
@@ -8390,6 +8448,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completed_tool_answer_request_drops_checkpoint_start_hook() {
+        let request = ChatRequest {
+            upstream_start: Some(crate::chathub::UpstreamStartHook::new(|| Ok(()))),
+            ..ChatRequest::default()
+        };
+
+        let answer = completed_tool_answer_request(
+            &request,
+            &ChatResult::default(),
+            &crate::agent_ledger::AgentLedger::default(),
+            128_000,
+        )
+        .expect("continuation request should be valid");
+
+        assert!(answer.upstream_start.is_none());
+    }
+
+    #[test]
+    fn internal_qualification_request_drops_checkpoint_start_hook() {
+        let request = ChatRequest {
+            upstream_start: Some(crate::chathub::UpstreamStartHook::new(|| Ok(()))),
+            ..ChatRequest::default()
+        };
+
+        let qualification =
+            internal_qualification_request(&request, "validate this response".to_owned(), false);
+
+        assert!(qualification.upstream_start.is_none());
+    }
+
     fn completed_duplicate_request(stream: bool, user_length: usize) -> Value {
         let mut body = json!({
             "model":"gpt-5.6-terra",
@@ -10664,6 +10753,39 @@ mod tests {
 
         let record = gateway.debug.records_for_test().pop().unwrap();
         assert_eq!(record["toolCallSuppressed"], true);
+    }
+
+    #[tokio::test]
+    async fn hermes_checkpoint_duplicate_fallback_starts_upstream_once() {
+        let chat = Arc::new(HookAwareDuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "The inspection result is already available.",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let mut body = completed_duplicate_request(false, 1);
+        body["session_key"] = Value::String("checkpoint-hook-fallback".to_owned());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "The inspection result is already available."
+        );
+        assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 1);
+        assert_eq!(chat.requests.lock().unwrap().len(), 2);
+        assert!(chat.requests.lock().unwrap()[1].upstream_start.is_none());
     }
 
     #[tokio::test]
