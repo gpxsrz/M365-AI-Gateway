@@ -28,7 +28,7 @@ Do not confuse M365's configured UTF-16 transport policy with the Hermes/model t
 - M365 `textInputLimitUTF16`: text policy before transport;
 - Hermes/model context: token-based context quality and compression policy.
 
-For non-Memory chat, M365 may convert safely movable bulk `user` / `tool` text into a deterministic `.txt` attachment. The current user ask, system/developer control, and tool identity must remain inline. Memory traffic does not use this auto-spill behavior.
+For non-Memory chat, M365 first tries inline and then moves only bulk `user` / `tool` text that makes the real outbound wire smaller. If that still cannot fit, it may place the current request's complete model-facing message projection in one deterministic `.txt` attachment while keeping the current user ask, system/developer control, tool definitions/protocol, and latest complete tool exchange inline. The document is not session history, memory, or a new governance authority, and it does not change Hermes checkpoint, ledger, compression, or replay contracts. Memory traffic does not use this auto-spill behavior.
 
 Hermes compression should therefore be driven by model-context quality rather than by an old M365 transport threshold. Effective context/compression values belong to the current Hermes profile and are not pinned to one upstream version in M365 public docs.
 

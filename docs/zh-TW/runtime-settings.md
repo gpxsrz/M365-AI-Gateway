@@ -75,6 +75,7 @@ Current privacy telemetry 使用封閉 schema，只保存 bounded 分類與不�
 - route template / workload class；
 - queue admission 與 breaker projection；
 - spill decision、size class、UTF-16 前後值；
+- transport projection、實際 wire 前後 UTF-16、inline core、generated 文件 bytes/message count、bounded fallback state；
 - provenance class；
 - upstream attempt / result class；
 - 隨機 correlation ID。

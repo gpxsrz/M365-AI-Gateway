@@ -17,6 +17,7 @@ Remember these six points:
 
 - The configured M365 UTF-16 transport text limit is not a model-token ceiling; its exact current value is maintained in [`runtime-settings.md`](runtime-settings.md).
 - Non-Memory bulk text auto-spills only when current ask, control, and tool identity can remain safe; otherwise the gateway fails closed.
+- When bulk spill still cannot fit, the full-context TXT fallback is only the current request's model-facing transport projection. It is not session history, a memory store, or Task / Run authority, and it does not prove that the model read or correctly used the document.
 - Memory traffic does not auto-spill and asks the consumer to compact/split oversized input.
 - After Microsoft grounding, the gateway cannot guarantee exact retrieval of arbitrary high-entropy byte positions from a large attachment.
 

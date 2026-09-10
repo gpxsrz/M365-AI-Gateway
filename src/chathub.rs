@@ -3,8 +3,8 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -162,6 +162,62 @@ pub struct ChatRequest {
     pub mcp_server_url: String,
     pub disable_built_in_search: bool,
     pub upstream_attempt_count: Arc<AtomicUsize>,
+    pub generated_attachment_reused: Arc<AtomicBool>,
+    #[doc(hidden)]
+    pub prepared_attachments: Arc<Mutex<PreparedAttachmentState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PreparedAttachmentState {
+    conversation_id: String,
+    session_id: String,
+    attachments: Vec<Attachment>,
+}
+
+pub(crate) fn inherit_prepared_attachments(request: &mut ChatRequest) {
+    let state = request
+        .prepared_attachments
+        .lock()
+        .expect("prepared attachment state poisoned")
+        .clone();
+    if state.conversation_id.is_empty() || state.attachments.len() != request.attachments.len() {
+        return;
+    }
+    if !request.conversation_id.is_empty() && request.conversation_id != state.conversation_id {
+        return;
+    }
+    if !same_attachment_sources(&request.attachments, &state.attachments) {
+        return;
+    }
+    if request.conversation_id.is_empty() {
+        request.conversation_id = state.conversation_id;
+    }
+    if request.session_id.is_empty() {
+        request.session_id = state.session_id;
+    }
+    request.attachments = state.attachments;
+}
+
+fn record_prepared_attachments(request: &ChatRequest) {
+    *request
+        .prepared_attachments
+        .lock()
+        .expect("prepared attachment state poisoned") = PreparedAttachmentState {
+        conversation_id: request.conversation_id.clone(),
+        session_id: request.session_id.clone(),
+        attachments: request.attachments.clone(),
+    };
+}
+
+fn same_attachment_sources(left: &[Attachment], right: &[Attachment]) -> bool {
+    left.iter().zip(right).all(|(left, right)| {
+        left.kind == right.kind
+            && left.url == right.url
+            && left.name == right.name
+            && left.mime_type == right.mime_type
+            && left.detail == right.detail
+            && left.generated_oversize_text == right.generated_oversize_text
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,7 +349,17 @@ async fn live_chat(
     if request.conversation_id.is_empty() {
         request.conversation_id = uuid_v4();
     }
+    inherit_prepared_attachments(&mut request);
+    let reuses_generated_attachment = request.attachments.iter().any(|attachment| {
+        generated_attachment_ready_for_reuse(attachment, &request.conversation_id)
+    });
     attachment::prepare(&account, &request.conversation_id, &mut request.attachments).await?;
+    record_prepared_attachments(&request);
+    if reuses_generated_attachment {
+        request
+            .generated_attachment_reused
+            .store(true, Ordering::Release);
+    }
     let request_id = uuid_v4();
     let url = websocket_url(&account, &request, &request_id, private_mode)?;
     let payload = chat_payload(&request, &request_id)?;
@@ -409,6 +475,13 @@ async fn live_chat(
         ))
     }
     .await
+}
+
+fn generated_attachment_ready_for_reuse(attachment: &Attachment, conversation_id: &str) -> bool {
+    attachment.generated_oversize_text
+        && !attachment.doc_id.is_empty()
+        && !attachment.reference_url.is_empty()
+        && attachment.uploaded_conversation_id == conversation_id
 }
 
 struct SignalRCollector {
@@ -872,7 +945,7 @@ fn websocket_url(
 }
 
 fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatError> {
-    let text = tool_protocol_prompt(
+    let text = outbound_message_text(
         &request.text,
         &request.tools,
         &request.tool_choice,
@@ -1026,7 +1099,12 @@ fn plugins(request: &ChatRequest) -> Vec<Value> {
     plugins
 }
 
-fn tool_protocol_prompt(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> String {
+pub(crate) fn outbound_message_text(
+    text: &str,
+    tools: &[Tool],
+    choice: &Value,
+    limit: usize,
+) -> String {
     if tools.is_empty() || choice.as_str() == Some("none") {
         return text.to_owned();
     }
@@ -1808,6 +1886,36 @@ mod tests {
     }
 
     #[test]
+    fn payload_message_text_uses_the_shared_outbound_builder() {
+        let request = ChatRequest {
+            text: "role-envelope".to_owned(),
+            tools: vec![Tool {
+                kind: "function".to_owned(),
+                function: json!({
+                    "name":"read_file",
+                    "description":"read a file",
+                    "parameters":{"type":"object"}
+                }),
+            }],
+            tool_choice: Value::String("auto".to_owned()),
+            tool_call_limit: 1,
+            ..ChatRequest::default()
+        };
+        let payload = chat_payload(&request, "request").unwrap();
+        let chat: Value =
+            serde_json::from_str(payload.split(RECORD_SEPARATOR).next().unwrap()).unwrap();
+        assert_eq!(
+            chat["arguments"][0]["message"]["text"],
+            outbound_message_text(
+                &request.text,
+                &request.tools,
+                &request.tool_choice,
+                request.tool_call_limit,
+            )
+        );
+    }
+
+    #[test]
     fn payload_uses_ready_annotations_without_leaking_attachment_sources() {
         let request = ChatRequest {
             text: "read".to_owned(),
@@ -1830,5 +1938,54 @@ mod tests {
         assert!(payload.contains("LocalFile"));
         assert!(payload.contains("SPO_ready"));
         assert!(!payload.contains("c2VjcmV0"));
+    }
+
+    #[test]
+    fn prepared_attachment_snapshot_is_reused_only_for_the_same_bound_request() {
+        let source = Attachment {
+            kind: "file".to_owned(),
+            url: "data:text/plain;base64,YQ==".to_owned(),
+            name: "context.txt".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            generated_oversize_text: true,
+            ..Attachment::default()
+        };
+        let mut request = ChatRequest {
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![source.clone()],
+            ..ChatRequest::default()
+        };
+        let mut prepared = source;
+        prepared.doc_id = "SPO_ready".to_owned();
+        prepared.reference_url = "https://tenant.sharepoint.com/context".to_owned();
+        prepared.transport_name = "context.txt".to_owned();
+        prepared.uploaded_conversation_id = "conversation".to_owned();
+        request.attachments[0] = prepared;
+        record_prepared_attachments(&request);
+
+        let mut followup = request.clone();
+        followup.attachments[0].doc_id.clear();
+        followup.attachments[0].reference_url.clear();
+        followup.attachments[0].uploaded_conversation_id.clear();
+        inherit_prepared_attachments(&mut followup);
+        assert_eq!(followup.attachments[0].doc_id, "SPO_ready");
+        assert!(generated_attachment_ready_for_reuse(
+            &followup.attachments[0],
+            "conversation"
+        ));
+
+        let mut other_conversation = followup.clone();
+        other_conversation.conversation_id = "other-conversation".to_owned();
+        other_conversation.attachments[0].doc_id.clear();
+        inherit_prepared_attachments(&mut other_conversation);
+        assert!(other_conversation.attachments[0].doc_id.is_empty());
+
+        let mut missing_reference = followup.attachments[0].clone();
+        missing_reference.reference_url.clear();
+        assert!(!generated_attachment_ready_for_reuse(
+            &missing_reference,
+            "conversation"
+        ));
     }
 }

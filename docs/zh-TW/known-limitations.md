@@ -17,6 +17,7 @@
 
 - M365 configured UTF-16 transport text limit 不是 model token ceiling；精確 current value 只在 [`runtime-settings.md`](runtime-settings.md) 維護。
 - 非Memory bulk text只有在可以保留current ask、control與tool identity時才會auto-spill；沒有安全candidate就fail closed。
+- Bulk spill仍無法容納時，full-context TXT fallback只承載目前 request 的 model-facing projection；它不是 session history、memory store 或 Task / Run authority，也不代表模型已完整讀取或正確使用文件。
 - Memory route不auto-spill，input太長時要求consumer compact / split。
 - Large attachment被Microsoft grounding後，Gateway不能保證任意高熵byte位置都能精確retrieval。
 

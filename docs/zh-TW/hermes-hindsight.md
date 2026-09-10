@@ -28,7 +28,7 @@
 - M365 `textInputLimitUTF16`：送往 transport 前的文字政策。
 - Hermes / model context：token-based context quality / compression policy。
 
-非 Memory chat 遇到過長、且能安全外移的 bulk `user` / `tool` text 時，M365 可以轉成 deterministic `.txt` attachment；真正 current user ask、system/developer control 與 tool identity 必須留 inline。Memory route 不做這種 auto-spill。
+非 Memory chat 先嘗試 inline，再只搬移會實際減少 outbound wire 的 bulk `user` / `tool` text；若仍超限，M365 可以把目前 request 的完整 model-facing message projection 放進一份 deterministic `.txt` attachment，同時把 current user ask、system/developer control、工具定義／協定與最近完整工具交換留 inline。這份文件不是 session history、memory 或新的治理 authority，且不改 Hermes 的 checkpoint、ledger、compression 或 replay 契約。Memory route 不做這種 auto-spill。
 
 因此 Hermes compression 應依 model context quality 設計，不要只為了躲 M365 UTF-16 wall 提前壓縮。實際 context/compression 值由目前 Hermes profile 自己管理，不在 M365 public docs 固定某個上游版本數字。
 

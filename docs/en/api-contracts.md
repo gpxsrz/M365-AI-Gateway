@@ -55,6 +55,16 @@ The effective text limit is `textInputLimitUTF16`, measured in UTF-16 code units
 
 For non-Memory requests, when bulk text can be moved without moving system/developer/assistant control, tool identity, or the true current user ask, the gateway may convert older user evidence, tool results, or trusted integration-bound source-material ranges into a deterministic UTF-8 `.txt` attachment and then re-measure inline text.
 
+Fallback is progressive:
+
+1. Use the original inline request when it fits.
+2. Use bulk spill only when the real outbound wire becomes smaller; a short message is skipped when its reference would be longer.
+3. If bulk spill still cannot fit, create one deterministic UTF-8 `m365-full-context/v1` TXT transport projection. It contains only the model-facing message sequence for this request, not session history, a memory store, or a Task / Run layer.
+
+The full document preserves original roles, order, content, assistant tool calls and complete arguments, `tool_call_id`, tool results/error markers, and source message indexes. The necessary inline core remains the system/developer controls, the latest real user request, the current tool definitions/call protocol, and the latest complete contiguous multi-tool-call/result exchange; pending or malformed exchanges are not invented. Overlapping messages in the document and inline envelope carry the same index and represent the same data, not two operations. Synthetic recovery is explicitly marked and is not promoted to a new human request.
+
+Fit is measured with the shared outbound builder's actual ChatHub `message.text`, including the caller-tool protocol prefix and tool definitions, rather than only an intermediate role envelope. The existing `received` field continues to mean the pre-spill caller role-envelope length; it is not the remaining length after movement. The document does not embed user-attachment binary/base64, HTTP debug data, credentials, private URLs, or data that was not originally supplied to the model. The fallback does not mutate canonical messages, tool identity, checkpoints, ledger, HMAC, or replay semantics; Memory traffic still does not auto-spill.
+
 When safe spill is impossible:
 
 ```text
@@ -73,6 +83,10 @@ recommended_action=reduce_input_or_retry_when_document_spill_is_available
 
 Typical `spill_reason` values cover full attachment slots, no safe candidate, inability to fit inline, generated-file size, or document authorization/upload failure.
 
+When bulk spill was attempted but the following full-context fallback also fails, the public error preserves the existing first-stage `spill_reason` for compatibility and adds `fallback_reason` when the second-stage result is available. These fields must not be conflated.
+
+Generated fallback attachments use content identity and conversation binding. A retry of identical content has a predictable identity; changed content or conversation requires a new version or revalidation. A generated TXT cannot masquerade as an ordinary user attachment or be recursively packed into the next document. Existing user attachments are not discarded to free a slot; full slots, missing/expired files, cancellation, and upload failure remain typed reduction/attachment errors.
+
 Memory traffic does not auto-spill. Oversized input preserves:
 
 ```text
@@ -90,6 +104,10 @@ recommended_action=compact_or_split_and_retry
 ```
 
 Spill does not remove the hard limit. Attachment grounding is also neither zero model-context cost nor guaranteed arbitrary-byte retrieval.
+
+The full-context TXT is a transport projection. It does not prove that the model read or correctly used the document, and HTTP 200, upload success, or a model self-report is not semantic acceptance. Deterministic qualification and real-user acceptance remain separate.
+
+The admin diagnostic surface exposes bounded live fields such as `transportProjection`, `wireBeforeUtf16`, `inlineCoreUtf16`, `wireAfterUtf16`, generated-document bytes/message count/state, and `fallbackFailure`. Durable v1 JSONL retains compatible fields such as `spillReason=full_context_document` but never stores the document body. After a process restart, missing live projection must not be treated as model acceptance evidence.
 
 ## Tools and structured output
 

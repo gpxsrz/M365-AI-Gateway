@@ -55,6 +55,16 @@ Effective 文字限制是 `textInputLimitUTF16`，單位為 UTF-16 code units；
 
 非 Memory request 超限時，若能在不移動 system/developer/assistant control、tool identity 與真正 current user ask 的前提下安全外移 bulk text，Gateway 可以把舊 user evidence、tool result 或可信 integration 綁定的 source-material range轉成 deterministic UTF-8 `.txt` attachment，再重新量測 inline text。
 
+Fallback 依序嘗試：
+
+1. 原本的 inline request。
+2. 只採用會讓真正 outbound wire 變短的 bulk spill；短內容若換成較長引用會被跳過。
+3. 若仍超限，建立一份 `m365-full-context/v1`、UTF-8、deterministic 的單一 TXT transport projection。文件只承載這次 request 實際要交給模型的 model-facing 訊息序列，不是 session history、memory store 或 Task / Run layer。
+
+完整文件保留原始 role、順序、content、assistant tool calls 與完整 arguments、`tool_call_id`、tool result / error 標記及原始 message index。必要 inline 核心仍保留 system/developer control、最新真正 user request、目前工具定義／呼叫協定，以及最近一個完整且連續的多 tool-call/result exchange；pending 或 malformed exchange 不會被自行拼造。文件和 inline 重疊的 message 以相同 index 表示同一份資料，不是兩次操作。Synthetic recovery 會明確標記，不會變成新的真人要求。
+
+Fit 判定使用共用的 outbound builder 產生的真正 ChatHub `message.text`，包含 caller tool protocol prefix 與 tool definitions；不是只量中間 role envelope。既有 `received` 欄位仍表示搬移前的 caller role-envelope 長度，不能解讀成搬移後剩餘長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。這個 fallback 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
+
 不能安全 spill 時回：
 
 ```text
@@ -73,6 +83,10 @@ recommended_action=reduce_input_or_retry_when_document_spill_is_available
 
 常見 `spill_reason` 包含 attachment slots 已滿、沒有安全 candidate、無法縮回限制內、generated file 過大、文件授權／upload 失敗。
 
+若 bulk 已嘗試但接續的 full-context fallback 也失敗，公開錯誤保留既有 `spill_reason` 的第一階段相容語意，並在有第二階段結果時增加 `fallback_reason`；這兩者不可混看成同一個量。
+
+Fallback 建立的 generated attachment 使用內容 identity 與 conversation binding；同一內容可重試而得到可預期名稱，內容或 conversation 改變時必須產生／重新驗證新版本，不能把 generated TXT 當普通 user attachment 或再包進下一份文件。既有 user attachment 不會為了騰 slot 被丟棄；slot 滿、缺檔、過期、取消或 upload 失敗都會走 typed reduction / attachment error。
+
 Memory route 不 auto-spill；超限時維持：
 
 ```text
@@ -90,6 +104,10 @@ recommended_action=compact_or_split_and_retry
 ```
 
 Spill 不移除 hard limit。Attachment grounding 也不代表 model-context cost 是 0 或任意 byte 都保證可檢索。
+
+Full-context TXT 是 transport projection，不保證模型已讀完、正確使用文件或能取回任意位置；HTTP 200、upload 成功或模型自稱理解都不是 semantic acceptance。真實使用者驗收與 deterministic qualification 分開。
+
+管理員診斷 surface 會以 bounded live 欄位顯示 `transportProjection`、`wireBeforeUtf16`、`inlineCoreUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`；durable v1 JSONL 保留 `spillReason=full_context_document` 等相容欄位，不保存文件內容。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
 
 ## Tools 與 structured output
 

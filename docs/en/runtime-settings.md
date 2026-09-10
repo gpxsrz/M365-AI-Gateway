@@ -75,6 +75,7 @@ Current privacy telemetry uses a closed schema with bounded classifications and 
 - route template / workload class;
 - queue admission and breaker projection;
 - spill decision, size class, UTF-16 before/after values;
+- transport projection, actual wire before/after UTF-16, inline core, generated-document bytes/message count, and bounded fallback state;
 - provenance class;
 - upstream attempt / result class;
 - random correlation ID.

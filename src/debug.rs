@@ -24,6 +24,7 @@ const MAX_RECORDS: usize = 1_000;
 const COMPACT_EVERY: usize = 100;
 const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECORDED_UTF16: usize = 1_000_000;
+const MAX_RECORDED_BYTES: usize = 64 * 1024 * 1024;
 const SURFACE_ID: &str = "m365-privacy-telemetry/v1";
 
 #[derive(Clone, Copy)]
@@ -89,6 +90,7 @@ pub(crate) enum SpillReason {
     CannotFitInline,
     GeneratedFileTooLarge,
     ProjectionFailed,
+    FullContextDocument,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +192,7 @@ telemetry_names!(SpillReason, {
     SpillReason::CannotFitInline => "cannot_fit_inline",
     SpillReason::GeneratedFileTooLarge => "generated_file_too_large",
     SpillReason::ProjectionFailed => "projection_failed",
+    SpillReason::FullContextDocument => "full_context_document",
 });
 telemetry_names!(UpstreamAttempt, {
     UpstreamAttempt::None => "none",
@@ -271,6 +274,37 @@ struct Record {
     caller_delivery: String,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_false")]
     tool_call_suppressed: bool,
+    // Transport details are a bounded live projection. They are deliberately
+    // absent from the v1 JSONL record so an older rollback reader can still
+    // read the authoritative durable surface.
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
+    transport_projection: String,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    wire_before_utf16: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    inline_core_utf16: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    wire_after_utf16: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    generated_document_bytes: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    generated_document_message_count: usize,
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
+    generated_document_state: String,
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
+    fallback_failure: String,
     request_id: String,
     error_code: String,
     input_tokens: usize,
@@ -301,6 +335,14 @@ where
 {
     let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
     Ok(false)
+}
+
+fn deserialize_zero_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(0)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -522,6 +564,14 @@ impl Record {
             post_policy_reason: "not_evaluated".to_owned(),
             caller_delivery: CallerDelivery::NotEvaluated.as_str().to_owned(),
             tool_call_suppressed: false,
+            transport_projection: "not_evaluated".to_owned(),
+            wire_before_utf16: 0,
+            inline_core_utf16: 0,
+            wire_after_utf16: 0,
+            generated_document_bytes: 0,
+            generated_document_message_count: 0,
+            generated_document_state: "not_evaluated".to_owned(),
+            fallback_failure: "not_evaluated".to_owned(),
             request_id: String::new(),
             error_code: String::new(),
             input_tokens: 0,
@@ -615,6 +665,7 @@ impl Record {
                     | "cannot_fit_inline"
                     | "generated_file_too_large"
                     | "projection_failed"
+                    | "full_context_document"
             )
             && valid_utf16_class(self.utf16_before, &self.utf16_before_class)
             && valid_utf16_class(self.utf16_after, &self.utf16_after_class)
@@ -650,6 +701,14 @@ impl Record {
                 self.caller_delivery.as_str(),
                 "not_evaluated" | "sent" | "failed" | "cancelled"
             )
+            && valid_transport_projection(&self.transport_projection)
+            && self.wire_before_utf16 <= MAX_RECORDED_UTF16
+            && self.inline_core_utf16 <= MAX_RECORDED_UTF16
+            && self.wire_after_utf16 <= MAX_RECORDED_UTF16
+            && self.generated_document_bytes <= MAX_RECORDED_BYTES
+            && self.generated_document_message_count <= MAX_RECORDED_UTF16
+            && valid_generated_document_state(&self.generated_document_state)
+            && valid_fallback_failure(&self.fallback_failure)
             && valid_spill_relation(
                 &self.route,
                 &self.provenance_class,
@@ -691,6 +750,12 @@ fn valid_spill_relation(
         }
         "eligible" => reason == "below_limit" && authenticated_recall && before == after,
         "performed" => {
+            if reason == "full_context_document" {
+                // Full-context records use the shared final-wire measurement
+                // so a durable performed decision proves a real reduction on
+                // a non-Memory route. Detailed projection fields remain live.
+                return route != "memory" && before > after;
+            }
             ((reason == "recalled_source_material" && authenticated_recall)
                 || reason == "safe_bulk_candidate")
                 && before > after
@@ -704,6 +769,7 @@ fn valid_spill_relation(
                     | "cannot_fit_inline"
                     | "generated_file_too_large"
                     | "projection_failed"
+                    | "full_context_document"
             ) && before == after
                 && ((reason == "memory_spill_disabled" && route == "memory")
                     || (reason != "memory_spill_disabled" && route != "memory"))
@@ -717,6 +783,37 @@ fn valid_correlation_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_transport_projection(value: &str) -> bool {
+    matches!(
+        value,
+        "not_evaluated" | "inline" | "bulk_spill" | "full_context_document" | "overflow"
+    )
+}
+
+fn valid_generated_document_state(value: &str) -> bool {
+    matches!(
+        value,
+        "not_evaluated" | "not_applicable" | "created" | "reused" | "failed" | "unknown"
+    )
+}
+
+fn valid_fallback_failure(value: &str) -> bool {
+    matches!(
+        value,
+        "not_evaluated"
+            | "not_applicable"
+            | "memory_spill_disabled"
+            | "attachment_slots_full"
+            | "no_safe_candidate"
+            | "cannot_fit_inline"
+            | "generated_file_too_large"
+            | "projection_failed"
+            | "graph_authorization_unavailable"
+            | "document_upload_failed"
+            | "attachment_upload_failed"
+    )
 }
 
 fn valid_utf16_class(value: usize, class: &str) -> bool {
@@ -802,6 +899,51 @@ impl Trace {
             record.utf16_after = utf16_after.min(MAX_RECORDED_UTF16);
             record.utf16_before_class = utf16_class(utf16_before).to_owned();
             record.utf16_after_class = utf16_class(utf16_after).to_owned();
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transport(
+        &self,
+        projection: &str,
+        wire_before_utf16: usize,
+        inline_core_utf16: usize,
+        wire_after_utf16: usize,
+        generated_document_bytes: usize,
+        generated_document_message_count: usize,
+        generated_document_state: &str,
+        fallback_failure: &str,
+    ) {
+        self.update(|record| {
+            record.transport_projection = projection.to_owned();
+            record.wire_before_utf16 = wire_before_utf16.min(MAX_RECORDED_UTF16);
+            record.inline_core_utf16 = inline_core_utf16.min(MAX_RECORDED_UTF16);
+            record.wire_after_utf16 = wire_after_utf16.min(MAX_RECORDED_UTF16);
+            record.generated_document_bytes = generated_document_bytes.min(MAX_RECORDED_BYTES);
+            record.generated_document_message_count =
+                generated_document_message_count.min(MAX_RECORDED_UTF16);
+            record.generated_document_state = generated_document_state.to_owned();
+            record.fallback_failure = fallback_failure.to_owned();
+        });
+    }
+
+    pub(crate) fn generated_document_reused(&self) {
+        self.update(|record| {
+            if record.generated_document_state == "created" {
+                record.generated_document_state = "reused".to_owned();
+            }
+        });
+    }
+
+    pub(crate) fn generated_document_failed(&self, failure: &str) {
+        self.update(|record| {
+            if matches!(
+                record.generated_document_state.as_str(),
+                "created" | "reused"
+            ) {
+                record.generated_document_state = "failed".to_owned();
+                record.fallback_failure = failure.to_owned();
+            }
         });
     }
 
@@ -938,6 +1080,14 @@ pub(crate) async fn detail(
         "upstreamResultClass": record.upstream_result_class,
         "callerDelivery": record.caller_delivery,
         "toolCallSuppressed": record.tool_call_suppressed,
+        "transportProjection": record.transport_projection,
+        "wireBeforeUtf16": record.wire_before_utf16,
+        "inlineCoreUtf16": record.inline_core_utf16,
+        "wireAfterUtf16": record.wire_after_utf16,
+        "generatedDocumentBytes": record.generated_document_bytes,
+        "generatedDocumentMessageCount": record.generated_document_message_count,
+        "generatedDocumentState": record.generated_document_state,
+        "fallbackFailure": record.fallback_failure,
         "requestId": record.request_id,
         "errorCode": record.error_code,
         "inputTokens": record.input_tokens,
@@ -1016,6 +1166,16 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["callerDelivery"] = serde_json::Value::String(record.caller_delivery.clone());
     value["toolCallSuppressed"] = serde_json::Value::Bool(record.tool_call_suppressed);
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
+    value["transportProjection"] = serde_json::Value::String(record.transport_projection.clone());
+    value["wireBeforeUtf16"] = serde_json::Value::from(record.wire_before_utf16);
+    value["inlineCoreUtf16"] = serde_json::Value::from(record.inline_core_utf16);
+    value["wireAfterUtf16"] = serde_json::Value::from(record.wire_after_utf16);
+    value["generatedDocumentBytes"] = serde_json::Value::from(record.generated_document_bytes);
+    value["generatedDocumentMessageCount"] =
+        serde_json::Value::from(record.generated_document_message_count);
+    value["generatedDocumentState"] =
+        serde_json::Value::String(record.generated_document_state.clone());
+    value["fallbackFailure"] = serde_json::Value::String(record.fallback_failure.clone());
     value
 }
 
@@ -1194,6 +1354,34 @@ mod tests {
     }
 
     #[test]
+    fn full_context_spill_relation_is_non_memory_and_reducing() {
+        assert!(valid_spill_relation(
+            "hermes",
+            "none",
+            "performed",
+            "full_context_document",
+            200,
+            100,
+        ));
+        assert!(!valid_spill_relation(
+            "memory",
+            "none",
+            "performed",
+            "full_context_document",
+            200,
+            100,
+        ));
+        assert!(!valid_spill_relation(
+            "hermes",
+            "none",
+            "performed",
+            "full_context_document",
+            100,
+            100,
+        ));
+    }
+
+    #[test]
     fn authoritative_telemetry_surface_is_durable_and_typed() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("debug-telemetry.jsonl");
@@ -1278,6 +1466,77 @@ mod tests {
             .clone();
         assert_eq!(record.caller_delivery, "not_evaluated");
         assert!(!record.tool_call_suppressed);
+    }
+
+    #[test]
+    fn transport_projection_is_visible_live_but_does_not_extend_v1_jsonl() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug-telemetry.jsonl");
+        let store = Store::open(path.clone(), "test").unwrap();
+        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
+        trace.spill(
+            SpillDecision::Performed,
+            SpillReason::FullContextDocument,
+            185_439,
+            82_045,
+        );
+        trace.transport(
+            "full_context_document",
+            185_439,
+            39_017,
+            82_045,
+            12_345,
+            50,
+            "created",
+            "not_applicable",
+        );
+        assert!(
+            store.records_for_test().is_empty(),
+            "the trace is not durable until it is dropped"
+        );
+        drop(trace);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let durable: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert!(durable.get("transportProjection").is_none());
+        assert!(durable.get("wireBeforeUtf16").is_none());
+
+        let live = store.records_for_test().pop().unwrap();
+        assert_eq!(live["transportProjection"], "full_context_document");
+        assert_eq!(live["wireBeforeUtf16"], 185_439);
+        assert_eq!(live["inlineCoreUtf16"], 39_017);
+        assert_eq!(live["wireAfterUtf16"], 82_045);
+        assert_eq!(live["generatedDocumentBytes"], 12_345);
+        assert_eq!(live["generatedDocumentMessageCount"], 50);
+        assert_eq!(live["generatedDocumentState"], "created");
+
+        let reopened = Store::open(path, "test").unwrap();
+        let durable = reopened.inner.lock().unwrap();
+        assert_eq!(
+            durable.records.front().unwrap().spill_reason,
+            "full_context_document"
+        );
+        drop(durable);
+        let reopened = reopened.records_for_test().pop().unwrap();
+        assert_eq!(reopened["transportProjection"], "not_evaluated");
+        assert_eq!(reopened["wireBeforeUtf16"], 0);
+
+        let failed_trace = store.start_request("POST", "/hermes/v1/chat/completions");
+        failed_trace.transport(
+            "full_context_document",
+            1,
+            1,
+            1,
+            1,
+            1,
+            "created",
+            "not_applicable",
+        );
+        failed_trace.generated_document_failed("document_upload_failed");
+        drop(failed_trace);
+        let failed = store.records_for_test().pop().unwrap();
+        assert_eq!(failed["generatedDocumentState"], "failed");
+        assert_eq!(failed["fallbackFailure"], "document_upload_failed");
     }
 
     #[test]
