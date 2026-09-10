@@ -10789,6 +10789,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hermes_streaming_checkpoint_duplicate_fallback_starts_upstream_once() {
+        let chat = Arc::new(HookAwareDuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "The streaming inspection result is already available.",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let mut body = completed_duplicate_request(true, 1);
+        body["session_key"] = Value::String("streaming-checkpoint-hook-fallback".to_owned());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("The streaming inspection result is already available."));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 1);
+        assert_eq!(chat.requests.lock().unwrap().len(), 2);
+        assert!(chat.requests.lock().unwrap()[1].upstream_start.is_none());
+    }
+
+    #[tokio::test]
     async fn hermes_new_read_only_readback_is_not_suppressed_as_duplicate() {
         let chat = Arc::new(DuplicateFallbackTransport::new([
             "```read_file\n{\"path\":\"workspace/report.txt\"}\n```",
