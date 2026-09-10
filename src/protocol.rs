@@ -5121,6 +5121,43 @@ mod tests {
         }
     }
 
+    struct PreparedPayloadRecordingTransport(Mutex<Option<ChatRequest>>);
+
+    impl ChatHubTransport for PreparedPayloadRecordingTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            mut request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                let conversation_id = request.conversation_id.clone();
+                let session_id = request.session_id.clone();
+                for attachment in &mut request.attachments {
+                    if attachment.generated_oversize_text {
+                        attachment.doc_id = "SPO_ready".to_owned();
+                        attachment.transport_name = "context-random.txt".to_owned();
+                        attachment.reference_url =
+                            "https://tenant.sharepoint.com/context".to_owned();
+                        attachment.uploaded_conversation_id = conversation_id.clone();
+                        attachment.uploaded_session_id = session_id.clone();
+                    }
+                }
+                assert!(
+                    crate::chathub::outbound_payload_utf16_units(&request)
+                        <= request.outbound_text_limit_utf16
+                );
+                self.0.lock().unwrap().replace(request);
+                Ok(ChatResult {
+                    text: "prepared result".to_owned(),
+                    conversation_id: "prepared-conversation".to_owned(),
+                    session_id: "prepared-session".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
     struct SensitiveProtocolFailureTransport;
 
     impl ChatHubTransport for SensitiveProtocolFailureTransport {
@@ -9002,6 +9039,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_issue_101_fixture_preserves_prepared_payload_budget_and_telemetry() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let (body, expected_long_argument) = issue_101_fixture_request(true);
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(PreparedPayloadRecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "body={response_body}");
+        assert!(response_body.ends_with("data: [DONE]\n\n"));
+
+        let request = chat.0.lock().unwrap();
+        let request = request.as_ref().expect("stream reached chat transport");
+        assert_eq!(request.tools.len(), 29);
+        assert_eq!(request.attachments.len(), 1);
+        assert!(
+            crate::chathub::outbound_payload_utf16_units(request)
+                <= request.outbound_text_limit_utf16
+        );
+        let attachment = request
+            .attachments
+            .iter()
+            .find(|attachment| attachment.generated_oversize_text)
+            .expect("fixture generated full-context attachment");
+        let encoded = attachment
+            .url
+            .strip_prefix("data:text/plain;base64,")
+            .unwrap();
+        let document = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+        let document: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(document["schema"], "m365-full-context/v1");
+        assert_eq!(document["source_message_count"], 50);
+        assert_eq!(document["message_count"], 50);
+        assert_eq!(
+            document["messages"][3]["message"]["tool_calls"][0]["function"]["arguments"],
+            expected_long_argument
+        );
+        assert_eq!(
+            document["messages"][49]["message"]["content"],
+            "latest real synthetic user ask: summarize the verified fixture without reissuing any completed caller tool."
+        );
+        let inline: Value = serde_json::from_str(&request.text).unwrap();
+        assert_eq!(
+            inline["transport_projection"]["kind"],
+            "full_context_document"
+        );
+        assert_eq!(inline["messages"][0]["role"], "system");
+        assert_eq!(inline["messages"][1]["role"], "developer");
+        assert_eq!(inline["messages"][4]["role"], "user");
+        let live = gateway.debug.records_for_test();
+        assert_eq!(live[0]["spillReason"], "full_context_document");
+        assert_eq!(live[0]["transportProjection"], "full_context_document");
+        assert_eq!(live[0]["generatedDocumentState"], "created");
+        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 128_000);
+        assert!(live[0]["wireAfterUtf16"].as_u64().unwrap() <= 128_000);
+        let durable = std::fs::read_to_string(telemetry_path).unwrap();
+        assert!(!durable.contains("fixture-python"));
+        assert!(!durable.contains("fixture-shell"));
+        assert!(!durable.contains(&expected_long_argument));
+        token_server.abort();
+    }
+
+    #[tokio::test]
     async fn attachment_preparation_failure_aborts_before_checkpoint_upstream_start() {
         let root = tempfile::tempdir().unwrap();
         let checkpoints =
@@ -10821,6 +10940,54 @@ mod tests {
         assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 1);
         assert_eq!(chat.requests.lock().unwrap().len(), 2);
         assert!(chat.requests.lock().unwrap()[1].upstream_start.is_none());
+    }
+
+    #[tokio::test]
+    async fn hermes_streaming_full_context_duplicate_fallback_starts_upstream_once() {
+        let chat = Arc::new(HookAwareDuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "The full-context streaming fallback is complete.",
+        ]));
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let mut settings = gateway.settings.current();
+        settings.text_input_limit_utf16 = 50_000;
+        gateway.settings.save(settings).unwrap();
+        let mut body = completed_duplicate_full_context_request(true, 60_000, 100);
+        body["session_key"] = Value::String("streaming-full-context-hook-fallback".to_owned());
+        body["session_id"] = Value::String("streaming-full-context-hook-fallback".to_owned());
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let response_body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "body={response_body}");
+        assert!(response_body.contains("The full-context streaming fallback is complete."));
+        assert!(response_body.ends_with("data: [DONE]\n\n"));
+        assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 1);
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            serde_json::from_str::<Value>(&requests[0].text).unwrap()["transport_projection"]["kind"]
+                == "full_context_document"
+        );
+        assert!(requests[1].upstream_start.is_none());
+        token_server.abort();
     }
 
     #[tokio::test]
