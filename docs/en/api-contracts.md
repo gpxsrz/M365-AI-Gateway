@@ -191,6 +191,8 @@ Local queue full/timeout is `503`, which is separate from Microsoft throttling.
 
 A hard upstream HTTP 429 is shared-account pressure evidence and opens/escalates the shared breaker. A verified soft conversation throttle may terminate the current request, but one bot notice does not by itself escalate shared cooldown. Ordinary quota/metering metadata is not a throttle merely because it is non-empty.
 
+A soft notice is classified only when ChatHub source metadata such as `author=bot`, `contentOrigin=BotConnection`, and an empty `messageType` is present together with an approved finite notice template. The classification also covers that source-backed notice in a completion result or across segmented updates. Ordinary answers, citations, tool results, code, or the same words without source metadata remain normal content; a global text scan does not turn them into throttles.
+
 Breaker states:
 
 ```text

@@ -191,6 +191,8 @@ GET /v1/artifacts/{capability}/content
 
 Hard upstream HTTP 429 會成為 shared-account pressure evidence並開／升級 breaker。已驗證的 soft conversation throttle 可以結束當前 request，但不單憑一個 bot notice 升級 shared cooldown。一般 quota / metering metadata 也不能只因非空就判 throttle。
 
+Soft notice 只有在 ChatHub 的 `author=bot`、`contentOrigin=BotConnection`、空白 `messageType` 等來源 metadata 與已核准的有限通知模板同時成立時才會分類；通知也可在 completion result 或分段 update 中被辨識。普通回答、引用、工具結果、程式碼或只有相同字句而沒有來源 metadata 時仍是正常內容，不會靠全域文字比對改成 throttle。
+
 Breaker 狀態：
 
 ```text

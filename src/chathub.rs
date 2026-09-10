@@ -416,6 +416,7 @@ struct SignalRCollector {
     final_text: String,
     throttling: Option<Value>,
     soft_throttle: bool,
+    soft_throttle_candidate: String,
     raw_result: String,
     events: Vec<Value>,
     conversation_id: String,
@@ -431,6 +432,7 @@ impl SignalRCollector {
             final_text: String::new(),
             throttling: None,
             soft_throttle: false,
+            soft_throttle_candidate: String::new(),
             raw_result: String::new(),
             events: Vec::new(),
             conversation_id,
@@ -438,6 +440,46 @@ impl SignalRCollector {
             request_id,
             ping_seen: false,
         }
+    }
+
+    fn observe_soft_throttle(&mut self, container: &Value) {
+        for text in source_backed_texts(container) {
+            if self.observe_soft_throttle_text(text) {
+                self.soft_throttle = true;
+                self.soft_throttle_candidate.clear();
+                return;
+            }
+        }
+    }
+
+    fn observe_soft_throttle_text(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        if known_soft_throttle_text(text) {
+            return true;
+        }
+
+        let mut combined = String::with_capacity(self.soft_throttle_candidate.len() + text.len());
+        combined.push_str(&self.soft_throttle_candidate);
+        combined.push_str(text);
+        if known_soft_throttle_text(&combined) {
+            return true;
+        }
+
+        if known_soft_throttle_prefix(&combined) {
+            if combined.chars().count() <= MAX_SOFT_THROTTLE_CANDIDATE_CHARS {
+                self.soft_throttle_candidate = combined;
+            } else {
+                self.soft_throttle_candidate.clear();
+            }
+        } else if known_soft_throttle_prefix(text) {
+            self.soft_throttle_candidate = text.to_owned();
+        } else {
+            self.soft_throttle_candidate.clear();
+        }
+        false
     }
 
     fn ingest(
@@ -469,7 +511,7 @@ impl SignalRCollector {
                     if let Some(throttling) = item.get("throttling") {
                         self.throttling = Some(throttling.clone());
                     }
-                    self.soft_throttle |= soft_throttle_message(item);
+                    self.observe_soft_throttle(item);
                     if let Some(result) = item.get("result") {
                         self.raw_result = result
                             .get("value")
@@ -522,7 +564,7 @@ impl SignalRCollector {
             if let Some(throttling) = argument.get("throttling") {
                 self.throttling = Some(throttling.clone());
             }
-            self.soft_throttle |= soft_throttle_message(argument);
+            self.observe_soft_throttle(argument);
             let messages = argument
                 .get("messages")
                 .and_then(Value::as_array)
@@ -1075,27 +1117,75 @@ fn reconcile_text(final_text: &str, streamed_text: &str) -> (String, String, Str
     }
 }
 
-fn soft_throttle_message(container: &Value) -> bool {
-    container
-        .get("messages")
-        .and_then(Value::as_array)
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                let text = message
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                message.get("author").and_then(Value::as_str) == Some("bot")
-                    && message.get("contentOrigin").and_then(Value::as_str) == Some("BotConnection")
-                    && message
-                        .get("messageType")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .is_empty()
-                    && ((text.contains("暫時無法回應") && text.contains("請稍後再試"))
-                        || (text.contains("暂时无法响应") && text.contains("请稍后重试")))
-            })
-        })
+// A capacity notice is an upstream event only when its source metadata is
+// present. Keep the text set finite so ordinary answers containing the same
+// words cannot become throttles through a global content scan.
+const MAX_SOFT_THROTTLE_CANDIDATE_CHARS: usize = 256;
+
+const KNOWN_SOFT_THROTTLE_TEXTS: &[&str] = &[
+    "暫時無法回應，請稍後再試",
+    "暂时无法响应，请稍后重试",
+    "我們暫時無法回應這麼大量的要求。請稍後再試一次。",
+    "我们暂时无法响应这么多请求。请稍后重试。",
+    "目前為高流量。請稍後再試一次。",
+    "当前为高流量。请稍后重试。",
+];
+
+fn source_backed_notice(value: &Value) -> bool {
+    value.get("author").and_then(Value::as_str) == Some("bot")
+        && value.get("contentOrigin").and_then(Value::as_str) == Some("BotConnection")
+        && value
+            .get("messageType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+}
+
+fn append_notice_texts<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
+    for key in ["text", "message"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str)
+            && !text.trim().is_empty()
+        {
+            texts.push(text);
+        }
+    }
+}
+
+fn source_backed_texts(container: &Value) -> Vec<&str> {
+    let mut texts = Vec::new();
+    if source_backed_notice(container) {
+        append_notice_texts(container, &mut texts);
+        if let Some(result) = container.get("result") {
+            append_notice_texts(result, &mut texts);
+        }
+    }
+    if let Some(messages) = container.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if source_backed_notice(message) {
+                append_notice_texts(message, &mut texts);
+            }
+        }
+    }
+    if !source_backed_notice(container)
+        && let Some(result) = container.get("result")
+        && source_backed_notice(result)
+    {
+        append_notice_texts(result, &mut texts);
+    }
+    texts
+}
+
+fn known_soft_throttle_text(text: &str) -> bool {
+    let text = text.trim();
+    KNOWN_SOFT_THROTTLE_TEXTS.contains(&text)
+}
+
+fn known_soft_throttle_prefix(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && KNOWN_SOFT_THROTTLE_TEXTS
+            .iter()
+            .any(|known| known.starts_with(text))
 }
 
 fn provider_error(value: Option<&Value>) -> Option<String> {
@@ -1494,6 +1584,152 @@ mod tests {
             collector.ingest(frame, &mut sink),
             Err(ChatError::RateLimited { soft: true, .. })
         ));
+    }
+
+    #[test]
+    fn recognized_capacity_notice_variant_is_a_soft_throttle() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":1,"target":"update","arguments":[{"messages":[{"author":"bot","contentOrigin":"BotConnection","messageType":"","text":"目前為高流量。請稍後再試一次。"}]}]}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        assert!(matches!(
+            collector.ingest(frame, &mut sink),
+            Err(ChatError::RateLimited { soft: true, .. })
+        ));
+    }
+
+    #[test]
+    fn source_backed_terminal_result_notice_is_a_soft_throttle() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":2,"item":{"author":"bot","contentOrigin":"BotConnection","messageType":"","result":{"message":"目前為高流量。請稍後再試一次。"}}}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        assert!(matches!(
+            collector.ingest(frame, &mut sink),
+            Err(ChatError::RateLimited { soft: true, .. })
+        ));
+    }
+
+    #[test]
+    fn nested_source_backed_terminal_result_notice_is_a_soft_throttle() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":2,"item":{"result":{"author":"bot","contentOrigin":"BotConnection","messageType":"","message":"目前為高流量。請稍後再試一次。"}}}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        assert!(matches!(
+            collector.ingest(frame, &mut sink),
+            Err(ChatError::RateLimited { soft: true, .. })
+        ));
+    }
+
+    #[test]
+    fn split_source_backed_capacity_notice_is_a_soft_throttle() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":1,"target":"update","arguments":[{"messages":[{"author":"bot","contentOrigin":"BotConnection","messageType":"","text":"目前為高流量。"}]}]}"#,
+            "\u{1e}",
+            r#"{"type":1,"target":"update","arguments":[{"messages":[{"author":"bot","contentOrigin":"BotConnection","messageType":"","text":"請稍後再試一次。"}]}]}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        assert!(matches!(
+            collector.ingest(frame, &mut sink),
+            Err(ChatError::RateLimited { soft: true, .. })
+        ));
+    }
+
+    #[test]
+    fn repeated_source_backed_capacity_notice_stays_an_error() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":1,"target":"update","arguments":[{"messages":[{"author":"bot","contentOrigin":"BotConnection","messageType":"","text":"目前為高流量。請稍後再試一次。"},{"author":"bot","contentOrigin":"BotConnection","messageType":"","text":"目前為高流量。請稍後再試一次。"}]}]}"#,
+            "\u{1e}",
+            r#"{"type":2,"item":{"result":{"message":"目前為高流量。請稍後再試一次。"}}}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        assert!(matches!(
+            collector.ingest(frame, &mut sink),
+            Err(ChatError::RateLimited { soft: true, .. })
+        ));
+    }
+
+    #[test]
+    fn capacity_phrase_without_verified_provider_source_is_normal_text() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":2,"item":{"throttling":{"remaining":1},"result":{"message":"目前為高流量。請稍後再試一次。"}}}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        let result = collector.ingest(frame, &mut sink).unwrap().unwrap();
+        assert_eq!(result.text, "目前為高流量。請稍後再試一次。");
+    }
+
+    #[test]
+    fn capacity_phrase_from_non_provider_content_is_normal_text() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":1,"target":"update","arguments":[{"messages":[{"author":"bot","contentOrigin":"Model","messageType":"Chat","text":"目前為高流量。請稍後再試一次。"}]}]}"#,
+            "\u{1e}",
+            r#"{"type":2,"item":{"result":{"message":"這是對高流量通知的說明。"}}}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        let result = collector.ingest(frame, &mut sink).unwrap().unwrap();
+        assert_eq!(result.text, "這是對高流量通知的說明。");
+    }
+
+    #[test]
+    fn source_metadata_with_non_chat_message_type_is_not_a_soft_throttle() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":1,"target":"update","arguments":[{"messages":[{"author":"bot","contentOrigin":"BotConnection","messageType":"Chat","text":"目前為高流量。請稍後再試一次。"}]}]}"#,
+            "\u{1e}",
+            r#"{"type":2,"item":{"result":{"message":"正常回答"}}}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        let result = collector.ingest(frame, &mut sink).unwrap().unwrap();
+        assert_eq!(result.text, "正常回答");
+    }
+
+    #[test]
+    fn non_template_provider_text_is_not_a_soft_throttle() {
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let mut sink = |_: StreamEvent| Ok(());
+        let frame = concat!(
+            r#"{"type":1,"target":"update","arguments":[{"messages":[{"author":"bot","contentOrigin":"BotConnection","messageType":"","text":"前文：目前為高流量。請稍後再試一次。"}]}]}"#,
+            "\u{1e}",
+            r#"{"type":2,"item":{"result":{"message":"正常回答"}}}"#,
+            "\u{1e}",
+            r#"{"type":3}"#,
+            "\u{1e}"
+        );
+        let result = collector.ingest(frame, &mut sink).unwrap().unwrap();
+        assert_eq!(result.text, "正常回答");
     }
 
     #[test]
