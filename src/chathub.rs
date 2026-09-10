@@ -1200,6 +1200,21 @@ pub(crate) fn outbound_message_text(
     )
 }
 
+pub(crate) fn outbound_payload_utf16_units(request: &ChatRequest) -> usize {
+    const FIT_CHECK_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
+    let mut request = request.clone();
+    if request.conversation_id.is_empty() {
+        request.conversation_id = FIT_CHECK_REQUEST_ID.to_owned();
+    }
+    if request.session_id.is_empty() {
+        request.session_id = FIT_CHECK_REQUEST_ID.to_owned();
+    }
+    chat_payload(&request, FIT_CHECK_REQUEST_ID)
+        .expect("ChatHub payload is serializable")
+        .encode_utf16()
+        .count()
+}
+
 fn fold_stream_text(current: &str, update: &str, cumulative: bool) -> (String, String) {
     if update.is_empty() {
         return (current.to_owned(), String::new());
@@ -1999,6 +2014,37 @@ mod tests {
         assert!(payload.contains("LocalFile"));
         assert!(payload.contains("SPO_ready"));
         assert!(!payload.contains("c2VjcmV0"));
+    }
+
+    #[test]
+    fn payload_fit_check_includes_ready_attachment_annotations() {
+        let request = ChatRequest {
+            text: "read".to_owned(),
+            tone: DEFAULT_TONE.to_owned(),
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                url: "data:text/plain;base64,c2VjcmV0".to_owned(),
+                name: "report.txt".to_owned(),
+                doc_id: "SPO_ready".to_owned(),
+                transport_name: "report-random.txt".to_owned(),
+                reference_url: "https://tenant.sharepoint.com/report".to_owned(),
+                uploaded_conversation_id: "conversation".to_owned(),
+                uploaded_session_id: "session".to_owned(),
+                ..Attachment::default()
+            }],
+            ..ChatRequest::default()
+        };
+        let message_units = outbound_message_text(
+            &request.text,
+            &request.tools,
+            &request.tool_choice,
+            request.tool_call_limit,
+        )
+        .encode_utf16()
+        .count();
+        assert!(outbound_payload_utf16_units(&request) > message_units);
     }
 
     #[test]

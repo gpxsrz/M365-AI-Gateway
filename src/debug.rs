@@ -134,7 +134,7 @@ pub(crate) enum CallerDelivery {
 macro_rules! telemetry_names {
     ($type:ty, {$($variant:path => $name:literal),+ $(,)?}) => {
         impl $type {
-            fn as_str(self) -> &'static str {
+            pub(crate) fn as_str(self) -> &'static str {
                 match self {
                     $($variant => $name),+
                 }
@@ -893,25 +893,12 @@ impl Trace {
         utf16_after: usize,
     ) {
         self.update(|record| {
-            if reason == SpillReason::FullContextDocument {
-                // spillDecision/spillReason/utf16* are the frozen v1 durable
-                // fields.  The v1 rollback reader rejects a new taxonomy, so
-                // keep those fields neutral and expose the new route through
-                // the bounded live transport projection below.
-                record.spill_decision = SpillDecision::None.as_str().to_owned();
-                record.spill_reason = SpillReason::NotApplicable.as_str().to_owned();
-                record.utf16_before = 0;
-                record.utf16_after = 0;
-                record.utf16_before_class = "unknown".to_owned();
-                record.utf16_after_class = "unknown".to_owned();
-            } else {
-                record.spill_decision = decision.as_str().to_owned();
-                record.spill_reason = reason.as_str().to_owned();
-                record.utf16_before = utf16_before.min(MAX_RECORDED_UTF16);
-                record.utf16_after = utf16_after.min(MAX_RECORDED_UTF16);
-                record.utf16_before_class = utf16_class(utf16_before).to_owned();
-                record.utf16_after_class = utf16_class(utf16_after).to_owned();
-            }
+            record.spill_decision = decision.as_str().to_owned();
+            record.spill_reason = reason.as_str().to_owned();
+            record.utf16_before = utf16_before.min(MAX_RECORDED_UTF16);
+            record.utf16_after = utf16_after.min(MAX_RECORDED_UTF16);
+            record.utf16_before_class = utf16_class(utf16_before).to_owned();
+            record.utf16_after_class = utf16_class(utf16_after).to_owned();
         });
     }
 
@@ -1544,10 +1531,10 @@ mod tests {
         let durable: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert!(durable.get("transportProjection").is_none());
         assert!(durable.get("wireBeforeUtf16").is_none());
-        assert_eq!(durable["spillDecision"], "none");
-        assert_eq!(durable["spillReason"], "not_applicable");
-        assert_eq!(durable["utf16Before"], 0);
-        assert_eq!(durable["utf16After"], 0);
+        assert_eq!(durable["spillDecision"], "performed");
+        assert_eq!(durable["spillReason"], "full_context_document");
+        assert_eq!(durable["utf16Before"], 185_439);
+        assert_eq!(durable["utf16After"], 82_045);
 
         let live = store.records_for_test().pop().unwrap();
         assert_eq!(live["transportProjection"], "full_context_document");
@@ -1562,7 +1549,7 @@ mod tests {
         let durable = reopened.inner.lock().unwrap();
         assert_eq!(
             durable.records.front().unwrap().spill_reason,
-            "not_applicable"
+            "full_context_document"
         );
         drop(durable);
         let reopened = reopened.records_for_test().pop().unwrap();

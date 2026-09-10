@@ -449,6 +449,7 @@ async fn execute_chat_request_inner(
                 transport_observation.generated_document_state = "created".to_owned();
                 flattened = spilled;
                 context.auto_spilled = true;
+                context.spill_reason = Some(reason);
                 trace.spill(
                     SpillDecision::Performed,
                     reason,
@@ -481,6 +482,7 @@ async fn execute_chat_request_inner(
                     transport_observation.generated_document_state = "created".to_owned();
                     flattened = spilled;
                     context.auto_spilled = true;
+                    context.spill_reason = Some(reason);
                     trace.spill(
                         SpillDecision::Performed,
                         reason,
@@ -959,7 +961,7 @@ async fn complete_chat(
             }
             if transport.completed_call_suppressed {
                 trace.tool_call_suppressed();
-                let mut answer_request = match completed_tool_answer_request(
+                let answer_request = match completed_tool_answer_request(
                     &fallback_request,
                     &result,
                     &agent_ledger,
@@ -975,7 +977,6 @@ async fn complete_chat(
                         );
                     }
                 };
-                crate::chathub::inherit_prepared_attachments(&mut answer_request);
                 let answer_attempt_count = reset_upstream_attempts(&answer_request);
                 let mut answer_sink = |_: StreamEvent| Ok(());
                 let answer = tokio::time::timeout(
@@ -1017,7 +1018,6 @@ async fn complete_chat(
                         );
                     }
                 };
-                crate::chathub::inherit_prepared_attachments(&mut answer_request);
                 result = match qualify_response_format(
                     &gateway,
                     fallback_account,
@@ -1385,7 +1385,7 @@ async fn stream_chat(
                 }
                 if transport.completed_call_suppressed {
                     trace.tool_call_suppressed();
-                    let mut answer_request = match completed_tool_answer_request(
+                    let answer_request = match completed_tool_answer_request(
                         &fallback_request,
                         &result,
                         &agent_ledger,
@@ -1396,14 +1396,19 @@ async fn stream_chat(
                             let (wire_units, limit) = continuation_overflow_details(&error);
                             trace.transport_failed("overflow", wire_units, "cannot_fit_inline");
                             permit.finish(StatusCode::BAD_REQUEST, None);
-                            let sent =
-                                send_sse(&sender, continuation_overflow_value(wire_units, limit));
+                            let sent = send_sse(
+                                &sender,
+                                continuation_overflow_value(
+                                    wire_units,
+                                    limit,
+                                    overflow_context.as_ref(),
+                                ),
+                            );
                             trace.caller_delivery(stream_error_delivery(&sender, sent));
                             let _ = send_sse_done(&trace, &sender);
                             return;
                         }
                     };
-                    crate::chathub::inherit_prepared_attachments(&mut answer_request);
                     let answer_attempt_count = reset_upstream_attempts(&answer_request);
                     let mut answer_sink = |_: StreamEvent| Ok(());
                     let answer = tokio::time::timeout(
@@ -1460,7 +1465,6 @@ async fn stream_chat(
                             return;
                         }
                     };
-                    crate::chathub::inherit_prepared_attachments(&mut answer_request);
                     result = match qualify_response_format(
                         &gateway,
                         fallback_account,
@@ -2085,21 +2089,55 @@ fn continuation_overflow_details(error: &ContinuationProjectionError) -> (usize,
     }
 }
 
-fn continuation_overflow_value(wire_units: usize, limit: usize) -> Value {
-    json!({
-        "error": {
-            "message": "the final-answer continuation exceeds the UTF-16 outbound message limit",
-            "type": "invalid_request_error",
-            "code": "text_input_too_large",
+fn continuation_overflow_value(
+    wire_units: usize,
+    limit: usize,
+    overflow_context: Option<&OverflowContext>,
+) -> Value {
+    let Some(context) = overflow_context else {
+        return json!({
+            "error": {
+                "message": "the final-answer continuation exceeds the UTF-16 outbound message limit",
+                "type": "invalid_request_error",
+                "code": "text_input_too_large",
+                "limit_type": "outbound_message_text_utf16",
+                "limit": limit,
+                "received": wire_units,
+                "retryable_after_reduction": true,
+                "spill_attempted": false,
+                "spill_reason": "cannot_fit_inline",
+                "recommended_action": "reduce_input_or_start_a_new_user_turn"
+            }
+        });
+    };
+    let spill_reason = context
+        .spill_reason
+        .map(SpillReason::as_str)
+        .unwrap_or(SpillReason::CannotFitInline.as_str());
+    let mut value = overflow_value(
+        context,
+        "text_input_too_large",
+        spill_reason,
+        "輸入文字超過目前上限，且最終工具續接仍無法安全容納",
+        "reduce_input_or_start_a_new_user_turn",
+    );
+    let error = value
+        .get_mut("error")
+        .and_then(Value::as_object_mut)
+        .expect("overflow value always contains an error object");
+    error.insert(
+        "fallback_reason".to_owned(),
+        Value::String(SpillReason::CannotFitInline.as_str().to_owned()),
+    );
+    error.insert(
+        "final_outbound".to_owned(),
+        json!({
             "limit_type": "outbound_message_text_utf16",
             "limit": limit,
             "received": wire_units,
-            "retryable_after_reduction": true,
-            "spill_attempted": false,
-            "spill_reason": "cannot_fit_inline",
-            "recommended_action": "reduce_input_or_start_a_new_user_turn"
-        }
-    })
+        }),
+    );
+    value
 }
 
 fn continuation_overflow_response(
@@ -2111,19 +2149,15 @@ fn continuation_overflow_response(
     let (wire_units, limit) = continuation_overflow_details(&error);
     trace.transport_failed("overflow", wire_units, "cannot_fit_inline");
     permit.finish(StatusCode::BAD_REQUEST, None);
-    if let Some(context) = overflow_context {
-        text_overflow_response(
-            context,
-            "cannot_fit_inline",
-            "輸入文字超過目前上限，且最終工具續接仍無法安全容納",
-        )
-    } else {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(continuation_overflow_value(wire_units, limit)),
-        )
-            .into_response()
-    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(continuation_overflow_value(
+            wire_units,
+            limit,
+            overflow_context,
+        )),
+    )
+        .into_response()
 }
 
 fn completed_tool_answer_request(
@@ -2148,12 +2182,8 @@ fn completed_tool_answer_request(
     answer.tools.clear();
     answer.tool_choice = Value::String("none".to_owned());
     answer.tool_call_limit = 1;
-    let wire_units = outbound_text_units(
-        &answer.text,
-        &answer.tools,
-        &answer.tool_choice,
-        answer.tool_call_limit,
-    );
+    crate::chathub::inherit_prepared_attachments(&mut answer);
+    let wire_units = crate::chathub::outbound_payload_utf16_units(&answer);
     if wire_units > text_input_limit {
         return Err(ContinuationProjectionError::CannotFitInline {
             wire_units,
@@ -3646,6 +3676,7 @@ struct OverflowContext {
     input_sha256: String,
     spill_attempted: bool,
     auto_spilled: bool,
+    spill_reason: Option<SpillReason>,
     fallback_failure: Option<String>,
 }
 
@@ -3677,6 +3708,7 @@ impl OverflowContext {
             input_sha256: sha256_hex(&bytes),
             spill_attempted: false,
             auto_spilled: false,
+            spill_reason: None,
             fallback_failure: None,
         }
     }
@@ -5431,13 +5463,25 @@ mod tests {
     struct DuplicateFallbackTransport {
         results: Mutex<VecDeque<String>>,
         requests: Mutex<Vec<ChatRequest>>,
+        conversation_id: String,
+        session_id: String,
     }
 
     impl DuplicateFallbackTransport {
         fn new(results: impl IntoIterator<Item = &'static str>) -> Self {
+            Self::with_identity(results, "conversation-1", "session-1")
+        }
+
+        fn with_identity(
+            results: impl IntoIterator<Item = &'static str>,
+            conversation_id: impl Into<String>,
+            session_id: impl Into<String>,
+        ) -> Self {
             Self {
                 results: Mutex::new(results.into_iter().map(str::to_owned).collect()),
                 requests: Mutex::new(Vec::new()),
+                conversation_id: conversation_id.into(),
+                session_id: session_id.into(),
             }
         }
     }
@@ -5459,8 +5503,8 @@ mod tests {
                     .expect("unexpected upstream request");
                 Ok(ChatResult {
                     text,
-                    conversation_id: "conversation-1".to_owned(),
-                    session_id: "session-1".to_owned(),
+                    conversation_id: self.conversation_id.clone(),
+                    session_id: self.session_id.clone(),
                     ..ChatResult::default()
                 })
             })
@@ -8187,8 +8231,8 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(durable["spillReason"], "not_applicable");
-        assert_eq!(durable["spillDecision"], "none");
+        assert_eq!(durable["spillReason"], "full_context_document");
+        assert_eq!(durable["spillDecision"], "performed");
         assert!(durable.get("transportProjection").is_none());
         token_server.abort();
     }
@@ -8216,6 +8260,308 @@ mod tests {
             }
             Ok(_) => panic!("over-limit follow-up was not rejected"),
         }
+    }
+
+    fn completed_duplicate_request(stream: bool, user_length: usize) -> Value {
+        let mut body = json!({
+            "model":"gpt-5.6-terra",
+            "messages":[
+                {"role":"user","content":"x".repeat(user_length)},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"completed-call","type":"function","function":{"name":"inspect","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"completed-call","content":"{\"output\":\"ok\",\"exit_code\":0,\"status\":\"completed\"}"}
+            ],
+            "tools":[{"type":"function","function":{
+                "name":"inspect",
+                "description":"Read one caller-side record.",
+                "parameters":{"type":"object"}
+            }}]
+        });
+        if stream {
+            body["stream"] = Value::Bool(true);
+        }
+        body
+    }
+
+    fn completed_duplicate_full_context_request(
+        stream: bool,
+        historical_argument_length: usize,
+        current_user_length: usize,
+    ) -> Value {
+        let historical_arguments = format!(
+            "{{\"path\":\"workspace/old.py\",\"script\":\"{}\"}}",
+            "x".repeat(historical_argument_length)
+        );
+        let mut body = json!({
+            "model":"gpt-5.6-terra",
+            "conversation_id": format!("conversation-{}", "c".repeat(1_500)),
+            "session_id": format!("session-{}", "s".repeat(1_500)),
+            "messages":[
+                {"role":"user","content":"old evidence"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"historical-call","type":"function","function":{"name":"inspect","arguments":historical_arguments}}
+                ]},
+                {"role":"tool","tool_call_id":"historical-call","content":"{\"output\":\"old\",\"exit_code\":0,\"status\":\"completed\"}"},
+                {"role":"user","content":"current request ".to_owned() + &"y".repeat(current_user_length)},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"completed-call","type":"function","function":{"name":"inspect","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"completed-call","content":"{\"output\":\"ok\",\"exit_code\":0,\"status\":\"completed\"}"}
+            ],
+            "tools":[{"type":"function","function":{
+                "name":"inspect",
+                "description":"Read one caller-side record.",
+                "parameters":{"type":"object"}
+            }}]
+        });
+        if stream {
+            body["stream"] = Value::Bool(true);
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn non_stream_completed_duplicate_final_payload_overflow_is_publicly_typed() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "unexpected final-answer fallback",
+        ]));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let mut settings = gateway.settings.current();
+        settings.text_input_limit_utf16 = 11_000;
+        gateway.settings.save(settings).unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&completed_duplicate_request(false, 8_000)).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "text_input_too_large");
+        assert_eq!(body["error"]["limit_type"], "outbound_message_text_utf16");
+        assert_eq!(body["error"]["limit"], 11_000);
+        assert!(body["error"]["received"].as_u64().unwrap() > 11_000);
+        assert_eq!(body["error"]["spill_attempted"], false);
+        assert_eq!(body["error"]["spill_reason"], "cannot_fit_inline");
+        assert_eq!(chat.requests.lock().unwrap().len(), 1);
+        let record = gateway.debug.records_for_test().pop().unwrap();
+        assert_eq!(record["status"], 400);
+        assert_eq!(record["admissionResult"], "admitted");
+        assert_eq!(record["transportProjection"], "overflow");
+        assert!(record["wireAfterUtf16"].as_u64().unwrap() > 11_000);
+        assert_eq!(record["fallbackFailure"], "cannot_fit_inline");
+        assert_eq!(record["callerDelivery"], "sent");
+        assert_eq!(record["toolCallSuppressed"], true);
+    }
+
+    #[tokio::test]
+    async fn streaming_completed_duplicate_final_payload_overflow_keeps_sse_contract() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "unexpected final-answer fallback",
+        ]));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let mut settings = gateway.settings.current();
+        settings.text_input_limit_utf16 = 11_000;
+        gateway.settings.save(settings).unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&completed_duplicate_request(true, 8_000)).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("\"code\":\"text_input_too_large\""));
+        assert!(body.contains("\"limit_type\":\"outbound_message_text_utf16\""));
+        assert!(body.contains("\"spill_attempted\":false"));
+        assert!(body.contains("\"spill_reason\":\"cannot_fit_inline\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        assert!(!body.contains("unexpected final-answer fallback"));
+        assert_eq!(chat.requests.lock().unwrap().len(), 1);
+        let record = gateway.debug.records_for_test().pop().unwrap();
+        assert_eq!(record["status"], 200);
+        assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
+        assert_eq!(record["transportProjection"], "overflow");
+        assert!(record["wireAfterUtf16"].as_u64().unwrap() > 11_000);
+        assert_eq!(record["fallbackFailure"], "cannot_fit_inline");
+        assert_eq!(record["callerDelivery"], "sent");
+        assert_eq!(record["toolCallSuppressed"], true);
+    }
+
+    #[tokio::test]
+    async fn non_stream_full_context_continuation_preserves_initial_spill_identity() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
+            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
+            format!("conversation-{}", "c".repeat(1_500)),
+            format!("session-{}", "s".repeat(1_500)),
+        ));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let telemetry_path = gateway.debug.path_for_test().unwrap();
+        let mut settings = gateway.settings.current();
+        settings.text_input_limit_utf16 = 12_000;
+        gateway.settings.save(settings).unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&completed_duplicate_full_context_request(
+                            false, 10_000, 5_000,
+                        ))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+        assert_eq!(body["error"]["code"], "text_input_too_large");
+        assert_eq!(body["error"]["spill_attempted"], true);
+        assert_eq!(body["error"]["spill_reason"], "full_context_document");
+        assert_eq!(body["error"]["fallback_reason"], "cannot_fit_inline");
+        assert_eq!(
+            body["error"]["final_outbound"]["limit_type"],
+            "outbound_message_text_utf16"
+        );
+        assert!(
+            body["error"]["final_outbound"]["received"]
+                .as_u64()
+                .unwrap()
+                > 12_000
+        );
+        assert_eq!(body["error"]["input_sha256"].as_str().unwrap().len(), 64);
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            serde_json::from_str::<Value>(&request.text).unwrap()["transport_projection"]["kind"],
+            "full_context_document"
+        );
+        let attachment = request
+            .attachments
+            .iter()
+            .find(|attachment| attachment.generated_oversize_text)
+            .expect("full context generated attachment");
+        let encoded = attachment
+            .url
+            .strip_prefix("data:text/plain;base64,")
+            .unwrap();
+        let document = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+        assert!(document.contains("historical-call"));
+        drop(requests);
+
+        let live = gateway.debug.records_for_test();
+        assert_eq!(live[0]["spillReason"], "full_context_document");
+        assert_eq!(live[0]["transportProjection"], "overflow");
+        assert_eq!(live[0]["fallbackFailure"], "cannot_fit_inline");
+        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 12_000);
+        assert!(live[0]["inlineCoreUtf16"].as_u64().unwrap() <= 12_000);
+        assert!(live[0]["wireAfterUtf16"].as_u64().unwrap() > 12_000);
+        let durable: Value = serde_json::from_str(
+            std::fs::read_to_string(telemetry_path)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable["spillDecision"], "performed");
+        assert_eq!(durable["spillReason"], "full_context_document");
+        token_server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_full_context_continuation_preserves_sse_and_spill_identity() {
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
+            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
+            format!("conversation-{}", "c".repeat(1_500)),
+            format!("session-{}", "s".repeat(1_500)),
+        ));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let mut settings = gateway.settings.current();
+        settings.text_input_limit_utf16 = 12_000;
+        gateway.settings.save(settings).unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&completed_duplicate_full_context_request(
+                            true, 10_000, 5_000,
+                        ))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.contains("\"code\":\"text_input_too_large\""));
+        assert!(body.contains("\"spill_attempted\":true"));
+        assert!(body.contains("\"spill_reason\":\"full_context_document\""));
+        assert!(body.contains("\"fallback_reason\":\"cannot_fit_inline\""));
+        assert!(body.contains("\"limit_type\":\"outbound_message_text_utf16\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        assert!(!body.contains("unexpected final-answer fallback"));
+        assert_eq!(chat.requests.lock().unwrap().len(), 1);
+        let live = gateway.debug.records_for_test();
+        assert_eq!(live[0]["status"], 200);
+        assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
+        assert_eq!(live[0]["spillReason"], "full_context_document");
+        assert_eq!(live[0]["transportProjection"], "overflow");
+        assert_eq!(live[0]["fallbackFailure"], "cannot_fit_inline");
+        assert!(live[0]["inlineCoreUtf16"].as_u64().unwrap() <= 12_000);
+        assert!(live[0]["wireAfterUtf16"].as_u64().unwrap() > 12_000);
+        token_server.abort();
     }
 
     #[tokio::test]
@@ -8904,7 +9250,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = String::from_utf8(
             to_bytes(response.into_body(), 64 * 1024)
                 .await
@@ -8912,6 +9258,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(body.contains("\"code\":\"text_input_too_large\""));
         assert!(body.contains("\"spill_reason\":\"document_upload_failed\""));
         assert!(body.contains("\"retryable_after_reduction\":true"));
