@@ -162,6 +162,7 @@ pub struct ChatRequest {
     pub tools: Vec<Tool>,
     pub tool_choice: Value,
     pub tool_call_limit: usize,
+    pub(crate) outbound_text_limit_utf16: usize,
     pub mcp_server_url: String,
     pub disable_built_in_search: bool,
     pub upstream_attempt_count: Arc<AtomicUsize>,
@@ -289,6 +290,8 @@ pub enum ChatError {
         generated_oversize_text: bool,
         message: String,
     },
+    #[error("ChatHub outbound payload exceeds the UTF-16 limit ({wire_units} > {limit})")]
+    PayloadTooLarge { wire_units: usize, limit: usize },
     #[error("ChatHub protocol: {0}")]
     Protocol(String),
 }
@@ -412,8 +415,15 @@ async fn live_chat(
             .store(true, Ordering::Release);
     }
     let request_id = uuid_v4();
-    let url = websocket_url(&account, &request, &request_id, private_mode)?;
     let payload = chat_payload(&request, &request_id)?;
+    let wire_units = payload.encode_utf16().count();
+    if request.outbound_text_limit_utf16 > 0 && wire_units > request.outbound_text_limit_utf16 {
+        return Err(ChatError::PayloadTooLarge {
+            wire_units,
+            limit: request.outbound_text_limit_utf16,
+        });
+    }
+    let url = websocket_url(&account, &request, &request_id, private_mode)?;
     if let Some(start) = request.upstream_start.as_ref() {
         start.call()?;
     }
@@ -2045,6 +2055,56 @@ mod tests {
         .encode_utf16()
         .count();
         assert!(outbound_payload_utf16_units(&request) > message_units);
+    }
+
+    #[tokio::test]
+    async fn live_chat_rejects_actual_prepared_payload_before_upstream_start() {
+        let started = Arc::new(AtomicBool::new(false));
+        let attachment = Attachment {
+            kind: "file".to_owned(),
+            url: "data:text/plain;base64,c2VjcmV0".to_owned(),
+            name: "context.txt".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            doc_id: "SPO_ready".to_owned(),
+            transport_name: "context-random.txt".to_owned(),
+            reference_url: "https://tenant.sharepoint.com/context".to_owned(),
+            uploaded_conversation_id: "conversation".to_owned(),
+            uploaded_session_id: "session".to_owned(),
+            generated_oversize_text: true,
+            ..Attachment::default()
+        };
+        let mut request = ChatRequest {
+            text: "payload".to_owned(),
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![attachment],
+            ..ChatRequest::default()
+        };
+        let wire_units = outbound_payload_utf16_units(&request);
+        request.outbound_text_limit_utf16 = wire_units - 1;
+        let started_for_hook = Arc::clone(&started);
+        request.upstream_start = Some(UpstreamStartHook::new(move || {
+            started_for_hook.store(true, Ordering::Release);
+            Ok(())
+        }));
+        let account = Account {
+            access_token: "access".to_owned(),
+            graph_access_token: String::new(),
+            oid: "oid".to_owned(),
+            tid: "tid".to_owned(),
+        };
+        let mut sink = |_: StreamEvent| Ok(());
+
+        let result = live_chat(account, request, false, &mut sink).await;
+
+        assert!(matches!(
+            result,
+            Err(ChatError::PayloadTooLarge {
+                wire_units: actual,
+                limit
+            }) if actual > limit && limit + 1 == wire_units
+        ));
+        assert!(!started.load(Ordering::Acquire));
     }
 
     #[test]

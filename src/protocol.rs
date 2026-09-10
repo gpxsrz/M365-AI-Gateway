@@ -713,6 +713,7 @@ async fn execute_chat_request_inner(
         tools: body.tools,
         tool_choice: body.tool_choice,
         tool_call_limit,
+        outbound_text_limit_utf16: text_input_limit,
         mcp_server_url: String::new(),
         disable_built_in_search: false,
         upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
@@ -1752,6 +1753,10 @@ enum ChatFailureClass<'a> {
         soft: bool,
     },
     AutoSpillOverflow,
+    FinalPayloadOverflow {
+        wire_units: usize,
+        limit: usize,
+    },
     Upstream,
 }
 
@@ -1809,6 +1814,7 @@ fn chat_error_telemetry_class(error: &ChatError) -> UpstreamResult {
         ChatError::RateLimited { .. } => UpstreamResult::RateLimited429,
         ChatError::ServiceUnavailable => UpstreamResult::ServiceUnavailable503,
         ChatError::Attachment { .. } => UpstreamResult::AttachmentError,
+        ChatError::PayloadTooLarge { .. } => UpstreamResult::ContextLength,
         ChatError::Terminal { message, .. } => {
             classify_upstream_text(message, UpstreamResult::TerminalError)
         }
@@ -1853,8 +1859,65 @@ fn classify_chat_failure<'a>(
         } if overflow_context.is_some_and(|context| context.auto_spilled) => {
             ChatFailureClass::AutoSpillOverflow
         }
+        ChatError::PayloadTooLarge { wire_units, limit } => {
+            ChatFailureClass::FinalPayloadOverflow {
+                wire_units: *wire_units,
+                limit: *limit,
+            }
+        }
         _ => ChatFailureClass::Upstream,
     }
+}
+
+fn outbound_payload_overflow_value(
+    wire_units: usize,
+    limit: usize,
+    overflow_context: Option<&OverflowContext>,
+) -> Value {
+    let Some(context) = overflow_context else {
+        return json!({
+            "error": {
+                "message": "the outbound message exceeds the UTF-16 limit after attachment preparation",
+                "type": "invalid_request_error",
+                "code": "text_input_too_large",
+                "limit_type": "outbound_message_text_utf16",
+                "limit": limit,
+                "received": wire_units,
+                "retryable_after_reduction": true,
+                "spill_attempted": false,
+                "spill_reason": "cannot_fit_inline",
+                "recommended_action": "reduce_input_or_start_a_new_user_turn"
+            }
+        });
+    };
+    let spill_reason = context
+        .spill_reason
+        .map(SpillReason::as_str)
+        .unwrap_or(SpillReason::CannotFitInline.as_str());
+    let mut value = overflow_value(
+        context,
+        "text_input_too_large",
+        spill_reason,
+        "輸入文字超過目前上限，且附件準備後的最終訊息仍無法安全容納",
+        "reduce_input_or_start_a_new_user_turn",
+    );
+    let error = value
+        .get_mut("error")
+        .and_then(Value::as_object_mut)
+        .expect("overflow value always contains an error object");
+    error.insert(
+        "fallback_reason".to_owned(),
+        Value::String(SpillReason::CannotFitInline.as_str().to_owned()),
+    );
+    error.insert(
+        "final_outbound".to_owned(),
+        json!({
+            "limit_type": "outbound_message_text_utf16",
+            "limit": limit,
+            "received": wire_units,
+        }),
+    );
+    value
 }
 
 fn chat_error_with_overflow(
@@ -1864,6 +1927,12 @@ fn chat_error_with_overflow(
     overflow_context: Option<&OverflowContext>,
 ) -> Response {
     trace.caller_delivery(CallerDelivery::Sent);
+    if let ChatError::PayloadTooLarge { wire_units, .. } = &error {
+        trace.transport_failed("overflow", *wire_units, "cannot_fit_inline");
+        if overflow_context.is_some_and(|context| context.auto_spilled) {
+            trace.generated_document_failed("cannot_fit_inline");
+        }
+    }
     if let ChatError::Attachment {
         generated_oversize_text,
         ..
@@ -1904,6 +1973,18 @@ fn chat_error_with_overflow(
                 "輸入文字超過目前上限，且自動文件轉移無法完成",
             )
         }
+        ChatFailureClass::FinalPayloadOverflow { wire_units, limit } => {
+            permit.finish(StatusCode::BAD_REQUEST, None);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(outbound_payload_overflow_value(
+                    wire_units,
+                    limit,
+                    overflow_context,
+                )),
+            )
+                .into_response()
+        }
         ChatFailureClass::Upstream => {
             permit.finish(StatusCode::BAD_GATEWAY, None);
             openai_error(
@@ -1924,6 +2005,12 @@ fn send_stream_chat_error(
     overflow_context: Option<&OverflowContext>,
 ) -> bool {
     trace.caller_delivery(CallerDelivery::Failed);
+    if let ChatError::PayloadTooLarge { wire_units, .. } = &error {
+        trace.transport_failed("overflow", *wire_units, "cannot_fit_inline");
+        if overflow_context.is_some_and(|context| context.auto_spilled) {
+            trace.generated_document_failed("cannot_fit_inline");
+        }
+    }
     if let ChatError::Attachment {
         generated_oversize_text,
         ..
@@ -1954,6 +2041,15 @@ fn send_stream_chat_error(
                     "document_upload_failed",
                     "輸入文字超過目前上限，且自動文件轉移無法完成",
                 ),
+            );
+            trace.caller_delivery(stream_error_delivery(sender, sent));
+            sent
+        }
+        ChatFailureClass::FinalPayloadOverflow { wire_units, limit } => {
+            permit.finish(StatusCode::BAD_REQUEST, None);
+            let sent = send_sse(
+                sender,
+                outbound_payload_overflow_value(wire_units, limit, overflow_context),
             );
             trace.caller_delivery(stream_error_delivery(sender, sent));
             sent
@@ -2585,6 +2681,7 @@ fn internal_qualification_request(
         upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
         generated_attachment_reused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         prepared_attachments: base.prepared_attachments.clone(),
+        outbound_text_limit_utf16: base.outbound_text_limit_utf16,
         upstream_start: base.upstream_start.clone(),
     }
 }
@@ -4983,6 +5080,37 @@ mod tests {
                 Err(ChatError::Attachment {
                     generated_oversize_text: true,
                     message: "synthetic document upload failure".to_owned(),
+                })
+            })
+        }
+    }
+
+    struct PreparedPayloadTooLargeTransport;
+
+    impl ChatHubTransport for PreparedPayloadTooLargeTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            mut request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                let conversation_id = request.conversation_id.clone();
+                let session_id = request.session_id.clone();
+                for attachment in &mut request.attachments {
+                    if attachment.generated_oversize_text {
+                        attachment.doc_id = "SPO_ready".to_owned();
+                        attachment.transport_name = "context-random.txt".to_owned();
+                        attachment.reference_url =
+                            "https://tenant.sharepoint.com/context".to_owned();
+                        attachment.uploaded_conversation_id = conversation_id.clone();
+                        attachment.uploaded_session_id = session_id.clone();
+                    }
+                }
+                let wire_units = crate::chathub::outbound_payload_utf16_units(&request);
+                Err(ChatError::PayloadTooLarge {
+                    wire_units,
+                    limit: request.outbound_text_limit_utf16,
                 })
             })
         }
@@ -8321,6 +8449,164 @@ mod tests {
         body
     }
 
+    fn issue_101_fixture_request(stream: bool) -> (Value, String) {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../fixtures/long-context-tool-calls.json"))
+                .expect("Issue #101 fixture is valid JSON");
+        let marker = fixture["expansion"]["historical_argument_marker"]
+            .as_str()
+            .expect("fixture expansion marker");
+        let python_repetitions = fixture["expansion"]["python_source_repetitions"]
+            .as_u64()
+            .expect("fixture python repetition count") as usize;
+        let shell_repetitions = fixture["expansion"]["shell_source_repetitions"]
+            .as_u64()
+            .expect("fixture shell repetition count") as usize;
+        let unicode_suffix = fixture["expansion"]["unicode_suffix"]
+            .as_str()
+            .expect("fixture Unicode suffix")
+            .to_owned();
+        let mut messages = fixture["messages"].clone();
+        let mut first_long_argument = None;
+        for message in messages.as_array_mut().expect("fixture messages array") {
+            let Some(arguments) = message
+                .pointer("/tool_calls/0/function/arguments")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if arguments != marker {
+                continue;
+            }
+            let call_id = message
+                .pointer("/tool_calls/0/id")
+                .and_then(Value::as_str)
+                .expect("fixture tool call id");
+            let call_number = call_id
+                .strip_prefix("fixture-call-")
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("fixture tool call number");
+            let is_long = call_number <= 2;
+            let python_source = if is_long {
+                "print('fixture-python')\n".repeat(python_repetitions)
+            } else {
+                format!("python-fixture-{call_number}")
+            };
+            let shell_source = if is_long {
+                "printf 'fixture-shell'\n".repeat(shell_repetitions)
+            } else {
+                format!("shell-fixture-{call_number}")
+            };
+            let expanded = serde_json::to_string(&json!({
+                "call_id": call_id,
+                "python_source": python_source,
+                "shell_source": shell_source,
+                "unicode_edge": unicode_suffix,
+            }))
+            .expect("fixture arguments are serializable");
+            if first_long_argument.is_none() && is_long {
+                first_long_argument = Some(expanded.clone());
+            }
+            message["tool_calls"][0]["function"]["arguments"] = Value::String(expanded);
+        }
+        let expected = first_long_argument.expect("fixture has a long historical argument");
+        let mut body = json!({
+            "model": "gpt-5.6-terra",
+            "messages": messages,
+            "tools": fixture["tools"],
+        });
+        if stream {
+            body["stream"] = Value::Bool(true);
+        }
+        (body, expected)
+    }
+
+    #[tokio::test]
+    async fn issue_101_fixture_preserves_full_context_document_shape() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let (body, expected_long_argument) = issue_101_fixture_request(false);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 50);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 29);
+        assert!(utf16_units(&expected_long_argument) > 128_000);
+        let source_messages = body["messages"].clone();
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = chat.0.lock().unwrap();
+        let request = request.as_ref().expect("fixture reached chat transport");
+        assert_eq!(request.tools.len(), 29);
+        assert_eq!(request.attachments.len(), 1);
+        let attachment = request
+            .attachments
+            .iter()
+            .find(|attachment| attachment.generated_oversize_text)
+            .expect("fixture generated full-context attachment");
+        let encoded = attachment
+            .url
+            .strip_prefix("data:text/plain;base64,")
+            .unwrap();
+        let document = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+        let document: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(document["schema"], "m365-full-context/v1");
+        assert_eq!(document["source_message_count"], 50);
+        assert_eq!(document["message_count"], 50);
+        for (index, source) in source_messages.as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                document["messages"][index]["message"]["role"],
+                source["role"]
+            );
+        }
+        assert_eq!(
+            document["messages"][3]["message"]["tool_calls"][0]["function"]["arguments"],
+            expected_long_argument
+        );
+        assert_eq!(
+            document["messages"][49]["message"]["content"],
+            "latest real synthetic user ask: summarize the verified fixture without reissuing any completed caller tool."
+        );
+        let inline: Value = serde_json::from_str(&request.text).unwrap();
+        assert_eq!(
+            inline["transport_projection"]["kind"],
+            "full_context_document"
+        );
+        assert_eq!(inline["messages"][0]["role"], "system");
+        assert_eq!(inline["messages"][1]["role"], "developer");
+        assert_eq!(inline["messages"][2]["role"], "assistant");
+        assert_eq!(
+            inline["messages"][2]["tool_calls"][0]["id"],
+            "fixture-call-15"
+        );
+        assert_eq!(inline["messages"][4]["role"], "user");
+        let wire_text = crate::chathub::outbound_message_text(
+            &request.text,
+            &request.tools,
+            &request.tool_choice,
+            request.tool_call_limit,
+        );
+        assert!(utf16_units(&wire_text) <= 128_000);
+        let live = gateway.debug.records_for_test();
+        assert_eq!(live[0]["spillReason"], "full_context_document");
+        assert_eq!(live[0]["transportProjection"], "full_context_document");
+        assert_eq!(live[0]["generatedDocumentState"], "created");
+        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 128_000);
+        assert!(live[0]["wireAfterUtf16"].as_u64().unwrap() <= 128_000);
+        token_server.abort();
+    }
+
     #[tokio::test]
     async fn non_stream_completed_duplicate_final_payload_overflow_is_publicly_typed() {
         let chat = Arc::new(DuplicateFallbackTransport::new([
@@ -8562,6 +8848,68 @@ mod tests {
         assert!(live[0]["inlineCoreUtf16"].as_u64().unwrap() <= 12_000);
         assert!(live[0]["wireAfterUtf16"].as_u64().unwrap() > 12_000);
         token_server.abort();
+    }
+
+    async fn assert_initial_full_context_attachment_payload_overflow(stream: bool) {
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(PreparedPayloadTooLargeTransport);
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat, oauth);
+        let mut settings = gateway.settings.current();
+        settings.text_input_limit_utf16 = 12_000;
+        gateway.settings.save(settings).unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&completed_duplicate_full_context_request(
+                            stream, 10_000, 5_000,
+                        ))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            status,
+            if stream {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
+        assert!(body.contains("\"code\":\"text_input_too_large\""));
+        assert!(body.contains("\"spill_reason\":\"full_context_document\""));
+        assert!(body.contains("\"fallback_reason\":\"cannot_fit_inline\""));
+        assert!(body.contains("\"limit_type\":\"outbound_message_text_utf16\""));
+        assert!(body.contains("\"final_outbound\""));
+        if stream {
+            assert!(body.ends_with("data: [DONE]\n\n"));
+        }
+        let record = gateway.debug.records_for_test().pop().unwrap();
+        assert_eq!(record["transportProjection"], "overflow");
+        assert_eq!(record["fallbackFailure"], "cannot_fit_inline");
+        assert_eq!(record["generatedDocumentState"], "failed");
+        assert!(record["wireAfterUtf16"].as_u64().unwrap() > 12_000);
+        token_server.abort();
+    }
+
+    #[tokio::test]
+    async fn initial_full_context_attachment_payload_overflow_is_typed_for_both_modes() {
+        assert_initial_full_context_attachment_payload_overflow(false).await;
+        assert_initial_full_context_attachment_payload_overflow(true).await;
     }
 
     #[tokio::test]

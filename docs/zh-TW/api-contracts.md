@@ -63,7 +63,9 @@ Fallback 依序嘗試：
 
 完整文件保留原始 role、順序、content、assistant tool calls 與完整 arguments、`tool_call_id`、tool result / error 標記及原始 message index。必要 inline 核心仍保留 system/developer control、最新真正 user request、目前工具定義／呼叫協定，以及最近一個完整且連續的多 tool-call/result exchange；pending 或 malformed exchange 不會被自行拼造。文件和 inline 重疊的 message 以相同 index 表示同一份資料，不是兩次操作。Synthetic recovery 會明確標記，不會變成新的真人要求。
 
-Fit 判定使用共用的 outbound builder 產生的真正 ChatHub `message.text`，包含 caller tool protocol prefix 與 tool definitions；不是只量中間 role envelope。Final-answer continuation 會在清除 tool 欄位、繼承已準備的 attachment annotations 與 conversation/session binding 後，再用完整 ChatHub payload 重新量測。既有 `received` 欄位仍表示搬移前的 caller role-envelope 長度，不能解讀成搬移後剩餘長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。這個 fallback 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
+初始 spill decision 使用共用 outbound builder 產生的真正 ChatHub `message.text`，包含 caller tool protocol prefix 與 tool definitions；不是只量中間 role envelope。Attachment preparation 完成後，`LiveChatHub` 會在 checkpoint 的 upstream-start hook 之前，再量一次包含 `messageAnnotations` 與 conversation/session binding 的完整 ChatHub serialized payload。即使初始 inline core 已通過，final payload 超限仍會回 typed、可恢復的 overflow。Final-answer continuation 也會在清除 tool 欄位、繼承已準備的 attachment annotations 與 conversation/session binding 後，再用完整 ChatHub payload 重新量測。既有 `received` 欄位仍表示搬移前的 caller role-envelope 長度，不能解讀成搬移後剩餘長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。這個 fallback 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
+
+公開 synthetic qualification input 是 [`fixtures/long-context-tool-calls.json`](../../fixtures/long-context-tool-calls.json)：50 個 model-facing messages、已完成的 tool-call/result pairs、compressed summary、29 個 tool definitions，以及 deterministic 的長 Python／shell argument expansion。它不含 private capture，只用於 transport qualification。
 
 不能安全 spill 時回：
 
