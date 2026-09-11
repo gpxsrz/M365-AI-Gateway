@@ -1,6 +1,6 @@
 # Issues #99/#100/#101 — bounded acceptance archive
 
-> **Archive only / 僅供歷史追溯**：本頁固定 2026-09-11 的 source、release、runtime 與觀察窗口；不是現在的操作手冊，也不替未觀測的自然事件背書。
+> **Archive only / 僅供歷史追溯**：本頁固定 2026-09-11 的 source、release、runtime 與觀察窗口；不是現在的操作手冊，也不替未觀測的自然事件背書。文末的 2026-09-12 addendum 只追加 bounded #99 acceptance／closure 結果，不改寫前文在當時截點的歷史事實。
 
 ## 固定邊界
 
@@ -58,3 +58,32 @@ This archive fixes the evidence boundary for 2026-09-11 in Asia/Taipei. Telemetr
 - **#101 is bounded:** the long-context spill and existing-session tool continuation blocker is resolved; the 18:43 attachment failure is bounded before upstream start, with no unresolved checkpoint or duplicate effect observed in the accessible records. The exact error/success logical join remains unknown and is not used to claim more than recovery safety.
 
 No 51MD task, canary, Hermes restart, deployment, rollback, or upstream-core change was performed in this closeout.
+
+---
+
+## 2026-09-12 — #99 bounded post-deployment acceptance addendum / 部署後有限驗收附錄
+
+This section is the current closeout record for #99. The preceding #99 `OPEN` and “evidence insufficient” statements remain true for the 2026-09-11 observation cutoff; they are not current Issue state.
+
+本節是 #99 的目前收尾紀錄。前文 #99 的 `OPEN` 與「證據不足」只適用於 2026-09-11 固定觀察截點，保留作歷史事實，不代表目前 Issue 狀態。
+
+### Fixed identities and acceptance evidence
+
+- The repaired runtime is `stable-v0.1.10`, commit `5c71ee5ab9f9a0766f2cfbc5b9cf1d9e874475a0`, tree `1b7aaf72e01918daea5da94a95d80f7e641bc31f`, Linux amd64 SHA-256 `81241f8a845a5a5853cc96b0cf76a96327faa83d0fcdc6ad100f2f94b86f56a2`.
+- The fixed Asia/Taipei user-acceptance window was `2026-09-12 01:07:24`–`01:10:15`. A real user message in the existing 51MD/PTC session was followed by two structured terminal calls; both tool results returned `exit_code=0`, and the assistant then produced a completed normal-path report.
+- The private acceptance artifact was independently identity-checked without publishing its path or contents: `3127` bytes, SHA-256 `281d5f6b2faf8cf2c7d5203c6944b11242e38891efd014f2733e970f089b97aa`; `completed=true`, `normal_path_acceptance=true`, `source_identity_stable=true`, and zero validation errors.
+- The bounded observation also recorded three successful post-deployment `full_context_document` requests with canonical `message.text` measurements `86930`, `87404`, and `82660` UTF-16 units. These values support the normal path only; they are not an exact reconstruction of the historical 17:50/17:52 wire.
+
+### Separate verdicts
+
+| verdict | result | evidence boundary |
+|---|---|---|
+| `DUPLICATE_CONTINUATION_DETERMINISTIC` | **PASS** | Existing public-handler offline RED→GREEN and fail-closed regressions prove preservation of the caller tool contract and rejection of unsafe replay. |
+| `DEPLOYED_RUNTIME_IDENTITY` | **PASS** | The running Production binary, version/commit marker, authenticated health/models, container state and retained rollback manifest match the released identity. |
+| `USER_NATURAL_NORMAL_PATH` | **PASS** | The fixed real-user window has model → tool → result → next-tool → artifact readback and a completed report. This is bounded normal-path acceptance, not completion of the full research. |
+| `USER_NATURAL_DUPLICATE_BRANCH` | **NOT_OBSERVED** | The natural window did not encounter duplicate fallback; no replay was manufactured. The deterministic offline regression remains the evidence for that branch. |
+| `HISTORICAL_17_50_17_52_EXACT_CAUSE` | **UNCONFIRMED** | The first suppressed historical upstream call and exact full-wire correlation remain unavailable; future records cannot backfill them. This is non-blocking for the accepted finite scope. |
+
+結案範圍限定為：「已修正被抑制呼叫之後撤掉全部工具的續接缺陷，保留原 caller 工具契約；既有離線故障回歸、修版部署與使用者自然正常續作驗收均成立。」這不宣稱所有歷史執行環境混淆、所有同參數新 readback、未帶可信唯讀契約工具的資格、Hermes 單行 JSON／truncated metadata、所有 SDK retry 路徑或自然 duplicate fallback 已被證明。
+
+The optional Hermes `tool_output.max_line_length=50000` candidate remains **not applied**; the active setting remains `2000`. No Hermes restart, reload, configuration change, message injection, 51MD replay, Task/canary, or upstream-core change is part of this addendum. The current-runtime rollback snapshot remains retained.

@@ -10,7 +10,7 @@ This is read-only history, not the current operating guide. AI agents should ope
 
 - [`memory-provider-compatibility-issues-42-44.md`](memory-provider-compatibility-issues-42-44.md): Issues #42–#44 的 Memory Provider hardening、舊 canary 與 live-qualification 記錄。
 - [`issues-99-101-acceptance-2026-09-11.md`](issues-99-101-acceptance-2026-09-11.md): Issues #99/#100/#101 的 bounded acceptance、疑點鑑識與復原安全性記錄。
-- [`issue-99-continuation-candidate-2026-09-11.md`](issue-99-continuation-candidate-2026-09-11.md): #99 的 Hermes 大型 JSON 操作驗證與 M365 continuation 修復候選；未部署、未結案。
+- [`issue-99-continuation-candidate-2026-09-11.md`](issue-99-continuation-candidate-2026-09-11.md): #99 的 Hermes 大型 JSON 操作驗證與 M365 continuation 修復候選；**截至 2026-09-11 的歷史截點**尚未部署、未結案，後續 bounded acceptance 結果見 [Issues #99/#100/#101 archive](issues-99-101-acceptance-2026-09-11.md)。
 
 Archive 內的 PASS 只適用於當時固定的 source、帳號、route 與 runtime，不能直接當成現在 Rust 或 Production 的 PASS。
 
