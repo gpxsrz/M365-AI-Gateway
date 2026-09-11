@@ -288,6 +288,12 @@ struct Record {
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     inline_core_utf16: usize,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    message_text_before_utf16: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    preliminary_message_text_after_utf16: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    message_text_after_utf16: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     wire_after_utf16: usize,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     preliminary_wire_after_utf16: usize,
@@ -569,6 +575,9 @@ impl Record {
             transport_projection: "not_evaluated".to_owned(),
             wire_before_utf16: 0,
             inline_core_utf16: 0,
+            message_text_before_utf16: 0,
+            preliminary_message_text_after_utf16: 0,
+            message_text_after_utf16: 0,
             wire_after_utf16: 0,
             preliminary_wire_after_utf16: 0,
             generated_document_bytes: 0,
@@ -707,6 +716,9 @@ impl Record {
             && valid_transport_projection(&self.transport_projection)
             && self.wire_before_utf16 <= MAX_RECORDED_UTF16
             && self.inline_core_utf16 <= MAX_RECORDED_UTF16
+            && self.message_text_before_utf16 <= MAX_RECORDED_UTF16
+            && self.preliminary_message_text_after_utf16 <= MAX_RECORDED_UTF16
+            && self.message_text_after_utf16 <= MAX_RECORDED_UTF16
             && self.wire_after_utf16 <= MAX_RECORDED_UTF16
             && self.preliminary_wire_after_utf16 <= MAX_RECORDED_UTF16
             && self.generated_document_bytes <= MAX_RECORDED_BYTES
@@ -755,9 +767,8 @@ fn valid_spill_relation(
         "eligible" => reason == "below_limit" && authenticated_recall && before == after,
         "performed" => {
             if reason == "full_context_document" {
-                // Full-context records use the shared final-wire measurement
-                // so a durable performed decision proves a real reduction on
-                // a non-Memory route. Detailed projection fields remain live.
+                // Durable spill measurements are canonical message.text units;
+                // complete serialized-payload observations remain live only.
                 return route != "memory" && before > after;
             }
             ((reason == "recalled_source_material" && authenticated_recall)
@@ -913,6 +924,9 @@ impl Trace {
         projection: &str,
         wire_before_utf16: usize,
         inline_core_utf16: usize,
+        message_text_before_utf16: usize,
+        preliminary_message_text_after_utf16: usize,
+        message_text_after_utf16: usize,
         wire_after_utf16: usize,
         generated_document_bytes: usize,
         generated_document_message_count: usize,
@@ -923,6 +937,10 @@ impl Trace {
             record.transport_projection = projection.to_owned();
             record.wire_before_utf16 = wire_before_utf16.min(MAX_RECORDED_UTF16);
             record.inline_core_utf16 = inline_core_utf16.min(MAX_RECORDED_UTF16);
+            record.message_text_before_utf16 = message_text_before_utf16.min(MAX_RECORDED_UTF16);
+            record.preliminary_message_text_after_utf16 =
+                preliminary_message_text_after_utf16.min(MAX_RECORDED_UTF16);
+            record.message_text_after_utf16 = message_text_after_utf16.min(MAX_RECORDED_UTF16);
             record.wire_after_utf16 = wire_after_utf16.min(MAX_RECORDED_UTF16);
             record.generated_document_bytes = generated_document_bytes.min(MAX_RECORDED_BYTES);
             record.generated_document_message_count =
@@ -958,30 +976,41 @@ impl Trace {
         });
     }
 
-    pub(crate) fn transport_failed(
+    pub(crate) fn transport_message_text_preliminary(&self, before: usize, after: usize) {
+        self.update(|record| {
+            record.message_text_before_utf16 = before.min(MAX_RECORDED_UTF16);
+            record.preliminary_message_text_after_utf16 = after.min(MAX_RECORDED_UTF16);
+        });
+    }
+
+    pub(crate) fn transport_message_text_preliminary_failed(
         &self,
-        projection: &str,
-        wire_after_utf16: usize,
+        preliminary_message_text_after_utf16: usize,
         fallback_failure: &str,
     ) {
         self.update(|record| {
-            record.transport_projection = projection.to_owned();
-            record.wire_after_utf16 = wire_after_utf16.min(MAX_RECORDED_UTF16);
+            record.transport_projection = "overflow".to_owned();
+            record.preliminary_message_text_after_utf16 =
+                preliminary_message_text_after_utf16.min(MAX_RECORDED_UTF16);
             record.fallback_failure = fallback_failure.to_owned();
         });
     }
 
-    pub(crate) fn transport_preliminary_failed(
+    pub(crate) fn transport_message_text_failed(
         &self,
-        projection: &str,
-        preliminary_wire_after_utf16: usize,
+        message_text_after_utf16: usize,
         fallback_failure: &str,
     ) {
         self.update(|record| {
-            record.transport_projection = projection.to_owned();
-            record.preliminary_wire_after_utf16 =
-                preliminary_wire_after_utf16.min(MAX_RECORDED_UTF16);
+            record.transport_projection = "overflow".to_owned();
+            record.message_text_after_utf16 = message_text_after_utf16.min(MAX_RECORDED_UTF16);
             record.fallback_failure = fallback_failure.to_owned();
+        });
+    }
+
+    pub(crate) fn transport_message_text_final(&self, message_text_after_utf16: usize) {
+        self.update(|record| {
+            record.message_text_after_utf16 = message_text_after_utf16.min(MAX_RECORDED_UTF16);
         });
     }
 
@@ -1147,6 +1176,9 @@ pub(crate) async fn detail(
         "transportProjection": record.transport_projection,
         "wireBeforeUtf16": record.wire_before_utf16,
         "inlineCoreUtf16": record.inline_core_utf16,
+        "messageTextBeforeUtf16": record.message_text_before_utf16,
+        "preliminaryMessageTextAfterUtf16": record.preliminary_message_text_after_utf16,
+        "messageTextAfterUtf16": record.message_text_after_utf16,
         "wireAfterUtf16": record.wire_after_utf16,
         "preliminaryWireAfterUtf16": record.preliminary_wire_after_utf16,
         "generatedDocumentBytes": record.generated_document_bytes,
@@ -1236,6 +1268,10 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["transportProjection"] = serde_json::Value::String(record.transport_projection.clone());
     value["wireBeforeUtf16"] = serde_json::Value::from(record.wire_before_utf16);
     value["inlineCoreUtf16"] = serde_json::Value::from(record.inline_core_utf16);
+    value["messageTextBeforeUtf16"] = serde_json::Value::from(record.message_text_before_utf16);
+    value["preliminaryMessageTextAfterUtf16"] =
+        serde_json::Value::from(record.preliminary_message_text_after_utf16);
+    value["messageTextAfterUtf16"] = serde_json::Value::from(record.message_text_after_utf16);
     value["wireAfterUtf16"] = serde_json::Value::from(record.wire_after_utf16);
     value["preliminaryWireAfterUtf16"] =
         serde_json::Value::from(record.preliminary_wire_after_utf16);
@@ -1569,6 +1605,9 @@ mod tests {
             "full_context_document",
             185_439,
             39_017,
+            185_439,
+            82_045,
+            82_045,
             82_045,
             12_345,
             50,
@@ -1584,6 +1623,9 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let durable: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert!(durable.get("transportProjection").is_none());
+        assert!(durable.get("messageTextBeforeUtf16").is_none());
+        assert!(durable.get("preliminaryMessageTextAfterUtf16").is_none());
+        assert!(durable.get("messageTextAfterUtf16").is_none());
         assert!(durable.get("wireBeforeUtf16").is_none());
         assert_eq!(durable["spillDecision"], "performed");
         assert_eq!(durable["spillReason"], "full_context_document");
@@ -1594,6 +1636,9 @@ mod tests {
         assert_eq!(live["transportProjection"], "full_context_document");
         assert_eq!(live["wireBeforeUtf16"], 185_439);
         assert_eq!(live["inlineCoreUtf16"], 39_017);
+        assert_eq!(live["messageTextBeforeUtf16"], 185_439);
+        assert_eq!(live["preliminaryMessageTextAfterUtf16"], 82_045);
+        assert_eq!(live["messageTextAfterUtf16"], 82_045);
         assert_eq!(live["wireAfterUtf16"], 82_045);
         assert_eq!(live["generatedDocumentBytes"], 12_345);
         assert_eq!(live["generatedDocumentMessageCount"], 50);
@@ -1613,6 +1658,9 @@ mod tests {
         let failed_trace = store.start_request("POST", "/hermes/v1/chat/completions");
         failed_trace.transport(
             "full_context_document",
+            1,
+            1,
+            1,
             1,
             1,
             1,

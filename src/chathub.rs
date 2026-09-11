@@ -167,6 +167,7 @@ pub struct ChatRequest {
     pub disable_built_in_search: bool,
     pub upstream_attempt_count: Arc<AtomicUsize>,
     pub generated_attachment_reused: Arc<AtomicBool>,
+    pub(crate) final_message_text_utf16: Arc<AtomicUsize>,
     pub(crate) final_wire_utf16: Arc<AtomicUsize>,
     #[doc(hidden)]
     pub prepared_attachments: Arc<Mutex<PreparedAttachmentState>>,
@@ -291,8 +292,11 @@ pub enum ChatError {
         generated_oversize_text: bool,
         message: String,
     },
-    #[error("ChatHub outbound payload exceeds the UTF-16 limit ({wire_units} > {limit})")]
-    PayloadTooLarge { wire_units: usize, limit: usize },
+    #[error("ChatHub message.text exceeds the UTF-16 limit ({message_text_units} > {limit})")]
+    PayloadTooLarge {
+        message_text_units: usize,
+        limit: usize,
+    },
     #[error("ChatHub protocol: {0}")]
     Protocol(String),
 }
@@ -382,17 +386,6 @@ impl LiveChatHub {
             attachment_preparer: prepare_attachments,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn with_attachment_preparer(
-        settings: runtime_settings::Store,
-        attachment_preparer: AttachmentPreparer,
-    ) -> Self {
-        Self {
-            settings,
-            attachment_preparer,
-        }
-    }
 }
 
 impl ChatHubTransport for LiveChatHub {
@@ -458,14 +451,27 @@ async fn live_chat(
             .store(true, Ordering::Release);
     }
     let request_id = uuid_v4();
+    let message_text_units = outbound_message_text(
+        &request.text,
+        &request.tools,
+        &request.tool_choice,
+        request.tool_call_limit,
+    )
+    .encode_utf16()
+    .count();
+    request
+        .final_message_text_utf16
+        .store(message_text_units, Ordering::Release);
     let payload = chat_payload(&request, &request_id)?;
     let wire_units = payload.encode_utf16().count();
     request
         .final_wire_utf16
         .store(wire_units, Ordering::Release);
-    if request.outbound_text_limit_utf16 > 0 && wire_units > request.outbound_text_limit_utf16 {
+    if request.outbound_text_limit_utf16 > 0
+        && message_text_units > request.outbound_text_limit_utf16
+    {
         return Err(ChatError::PayloadTooLarge {
-            wire_units,
+            message_text_units,
             limit: request.outbound_text_limit_utf16,
         });
     }
@@ -1712,44 +1718,6 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
 
-    fn synthetic_prepared_attachment(
-        conversation_id: &str,
-        session_id: &str,
-        attachments: &mut [Attachment],
-    ) {
-        for attachment in attachments {
-            if !attachment.generated_oversize_text {
-                continue;
-            }
-            attachment.doc_id = format!(
-                "SPO_{}",
-                "d".repeat(crate::attachment::MAX_PREPARED_DOC_ID_UTF16 - 4)
-            );
-            attachment.transport_name = format!(
-                "{}.txt",
-                "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16 - 4)
-            );
-            let prefix = "https://prepared-attachment.invalid/sites/synthetic/";
-            let suffix_units = crate::attachment::MAX_PREPARED_REFERENCE_URL_UTF16
-                .saturating_sub(prefix.encode_utf16().count());
-            attachment.reference_url = format!("{prefix}{}", "r".repeat(suffix_units));
-            attachment.uploaded_conversation_id = conversation_id.to_owned();
-            attachment.uploaded_session_id = session_id.to_owned();
-        }
-    }
-
-    fn synthetic_attachment_preparer<'a>(
-        _: &'a Account,
-        conversation_id: &'a str,
-        session_id: &'a str,
-        attachments: &'a mut [Attachment],
-    ) -> AttachmentPreparationFuture<'a> {
-        Box::pin(async move {
-            synthetic_prepared_attachment(conversation_id, session_id, attachments);
-            Ok(())
-        })
-    }
-
     #[test]
     fn generated_artifacts_require_structured_code_interpreter_metadata() {
         let protected =
@@ -2198,34 +2166,57 @@ mod tests {
         )
         .encode_utf16()
         .count();
+        assert!(message_units < 128_000);
         assert!(outbound_payload_utf16_units(&request) > message_units);
     }
 
+    #[test]
+    fn outbound_message_text_uses_utf16_limit_edges_and_preserves_special_text() {
+        let tools = vec![Tool {
+            kind: "function".to_owned(),
+            function: json!({
+                "name": "inspect",
+                "description": "quote \" and slash \\\\ and newline\n中文😀",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "line\n中文😀"}
+                    }
+                }
+            }),
+        }];
+        let choice = Value::String("auto".to_owned());
+        let prefix_units = outbound_message_text("", &tools, &choice, 128)
+            .encode_utf16()
+            .count();
+
+        for target in [127_999, 128_000, 128_001] {
+            let text = "a".repeat(target - prefix_units);
+            assert_eq!(
+                outbound_message_text(&text, &tools, &choice, 128)
+                    .encode_utf16()
+                    .count(),
+                target
+            );
+        }
+
+        let special = "quoted: \" \\ path\n中文😀🚀";
+        assert_eq!(
+            outbound_message_text(special, &tools, &choice, 128)
+                .encode_utf16()
+                .count(),
+            prefix_units + special.encode_utf16().count()
+        );
+    }
+
     #[tokio::test]
-    async fn live_chat_rejects_actual_prepared_payload_before_upstream_start() {
+    async fn live_chat_checks_message_text_before_upstream_start() {
         let started = Arc::new(AtomicBool::new(false));
-        let attachment = Attachment {
-            kind: "file".to_owned(),
-            url: "data:text/plain;base64,c2VjcmV0".to_owned(),
-            name: "context.txt".to_owned(),
-            mime_type: "text/plain".to_owned(),
-            doc_id: "SPO_ready".to_owned(),
-            transport_name: "context-random.txt".to_owned(),
-            reference_url: "https://tenant.sharepoint.com/context".to_owned(),
-            uploaded_conversation_id: "conversation".to_owned(),
-            uploaded_session_id: "session".to_owned(),
-            generated_oversize_text: true,
-            ..Attachment::default()
-        };
         let mut request = ChatRequest {
-            text: "payload".to_owned(),
-            conversation_id: "conversation".to_owned(),
-            session_id: "session".to_owned(),
-            attachments: vec![attachment],
+            text: "x".repeat(128_001),
+            outbound_text_limit_utf16: 128_000,
             ..ChatRequest::default()
         };
-        let wire_units = outbound_payload_utf16_units(&request);
-        request.outbound_text_limit_utf16 = wire_units - 1;
         let started_for_hook = Arc::clone(&started);
         request.upstream_start = Some(UpstreamStartHook::new(move || {
             started_for_hook.store(true, Ordering::Release);
@@ -2238,79 +2229,15 @@ mod tests {
             tid: "tid".to_owned(),
         };
         let mut sink = |_: StreamEvent| Ok(());
-
         let result = live_chat(account, request, false, &mut sink, prepare_attachments).await;
 
         assert!(matches!(
             result,
             Err(ChatError::PayloadTooLarge {
-                wire_units: actual,
-                limit
-            }) if actual > limit && limit + 1 == wire_units
+                message_text_units: 128_001,
+                limit: 128_000,
+            })
         ));
-        assert!(!started.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn live_chat_prepares_attachment_and_guards_final_wire_before_upstream_start() {
-        let started = Arc::new(AtomicBool::new(false));
-        let request = ChatRequest {
-            text: "x".repeat(120_000),
-            conversation_id: "conversation".to_owned(),
-            session_id: "session".to_owned(),
-            attachments: vec![Attachment {
-                kind: "file".to_owned(),
-                url: "data:text/plain;base64,YQ==".to_owned(),
-                name: "context.txt".to_owned(),
-                mime_type: "text/plain".to_owned(),
-                generated_oversize_text: true,
-                ..Attachment::default()
-            }],
-            outbound_text_limit_utf16: 128_000,
-            ..ChatRequest::default()
-        };
-        let unprepared_wire = outbound_payload_utf16_units(&request);
-        let mut prepared = request.clone();
-        synthetic_prepared_attachment(
-            &prepared.conversation_id,
-            &prepared.session_id,
-            &mut prepared.attachments,
-        );
-        let prepared_wire = outbound_payload_utf16_units(&prepared);
-        assert!(unprepared_wire <= request.outbound_text_limit_utf16);
-        assert!(prepared_wire > request.outbound_text_limit_utf16);
-        let final_wire = request.final_wire_utf16.clone();
-        let started_for_hook = Arc::clone(&started);
-        let mut request = request;
-        request.upstream_start = Some(UpstreamStartHook::new(move || {
-            started_for_hook.store(true, Ordering::Release);
-            Ok(())
-        }));
-        let account = Account {
-            access_token: "access".to_owned(),
-            graph_access_token: String::new(),
-            oid: "oid".to_owned(),
-            tid: "tid".to_owned(),
-        };
-        let root = tempfile::tempdir().unwrap();
-        let settings = runtime_settings::Store::open(
-            root.path(),
-            &crate::Config::for_test(root.path().to_path_buf()),
-        )
-        .unwrap();
-        let hub = LiveChatHub::with_attachment_preparer(settings, synthetic_attachment_preparer);
-        let mut sink = |_: StreamEvent| Ok(());
-        let result = hub.chat(account, request, &mut sink).await;
-        let (actual_wire, limit) = match result {
-            Err(ChatError::PayloadTooLarge { wire_units, limit }) => (wire_units, limit),
-            other => {
-                panic!("result={other:?} unprepared={unprepared_wire} prepared={prepared_wire}")
-            }
-        };
-        assert_eq!(limit, 128_000);
-        assert!(actual_wire > limit);
-        assert!(actual_wire >= prepared_wire);
-        assert_eq!(final_wire.load(Ordering::Acquire), actual_wire);
         assert!(!started.load(Ordering::Acquire));
     }
 

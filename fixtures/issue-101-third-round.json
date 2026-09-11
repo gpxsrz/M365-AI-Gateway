@@ -1,0 +1,34 @@
+{
+  "schema": "m365-issue-101-third-round-fixture/v1",
+  "purpose": "Public synthetic transport qualification only; no private capture, credentials, replayable payload, or live task data.",
+  "measurement_basis": {
+    "active_message_count": 51,
+    "user_count": 7,
+    "assistant_count": 24,
+    "tool_result_count": 20,
+    "completed_tool_call_count": 20,
+    "caller_tool_definition_count": 29,
+    "consecutive_final_user_boundaries": 2,
+    "source_note": "Counts and bounded size targets are derived from an anonymized Hermes session structure readback; caller schema bodies were not persisted in that session and are represented by a deterministic escaping-heavy synthetic schema."
+  },
+  "observed_failure": {
+    "caller_role_envelope_utf16": 185795,
+    "text_input_limit_utf16": 128000,
+    "admission_result": "not_reached",
+    "upstream_attempt_class": "none",
+    "spill_decision": "denied",
+    "spill_reason": "cannot_fit_inline",
+    "retryable": false,
+    "retryable_after_reduction": true
+  },
+  "role_sequence": [
+    "user", "assistant_tool", "tool", "assistant_text", "user", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_text", "user", "assistant_text", "user", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_text", "user", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "assistant_tool", "tool", "user", "user"
+  ],
+  "argument_utf16_units": [41, 883, 298, 300, 300, 299, 112, 4757, 4759, 4722, 4568, 3492, 119, 41, 5051, 7734, 8272, 5665, 5858, 8141],
+  "result_utf16_units": [169, 24, 123, 125, 123, 123, 18282, 238, 60, 238, 8553, 12801, 528, 6636, 580, 138, 1399, 1013, 1670, 2063],
+  "user_utf16_units": [500, 450, 400, 400, 472, 128, 128],
+  "assistant_text_utf16_units": [17852, 300, 300, 303],
+  "schema_description_utf16_units": 1200,
+  "schema_parameter_description_utf16_units": 1200,
+  "unicode_seed": "工具 schema \"quote\" \\ path\n中文😀🚀"
+}
