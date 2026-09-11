@@ -1096,11 +1096,27 @@ async fn complete_chat(
                     );
                 }
                 transport = apply_transport_projection(
-                    project_tool_calls(&result.text, &[], &Value::String("none".to_owned()), 1),
+                    project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
                     &agent_ledger,
-                    &[],
+                    &tools,
                     suppress_duplicate_tool_calls,
                 );
+                if transport.projection.overflowed {
+                    permit.finish(StatusCode::BAD_GATEWAY, None);
+                    return openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        "invalid_tool_call",
+                        "model returned more tool calls than the safe request limit",
+                    );
+                }
+                if transport.suppressed && transport.projection.calls.is_empty() {
+                    return unsafe_tool_replay_response(permit);
+                }
+                if tool_choice_requires_call(&tool_choice) && transport.projection.calls.is_empty()
+                {
+                    return tool_choice_unsatisfied_response(permit);
+                }
             }
             let projection = transport.projection;
             if let Err(message) =
@@ -1416,6 +1432,9 @@ async fn stream_chat(
                 }
                 if transport.completed_call_suppressed {
                     trace.tool_call_suppressed();
+                    // The bounded repair changes only the upstream context. Keep the
+                    // caller's tool contract so a distinct legal continuation remains
+                    // structured instead of becoming ordinary final-answer text.
                     let answer_request = match completed_tool_answer_request(
                         &fallback_request,
                         &result,
@@ -1568,11 +1587,34 @@ async fn stream_chat(
                         return;
                     }
                     transport = apply_transport_projection(
-                        project_tool_calls(&result.text, &[], &Value::String("none".to_owned()), 1),
+                        project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
                         &agent_ledger,
-                        &[],
+                        &tools,
                         suppress_duplicate_tool_calls,
                     );
+                    if transport.projection.overflowed {
+                        permit.finish(StatusCode::BAD_GATEWAY, None);
+                        send_sse_error(
+                            &trace,
+                            &sender,
+                            "invalid_tool_call",
+                            "model returned more tool calls than the safe request limit",
+                        );
+                        let _ = send_sse_done(&trace, &sender);
+                        return;
+                    }
+                    if transport.suppressed && transport.projection.calls.is_empty() {
+                        send_unsafe_tool_replay_error(&trace, &sender, permit);
+                        let _ = send_sse_done(&trace, &sender);
+                        return;
+                    }
+                    if tool_choice_requires_call(&tool_choice)
+                        && transport.projection.calls.is_empty()
+                    {
+                        send_tool_choice_unsatisfied_error(&trace, &sender, permit);
+                        let _ = send_sse_done(&trace, &sender);
+                        return;
+                    }
                 }
                 let projection = transport.projection;
                 if let Err(message) =
@@ -2213,6 +2255,7 @@ fn assistant_message(projection: &ToolProjection) -> Value {
 struct TransportProjection {
     projection: ToolProjection,
     completed_call_suppressed: bool,
+    suppressed: bool,
 }
 
 fn apply_transport_projection(
@@ -2225,6 +2268,7 @@ fn apply_transport_projection(
         return TransportProjection {
             projection,
             completed_call_suppressed: false,
+            suppressed: false,
         };
     }
     let (calls, suppressed) = ledger.filter_known_calls(projection.calls, |name| {
@@ -2244,6 +2288,7 @@ fn apply_transport_projection(
     TransportProjection {
         projection,
         completed_call_suppressed,
+        suppressed,
     }
 }
 
@@ -2357,9 +2402,6 @@ fn completed_tool_answer_request(
         answer.session_id = result.session_id.clone();
     }
     answer.started = false;
-    answer.tools.clear();
-    answer.tool_choice = Value::String("none".to_owned());
-    answer.tool_call_limit = 1;
     crate::chathub::inherit_prepared_attachments(&mut answer);
     let message_text_units = utf16_units(&crate::chathub::outbound_message_text(
         &answer.text,
@@ -2374,6 +2416,70 @@ fn completed_tool_answer_request(
         });
     }
     Ok(answer)
+}
+
+fn unsafe_tool_replay_value() -> Value {
+    json!({
+        "error": {
+            "type": "tool_protocol_error",
+            "code": "unsafe_tool_replay",
+            "message": "A tool call with an unknown or unsafe outcome was repeated; no new tool call or final checkpoint was accepted.",
+            "retryable": false,
+            "recommended_action": "reconcile_the_existing_call_or_start_a_new_user_turn"
+        }
+    })
+}
+
+fn unsafe_tool_replay_response(permit: crate::traffic::Permit) -> Response {
+    permit.finish(StatusCode::CONFLICT, None);
+    (StatusCode::CONFLICT, Json(unsafe_tool_replay_value())).into_response()
+}
+
+fn send_unsafe_tool_replay_error(
+    trace: &crate::debug::Trace,
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+    permit: crate::traffic::Permit,
+) -> bool {
+    permit.finish(StatusCode::CONFLICT, None);
+    let sent = send_sse(sender, unsafe_tool_replay_value());
+    trace.caller_delivery(stream_error_delivery(sender, sent));
+    sent
+}
+
+fn tool_choice_requires_call(choice: &Value) -> bool {
+    match choice {
+        Value::String(mode) => mode.eq_ignore_ascii_case("required"),
+        Value::Object(_) => true,
+        _ => false,
+    }
+}
+
+fn tool_choice_unsatisfied_value() -> Value {
+    json!({
+        "error": {
+            "type": "tool_protocol_error",
+            "code": "tool_choice_unsatisfied",
+            "message": "The caller's tool_choice requires a legal tool call; no accepted tool call was produced.",
+            "retryable": false,
+            "recommended_action": "reconcile_the_existing_call_or_start_a_new_user_turn"
+        }
+    })
+}
+
+fn tool_choice_unsatisfied_response(permit: crate::traffic::Permit) -> Response {
+    permit.finish(StatusCode::CONFLICT, None);
+    (StatusCode::CONFLICT, Json(tool_choice_unsatisfied_value())).into_response()
+}
+
+fn send_tool_choice_unsatisfied_error(
+    trace: &crate::debug::Trace,
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+    permit: crate::traffic::Permit,
+) -> bool {
+    permit.finish(StatusCode::CONFLICT, None);
+    let sent = send_sse(sender, tool_choice_unsatisfied_value());
+    trace.caller_delivery(stream_error_delivery(sender, sent));
+    sent
 }
 
 fn tool_round_limit_response(
@@ -12553,11 +12659,355 @@ mod tests {
         let requests = chat.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(!requests[0].tools.is_empty());
-        assert!(requests[1].tools.is_empty());
-        assert_eq!(requests[1].tool_choice, Value::String("none".to_owned()));
+        assert_eq!(requests[1].tools.len(), 1);
+        assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
 
         let record = gateway.debug.records_for_test().pop().unwrap();
         assert_eq!(record["toolCallSuppressed"], true);
+    }
+
+    fn duplicate_fallback_with_legal_followup_request(stream: bool) -> Value {
+        let mut body = json!({
+            "model":"gpt-5.6-terra",
+            "messages":[
+                {"role":"user","content":"Continue from the retained inspection."},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"completed-inspect","type":"function","function":{"name":"inspect","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"completed-inspect","content":"{\"output\":\"already inspected\",\"status\":\"completed\"}"}
+            ],
+            "tools":[
+                {"type":"function","function":{
+                    "name":"inspect",
+                    "description":"Read the retained inspection.",
+                    "parameters":{"type":"object"}
+                }},
+                {"type":"function","function":{
+                    "name":"read_file",
+                    "description":"Read one current caller-side file.",
+                    "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                }}
+            ],
+            "tool_choice":"auto"
+        });
+        if stream {
+            body["stream"] = Value::Bool(true);
+        }
+        body
+    }
+
+    async fn assert_duplicate_fallback_preserves_legal_followup(stream: bool) {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "```read_file\n{\"path\":\"workspace/current.json\"}\n```",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&duplicate_fallback_with_legal_followup_request(stream))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        if stream {
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            let frames = sse_values(&body);
+            sole_sse_terminal(&frames, "tool_calls");
+            let tool_call = frames
+                .iter()
+                .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls/0"))
+                .expect("stream must contain the projected caller tool call");
+            assert_eq!(tool_call["function"]["name"], "read_file");
+        } else {
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+            assert_eq!(
+                value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                "read_file"
+            );
+        }
+
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].tools.len(), 2);
+        assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn hermes_duplicate_fallback_keeps_a_distinct_non_stream_tool_call() {
+        assert_duplicate_fallback_preserves_legal_followup(false).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_duplicate_fallback_keeps_a_distinct_stream_tool_call() {
+        assert_duplicate_fallback_preserves_legal_followup(true).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_duplicate_fallback_tool_result_can_continue_normally() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "```read_file\n{\"path\":\"workspace/current.json\"}\n```",
+            "The caller readback was accepted and the request can continue.",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let session_key = "duplicate-fallback-result-continuation";
+        let mut first_request = duplicate_fallback_with_legal_followup_request(false);
+        first_request["session_key"] = Value::String(session_key.to_owned());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&first_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let assistant = first["choices"][0]["message"].clone();
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "read_file");
+        let call_id = assistant["tool_calls"][0]["id"]
+            .as_str()
+            .expect("caller tool call id")
+            .to_owned();
+
+        let mut messages = first_request["messages"].as_array().unwrap().clone();
+        messages.push(assistant);
+        messages.push(json!({
+            "role":"tool",
+            "tool_call_id":call_id,
+            "content":"{\"content\":\"current file\",\"status\":\"completed\"}"
+        }));
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":session_key,
+                            "messages":messages,
+                            "tools":first_request["tools"].clone(),
+                            "tool_choice":"auto"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            second["choices"][0]["message"]["content"],
+            "The caller readback was accepted and the request can continue."
+        );
+        assert_eq!(chat.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn hermes_duplicate_fallback_does_not_widen_specific_tool_choice() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "```read_file\n{\"path\":\"workspace/current.json\"}\n```",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let mut request = duplicate_fallback_with_legal_followup_request(false);
+        let specific_choice = json!({
+            "type":"function",
+            "function":{"name":"inspect"}
+        });
+        request["tool_choice"] = specific_choice.clone();
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(value["error"]["type"], "tool_protocol_error");
+        assert_eq!(value["error"]["code"], "tool_choice_unsatisfied");
+        assert_eq!(chat.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            chat.requests.lock().unwrap()[1].tool_choice,
+            specific_choice
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_duplicate_fallback_does_not_widen_required_tool_choice_in_stream() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "The required caller tool was not selected.",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let mut request = duplicate_fallback_with_legal_followup_request(true);
+        request["tool_choice"] = Value::String("required".to_owned());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("tool_choice_unsatisfied"), "body={body}");
+        assert!(!body.contains("finish_reason"), "body={body}");
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        assert_eq!(chat.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            chat.requests.lock().unwrap()[1].tool_choice,
+            Value::String("required".to_owned())
+        );
+    }
+
+    async fn assert_duplicate_fallback_overflow_fails_closed(stream: bool) {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "```read_file\n{\"path\":\"a\"}\n```\n```read_file\n{\"path\":\"b\"}\n```",
+        ]));
+        let (app, raw_key) = app_with_chat(chat.clone());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&duplicate_fallback_with_legal_followup_request(stream))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if stream {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("invalid_tool_call"), "body={body}");
+            assert!(!body.contains("finish_reason"), "body={body}");
+            assert!(body.ends_with("data: [DONE]\n\n"));
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["error"]["code"], "invalid_tool_call");
+        }
+        assert_eq!(chat.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hermes_duplicate_fallback_overflow_fails_closed_non_stream() {
+        assert_duplicate_fallback_overflow_fails_closed(false).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_duplicate_fallback_overflow_fails_closed_stream() {
+        assert_duplicate_fallback_overflow_fails_closed(true).await;
+    }
+
+    async fn assert_repeated_duplicate_fallback_fails_closed(stream: bool) {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "```inspect\n{}\n```",
+        ]));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(Arc::clone(&gateway));
+        let mut request = duplicate_fallback_with_legal_followup_request(stream);
+        request["session_key"] = Value::String("repeated-duplicate-fallback".to_owned());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if stream {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("unsafe_tool_replay"), "body={body}");
+            assert!(!body.contains("finish_reason"), "body={body}");
+            assert!(body.ends_with("data: [DONE]\n\n"));
+        } else {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["error"]["type"], "tool_protocol_error");
+            assert_eq!(value["error"]["code"], "unsafe_tool_replay");
+        }
+
+        assert_eq!(chat.requests.lock().unwrap().len(), 2);
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hermes_repeated_duplicate_fallback_is_typed_non_stream_error() {
+        assert_repeated_duplicate_fallback_fails_closed(false).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_repeated_duplicate_fallback_is_typed_stream_error() {
+        assert_repeated_duplicate_fallback_fails_closed(true).await;
     }
 
     #[tokio::test]
@@ -12909,8 +13359,8 @@ mod tests {
         let requests = chat.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(!requests[0].tools.is_empty());
-        assert!(requests[1].tools.is_empty());
-        assert_eq!(requests[1].tool_choice, Value::String("none".to_owned()));
+        assert_eq!(requests[1].tools.len(), 1);
+        assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
     }
 
     #[tokio::test]

@@ -61,7 +61,7 @@ Execution identity 缺失、wire key 衝突或 provenance 無法證明時，應�
 
 ## Tool continuation 與 duplicate effect
 
-Hermes transport ledger 可以辨識已完成的 exact tool call，避免同一 transport effect 被重送，並在需要時要求一次沒有 tools 的 continuation。
+Hermes transport ledger 可以辨識已完成的 exact tool call，避免同一 transport effect 被重送，並在需要時要求一次保留 caller 工具契約的 bounded continuation；只阻止被安全檢查拒絕的候選。若續接再次只收到不安全重播，非串流回 typed HTTP `409 unsafe_tool_replay`，串流送出同一錯誤代碼後結束；若原本是 `required` 或特定工具選擇而沒有合法 call，則回 `tool_choice_unsatisfied`。兩者都不接受成功 final 或 checkpoint。
 
 這只回答「這個 transport tool effect 是否已經有證據」，不回答「Agent 工作是否完成」。Task / Run semantic completion 仍由 ACP 的 acceptance contract 判定。
 

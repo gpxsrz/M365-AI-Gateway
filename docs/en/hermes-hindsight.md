@@ -61,7 +61,7 @@ Missing execution identity, conflicting wire identity, or unprovable provenance 
 
 ## Tool continuation and duplicate effects
 
-The Hermes transport ledger may recognize an already completed exact tool call, suppress the same transport effect, and request a no-tools continuation when needed.
+The Hermes transport ledger may recognize an already completed exact tool call, suppress the same transport effect, and request one bounded continuation that preserves the caller's tool contract when needed; only candidates rejected by the safety check are removed. If the continuation again receives only an unsafe replay, non-streaming returns typed HTTP `409 unsafe_tool_replay`; streaming emits the same error code and ends. If the original choice was `required` or a specific tool choice and no legal call is produced, it returns `tool_choice_unsatisfied`. Neither accepts a successful final or checkpoint.
 
 This answers “do we already have evidence for this transport tool effect?” It does not answer “is the Agent task complete?” Task / Run semantic completion remains an ACP acceptance decision.
 
