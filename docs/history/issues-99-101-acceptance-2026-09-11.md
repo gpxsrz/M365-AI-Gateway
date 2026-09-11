@@ -25,7 +25,7 @@
 
 ### #99 — caller-tool source, pairing, order and continuation
 
-- 疑點窗口的 durable Hermes chain 讀回 `session_search` 結果 `count=0`、之後 `count=5`、再之後 `count=1`；active tool calls/results 為 `119/119` matched，沒有 active orphan 或 duplicate ID。
+- 疑點窗口的 durable Hermes chain 讀回 `session_search` 結果 `count=0`、之後 `count=5`、再之後 `count=1`；同一受控 session 的全段 active durable tool calls/results readback 為 `119/119` matched，沒有 active orphan 或 duplicate ID（不是疑點窗口內的請求數）。
 - 同一窗口的 M365 telemetry 有 15 筆 admitted full-context chat，均 upstream success，沒有 attachment/transport error。
 - **Decision: OPEN — evidence insufficient.** 尚缺當次 Hermes outbound input、Gateway role/tool/checkpoint projection、upstream reply 與 caller delivery 的 exact correlation/full-wire reconstruction。後來查到結果不能單獨證明先前沒有漏傳；「附件過期」也沒有實際 attachment failure evidence。搜尋過窄／過早要求補背景是合理但未證實的模型層推論。
 - 最小下一步：取得去敏的單次 correlation record，能將 session event、Gateway correlation/checkpoint、upstream start/result、tool call/result ID 與順序綁在一起；在此之前不判 Gateway 有錯，也不判模型有錯。
@@ -34,14 +34,14 @@
 
 - current source 的分類需要支援的 provider source metadata 與有限通知形狀；普通內容、來源未知、非 provider 來源不因相同字句被改判。focused regression `6/6` PASS。
 - 自然窗口有正常 chat success evidence；沒有觀測到自然容量事件。歷史事故的完整 upstream origin 仍 **UNCONFIRMED**。
-- **Decision: eligible for bounded closure / CLOSED only after the Issue readback.** 這個結論只涵蓋已支援 source-backed failure qualification、普通內容不誤判與自然正常路徑；不宣稱自然 429 或歷史 origin 已實測確認。
+- **Decision: CLOSED within bounded scope**（Issue readback completed at `2026-09-11T12:03:20Z`）。這個結論只涵蓋已支援 source-backed failure qualification、普通內容不誤判與自然正常路徑；不宣稱自然 429 或歷史 origin 已實測確認。
 
 ### #101 — full-context spill and caller-tool continuation
 
 - current v0.1.9 artifact 與 e5 source identity 相符；focused regression `12/12` PASS，既有 exact e5 qualification 另驗證 stream/non-stream、tool error state、binding/source isolation 與實際 LiveChatHub/SignalR 路徑。
 - 自然 telemetry 實際記錄 `full_context_document`，`utf16Before` 最高 `1,000,000`、`utf16After` 最高 `111,686`；既有 session 仍有合法且成對的 caller/tool work 與新結果 readback。
 - 18:43 的 `attachment_error` 在目前 execution path 於 upstream-start 前結束；之後有成功紀錄，checkpoint 沒有 unresolved in-flight/unknown，未見 duplicate caller mutation。細部 attachment service 原因與 error/success 的同一 logical-request join 仍未知，但不需要靠 proximity 宣稱同一請求才能證明失敗嘗試沒有進入 upstream effect。
-- **Decision: eligible for bounded closure / CLOSED only after the Issue readback.** 結案文字限定為：超長上下文搬移與既有session工具續接的原阻塞已解決。不保證模型讀取文件每一位置，也不保證Hermes永不失憶。
+- **Decision: CLOSED within bounded scope**（Issue readback completed at `2026-09-11T12:03:58Z`）。結案文字限定為：超長上下文搬移與既有session工具續接的原阻塞已解決。不保證模型讀取文件每一位置，也不保證Hermes永不失憶。
 
 ## Explicit non-claims
 
