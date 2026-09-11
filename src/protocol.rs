@@ -5100,7 +5100,7 @@ mod tests {
             DEFAULT_AUTHORITY, DEFAULT_CLIENT_ID, DEFAULT_REDIRECT_URI, DEFAULT_SCOPE, OAuthConfig,
             TokenSet, TokenStore,
         },
-        chathub::{ChatFuture, ChatHubTransport, ChatResult, EventSink},
+        chathub::{Attachment, ChatFuture, ChatHubTransport, ChatResult, EventSink, LiveChatHub},
         checkpoint::CheckpointStore,
         oauth_flow::PkceManager,
     };
@@ -5376,135 +5376,146 @@ mod tests {
         }
     }
 
-    struct Issue101ToolContinuationTransport {
-        requests: Mutex<Vec<ChatRequest>>,
-        upstream_calls: AtomicUsize,
-        upstream_start_calls: AtomicUsize,
-    }
+    fn issue_101_prepare_attachments<'a>(
+        _: &'a Account,
+        conversation_id: &'a str,
+        session_id: &'a str,
+        attachments: &'a mut [Attachment],
+    ) -> crate::chathub::AttachmentPreparationFuture<'a> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-    impl Issue101ToolContinuationTransport {
-        fn new() -> Self {
-            Self {
-                requests: Mutex::new(Vec::new()),
-                upstream_calls: AtomicUsize::new(0),
-                upstream_start_calls: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl ChatHubTransport for Issue101ToolContinuationTransport {
-        fn upstream_start_after_preparation(&self) -> bool {
-            true
-        }
-
-        fn chat<'a>(
-            &'a self,
-            _: Account,
-            mut request: ChatRequest,
-            _: &'a mut (dyn EventSink + Send),
-        ) -> ChatFuture<'a> {
-            Box::pin(async move {
-                let call_index = self.upstream_calls.fetch_add(1, Ordering::AcqRel);
-                assert_eq!(
-                    request.upstream_attempt_count.load(Ordering::Acquire),
-                    0,
-                    "the isolated upstream must be reached once without a retry"
-                );
-
-                if call_index == 0 {
-                    request.conversation_id = "issue-101-tool-conversation".to_owned();
-                    request.session_id = "issue-101-tool-session".to_owned();
-                    assert_eq!(request.attachments.len(), 1);
-                    let attachment = request
-                        .attachments
-                        .first_mut()
-                        .expect("the long fixture must produce one context attachment");
-                    assert!(attachment.generated_oversize_text);
-                    attachment.doc_id = format!(
-                        "SPO_{}",
-                        "d".repeat(crate::attachment::MAX_PREPARED_DOC_ID_UTF16 - 4)
-                    );
-                    attachment.transport_name = format!(
-                        "{}.txt",
-                        "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16 - 4)
-                    );
-                    attachment.reference_url =
-                        "https://prepared-attachment.invalid/issue-101/context".to_owned();
-                    attachment.uploaded_conversation_id = request.conversation_id.clone();
-                    attachment.uploaded_session_id = request.session_id.clone();
-                } else {
-                    assert_eq!(request.attachments.len(), 0);
-                    assert_eq!(request.conversation_id, "issue-101-tool-conversation");
-                    assert_eq!(request.session_id, "issue-101-tool-session");
-                    let envelope: Value =
-                        serde_json::from_str(&request.text).expect("continuation role envelope");
-                    let messages = envelope["messages"]
-                        .as_array()
-                        .expect("continuation role envelope messages");
-                    assert_eq!(messages.len(), 1);
-                    assert_eq!(messages[0]["role"], "tool");
-                    assert!(
-                        !messages[0]["tool_call_id"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .is_empty()
-                    );
+        Box::pin(async move {
+            for attachment in attachments {
+                if !attachment.generated_oversize_text {
+                    continue;
                 }
-
-                let message_text_units = utf16_units(&crate::chathub::outbound_message_text(
-                    &request.text,
-                    &request.tools,
-                    &request.tool_choice,
-                    request.tool_call_limit,
-                ));
-                assert!(message_text_units <= request.outbound_text_limit_utf16);
-                request
-                    .final_message_text_utf16
-                    .store(message_text_units, Ordering::Release);
-                request.final_wire_utf16.store(
-                    crate::chathub::outbound_payload_utf16_units(&request),
-                    Ordering::Release,
-                );
-                let start = request
-                    .upstream_start
-                    .as_ref()
-                    .expect("checkpoint-bound upstream request must carry a start hook");
+                let encoded = attachment
+                    .url
+                    .strip_prefix("data:text/plain;base64,")
+                    .expect("full-context document upload input");
+                let document: Value =
+                    serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+                let (expected_body, expected_system_prompt) =
+                    issue_101_third_round_controls_fixture_request();
+                let expected_messages = expected_body["messages"]
+                    .as_array()
+                    .expect("controls fixture messages");
+                assert_eq!(document["schema"], "m365-full-context/v1");
+                assert_eq!(document["source_message_count"], 52);
+                assert_eq!(document["message_count"], 52);
+                for (index, source) in expected_messages.iter().enumerate() {
+                    let projected = &document["messages"][index]["message"];
+                    assert_eq!(document["messages"][index]["message_index"], index);
+                    assert_eq!(projected["role"], source["role"]);
+                    if let Some(content) = source.get("content").filter(|value| value.is_string()) {
+                        assert_eq!(projected["content"], *content);
+                    } else if source.get("content").is_some_and(Value::is_null) {
+                        assert_eq!(projected["content"], "");
+                    }
+                    if let Some(tool_calls) = source.get("tool_calls") {
+                        assert_eq!(projected["tool_calls"], *tool_calls);
+                    }
+                    if let Some(tool_call_id) = source.get("tool_call_id") {
+                        assert_eq!(projected["tool_call_id"], *tool_call_id);
+                    }
+                    assert_eq!(
+                        projected["tool_result_is_error"],
+                        source
+                            .get("tool_result_is_error")
+                            .cloned()
+                            .unwrap_or(Value::Bool(false))
+                    );
+                    if source["role"] == "tool"
+                        || (source["role"] == "assistant" && source.get("tool_calls").is_some())
+                    {
+                        assert_eq!(projected["execution_surface"], "caller_tool");
+                    }
+                }
                 assert_eq!(
-                    self.upstream_start_calls.fetch_add(1, Ordering::AcqRel),
-                    call_index,
-                    "each prepared upstream request gets exactly one start hook"
+                    document["messages"][0]["message"]["content"],
+                    expected_system_prompt
                 );
-                start.call()?;
-                request.upstream_attempt_count.store(1, Ordering::Release);
-                self.requests.lock().unwrap().push(request);
+                attachment.doc_id = format!(
+                    "SPO_{}",
+                    "d".repeat(crate::attachment::MAX_PREPARED_DOC_ID_UTF16 - 4)
+                );
+                attachment.transport_name = format!(
+                    "{}.txt",
+                    "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16 - 4)
+                );
+                attachment.reference_url =
+                    "https://prepared-attachment.invalid/issue-101/context".to_owned();
+                attachment.uploaded_conversation_id = conversation_id.to_owned();
+                attachment.uploaded_session_id = session_id.to_owned();
+            }
+            Ok(())
+        })
+    }
 
-                if call_index == 0 {
-                    let arguments = json!({
-                        "path": "workspace/continuation.json",
-                        "mode": "read_only"
-                    });
-                    Ok(ChatResult {
-                        text: format!(
+    async fn issue_101_upstream_server()
+    -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_by_server = Arc::clone(&received);
+        let server = tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let mut payload_received = false;
+                while let Some(message) = socket.next().await {
+                    let message = message.unwrap();
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let text = text.to_string();
+                    if text.starts_with("{\"protocol\":\"json\"") {
+                        socket
+                            .send(Message::Text("{}".to_owned().into()))
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    let chat_frame = text
+                        .split('\x1e')
+                        .find(|frame| frame.contains("\"target\":\"chat\""))
+                        .expect("actual LiveChatHub must send the chat payload");
+                    serde_json::from_str::<Value>(chat_frame).expect("valid ChatHub payload");
+                    received_by_server.lock().unwrap().push(text);
+                    let result_message = if connection_index == 0 {
+                        let arguments = json!({
+                            "path": "workspace/continuation.json",
+                            "mode": "read_only"
+                        });
+                        format!(
                             "```third_round_tool_01\n{}\n```",
                             serde_json::to_string(&arguments).unwrap()
-                        ),
-                        conversation_id: "issue-101-tool-conversation".to_owned(),
-                        session_id: "issue-101-tool-session".to_owned(),
-                        request_id: "issue-101-tool-request-1".to_owned(),
-                        ..ChatResult::default()
-                    })
-                } else {
-                    Ok(ChatResult {
-                        text: "The caller tool result was accepted and the task can continue."
-                            .to_owned(),
-                        conversation_id: "issue-101-tool-conversation".to_owned(),
-                        session_id: "issue-101-tool-session".to_owned(),
-                        request_id: "issue-101-tool-request-2".to_owned(),
-                        ..ChatResult::default()
-                    })
+                        )
+                    } else {
+                        "The caller tool result was accepted and the task can continue.".to_owned()
+                    };
+                    for frame in [
+                        json!({"type":2,"item":{"result":{"message":result_message}}}),
+                        json!({"type":3}),
+                    ] {
+                        socket
+                            .send(Message::Text(format!("{frame}\x1e").into()))
+                            .await
+                            .unwrap();
+                    }
+                    payload_received = true;
+                    break;
                 }
-            })
-        }
+                assert!(
+                    payload_received,
+                    "isolated upstream received no chat payload"
+                );
+            }
+        });
+        (format!("ws://{address}"), received, server)
     }
 
     struct SensitiveProtocolFailureTransport;
@@ -9235,11 +9246,35 @@ mod tests {
     }
 
     fn sse_values(body: &str) -> Vec<Value> {
-        body.lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .filter(|line| *line != "[DONE]")
-            .map(|line| serde_json::from_str(line).expect("valid SSE JSON frame"))
-            .collect()
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        let mut done_count = 0;
+        let mut values = Vec::new();
+        for line in body.lines().filter(|line| !line.is_empty()) {
+            let data = line.strip_prefix("data: ").expect("SSE data frame");
+            if data == "[DONE]" {
+                done_count += 1;
+            } else {
+                values.push(serde_json::from_str(data).expect("valid SSE JSON frame"));
+            }
+        }
+        assert_eq!(done_count, 1, "SSE must contain exactly one [DONE]");
+        values
+    }
+
+    fn sole_sse_terminal<'a>(frames: &'a [Value], finish_reason: &str) -> &'a Value {
+        let terminals = frames
+            .iter()
+            .filter(|frame| !frame["choices"][0]["finish_reason"].is_null())
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "SSE must contain one terminal choice");
+        assert_eq!(terminals[0]["choices"][0]["finish_reason"], finish_reason);
+        terminals[0]
+    }
+
+    fn issue_101_user_request_from_outbound_message(text: &str) -> &str {
+        text.split_once("\n\nUser request:\n")
+            .map(|(_, request)| request)
+            .expect("canonical tool protocol prefix")
     }
 
     async fn assert_issue_101_third_round_fixture_is_usable(stream: bool) {
@@ -9379,8 +9414,6 @@ mod tests {
     }
 
     async fn assert_issue_101_controls_tool_continuation(stream: bool) {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-
         let (mut first_body, system_prompt) = issue_101_third_round_controls_fixture_request();
         first_body["stream"] = Value::Bool(stream);
         first_body["session_key"] = Value::String("issue-101-controls-continuation".to_owned());
@@ -9460,9 +9493,16 @@ mod tests {
         assert!(initial_message_text_units > 128_000);
         assert!(initial_payload_units > initial_message_text_units);
 
+        let (websocket_base, upstream_payloads, upstream_server) =
+            issue_101_upstream_server().await;
         let (oauth, token_server) = oauth_with_graph_token_server().await;
-        let chat = Arc::new(Issue101ToolContinuationTransport::new());
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let (mut gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth);
+        let settings = gateway.settings.clone();
+        let live_chat =
+            LiveChatHub::new_for_test(settings, issue_101_prepare_attachments, websocket_base);
+        Arc::get_mut(&mut gateway)
+            .expect("test gateway must be uniquely owned before routing")
+            .chat = Arc::new(live_chat);
         let app = Gateway::router(Arc::clone(&gateway));
         let first = app
             .clone()
@@ -9485,18 +9525,15 @@ mod tests {
         );
         let first_body_text = String::from_utf8(first_body_bytes.to_vec()).unwrap();
         let assistant = if stream {
-            assert!(first_body_text.ends_with("data: [DONE]\n\n"));
             let frames = sse_values(&first_body_text);
-            assert!(
-                frames
-                    .iter()
-                    .any(|frame| { frame["choices"][0]["finish_reason"] == "tool_calls" })
-            );
-            let call = frames
+            let terminal = sole_sse_terminal(&frames, "tool_calls");
+            let calls = frames
                 .iter()
-                .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls/0").cloned())
-                .expect("stream tool call frame");
-            json!({"role":"assistant","content":null,"tool_calls":[call]})
+                .filter_map(|frame| frame.pointer("/choices/0/delta/tool_calls/0"))
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "stream must contain one caller tool call");
+            assert!(terminal["choices"][0]["delta"]["tool_calls"].is_null());
+            json!({"role":"assistant","content":null,"tool_calls":[calls[0].clone()]})
         } else {
             let value: Value = serde_json::from_str(&first_body_text).unwrap();
             assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
@@ -9511,19 +9548,31 @@ mod tests {
         assert!(!call_id.is_empty());
         assert_eq!(call["type"], "function");
         let name = call["function"]["name"].as_str().unwrap();
-        assert!(
-            tools_value
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| { tool["function"]["name"].as_str() == Some(name) })
-        );
+        let selected_tool = tools_value
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"].as_str() == Some(name))
+            .expect("caller tool identity must be declared in the request");
         let arguments: Value =
             serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        let validator = jsonschema::validator_for(&selected_tool["function"]["parameters"])
+            .expect("fixture tool parameters are a valid JSON schema");
+        assert!(
+            validator.is_valid(&arguments),
+            "upstream caller tool arguments must satisfy the declared schema"
+        );
         assert_eq!(arguments["path"], "workspace/continuation.json");
         assert_eq!(arguments["mode"], "read_only");
         assert_eq!(arguments.as_object().unwrap().len(), 2);
+        assert!(source_messages_typed.iter().all(|message| {
+            message
+                .tool_calls
+                .iter()
+                .all(|historical| historical["id"].as_str() != Some(call_id))
+        }));
         assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
 
         let tool_result = json!({
             "status": "completed",
@@ -9566,13 +9615,9 @@ mod tests {
         );
         let second_body_text = String::from_utf8(second_body_bytes.to_vec()).unwrap();
         if stream {
-            assert!(second_body_text.ends_with("data: [DONE]\n\n"));
             let frames = sse_values(&second_body_text);
-            assert!(
-                frames
-                    .iter()
-                    .any(|frame| { frame["choices"][0]["finish_reason"] == "stop" })
-            );
+            let terminal = sole_sse_terminal(&frames, "stop");
+            assert!(terminal["choices"][0]["delta"]["content"].is_null());
             let content = frames
                 .iter()
                 .filter_map(|frame| frame.pointer("/choices/0/delta/content"))
@@ -9593,86 +9638,79 @@ mod tests {
             assert!(value["choices"][0]["message"]["tool_calls"].is_null());
         }
         assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
 
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let first_request = &requests[0];
-        let second_request = &requests[1];
-        assert_eq!(first_request.tools.len(), 29);
-        assert_eq!(second_request.tools.len(), 29);
-        assert_eq!(first_request.attachments.len(), 1);
-        assert!(first_request.attachments[0].generated_oversize_text);
-        assert_eq!(
-            first_request.attachments[0].uploaded_conversation_id,
-            first_request.conversation_id
-        );
-        assert_eq!(
-            first_request.attachments[0].uploaded_session_id,
-            first_request.session_id
-        );
-        assert_eq!(
-            first_request.conversation_id,
-            second_request.conversation_id
-        );
-        assert_eq!(first_request.session_id, second_request.session_id);
-        assert!(second_request.attachments.is_empty());
-        let first_message_text_units = utf16_units(&crate::chathub::outbound_message_text(
-            &first_request.text,
-            &first_request.tools,
-            &first_request.tool_choice,
-            first_request.tool_call_limit,
-        ));
-        let second_message_text_units = utf16_units(&crate::chathub::outbound_message_text(
-            &second_request.text,
-            &second_request.tools,
-            &second_request.tool_choice,
-            second_request.tool_call_limit,
-        ));
-        assert!(first_message_text_units <= 128_000);
-        assert!(second_message_text_units <= 128_000);
+        upstream_server.await.unwrap();
+        let payloads = upstream_payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 2);
+        let first_payload = payloads[0]
+            .split('\x1e')
+            .find(|frame| frame.contains("\"target\":\"chat\""))
+            .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+            .expect("first ChatHub payload");
+        let second_payload = payloads[1]
+            .split('\x1e')
+            .find(|frame| frame.contains("\"target\":\"chat\""))
+            .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+            .expect("second ChatHub payload");
+        let first_argument = &first_payload["arguments"][0];
+        let second_argument = &second_payload["arguments"][0];
+        let first_message_text = first_argument["message"]["text"]
+            .as_str()
+            .expect("first ChatHub message.text");
+        let second_message_text = second_argument["message"]["text"]
+            .as_str()
+            .expect("second ChatHub message.text");
+        let first_message_text_units = utf16_units(first_message_text);
+        let second_message_text_units = utf16_units(second_message_text);
         assert_eq!(first_message_text_units, 107_936);
         assert_eq!(second_message_text_units, 79_695);
-        assert_eq!(
-            first_request
-                .final_message_text_utf16
-                .load(Ordering::Acquire),
-            first_message_text_units
+        assert!(first_message_text.contains("third_round_tool_01"));
+        assert!(first_message_text.contains("parameter description"));
+        assert!(second_message_text.contains("continuation result"));
+        assert_eq!(first_argument["plugins"].as_array().unwrap().len(), 30);
+        assert_eq!(second_argument["plugins"].as_array().unwrap().len(), 30);
+        assert!(
+            first_argument["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|plugin| {
+                    plugin["Id"] == "third_round_tool_01" && plugin["Source"] == "Client"
+                })
         );
-        assert_eq!(
-            second_request
-                .final_message_text_utf16
-                .load(Ordering::Acquire),
-            second_message_text_units
+        assert!(
+            second_argument["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|plugin| {
+                    plugin["Id"] == "third_round_tool_01" && plugin["Source"] == "Client"
+                })
         );
-        assert!(first_request.final_wire_utf16.load(Ordering::Acquire) > first_message_text_units);
+        let first_annotations = first_argument["message"]["messageAnnotations"]
+            .as_array()
+            .expect("prepared context annotation");
+        assert_eq!(first_annotations.len(), 1);
+        assert_eq!(first_annotations[0]["messageAnnotationType"], "LocalFile");
+        assert_eq!(first_annotations[0]["id"].as_str().unwrap().len(), 2_048);
+        assert!(
+            first_annotations[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(".txt")
+        );
+        assert!(
+            second_argument["message"]
+                .get("messageAnnotations")
+                .is_none()
+        );
+        assert_eq!(first_argument["sessionId"], second_argument["sessionId"]);
 
-        let encoded = first_request.attachments[0]
-            .url
-            .strip_prefix("data:text/plain;base64,")
-            .expect("full-context attachment");
-        let document: Value = serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
-        assert_eq!(document["schema"], "m365-full-context/v1");
-        assert_eq!(document["source_message_count"], 52);
-        assert_eq!(document["message_count"], 52);
-        for (index, source) in source_messages.as_array().unwrap().iter().enumerate() {
-            let projected = &document["messages"][index]["message"];
-            assert_eq!(document["messages"][index]["message_index"], index);
-            assert_eq!(projected["role"], source["role"]);
-            if let Some(content) = source.get("content").filter(|value| value.is_string()) {
-                assert_eq!(projected["content"], *content);
-            } else if source.get("content").is_some_and(Value::is_null) {
-                assert_eq!(projected["content"], "");
-            }
-            if let Some(tool_calls) = source.get("tool_calls") {
-                assert_eq!(projected["tool_calls"], *tool_calls);
-            }
-            if let Some(tool_call_id) = source.get("tool_call_id") {
-                assert_eq!(projected["tool_call_id"], *tool_call_id);
-            }
-        }
-        assert_eq!(document["messages"][0]["message"]["role"], "system");
-        assert_eq!(document["messages"][0]["message"]["content"], system_prompt);
-        let inline: Value = serde_json::from_str(&first_request.text).unwrap();
+        let inline: Value = serde_json::from_str(issue_101_user_request_from_outbound_message(
+            first_message_text,
+        ))
+        .unwrap();
         assert_eq!(
             inline["transport_projection"]["kind"],
             "full_context_document"
@@ -9682,7 +9720,10 @@ mod tests {
             json!([0, 51])
         );
 
-        let continuation_envelope: Value = serde_json::from_str(&second_request.text).unwrap();
+        let continuation_envelope: Value = serde_json::from_str(
+            issue_101_user_request_from_outbound_message(second_message_text),
+        )
+        .unwrap();
         assert_eq!(
             continuation_envelope["messages"].as_array().unwrap().len(),
             1
@@ -9713,15 +9754,10 @@ mod tests {
         );
         assert_eq!(live[0]["messageTextAfterUtf16"], first_message_text_units);
         assert_eq!(live[0]["preliminaryWireAfterUtf16"], 211_609);
-        assert_eq!(live[0]["wireAfterUtf16"], 207_524);
-        assert_eq!(
-            first_request.final_wire_utf16.load(Ordering::Acquire),
-            207_524
-        );
         assert_eq!(live[1]["status"], 200);
         assert!(live[1]["messageTextAfterUtf16"].as_u64().unwrap() <= 128_000);
-        assert_eq!(chat.upstream_calls.load(Ordering::Acquire), 2);
-        assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 2);
+        assert_eq!(live[0]["wireAfterUtf16"], utf16_units(&payloads[0]));
+        assert_eq!(live[1]["wireAfterUtf16"], utf16_units(&payloads[1]));
 
         token_server.abort();
     }
@@ -9734,6 +9770,48 @@ mod tests {
     #[tokio::test]
     async fn issue_101_controls_fixture_supports_tool_continuation_stream() {
         assert_issue_101_controls_tool_continuation(true).await;
+    }
+
+    #[tokio::test]
+    async fn issue_101_controls_fixture_rejects_unknown_tool_result_before_upstream() {
+        let (mut body, _) = issue_101_third_round_controls_fixture_request();
+        body["session_key"] = Value::String("issue-101-controls-invalid-pair".to_owned());
+        body["messages"].as_array_mut().unwrap().extend([
+            json!({
+                "role":"assistant",
+                "content":null,
+                "tool_calls":[{"id":"issue-101-new-call","type":"function","function":{
+                    "name":"third_round_tool_01",
+                    "arguments":"{\"path\":\"workspace/invalid.json\",\"mode\":\"read_only\"}"
+                }}]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"issue-101-unknown-call",
+                "content":"{\"status\":\"completed\",\"output\":\"unexpected\"}"
+            }),
+        ]);
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(error["error"]["type"], "tool_protocol_error");
+        assert!(chat.0.lock().unwrap().is_none());
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
     }
 
     #[tokio::test]

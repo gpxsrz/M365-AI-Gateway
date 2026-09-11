@@ -377,6 +377,8 @@ pub trait ChatHubTransport: Send + Sync {
 pub struct LiveChatHub {
     settings: runtime_settings::Store,
     attachment_preparer: AttachmentPreparer,
+    #[cfg(test)]
+    websocket_base: String,
 }
 
 impl LiveChatHub {
@@ -384,6 +386,22 @@ impl LiveChatHub {
         Self {
             settings,
             attachment_preparer: prepare_attachments,
+            #[cfg(test)]
+            websocket_base: WS_BASE.to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        settings: runtime_settings::Store,
+        attachment_preparer: AttachmentPreparer,
+        websocket_base: String,
+    ) -> Self {
+        Self {
+            settings,
+            attachment_preparer,
+            #[cfg(test)]
+            websocket_base,
         }
     }
 }
@@ -401,8 +419,20 @@ impl ChatHubTransport for LiveChatHub {
     ) -> ChatFuture<'a> {
         let private_mode = self.settings.current().chat_mode != "normal";
         let attachment_preparer = self.attachment_preparer;
+        #[cfg(test)]
+        let websocket_base = self.websocket_base.clone();
+        #[cfg(not(test))]
+        let websocket_base = WS_BASE.to_owned();
         Box::pin(async move {
-            live_chat(account, request, private_mode, events, attachment_preparer).await
+            live_chat(
+                account,
+                request,
+                private_mode,
+                events,
+                attachment_preparer,
+                &websocket_base,
+            )
+            .await
         })
     }
 }
@@ -413,6 +443,7 @@ async fn live_chat(
     private_mode: bool,
     events: &mut (dyn EventSink + Send),
     attachment_preparer: AttachmentPreparer,
+    websocket_base: &str,
 ) -> Result<ChatResult, ChatError> {
     if account.access_token.is_empty() || account.oid.is_empty() || account.tid.is_empty() {
         return Err(ChatError::MissingIdentity);
@@ -475,7 +506,13 @@ async fn live_chat(
             limit: request.outbound_text_limit_utf16,
         });
     }
-    let url = websocket_url(&account, &request, &request_id, private_mode)?;
+    let url = websocket_url_with_base(
+        websocket_base,
+        &account,
+        &request,
+        &request_id,
+        private_mode,
+    )?;
     if let Some(start) = request.upstream_start.as_ref() {
         start.call()?;
     }
@@ -1035,13 +1072,24 @@ fn generated_artifacts(events: &[Value], raw_result: &str) -> Result<Vec<Artifac
     Ok(collector.values)
 }
 
+#[cfg(test)]
 fn websocket_url(
     account: &Account,
     request: &ChatRequest,
     request_id: &str,
     private_mode: bool,
 ) -> Result<Url, ChatError> {
-    let mut url = Url::parse(&format!("{WS_BASE}/{}@{}", account.oid, account.tid))
+    websocket_url_with_base(WS_BASE, account, request, request_id, private_mode)
+}
+
+fn websocket_url_with_base(
+    base: &str,
+    account: &Account,
+    request: &ChatRequest,
+    request_id: &str,
+    private_mode: bool,
+) -> Result<Url, ChatError> {
+    let mut url = Url::parse(&format!("{base}/{}@{}", account.oid, account.tid))
         .map_err(|error| ChatError::Transport(error.to_string()))?;
     url.query_pairs_mut()
         .append_pair("chatsessionid", request_id)
@@ -2229,7 +2277,15 @@ mod tests {
             tid: "tid".to_owned(),
         };
         let mut sink = |_: StreamEvent| Ok(());
-        let result = live_chat(account, request, false, &mut sink, prepare_attachments).await;
+        let result = live_chat(
+            account,
+            request,
+            false,
+            &mut sink,
+            prepare_attachments,
+            WS_BASE,
+        )
+        .await;
 
         assert!(matches!(
             result,
