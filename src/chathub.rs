@@ -167,6 +167,7 @@ pub struct ChatRequest {
     pub disable_built_in_search: bool,
     pub upstream_attempt_count: Arc<AtomicUsize>,
     pub generated_attachment_reused: Arc<AtomicBool>,
+    pub(crate) final_wire_utf16: Arc<AtomicUsize>,
     #[doc(hidden)]
     pub prepared_attachments: Arc<Mutex<PreparedAttachmentState>>,
     #[doc(hidden)]
@@ -333,6 +334,29 @@ where
 
 pub type ChatFuture<'a> = Pin<Box<dyn Future<Output = Result<ChatResult, ChatError>> + Send + 'a>>;
 
+pub(crate) type AttachmentPreparationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ChatError>> + Send + 'a>>;
+pub(crate) type AttachmentPreparer = for<'a> fn(
+    &'a Account,
+    &'a str,
+    &'a str,
+    &'a mut [Attachment],
+) -> AttachmentPreparationFuture<'a>;
+
+fn prepare_attachments<'a>(
+    account: &'a Account,
+    conversation_id: &'a str,
+    session_id: &'a str,
+    attachments: &'a mut [Attachment],
+) -> AttachmentPreparationFuture<'a> {
+    Box::pin(attachment::prepare(
+        account,
+        conversation_id,
+        session_id,
+        attachments,
+    ))
+}
+
 pub trait ChatHubTransport: Send + Sync {
     fn upstream_start_after_preparation(&self) -> bool {
         false
@@ -348,11 +372,26 @@ pub trait ChatHubTransport: Send + Sync {
 
 pub struct LiveChatHub {
     settings: runtime_settings::Store,
+    attachment_preparer: AttachmentPreparer,
 }
 
 impl LiveChatHub {
     pub fn new(settings: runtime_settings::Store) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            attachment_preparer: prepare_attachments,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_attachment_preparer(
+        settings: runtime_settings::Store,
+        attachment_preparer: AttachmentPreparer,
+    ) -> Self {
+        Self {
+            settings,
+            attachment_preparer,
+        }
     }
 }
 
@@ -368,7 +407,10 @@ impl ChatHubTransport for LiveChatHub {
         events: &'a mut (dyn EventSink + Send),
     ) -> ChatFuture<'a> {
         let private_mode = self.settings.current().chat_mode != "normal";
-        Box::pin(async move { live_chat(account, request, private_mode, events).await })
+        let attachment_preparer = self.attachment_preparer;
+        Box::pin(async move {
+            live_chat(account, request, private_mode, events, attachment_preparer).await
+        })
     }
 }
 
@@ -377,6 +419,7 @@ async fn live_chat(
     mut request: ChatRequest,
     private_mode: bool,
     events: &mut (dyn EventSink + Send),
+    attachment_preparer: AttachmentPreparer,
 ) -> Result<ChatResult, ChatError> {
     if account.access_token.is_empty() || account.oid.is_empty() || account.tid.is_empty() {
         return Err(ChatError::MissingIdentity);
@@ -401,7 +444,7 @@ async fn live_chat(
             &request.session_id,
         )
     });
-    attachment::prepare(
+    attachment_preparer(
         &account,
         &request.conversation_id,
         &request.session_id,
@@ -417,6 +460,9 @@ async fn live_chat(
     let request_id = uuid_v4();
     let payload = chat_payload(&request, &request_id)?;
     let wire_units = payload.encode_utf16().count();
+    request
+        .final_wire_utf16
+        .store(wire_units, Ordering::Release);
     if request.outbound_text_limit_utf16 > 0 && wire_units > request.outbound_text_limit_utf16 {
         return Err(ChatError::PayloadTooLarge {
             wire_units,
@@ -1210,8 +1256,10 @@ pub(crate) fn outbound_message_text(
     )
 }
 
+const FIT_CHECK_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+#[cfg(test)]
 pub(crate) fn outbound_payload_utf16_units(request: &ChatRequest) -> usize {
-    const FIT_CHECK_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
     let mut request = request.clone();
     if request.conversation_id.is_empty() {
         request.conversation_id = FIT_CHECK_REQUEST_ID.to_owned();
@@ -1223,6 +1271,64 @@ pub(crate) fn outbound_payload_utf16_units(request: &ChatRequest) -> usize {
         .expect("ChatHub payload is serializable")
         .encode_utf16()
         .count()
+}
+
+pub(crate) fn outbound_payload_utf16_units_with_prepared_reservation(
+    request: &ChatRequest,
+) -> usize {
+    let mut request = request.clone();
+    if request.conversation_id.is_empty() {
+        request.conversation_id = FIT_CHECK_REQUEST_ID.to_owned();
+    }
+    if request.session_id.is_empty() {
+        request.session_id = FIT_CHECK_REQUEST_ID.to_owned();
+    }
+    reserve_unprepared_attachment_metadata(&mut request);
+    chat_payload(&request, FIT_CHECK_REQUEST_ID)
+        .expect("ChatHub payload is serializable")
+        .encode_utf16()
+        .count()
+}
+
+fn reserve_unprepared_attachment_metadata(request: &mut ChatRequest) {
+    let conversation_id = request.conversation_id.clone();
+    let session_id = request.session_id.clone();
+    for attachment in &mut request.attachments {
+        let ready = match attachment.kind.as_str() {
+            "file" => {
+                !attachment.doc_id.is_empty()
+                    && !attachment.reference_url.is_empty()
+                    && attachment.uploaded_conversation_id == conversation_id
+                    && attachment.uploaded_session_id == session_id
+            }
+            "image" => {
+                !attachment.doc_id.is_empty()
+                    && attachment.uploaded_conversation_id == conversation_id
+                    && attachment.uploaded_session_id == session_id
+            }
+            _ => true,
+        };
+        if ready {
+            continue;
+        }
+        attachment.doc_id = "d".repeat(crate::attachment::MAX_PREPARED_DOC_ID_UTF16);
+        attachment.uploaded_conversation_id = conversation_id.clone();
+        attachment.uploaded_session_id = session_id.clone();
+        match attachment.kind.as_str() {
+            "file" => {
+                attachment.transport_name = "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16);
+                let prefix = "https://prepared-attachment.invalid/";
+                let suffix_units = crate::attachment::MAX_PREPARED_REFERENCE_URL_UTF16
+                    .saturating_sub(prefix.encode_utf16().count());
+                attachment.reference_url = format!("{prefix}{}", "r".repeat(suffix_units));
+            }
+            "image" => {
+                attachment.name = "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16);
+                attachment.file_type = "i".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn fold_stream_text(current: &str, update: &str, cumulative: bool) -> (String, String) {
@@ -1605,6 +1711,44 @@ fn uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_prepared_attachment(
+        conversation_id: &str,
+        session_id: &str,
+        attachments: &mut [Attachment],
+    ) {
+        for attachment in attachments {
+            if !attachment.generated_oversize_text {
+                continue;
+            }
+            attachment.doc_id = format!(
+                "SPO_{}",
+                "d".repeat(crate::attachment::MAX_PREPARED_DOC_ID_UTF16 - 4)
+            );
+            attachment.transport_name = format!(
+                "{}.txt",
+                "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16 - 4)
+            );
+            let prefix = "https://prepared-attachment.invalid/sites/synthetic/";
+            let suffix_units = crate::attachment::MAX_PREPARED_REFERENCE_URL_UTF16
+                .saturating_sub(prefix.encode_utf16().count());
+            attachment.reference_url = format!("{prefix}{}", "r".repeat(suffix_units));
+            attachment.uploaded_conversation_id = conversation_id.to_owned();
+            attachment.uploaded_session_id = session_id.to_owned();
+        }
+    }
+
+    fn synthetic_attachment_preparer<'a>(
+        _: &'a Account,
+        conversation_id: &'a str,
+        session_id: &'a str,
+        attachments: &'a mut [Attachment],
+    ) -> AttachmentPreparationFuture<'a> {
+        Box::pin(async move {
+            synthetic_prepared_attachment(conversation_id, session_id, attachments);
+            Ok(())
+        })
+    }
 
     #[test]
     fn generated_artifacts_require_structured_code_interpreter_metadata() {
@@ -2095,7 +2239,7 @@ mod tests {
         };
         let mut sink = |_: StreamEvent| Ok(());
 
-        let result = live_chat(account, request, false, &mut sink).await;
+        let result = live_chat(account, request, false, &mut sink, prepare_attachments).await;
 
         assert!(matches!(
             result,
@@ -2104,6 +2248,69 @@ mod tests {
                 limit
             }) if actual > limit && limit + 1 == wire_units
         ));
+        assert!(!started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn live_chat_prepares_attachment_and_guards_final_wire_before_upstream_start() {
+        let started = Arc::new(AtomicBool::new(false));
+        let request = ChatRequest {
+            text: "x".repeat(120_000),
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                url: "data:text/plain;base64,YQ==".to_owned(),
+                name: "context.txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                generated_oversize_text: true,
+                ..Attachment::default()
+            }],
+            outbound_text_limit_utf16: 128_000,
+            ..ChatRequest::default()
+        };
+        let unprepared_wire = outbound_payload_utf16_units(&request);
+        let mut prepared = request.clone();
+        synthetic_prepared_attachment(
+            &prepared.conversation_id,
+            &prepared.session_id,
+            &mut prepared.attachments,
+        );
+        let prepared_wire = outbound_payload_utf16_units(&prepared);
+        assert!(unprepared_wire <= request.outbound_text_limit_utf16);
+        assert!(prepared_wire > request.outbound_text_limit_utf16);
+        let final_wire = request.final_wire_utf16.clone();
+        let started_for_hook = Arc::clone(&started);
+        let mut request = request;
+        request.upstream_start = Some(UpstreamStartHook::new(move || {
+            started_for_hook.store(true, Ordering::Release);
+            Ok(())
+        }));
+        let account = Account {
+            access_token: "access".to_owned(),
+            graph_access_token: String::new(),
+            oid: "oid".to_owned(),
+            tid: "tid".to_owned(),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let settings = runtime_settings::Store::open(
+            root.path(),
+            &crate::Config::for_test(root.path().to_path_buf()),
+        )
+        .unwrap();
+        let hub = LiveChatHub::with_attachment_preparer(settings, synthetic_attachment_preparer);
+        let mut sink = |_: StreamEvent| Ok(());
+        let result = hub.chat(account, request, &mut sink).await;
+        let (actual_wire, limit) = match result {
+            Err(ChatError::PayloadTooLarge { wire_units, limit }) => (wire_units, limit),
+            other => {
+                panic!("result={other:?} unprepared={unprepared_wire} prepared={prepared_wire}")
+            }
+        };
+        assert_eq!(limit, 128_000);
+        assert!(actual_wire > limit);
+        assert!(actual_wire >= prepared_wire);
+        assert_eq!(final_wire.load(Ordering::Acquire), actual_wire);
         assert!(!started.load(Ordering::Acquire));
     }
 

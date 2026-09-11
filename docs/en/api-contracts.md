@@ -63,7 +63,7 @@ Fallback is progressive:
 
 The full document preserves original roles, order, content, assistant tool calls and complete arguments, `tool_call_id`, tool results/error markers, and source message indexes. The necessary inline core remains the system/developer controls, the latest real user request, the current tool definitions/call protocol, and the latest complete contiguous multi-tool-call/result exchange; pending or malformed exchanges are not invented. Overlapping messages in the document and inline envelope carry the same index and represent the same data, not two operations. Synthetic recovery is explicitly marked and is not promoted to a new human request.
 
-The initial spill decision uses the shared outbound builder's actual ChatHub `message.text`, including the caller-tool protocol prefix and tool definitions, rather than only an intermediate role envelope. After attachment preparation, `LiveChatHub` re-measures the complete serialized ChatHub payload, including `messageAnnotations` and conversation/session binding, before the checkpoint's upstream-start hook. A request that passed the initial inline-core check is still rejected with typed recoverable overflow if this final payload check exceeds the limit. A final-answer continuation is likewise re-measured with the complete ChatHub payload after tool fields are cleared and prepared attachment annotations plus conversation/session binding are inherited. The existing `received` field continues to mean the pre-spill caller role-envelope length; it is not the remaining length after movement. The document does not embed user-attachment binary/base64, HTTP debug data, credentials, private URLs, or data that was not originally supplied to the model. The fallback does not mutate canonical messages, tool identity, checkpoints, ledger, HMAC, or replay semantics; Memory traffic still does not auto-spill.
+Both the initial fit/spill decision and the post-preparation final-fit guard use the same canonical ChatHub `chat_payload()` builder. It includes the caller-tool protocol, tool definitions, ChatHub envelope, plugins, and message annotations; no second envelope formula is maintained. Before attachments are prepared, the builder applies a deterministic reservation whose metadata bounds are enforced by the attachment producer; spill selection is made under the contract that the prepared final payload must fit. After preparation, `LiveChatHub` measures the complete serialized payload with the real `messageAnnotations` and conversation/session binding in UTF-16 before the checkpoint's upstream-start hook. `preliminaryWireAfterUtf16` is the bounded preflight projection. `wireAfterUtf16` is reserved for the exact serialized wire that was prepared and can be sent, or the exact final wire rejected by the final guard; it is not populated by a preliminary text estimate. If attachment preparation cannot satisfy the metadata bounds, or if the prepared wire still exceeds the limit, the request ends safely before upstream. If the required latest complete tool exchange cannot remain inline together with controls and the latest ask, full-context projection fails closed instead of dropping that exchange. A final-answer continuation uses the same complete ChatHub payload builder after tool fields are cleared and prepared attachment annotations plus conversation/session binding are inherited; a continuation rejected before preparation reports `preliminary_outbound`, while a post-preparation rejection reports `final_outbound`. The existing `received` field continues to mean the pre-spill caller role-envelope length; it is not the remaining length after movement. The document does not embed user-attachment binary/base64, HTTP debug data, credentials, private URLs, or data that was not originally supplied to the model. The fallback does not mutate canonical messages, tool identity, checkpoints, ledger, HMAC, or replay semantics; Memory traffic still does not auto-spill.
 
 The public synthetic qualification input is [`fixtures/long-context-tool-calls.json`](../../fixtures/long-context-tool-calls.json): 50 model-facing messages, completed tool-call/result pairs, a compressed summary, 29 tool definitions, and deterministic long Python/shell argument expansion. It contains no private capture and is transport qualification only.
 
@@ -76,12 +76,15 @@ code=text_input_too_large
 limit_type=caller_text_utf16
 limit=<effective UTF-16 limit>
 received=<measured UTF-16 units>
+retryable=false
 retryable_after_reduction=true
 spill_attempted=<true|false>
 spill_reason=<typed reason>
 input_sha256=<64-hex digest>
 recommended_action=reduce_input_or_retry_when_document_spill_is_available
 ```
+
+`retryable=false` means the unchanged request body must not be replayed; `retryable_after_reduction=true` only permits a newly reduced request. This does not change 429/503 retry semantics.
 
 Typical `spill_reason` values cover full attachment slots, no safe candidate, inability to fit inline, generated-file size, or document authorization/upload failure.
 
@@ -109,7 +112,7 @@ Spill does not remove the hard limit. Attachment grounding is also neither zero 
 
 The full-context TXT is a transport projection. It does not prove that the model read or correctly used the document, and HTTP 200, upload success, or a model self-report is not semantic acceptance. Deterministic qualification and real-user acceptance remain separate.
 
-The admin diagnostic surface exposes bounded live fields such as `transportProjection`, `wireBeforeUtf16`, `inlineCoreUtf16`, `wireAfterUtf16`, generated-document bytes/message count/state, and `fallbackFailure`. The durable v1 JSONL records the typed `spillDecision`, `spillReason`, and bounded UTF-16 before/after measurements, including `full_context_document`; transport projection details remain bounded live fields and never store the document body. After a process restart, missing live projection must not be treated as model acceptance evidence.
+The admin diagnostic surface exposes bounded live fields such as `transportProjection`, `wireBeforeUtf16`, `inlineCoreUtf16`, `preliminaryWireAfterUtf16`, `wireAfterUtf16`, generated-document bytes/message count/state, and `fallbackFailure`. The durable v1 JSONL records the typed `spillDecision`, `spillReason`, and bounded UTF-16 before/after measurements, including `full_context_document`; transport projection details remain bounded live fields and never store the document body. After a process restart, missing live projection must not be treated as model acceptance evidence.
 
 ## Tools and structured output
 

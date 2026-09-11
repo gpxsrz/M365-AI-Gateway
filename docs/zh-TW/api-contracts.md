@@ -63,7 +63,7 @@ Fallback 依序嘗試：
 
 完整文件保留原始 role、順序、content、assistant tool calls 與完整 arguments、`tool_call_id`、tool result / error 標記及原始 message index。必要 inline 核心仍保留 system/developer control、最新真正 user request、目前工具定義／呼叫協定，以及最近一個完整且連續的多 tool-call/result exchange；pending 或 malformed exchange 不會被自行拼造。文件和 inline 重疊的 message 以相同 index 表示同一份資料，不是兩次操作。Synthetic recovery 會明確標記，不會變成新的真人要求。
 
-初始 spill decision 使用共用 outbound builder 產生的真正 ChatHub `message.text`，包含 caller tool protocol prefix 與 tool definitions；不是只量中間 role envelope。Attachment preparation 完成後，`LiveChatHub` 會在 checkpoint 的 upstream-start hook 之前，再量一次包含 `messageAnnotations` 與 conversation/session binding 的完整 ChatHub serialized payload。即使初始 inline core 已通過，final payload 超限仍會回 typed、可恢復的 overflow。Final-answer continuation 也會在清除 tool 欄位、繼承已準備的 attachment annotations 與 conversation/session binding 後，再用完整 ChatHub payload 重新量測。既有 `received` 欄位仍表示搬移前的 caller role-envelope 長度，不能解讀成搬移後剩餘長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。這個 fallback 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
+初始 fit 與 spill decision，以及 attachment preparation 後的 final-fit guard，都以同一個真正的 ChatHub `chat_payload()` canonical builder 為 authority；包含 caller tool protocol、tool definitions、ChatHub envelope、plugins 與 message annotations，不另複製 envelope 公式。Attachment 尚未準備時，builder 使用由 attachment producer 同時 enforce 的 metadata bounds 做 deterministic reservation；因此 spill selection 是在「prepared final payload 必須能 fit」的 contract 下決策。Attachment preparation 完成後，`LiveChatHub` 會在 checkpoint 的 upstream-start hook 之前，對包含真實 `messageAnnotations` 與 conversation/session binding 的完整 serialized payload 做 exact UTF-16 量測。`preliminaryWireAfterUtf16` 是 bounded preflight projection；`wireAfterUtf16` 只表示已準備且可送出的 exact serialized wire，或 final guard 實際拒絕的 exact wire，不會再被 preliminary text estimate 填入。若 attachment metadata 超過 producer bounds，或 prepared wire 仍超限，request 會在 upstream 前安全結束。若必要的最新完整 tool exchange 無法和 controls、最新 ask 一起留在 inline，full-context projection 會 fail closed，不會把該 exchange 從 inline 移除。Final-answer continuation 同樣走完整 ChatHub payload builder；準備前拒絕回報 `preliminary_outbound`，準備後拒絕回報 `final_outbound`。既有 `received` 欄位仍表示搬移前的 caller role-envelope 長度，不能解讀成搬移後剩餘長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。這個 fallback 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
 
 公開 synthetic qualification input 是 [`fixtures/long-context-tool-calls.json`](../../fixtures/long-context-tool-calls.json)：50 個 model-facing messages、已完成的 tool-call/result pairs、compressed summary、29 個 tool definitions，以及 deterministic 的長 Python／shell argument expansion。它不含 private capture，只用於 transport qualification。
 
@@ -76,12 +76,15 @@ code=text_input_too_large
 limit_type=caller_text_utf16
 limit=<effective UTF-16 limit>
 received=<measured UTF-16 units>
+retryable=false
 retryable_after_reduction=true
 spill_attempted=<true|false>
 spill_reason=<typed reason>
 input_sha256=<64-hex digest>
 recommended_action=reduce_input_or_retry_when_document_spill_is_available
 ```
+
+`retryable=false` 表示相同 request body 不可直接重送；`retryable_after_reduction=true` 只表示 caller 改用較小輸入後可以建立新的 request。這不改變 429/503 的 retry 語意。
 
 常見 `spill_reason` 包含 attachment slots 已滿、沒有安全 candidate、無法縮回限制內、generated file 過大、文件授權／upload 失敗。
 
@@ -109,7 +112,7 @@ Spill 不移除 hard limit。Attachment grounding 也不代表 model-context cos
 
 Full-context TXT 是 transport projection，不保證模型已讀完、正確使用文件或能取回任意位置；HTTP 200、upload 成功或模型自稱理解都不是 semantic acceptance。真實使用者驗收與 deterministic qualification 分開。
 
-管理員診斷 surface 會以 bounded live 欄位顯示 `transportProjection`、`wireBeforeUtf16`、`inlineCoreUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`。Durable v1 JSONL 會記錄 typed `spillDecision`、`spillReason` 與 bounded UTF-16 前後量測，包含 `full_context_document`；transport projection 細節仍是 bounded live 欄位，且不保存文件內容。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
+管理員診斷 surface 會以 bounded live 欄位顯示 `transportProjection`、`wireBeforeUtf16`、`inlineCoreUtf16`、`preliminaryWireAfterUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`。Durable v1 JSONL 會記錄 typed `spillDecision`、`spillReason` 與 bounded UTF-16 前後量測，包含 `full_context_document`；transport projection 細節仍是 bounded live 欄位，且不保存文件內容。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
 
 ## Tools 與 structured output
 

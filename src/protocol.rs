@@ -385,13 +385,17 @@ async fn execute_chat_request_inner(
     }
     let text_input_limit = gateway.settings.current().text_input_limit_utf16;
     let tool_call_limit = request_tool_call_limit(&gateway, &body);
-    let received_text_units = utf16_units(&flattened.text);
-    let wire_before_units = outbound_text_units(
-        &flattened.text,
-        &body.tools,
-        &body.tool_choice,
+    let transport_budget = TransportBudget {
+        limit: text_input_limit,
+        tone: &resolved_tone,
+        conversation_id: &body.conversation_id,
+        session_id: &body.session_id,
+        tools: &body.tools,
+        tool_choice: &body.tool_choice,
         tool_call_limit,
-    );
+    };
+    let received_text_units = utf16_units(&flattened.text);
+    let wire_before_units = transport_budget.wire_units(&flattened.text, &flattened.attachments);
     let mut transport_observation =
         TransportObservation::inline(wire_before_units, received_text_units);
     let mut overflow_context = (received_text_units > text_input_limit
@@ -420,14 +424,11 @@ async fn execute_chat_request_inner(
     };
     if !memory_request && let Some(context) = overflow_context.as_mut() {
         context.spill_attempted = true;
-        match spill_oversized_bulk_text(
+        match spill_oversized_bulk_text_with_budget(
             &prompt_messages,
             &flattened,
-            text_input_limit,
             recalled_source.as_ref(),
-            &body.tools,
-            &body.tool_choice,
-            tool_call_limit,
+            &transport_budget,
         ) {
             Ok((spilled, reason)) => {
                 transport_observation.projection = if reason == SpillReason::FullContextDocument {
@@ -437,12 +438,8 @@ async fn execute_chat_request_inner(
                 }
                 .to_owned();
                 transport_observation.inline_core_utf16 = utf16_units(&spilled.text);
-                transport_observation.wire_after_utf16 = outbound_text_units(
-                    &spilled.text,
-                    &body.tools,
-                    &body.tool_choice,
-                    tool_call_limit,
-                );
+                transport_observation.preliminary_wire_after_utf16 =
+                    transport_budget.wire_units(&spilled.text, &spilled.attachments);
                 transport_observation.generated_document_bytes = spilled.generated_document_bytes;
                 transport_observation.generated_document_message_count =
                     spilled.generated_document_message_count;
@@ -454,27 +451,20 @@ async fn execute_chat_request_inner(
                     SpillDecision::Performed,
                     reason,
                     received_text_units,
-                    utf16_units(&flattened.text),
+                    transport_observation.preliminary_wire_after_utf16,
                 );
             }
-            Err(bulk_error) => match spill_full_context_document(
+            Err(bulk_error) => match spill_full_context_document_with_budget(
                 &prompt_messages,
                 &flattened,
-                text_input_limit,
-                &body.tools,
-                &body.tool_choice,
-                tool_call_limit,
+                &transport_budget,
                 context_scope,
             ) {
                 Ok((spilled, reason)) => {
                     transport_observation.projection = "full_context_document".to_owned();
                     transport_observation.inline_core_utf16 = utf16_units(&spilled.text);
-                    transport_observation.wire_after_utf16 = outbound_text_units(
-                        &spilled.text,
-                        &body.tools,
-                        &body.tool_choice,
-                        tool_call_limit,
-                    );
+                    transport_observation.preliminary_wire_after_utf16 =
+                        transport_budget.wire_units(&spilled.text, &spilled.attachments);
                     transport_observation.generated_document_bytes =
                         spilled.generated_document_bytes;
                     transport_observation.generated_document_message_count =
@@ -487,7 +477,7 @@ async fn execute_chat_request_inner(
                         SpillDecision::Performed,
                         reason,
                         wire_before_units,
-                        transport_observation.wire_after_utf16,
+                        transport_observation.preliminary_wire_after_utf16,
                     );
                 }
                 Err(full_context_error) => {
@@ -529,13 +519,9 @@ async fn execute_chat_request_inner(
         );
     }
     transport_observation.inline_core_utf16 = utf16_units(&flattened.text);
-    transport_observation.wire_after_utf16 = outbound_text_units(
-        &flattened.text,
-        &body.tools,
-        &body.tool_choice,
-        tool_call_limit,
-    );
-    if transport_observation.wire_after_utf16 > text_input_limit {
+    transport_observation.preliminary_wire_after_utf16 =
+        transport_budget.wire_units(&flattened.text, &flattened.attachments);
+    if transport_observation.preliminary_wire_after_utf16 > text_input_limit {
         transport_observation.projection = "overflow".to_owned();
         if transport_observation.fallback_failure == "not_applicable" {
             transport_observation.fallback_failure = if memory_request {
@@ -547,11 +533,11 @@ async fn execute_chat_request_inner(
                     .to_owned()
             };
         }
-        trace.transport(
+        trace.transport_preliminary(
             &transport_observation.projection,
             transport_observation.wire_before_utf16,
             transport_observation.inline_core_utf16,
-            transport_observation.wire_after_utf16,
+            transport_observation.preliminary_wire_after_utf16,
             transport_observation.generated_document_bytes,
             transport_observation.generated_document_message_count,
             &transport_observation.generated_document_state,
@@ -569,24 +555,30 @@ async fn execute_chat_request_inner(
                 "輸入文字超過目前上限，且無法安全轉為文件附件",
             );
         }
-        return openai_error(
+        return (
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "text_input_too_large",
-            "輸入文字超過目前上限",
-        );
+            Json(json!({
+                "error": {
+                    "message": "輸入文字超過目前上限",
+                    "type": "invalid_request_error",
+                    "code": "text_input_too_large",
+                    "retryable": false,
+                    "retryable_after_reduction": true,
+                }
+            })),
+        )
+            .into_response();
     }
-    trace.transport(
+    trace.transport_preliminary(
         &transport_observation.projection,
         transport_observation.wire_before_utf16,
         transport_observation.inline_core_utf16,
-        transport_observation.wire_after_utf16,
+        transport_observation.preliminary_wire_after_utf16,
         transport_observation.generated_document_bytes,
         transport_observation.generated_document_message_count,
         &transport_observation.generated_document_state,
         &transport_observation.fallback_failure,
     );
-
     let traffic_limits = traffic_limits(&settings);
     let before_admission = gateway.traffic.snapshot();
     trace.breaker(
@@ -718,6 +710,7 @@ async fn execute_chat_request_inner(
         disable_built_in_search: false,
         upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
         generated_attachment_reused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        final_wire_utf16: Arc::new(AtomicUsize::new(0)),
         prepared_attachments: Arc::new(std::sync::Mutex::new(
             crate::chathub::PreparedAttachmentState::default(),
         )),
@@ -862,6 +855,7 @@ async fn complete_chat(
     let fallback_account = account.clone();
     let mut fallback_request = request.clone();
     fallback_request.upstream_start = None;
+    let final_wire_utf16 = Arc::clone(&request.final_wire_utf16);
     let generated_attachment_reused = request.generated_attachment_reused.clone();
     let upstream_attempt_count = reset_upstream_attempts(&request);
     let mut sink = |_: StreamEvent| Ok(());
@@ -878,6 +872,7 @@ async fn complete_chat(
         upstream,
     )
     .await;
+    observe_final_transport_wire(&trace, &final_wire_utf16);
     if generated_attachment_reused.load(Ordering::Acquire) {
         trace.generated_document_reused();
     }
@@ -981,6 +976,7 @@ async fn complete_chat(
                     }
                 };
                 let answer_attempt_count = reset_upstream_attempts(&answer_request);
+                let answer_final_wire_utf16 = Arc::clone(&answer_request.final_wire_utf16);
                 let mut answer_sink = |_: StreamEvent| Ok(());
                 let answer = tokio::time::timeout(
                     std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
@@ -991,6 +987,7 @@ async fn complete_chat(
                     ),
                 )
                 .await;
+                observe_final_transport_wire(&trace, &answer_final_wire_utf16);
                 let answer = match answer {
                     Ok(Ok(answer)) => {
                         observe_success(&trace, &answer_attempt_count, UpstreamAttempt::Followup);
@@ -1224,6 +1221,7 @@ async fn stream_chat(
         let fallback_account = account.clone();
         let mut fallback_request = request.clone();
         fallback_request.upstream_start = None;
+        let final_wire_utf16 = Arc::clone(&request.final_wire_utf16);
         let generated_attachment_reused = request.generated_attachment_reused.clone();
         let upstream_attempt_count = reset_upstream_attempts(&request);
         let buffer_for_tools = checkpoint
@@ -1289,8 +1287,9 @@ async fn stream_chat(
             result = tokio::time::timeout(
                 std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
                 upstream,
-            ) => result,
+        ) => result,
         };
+        observe_final_transport_wire(&trace, &final_wire_utf16);
         if generated_attachment_reused.load(Ordering::Acquire) {
             trace.generated_document_reused();
         }
@@ -1399,7 +1398,11 @@ async fn stream_chat(
                         Ok(request) => request,
                         Err(error) => {
                             let (wire_units, limit) = continuation_overflow_details(&error);
-                            trace.transport_failed("overflow", wire_units, "cannot_fit_inline");
+                            trace.transport_preliminary_failed(
+                                "overflow",
+                                wire_units,
+                                "cannot_fit_inline",
+                            );
                             permit.finish(StatusCode::BAD_REQUEST, None);
                             let sent = send_sse(
                                 &sender,
@@ -1415,6 +1418,7 @@ async fn stream_chat(
                         }
                     };
                     let answer_attempt_count = reset_upstream_attempts(&answer_request);
+                    let answer_final_wire_utf16 = Arc::clone(&answer_request.final_wire_utf16);
                     let mut answer_sink = |_: StreamEvent| Ok(());
                     let answer = tokio::time::timeout(
                         std::time::Duration::from_secs(
@@ -1427,6 +1431,7 @@ async fn stream_chat(
                         ),
                     )
                     .await;
+                    observe_final_transport_wire(&trace, &answer_final_wire_utf16);
                     let answer = match answer {
                         Ok(Ok(answer)) => {
                             observe_success(
@@ -1773,6 +1778,13 @@ fn observe_success(
     trace.upstream_result(UpstreamResult::Success);
 }
 
+fn observe_final_transport_wire(trace: &crate::debug::Trace, final_wire_utf16: &AtomicUsize) {
+    let wire_units = final_wire_utf16.load(Ordering::Acquire);
+    if wire_units > 0 {
+        trace.transport_final_wire(wire_units);
+    }
+}
+
 fn observe_error(
     trace: &crate::debug::Trace,
     error: &ChatError,
@@ -1887,6 +1899,7 @@ fn outbound_payload_overflow_value(
                 "limit_type": "outbound_message_text_utf16",
                 "limit": limit,
                 "received": wire_units,
+                "retryable": false,
                 "retryable_after_reduction": true,
                 "spill_attempted": false,
                 "spill_reason": "cannot_fit_inline",
@@ -2121,6 +2134,9 @@ fn overflow_value(
         "input_sha256": context.input_sha256,
         "recommended_action": recommended_action
     });
+    if code == "text_input_too_large" {
+        error["retryable"] = Value::Bool(false);
+    }
     if let Some(fallback_failure) = &context.fallback_failure {
         error["fallback_reason"] = Value::String(fallback_failure.clone());
     }
@@ -2203,6 +2219,8 @@ fn continuation_overflow_value(
                 "limit_type": "outbound_message_text_utf16",
                 "limit": limit,
                 "received": wire_units,
+                "preliminary": true,
+                "retryable": false,
                 "retryable_after_reduction": true,
                 "spill_attempted": false,
                 "spill_reason": "cannot_fit_inline",
@@ -2230,7 +2248,7 @@ fn continuation_overflow_value(
         Value::String(SpillReason::CannotFitInline.as_str().to_owned()),
     );
     error.insert(
-        "final_outbound".to_owned(),
+        "preliminary_outbound".to_owned(),
         json!({
             "limit_type": "outbound_message_text_utf16",
             "limit": limit,
@@ -2247,7 +2265,7 @@ fn continuation_overflow_response(
     error: ContinuationProjectionError,
 ) -> Response {
     let (wire_units, limit) = continuation_overflow_details(&error);
-    trace.transport_failed("overflow", wire_units, "cannot_fit_inline");
+    trace.transport_preliminary_failed("overflow", wire_units, "cannot_fit_inline");
     permit.finish(StatusCode::BAD_REQUEST, None);
     (
         StatusCode::BAD_REQUEST,
@@ -2284,7 +2302,8 @@ fn completed_tool_answer_request(
     answer.tool_choice = Value::String("none".to_owned());
     answer.tool_call_limit = 1;
     crate::chathub::inherit_prepared_attachments(&mut answer);
-    let wire_units = crate::chathub::outbound_payload_utf16_units(&answer);
+    let wire_units =
+        crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(&answer);
     if wire_units > text_input_limit {
         return Err(ContinuationProjectionError::CannotFitInline {
             wire_units,
@@ -2685,6 +2704,7 @@ fn internal_qualification_request(
         disable_built_in_search: true,
         upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
         generated_attachment_reused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        final_wire_utf16: Arc::new(AtomicUsize::new(0)),
         prepared_attachments: base.prepared_attachments.clone(),
         outbound_text_limit_utf16: base.outbound_text_limit_utf16,
         upstream_start: None,
@@ -3749,7 +3769,7 @@ struct TransportObservation {
     projection: String,
     wire_before_utf16: usize,
     inline_core_utf16: usize,
-    wire_after_utf16: usize,
+    preliminary_wire_after_utf16: usize,
     generated_document_bytes: usize,
     generated_document_message_count: usize,
     generated_document_state: String,
@@ -3762,12 +3782,41 @@ impl TransportObservation {
             projection: "inline".to_owned(),
             wire_before_utf16: wire_utf16,
             inline_core_utf16,
-            wire_after_utf16: wire_utf16,
+            preliminary_wire_after_utf16: wire_utf16,
             generated_document_bytes: 0,
             generated_document_message_count: 0,
             generated_document_state: "not_applicable".to_owned(),
             fallback_failure: "not_applicable".to_owned(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TransportBudget<'a> {
+    limit: usize,
+    tone: &'a str,
+    conversation_id: &'a str,
+    session_id: &'a str,
+    tools: &'a [Tool],
+    tool_choice: &'a Value,
+    tool_call_limit: usize,
+}
+
+impl TransportBudget<'_> {
+    fn wire_units(&self, text: &str, attachments: &[Attachment]) -> usize {
+        let request = ChatRequest {
+            text: text.to_owned(),
+            tone: self.tone.to_owned(),
+            conversation_id: self.conversation_id.to_owned(),
+            session_id: self.session_id.to_owned(),
+            attachments: attachments.to_vec(),
+            tools: self.tools.to_vec(),
+            tool_choice: self.tool_choice.clone(),
+            tool_call_limit: self.tool_call_limit,
+            outbound_text_limit_utf16: self.limit,
+            ..ChatRequest::default()
+        };
+        crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(&request)
     }
 }
 
@@ -3985,6 +4034,7 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(test)]
 fn spill_oversized_bulk_text(
     messages: &[OpenAiMessage],
     flattened: &FlattenedMessages,
@@ -3993,6 +4043,24 @@ fn spill_oversized_bulk_text(
     tools: &[Tool],
     tool_choice: &Value,
     tool_call_limit: usize,
+) -> Result<(FlattenedMessages, SpillReason), SpillFailure> {
+    let budget = TransportBudget {
+        limit: text_input_limit,
+        tone: "",
+        conversation_id: "",
+        session_id: "",
+        tools,
+        tool_choice,
+        tool_call_limit,
+    };
+    spill_oversized_bulk_text_with_budget(messages, flattened, recalled_source, &budget)
+}
+
+fn spill_oversized_bulk_text_with_budget(
+    messages: &[OpenAiMessage],
+    flattened: &FlattenedMessages,
+    recalled_source: Option<&AuthenticatedRecalledSource>,
+    budget: &TransportBudget<'_>,
 ) -> Result<(FlattenedMessages, SpillReason), SpillFailure> {
     if flattened.attachments.len() >= crate::attachment::MAX_ATTACHMENTS {
         return Err(SpillFailure::AttachmentSlotsFull);
@@ -4017,8 +4085,13 @@ fn spill_oversized_bulk_text(
     let provisional_file_sha = "0".repeat(64);
     let mut rewritten = messages.to_vec();
     let mut selected = Vec::new();
-    let mut current_wire_units =
-        outbound_text_units(&flattened.text, tools, tool_choice, tool_call_limit);
+    let mut fit_attachments = flattened.attachments.clone();
+    fit_attachments.push(Attachment {
+        kind: "file".to_owned(),
+        generated_oversize_text: true,
+        ..Attachment::default()
+    });
+    let mut current_wire_units = budget.wire_units(&flattened.text, &fit_attachments);
     let mut fits = false;
     for candidate in candidates {
         let mut trial = rewritten.clone();
@@ -4030,15 +4103,14 @@ fn spill_oversized_bulk_text(
         .ok_or(SpillFailure::ProjectionFailed)?;
         let trial_flattened =
             flatten_messages(&trial).map_err(|_| SpillFailure::ProjectionFailed)?;
-        let trial_wire_units =
-            outbound_text_units(&trial_flattened.text, tools, tool_choice, tool_call_limit);
+        let trial_wire_units = budget.wire_units(&trial_flattened.text, &fit_attachments);
         if trial_wire_units >= current_wire_units {
             continue;
         }
         rewritten = trial;
         selected.push(candidate);
         current_wire_units = trial_wire_units;
-        fits = current_wire_units <= text_input_limit;
+        fits = current_wire_units <= budget.limit;
         if fits {
             break;
         }
@@ -4078,29 +4150,28 @@ fn spill_oversized_bulk_text(
     }
     let mut final_flattened =
         flatten_messages(&final_messages).map_err(|_| SpillFailure::ProjectionFailed)?;
-    if outbound_text_units(&final_flattened.text, tools, tool_choice, tool_call_limit)
-        > text_input_limit
-    {
-        return Err(SpillFailure::CannotFitInline);
-    }
     let attachment = Attachment {
         kind: "file".to_owned(),
         url: format!(
             "data:text/plain;base64,{}",
             STANDARD.encode(spill.as_bytes())
         ),
-        name,
+        name: name.clone(),
         mime_type: "text/plain".to_owned(),
         generated_oversize_text: true,
         ..Attachment::default()
     };
     final_flattened.attachments = flattened.attachments.clone();
     final_flattened.attachments.push(attachment);
+    if budget.wire_units(&final_flattened.text, &final_flattened.attachments) > budget.limit {
+        return Err(SpillFailure::CannotFitInline);
+    }
     final_flattened.generated_document_bytes = spill.len();
     final_flattened.generated_document_message_count = selected.len();
     Ok((final_flattened, reason))
 }
 
+#[cfg(test)]
 fn spill_full_context_document(
     messages: &[OpenAiMessage],
     flattened: &FlattenedMessages,
@@ -4108,6 +4179,24 @@ fn spill_full_context_document(
     tools: &[Tool],
     tool_choice: &Value,
     tool_call_limit: usize,
+    context_scope: &str,
+) -> Result<(FlattenedMessages, SpillReason), SpillFailure> {
+    let budget = TransportBudget {
+        limit: text_input_limit,
+        tone: "",
+        conversation_id: "",
+        session_id: "",
+        tools,
+        tool_choice,
+        tool_call_limit,
+    };
+    spill_full_context_document_with_budget(messages, flattened, &budget, context_scope)
+}
+
+fn spill_full_context_document_with_budget(
+    messages: &[OpenAiMessage],
+    flattened: &FlattenedMessages,
+    budget: &TransportBudget<'_>,
     context_scope: &str,
 ) -> Result<(FlattenedMessages, SpillReason), SpillFailure> {
     if flattened.attachments.len() >= crate::attachment::MAX_ATTACHMENTS {
@@ -4127,42 +4216,30 @@ fn spill_full_context_document(
     }
     let file_sha = sha256_hex(document.as_bytes());
     let name = format!("m365-oversize-{file_sha}.txt");
-    let selected = full_context_inline_indexes(messages);
-    let inline_messages = normalized
-        .iter()
-        .filter(|message| selected.get(message.source_index).copied().unwrap_or(false))
-        .collect::<Vec<_>>();
-    let inline_message_indexes = inline_messages
-        .iter()
-        .map(|message| message.source_index)
-        .collect::<Vec<_>>();
-    let inline_text = full_context_inline_text(
-        inline_messages
-            .into_iter()
-            .map(|message| message.value.clone())
-            .collect(),
-        inline_message_indexes,
-        normalized.len(),
-        &name,
-        &file_sha,
-        context_scope,
-    )?;
-    if outbound_text_units(&inline_text, tools, tool_choice, tool_call_limit) > text_input_limit {
-        return Err(SpillFailure::CannotFitInline);
-    }
     let attachment = Attachment {
         kind: "file".to_owned(),
         url: format!(
             "data:text/plain;base64,{}",
             STANDARD.encode(document.as_bytes())
         ),
-        name,
+        name: name.clone(),
         mime_type: "text/plain".to_owned(),
         generated_oversize_text: true,
         ..Attachment::default()
     };
     let mut attachments = flattened.attachments.clone();
     attachments.push(attachment);
+    let selected = full_context_inline_indexes(messages);
+    let inline_text = full_context_inline_text_for_selection(
+        &normalized,
+        &selected,
+        &name,
+        &file_sha,
+        context_scope,
+    )?;
+    if budget.wire_units(&inline_text, &attachments) > budget.limit {
+        return Err(SpillFailure::CannotFitInline);
+    }
     Ok((
         FlattenedMessages {
             text: inline_text,
@@ -4197,6 +4274,34 @@ fn full_context_document(
     .map_err(|_| SpillFailure::ProjectionFailed)
 }
 
+fn full_context_inline_text_for_selection(
+    normalized: &[NormalizedMessage],
+    selected: &[bool],
+    attachment_name: &str,
+    file_sha: &str,
+    context_scope: &str,
+) -> Result<String, SpillFailure> {
+    let inline_messages = normalized
+        .iter()
+        .filter(|message| selected.get(message.source_index).copied().unwrap_or(false))
+        .collect::<Vec<_>>();
+    let inline_message_indexes = inline_messages
+        .iter()
+        .map(|message| message.source_index)
+        .collect::<Vec<_>>();
+    full_context_inline_text(
+        inline_messages
+            .into_iter()
+            .map(|message| message.value.clone())
+            .collect(),
+        inline_message_indexes,
+        normalized.len(),
+        attachment_name,
+        file_sha,
+        context_scope,
+    )
+}
+
 fn full_context_inline_text(
     messages: Vec<Value>,
     inline_message_indexes: Vec<usize>,
@@ -4224,6 +4329,14 @@ fn full_context_inline_text(
 }
 
 fn full_context_inline_indexes(messages: &[OpenAiMessage]) -> Vec<bool> {
+    let mut selected = full_context_required_inline_indexes(messages);
+    for index in latest_complete_tool_exchange(messages) {
+        selected[index] = true;
+    }
+    selected
+}
+
+fn full_context_required_inline_indexes(messages: &[OpenAiMessage]) -> Vec<bool> {
     let mut selected = vec![false; messages.len()];
     for (index, message) in messages.iter().enumerate() {
         if matches!(message.role.as_str(), "system" | "developer")
@@ -4233,9 +4346,6 @@ fn full_context_inline_indexes(messages: &[OpenAiMessage]) -> Vec<bool> {
         }
     }
     if let Some(index) = latest_execution_user_index(messages) {
-        selected[index] = true;
-    }
-    for index in latest_complete_tool_exchange(messages) {
         selected[index] = true;
     }
     selected
@@ -4838,20 +4948,6 @@ fn utf16_units(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
-fn outbound_text_units(
-    text: &str,
-    tools: &[Tool],
-    tool_choice: &Value,
-    tool_call_limit: usize,
-) -> usize {
-    utf16_units(&crate::chathub::outbound_message_text(
-        text,
-        tools,
-        tool_choice,
-        tool_call_limit,
-    ))
-}
-
 fn random_id() -> String {
     let mut bytes = [0_u8; 16];
     rand::rng().fill(&mut bytes);
@@ -5104,10 +5200,19 @@ mod tests {
                 let session_id = request.session_id.clone();
                 for attachment in &mut request.attachments {
                     if attachment.generated_oversize_text {
-                        attachment.doc_id = "SPO_ready".to_owned();
-                        attachment.transport_name = "context-random.txt".to_owned();
-                        attachment.reference_url =
-                            "https://tenant.sharepoint.com/context".to_owned();
+                        attachment.doc_id = format!(
+                            "SPO_{}",
+                            "d".repeat(crate::attachment::MAX_PREPARED_DOC_ID_UTF16 - 4)
+                        );
+                        attachment.transport_name = format!(
+                            "{}.txt",
+                            "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16 - 4)
+                        );
+                        let prefix = "https://prepared-attachment.invalid/sites/final-overflow/";
+                        let suffix_units = (crate::attachment::MAX_PREPARED_REFERENCE_URL_UTF16
+                            + 2_048)
+                            .saturating_sub(prefix.encode_utf16().count());
+                        attachment.reference_url = format!("{prefix}{}", "r".repeat(suffix_units));
                         attachment.uploaded_conversation_id = conversation_id.clone();
                         attachment.uploaded_session_id = session_id.clone();
                     }
@@ -5138,15 +5243,16 @@ mod tests {
                         attachment.doc_id = "SPO_ready".to_owned();
                         attachment.transport_name = "context-random.txt".to_owned();
                         attachment.reference_url =
-                            "https://tenant.sharepoint.com/context".to_owned();
+                            "https://prepared-attachment.invalid/context".to_owned();
                         attachment.uploaded_conversation_id = conversation_id.clone();
                         attachment.uploaded_session_id = session_id.clone();
                     }
                 }
-                assert!(
-                    crate::chathub::outbound_payload_utf16_units(&request)
-                        <= request.outbound_text_limit_utf16
-                );
+                let final_wire = crate::chathub::outbound_payload_utf16_units(&request);
+                request
+                    .final_wire_utf16
+                    .store(final_wire, Ordering::Release);
+                assert!(final_wire <= request.outbound_text_limit_utf16);
                 self.0.lock().unwrap().replace(request);
                 Ok(ChatResult {
                     text: "prepared result".to_owned(),
@@ -5154,6 +5260,88 @@ mod tests {
                     session_id: "prepared-session".to_owned(),
                     ..ChatResult::default()
                 })
+            })
+        }
+    }
+
+    struct Issue101PreparedPayloadProbe(Arc<AtomicUsize>, Arc<Mutex<Option<ChatRequest>>>);
+
+    impl ChatHubTransport for Issue101PreparedPayloadProbe {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            mut request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                let preliminary = crate::chathub::outbound_payload_utf16_units(&request);
+                let conversation_id = if request.conversation_id.is_empty() {
+                    "00000000-0000-4000-8000-000000000000".to_owned()
+                } else {
+                    request.conversation_id.clone()
+                };
+                let session_id = if request.session_id.is_empty() {
+                    "11111111-1111-4111-8111-111111111111".to_owned()
+                } else {
+                    request.session_id.clone()
+                };
+                request.conversation_id = conversation_id.clone();
+                request.session_id = session_id.clone();
+                for attachment in &mut request.attachments {
+                    if attachment.generated_oversize_text {
+                        attachment.doc_id = format!(
+                            "SPO_{}",
+                            "d".repeat(crate::attachment::MAX_PREPARED_DOC_ID_UTF16 - 4)
+                        );
+                        attachment.transport_name = format!(
+                            "{}.txt",
+                            "n".repeat(crate::attachment::MAX_PREPARED_NAME_UTF16 - 4)
+                        );
+                        attachment.reference_url = format!(
+                            "https://prepared-attachment.invalid/sites/fixture/{}",
+                            "r".repeat(3_072)
+                        );
+                        attachment.uploaded_conversation_id = conversation_id.clone();
+                        attachment.uploaded_session_id = session_id.clone();
+                    }
+                }
+                let final_wire = crate::chathub::outbound_payload_utf16_units(&request);
+                let preliminary_text = utf16_units(&crate::chathub::outbound_message_text(
+                    &request.text,
+                    &request.tools,
+                    &request.tool_choice,
+                    request.tool_call_limit,
+                ));
+                assert!(
+                    preliminary_text <= request.outbound_text_limit_utf16,
+                    "synthetic preliminary text payload must fit: {preliminary_text}"
+                );
+                assert!(
+                    preliminary <= request.outbound_text_limit_utf16,
+                    "synthetic unprepared canonical payload must fit: {preliminary}"
+                );
+                assert!(
+                    final_wire <= request.outbound_text_limit_utf16,
+                    "synthetic prepared canonical payload must fit: {final_wire}"
+                );
+                request
+                    .final_wire_utf16
+                    .store(final_wire, Ordering::Release);
+                self.0.fetch_add(1, Ordering::AcqRel);
+                self.1.lock().unwrap().replace(request.clone());
+                if final_wire > request.outbound_text_limit_utf16 {
+                    Err(ChatError::PayloadTooLarge {
+                        wire_units: final_wire,
+                        limit: request.outbound_text_limit_utf16,
+                    })
+                } else {
+                    Ok(ChatResult {
+                        text: "prepared result".to_owned(),
+                        conversation_id: "prepared-conversation".to_owned(),
+                        session_id: "prepared-session".to_owned(),
+                        ..ChatResult::default()
+                    })
+                }
             })
         }
     }
@@ -8486,6 +8674,57 @@ mod tests {
     }
 
     #[test]
+    fn completed_tool_answer_reserves_attachment_metadata_for_a_new_binding() {
+        let request = ChatRequest {
+            text: "continue with the retained result".to_owned(),
+            conversation_id: "conversation-old".to_owned(),
+            session_id: "session-old".to_owned(),
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                url: "data:text/plain;base64,YQ==".to_owned(),
+                name: "context.txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                doc_id: "old-document".to_owned(),
+                transport_name: "old-context.txt".to_owned(),
+                reference_url: "https://prepared-attachment.invalid/old".to_owned(),
+                uploaded_conversation_id: "conversation-old".to_owned(),
+                uploaded_session_id: "session-old".to_owned(),
+                generated_oversize_text: true,
+                ..Attachment::default()
+            }],
+            ..ChatRequest::default()
+        };
+        let result = ChatResult {
+            conversation_id: "conversation-new".to_owned(),
+            session_id: "session-new".to_owned(),
+            ..ChatResult::default()
+        };
+        let candidate = completed_tool_answer_request(
+            &request,
+            &result,
+            &crate::agent_ledger::AgentLedger::default(),
+            usize::MAX,
+        )
+        .expect("continuation candidate should be constructible");
+        let unprepared = crate::chathub::outbound_payload_utf16_units(&candidate);
+        let reserved =
+            crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(&candidate);
+        assert!(reserved > unprepared);
+        match completed_tool_answer_request(
+            &request,
+            &result,
+            &crate::agent_ledger::AgentLedger::default(),
+            reserved - 1,
+        ) {
+            Err(ContinuationProjectionError::CannotFitInline { wire_units, limit }) => {
+                assert_eq!(wire_units, reserved);
+                assert_eq!(limit, reserved - 1);
+            }
+            Ok(_) => panic!("continuation reservation was not enforced"),
+        }
+    }
+
+    #[test]
     fn completed_tool_answer_request_drops_checkpoint_start_hook() {
         let request = ChatRequest {
             upstream_start: Some(crate::chathub::UpstreamStartHook::new(|| Ok(()))),
@@ -8735,13 +8974,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_stream_completed_duplicate_final_payload_overflow_is_publicly_typed() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "unexpected final-answer fallback",
-        ]));
+        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
+            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
+            format!("conversation-{}", "c".repeat(1_500)),
+            format!("session-{}", "s".repeat(1_500)),
+        ));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
         let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 11_000;
+        settings.text_input_limit_utf16 = 14_000;
         gateway.settings.save(settings).unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
@@ -8763,8 +9003,8 @@ mod tests {
                 .unwrap();
         assert_eq!(body["error"]["code"], "text_input_too_large");
         assert_eq!(body["error"]["limit_type"], "outbound_message_text_utf16");
-        assert_eq!(body["error"]["limit"], 11_000);
-        assert!(body["error"]["received"].as_u64().unwrap() > 11_000);
+        assert_eq!(body["error"]["limit"], 14_000);
+        assert!(body["error"]["received"].as_u64().unwrap() > 14_000);
         assert_eq!(body["error"]["spill_attempted"], false);
         assert_eq!(body["error"]["spill_reason"], "cannot_fit_inline");
         assert_eq!(chat.requests.lock().unwrap().len(), 1);
@@ -8772,7 +9012,7 @@ mod tests {
         assert_eq!(record["status"], 400);
         assert_eq!(record["admissionResult"], "admitted");
         assert_eq!(record["transportProjection"], "overflow");
-        assert!(record["wireAfterUtf16"].as_u64().unwrap() > 11_000);
+        assert!(record["preliminaryWireAfterUtf16"].as_u64().unwrap() > 14_000);
         assert_eq!(record["fallbackFailure"], "cannot_fit_inline");
         assert_eq!(record["callerDelivery"], "sent");
         assert_eq!(record["toolCallSuppressed"], true);
@@ -8780,13 +9020,14 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_completed_duplicate_final_payload_overflow_keeps_sse_contract() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "unexpected final-answer fallback",
-        ]));
+        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
+            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
+            format!("conversation-{}", "c".repeat(1_500)),
+            format!("session-{}", "s".repeat(1_500)),
+        ));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
         let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 11_000;
+        settings.text_input_limit_utf16 = 14_000;
         gateway.settings.save(settings).unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
@@ -8821,7 +9062,7 @@ mod tests {
         assert_eq!(record["status"], 200);
         assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
         assert_eq!(record["transportProjection"], "overflow");
-        assert!(record["wireAfterUtf16"].as_u64().unwrap() > 11_000);
+        assert!(record["preliminaryWireAfterUtf16"].as_u64().unwrap() > 14_000);
         assert_eq!(record["fallbackFailure"], "cannot_fit_inline");
         assert_eq!(record["callerDelivery"], "sent");
         assert_eq!(record["toolCallSuppressed"], true);
@@ -8834,13 +9075,13 @@ mod tests {
         let (oauth, token_server) = oauth_with_graph_token_server().await;
         let chat = Arc::new(DuplicateFallbackTransport::with_identity(
             ["```inspect\n{}\n```", "unexpected final-answer fallback"],
-            format!("conversation-{}", "c".repeat(1_500)),
-            format!("session-{}", "s".repeat(1_500)),
+            format!("conversation-{}", "c".repeat(10_000)),
+            format!("session-{}", "s".repeat(10_000)),
         ));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
         let telemetry_path = gateway.debug.path_for_test().unwrap();
         let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 12_000;
+        settings.text_input_limit_utf16 = 23_000;
         gateway.settings.save(settings).unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
@@ -8850,7 +9091,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&completed_duplicate_full_context_request(
-                            false, 10_000, 5_000,
+                            false, 30_000, 2_000,
                         ))
                         .unwrap(),
                     ))
@@ -8868,15 +9109,16 @@ mod tests {
         assert_eq!(body["error"]["spill_attempted"], true);
         assert_eq!(body["error"]["spill_reason"], "full_context_document");
         assert_eq!(body["error"]["fallback_reason"], "cannot_fit_inline");
+        assert_eq!(body["error"]["retryable"], false);
         assert_eq!(
-            body["error"]["final_outbound"]["limit_type"],
+            body["error"]["preliminary_outbound"]["limit_type"],
             "outbound_message_text_utf16"
         );
         assert!(
-            body["error"]["final_outbound"]["received"]
+            body["error"]["preliminary_outbound"]["received"]
                 .as_u64()
                 .unwrap()
-                > 12_000
+                > 23_000
         );
         assert_eq!(body["error"]["input_sha256"].as_str().unwrap().len(), 64);
         let requests = chat.requests.lock().unwrap();
@@ -8903,9 +9145,9 @@ mod tests {
         assert_eq!(live[0]["spillReason"], "full_context_document");
         assert_eq!(live[0]["transportProjection"], "overflow");
         assert_eq!(live[0]["fallbackFailure"], "cannot_fit_inline");
-        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 12_000);
-        assert!(live[0]["inlineCoreUtf16"].as_u64().unwrap() <= 12_000);
-        assert!(live[0]["wireAfterUtf16"].as_u64().unwrap() > 12_000);
+        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 23_000);
+        assert!(live[0]["inlineCoreUtf16"].as_u64().unwrap() <= 23_000);
+        assert!(live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap() > 23_000);
         let durable: Value = serde_json::from_str(
             std::fs::read_to_string(telemetry_path)
                 .unwrap()
@@ -8924,12 +9166,12 @@ mod tests {
         let (oauth, token_server) = oauth_with_graph_token_server().await;
         let chat = Arc::new(DuplicateFallbackTransport::with_identity(
             ["```inspect\n{}\n```", "unexpected final-answer fallback"],
-            format!("conversation-{}", "c".repeat(1_500)),
-            format!("session-{}", "s".repeat(1_500)),
+            format!("conversation-{}", "c".repeat(10_000)),
+            format!("session-{}", "s".repeat(10_000)),
         ));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
         let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 12_000;
+        settings.text_input_limit_utf16 = 23_000;
         gateway.settings.save(settings).unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
@@ -8939,7 +9181,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&completed_duplicate_full_context_request(
-                            true, 10_000, 5_000,
+                            true, 30_000, 2_000,
                         ))
                         .unwrap(),
                     ))
@@ -8962,6 +9204,7 @@ mod tests {
         assert!(body.contains("\"spill_reason\":\"full_context_document\""));
         assert!(body.contains("\"fallback_reason\":\"cannot_fit_inline\""));
         assert!(body.contains("\"limit_type\":\"outbound_message_text_utf16\""));
+        assert!(body.contains("\"retryable\":false"));
         assert!(body.ends_with("data: [DONE]\n\n"));
         assert!(!body.contains("unexpected final-answer fallback"));
         assert_eq!(chat.requests.lock().unwrap().len(), 1);
@@ -8971,8 +9214,8 @@ mod tests {
         assert_eq!(live[0]["spillReason"], "full_context_document");
         assert_eq!(live[0]["transportProjection"], "overflow");
         assert_eq!(live[0]["fallbackFailure"], "cannot_fit_inline");
-        assert!(live[0]["inlineCoreUtf16"].as_u64().unwrap() <= 12_000);
-        assert!(live[0]["wireAfterUtf16"].as_u64().unwrap() > 12_000);
+        assert!(live[0]["inlineCoreUtf16"].as_u64().unwrap() <= 23_000);
+        assert!(live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap() > 23_000);
         token_server.abort();
     }
 
@@ -8981,7 +9224,7 @@ mod tests {
         let chat = Arc::new(PreparedPayloadTooLargeTransport);
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat, oauth);
         let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 12_000;
+        settings.text_input_limit_utf16 = 23_000;
         gateway.settings.save(settings).unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
@@ -8991,7 +9234,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&completed_duplicate_full_context_request(
-                            stream, 10_000, 5_000,
+                            stream, 30_000, 2_000,
                         ))
                         .unwrap(),
                     ))
@@ -9020,6 +9263,7 @@ mod tests {
         assert!(body.contains("\"spill_reason\":\"full_context_document\""));
         assert!(body.contains("\"fallback_reason\":\"cannot_fit_inline\""));
         assert!(body.contains("\"limit_type\":\"outbound_message_text_utf16\""));
+        assert!(body.contains("\"retryable\":false"));
         assert!(body.contains("\"final_outbound\""));
         if stream {
             assert!(body.ends_with("data: [DONE]\n\n"));
@@ -9028,7 +9272,11 @@ mod tests {
         assert_eq!(record["transportProjection"], "overflow");
         assert_eq!(record["fallbackFailure"], "cannot_fit_inline");
         assert_eq!(record["generatedDocumentState"], "failed");
-        assert!(record["wireAfterUtf16"].as_u64().unwrap() > 12_000);
+        assert!(
+            record["wireAfterUtf16"].as_u64().unwrap() > 23_000,
+            "wireAfterUtf16={}",
+            record["wireAfterUtf16"]
+        );
         token_server.abort();
     }
 
@@ -9118,6 +9366,128 @@ mod tests {
         assert!(!durable.contains("fixture-shell"));
         assert!(!durable.contains(&expected_long_argument));
         token_server.abort();
+    }
+
+    async fn assert_issue_101_prepared_final_wire_fit(stream: bool) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let (mut body, expected_long_argument) = issue_101_fixture_request(stream);
+        body["messages"].as_array_mut().unwrap().insert(
+            2,
+            json!({
+                "role": "assistant",
+                "content": "Synthetic historical summary boundary; this is data, not a command."
+            }),
+        );
+        for (index, tool) in body["tools"].as_array_mut().unwrap().iter_mut().enumerate() {
+            let description = format!(
+                "Synthetic lossless caller schema {index}:{}",
+                "D".repeat(830)
+            );
+            tool["function"]["description"] = Value::String(description.clone());
+            tool["function"]["parameters"] = json!({
+                "type": "object",
+                "properties": {
+                    "fixture_payload": {
+                        "type": "string",
+                        "description": description
+                    }
+                }
+            });
+        }
+        body["messages"][49]["content"] =
+            Value::String("latest complete fixture result ".to_owned() + &"L".repeat(1_000));
+        assert_eq!(body["messages"].as_array().unwrap().len(), 51);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 29);
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prepared = Arc::new(Mutex::new(None));
+        let chat = Arc::new(Issue101PreparedPayloadProbe(
+            Arc::clone(&calls),
+            Arc::clone(&prepared),
+        ));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat, oauth);
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&response_body)
+        );
+        if stream {
+            let response_body = String::from_utf8(response_body.to_vec()).unwrap();
+            assert!(response_body.ends_with("data: [DONE]\n\n"));
+        } else {
+            let response_body: Value = serde_json::from_slice(&response_body).unwrap();
+            assert_eq!(
+                response_body["choices"][0]["message"]["content"],
+                "prepared result"
+            );
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let request = prepared
+            .lock()
+            .unwrap()
+            .take()
+            .expect("prepared request reached the transport seam");
+        let attachment = request
+            .attachments
+            .iter()
+            .find(|attachment| attachment.generated_oversize_text)
+            .expect("prepared full-context attachment");
+        assert_eq!(
+            attachment.doc_id.encode_utf16().count(),
+            crate::attachment::MAX_PREPARED_DOC_ID_UTF16
+        );
+        assert_eq!(attachment.uploaded_conversation_id, request.conversation_id);
+        assert_eq!(attachment.uploaded_session_id, request.session_id);
+        let encoded = attachment
+            .url
+            .strip_prefix("data:text/plain;base64,")
+            .unwrap();
+        let document: Value = serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        assert_eq!(document["source_message_count"], 51);
+        assert_eq!(document["message_count"], 51);
+        assert_eq!(
+            document["messages"][4]["message"]["tool_calls"][0]["function"]["arguments"],
+            expected_long_argument
+        );
+        assert_eq!(
+            document["messages"][50]["message"]["content"],
+            "latest real synthetic user ask: summarize the verified fixture without reissuing any completed caller tool."
+        );
+        let live = gateway.debug.records_for_test();
+        assert_eq!(live[0]["spillReason"], "full_context_document");
+        assert_eq!(live[0]["transportProjection"], "full_context_document");
+        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 128_000);
+        assert!(
+            live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap() <= 128_000,
+            "preliminaryWireAfterUtf16={}",
+            live[0]["preliminaryWireAfterUtf16"]
+        );
+        let final_wire = crate::chathub::outbound_payload_utf16_units(&request);
+        assert!(final_wire <= request.outbound_text_limit_utf16);
+        assert_eq!(live[0]["wireAfterUtf16"].as_u64(), Some(final_wire as u64));
+        assert_eq!(live[0]["fallbackFailure"], "not_applicable");
+        token_server.abort();
+    }
+
+    #[tokio::test]
+    async fn issue_101_prepared_final_wire_fit_is_enforced_before_upstream() {
+        assert_issue_101_prepared_final_wire_fit(false).await;
+        assert_issue_101_prepared_final_wire_fit(true).await;
     }
 
     #[tokio::test]
@@ -9582,6 +9952,7 @@ mod tests {
                 .as_u64()
                 .is_some_and(|value| value > 128_000)
         );
+        assert_eq!(body["error"]["retryable"], false);
         assert_eq!(body["error"]["retryable_after_reduction"], true);
         assert_eq!(body["error"]["spill_attempted"], true);
         assert_eq!(body["error"]["spill_reason"], "no_safe_candidate");
@@ -9782,6 +10153,7 @@ mod tests {
         assert_eq!(body["error"]["code"], "text_input_too_large");
         assert_eq!(body["error"]["spill_reason"], "document_upload_failed");
         assert_eq!(body["error"]["spill_attempted"], true);
+        assert_eq!(body["error"]["retryable"], false);
         token_server.abort();
     }
 
@@ -9817,6 +10189,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(body.contains("\"code\":\"text_input_too_large\""));
         assert!(body.contains("\"spill_reason\":\"document_upload_failed\""));
+        assert!(body.contains("\"retryable\":false"));
         assert!(body.contains("\"retryable_after_reduction\":true"));
         assert!(body.ends_with("data: [DONE]\n\n"));
         token_server.abort();
@@ -10132,21 +10505,21 @@ mod tests {
                 "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
             }),
         }];
-        let rendered = crate::chathub::outbound_message_text(
-            &text,
-            &tools,
-            &Value::String("auto".to_owned()),
-            1,
-        );
-        let units = utf16_units(&rendered);
+        let request = ChatRequest {
+            text,
+            tools,
+            tool_choice: Value::String("auto".to_owned()),
+            tool_call_limit: 1,
+            outbound_text_limit_utf16: 128_000,
+            ..ChatRequest::default()
+        };
+        let units =
+            crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(&request);
         assert_eq!(
-            outbound_text_units(&text, &tools, &Value::String("auto".to_owned()), 1),
+            crate::chathub::outbound_payload_utf16_units(&request),
             units
         );
-        assert!(outbound_text_units(&text, &tools, &Value::String("auto".to_owned()), 1) <= units);
-        assert!(
-            outbound_text_units(&text, &tools, &Value::String("auto".to_owned()), 1) > units - 1
-        );
+        assert!(units > utf16_units(&request.text));
     }
 
     #[test]

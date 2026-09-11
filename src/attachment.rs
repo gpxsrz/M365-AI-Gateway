@@ -18,6 +18,9 @@ use crate::chathub::{Account, Attachment, ChatError};
 
 pub(crate) const MAX_ATTACHMENTS: usize = 3;
 pub(crate) const MAX_BYTES: u64 = 512 << 20;
+pub(crate) const MAX_PREPARED_DOC_ID_UTF16: usize = 2_048;
+pub(crate) const MAX_PREPARED_NAME_UTF16: usize = 2_048;
+pub(crate) const MAX_PREPARED_REFERENCE_URL_UTF16: usize = 4_096;
 const MAX_REDIRECTS: usize = 5;
 const DOCUMENT_CHUNK: usize = 983_040;
 
@@ -86,6 +89,11 @@ async fn upload_document(
     }
     let spool = spool(&attachment.url, &attachment.mime_type, &attachment.name).await?;
     let transport_name = document_name(&spool.name, attachment.generated_oversize_text);
+    validate_prepared_metadata(
+        &transport_name,
+        MAX_PREPARED_NAME_UTF16,
+        "document upload returned an oversized file name",
+    )?;
     let create_url = format!(
         "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads:/{}:/createUploadSession",
         percent_encode_path(&transport_name)
@@ -173,6 +181,16 @@ async fn upload_document(
     } else {
         ready.spo_id
     };
+    validate_prepared_metadata(
+        &doc_id,
+        MAX_PREPARED_DOC_ID_UTF16,
+        "document upload returned an oversized document id",
+    )?;
+    validate_prepared_metadata(
+        reference.as_str(),
+        MAX_PREPARED_REFERENCE_URL_UTF16,
+        "document upload returned an oversized reference URL",
+    )?;
     attachment.doc_id = doc_id;
     attachment.name = spool.name.clone();
     attachment.transport_name = transport_name;
@@ -244,8 +262,8 @@ async fn upload_image(
     if ready.result.value != "Success" || ready.doc_id.trim().is_empty() {
         return Err(protocol("image upload did not return a ready image"));
     }
-    attachment.doc_id = ready.doc_id;
-    attachment.name = if ready.file_name.trim().is_empty() {
+    let doc_id = ready.doc_id;
+    let name = if ready.file_name.trim().is_empty() {
         if spool.name.trim().is_empty() {
             format!("image-{index}.{}", detected.trim_start_matches("image/"))
         } else {
@@ -254,10 +272,43 @@ async fn upload_image(
     } else {
         ready.file_name
     };
-    attachment.file_type = normalize_image_extension(&ready.file_type, detected);
+    let file_type = normalize_image_extension(&ready.file_type, detected);
+    validate_prepared_metadata(
+        &doc_id,
+        MAX_PREPARED_DOC_ID_UTF16,
+        "image upload returned an oversized document id",
+    )?;
+    validate_prepared_metadata(
+        &name,
+        MAX_PREPARED_NAME_UTF16,
+        "image upload returned an oversized file name",
+    )?;
+    validate_prepared_metadata(
+        &file_type,
+        MAX_PREPARED_NAME_UTF16,
+        "image upload returned an oversized file type",
+    )?;
+    attachment.doc_id = doc_id;
+    attachment.name = name;
+    attachment.file_type = file_type;
     attachment.mime_type = detected.to_owned();
     attachment.uploaded_conversation_id = conversation_id.to_owned();
     attachment.uploaded_session_id = session_id.to_owned();
+    Ok(())
+}
+
+fn validate_prepared_metadata(
+    value: &str,
+    limit: usize,
+    message: &'static str,
+) -> Result<(), ChatError> {
+    let serialized_units = serde_json::to_string(value)
+        .expect("prepared attachment metadata is serializable")
+        .encode_utf16()
+        .count();
+    if serialized_units > limit.saturating_add(2) {
+        return Err(protocol(message));
+    }
     Ok(())
 }
 
@@ -853,6 +904,34 @@ mod tests {
         assert_eq!(document_name(original, true), original);
         assert_eq!(document_name(original, true), original);
         assert_ne!(document_name(original, false), original);
+    }
+
+    #[test]
+    fn prepared_metadata_bounds_are_measured_in_utf16_units() {
+        assert!(
+            validate_prepared_metadata(
+                &"😀".repeat(MAX_PREPARED_DOC_ID_UTF16 / 2),
+                MAX_PREPARED_DOC_ID_UTF16,
+                "too large"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_prepared_metadata(
+                &"😀".repeat(MAX_PREPARED_DOC_ID_UTF16 / 2 + 1),
+                MAX_PREPARED_DOC_ID_UTF16,
+                "too large"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_prepared_metadata(
+                &"\"".repeat(MAX_PREPARED_DOC_ID_UTF16),
+                MAX_PREPARED_DOC_ID_UTF16,
+                "too large"
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

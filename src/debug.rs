@@ -290,6 +290,8 @@ struct Record {
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     wire_after_utf16: usize,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    preliminary_wire_after_utf16: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     generated_document_bytes: usize,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     generated_document_message_count: usize,
@@ -568,6 +570,7 @@ impl Record {
             wire_before_utf16: 0,
             inline_core_utf16: 0,
             wire_after_utf16: 0,
+            preliminary_wire_after_utf16: 0,
             generated_document_bytes: 0,
             generated_document_message_count: 0,
             generated_document_state: "not_evaluated".to_owned(),
@@ -705,6 +708,7 @@ impl Record {
             && self.wire_before_utf16 <= MAX_RECORDED_UTF16
             && self.inline_core_utf16 <= MAX_RECORDED_UTF16
             && self.wire_after_utf16 <= MAX_RECORDED_UTF16
+            && self.preliminary_wire_after_utf16 <= MAX_RECORDED_UTF16
             && self.generated_document_bytes <= MAX_RECORDED_BYTES
             && self.generated_document_message_count <= MAX_RECORDED_UTF16
             && valid_generated_document_state(&self.generated_document_state)
@@ -902,6 +906,7 @@ impl Trace {
         });
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn transport(
         &self,
@@ -927,6 +932,32 @@ impl Trace {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transport_preliminary(
+        &self,
+        projection: &str,
+        wire_before_utf16: usize,
+        inline_core_utf16: usize,
+        preliminary_wire_after_utf16: usize,
+        generated_document_bytes: usize,
+        generated_document_message_count: usize,
+        generated_document_state: &str,
+        fallback_failure: &str,
+    ) {
+        self.update(|record| {
+            record.transport_projection = projection.to_owned();
+            record.wire_before_utf16 = wire_before_utf16.min(MAX_RECORDED_UTF16);
+            record.inline_core_utf16 = inline_core_utf16.min(MAX_RECORDED_UTF16);
+            record.preliminary_wire_after_utf16 =
+                preliminary_wire_after_utf16.min(MAX_RECORDED_UTF16);
+            record.generated_document_bytes = generated_document_bytes.min(MAX_RECORDED_BYTES);
+            record.generated_document_message_count =
+                generated_document_message_count.min(MAX_RECORDED_UTF16);
+            record.generated_document_state = generated_document_state.to_owned();
+            record.fallback_failure = fallback_failure.to_owned();
+        });
+    }
+
     pub(crate) fn transport_failed(
         &self,
         projection: &str,
@@ -937,6 +968,26 @@ impl Trace {
             record.transport_projection = projection.to_owned();
             record.wire_after_utf16 = wire_after_utf16.min(MAX_RECORDED_UTF16);
             record.fallback_failure = fallback_failure.to_owned();
+        });
+    }
+
+    pub(crate) fn transport_preliminary_failed(
+        &self,
+        projection: &str,
+        preliminary_wire_after_utf16: usize,
+        fallback_failure: &str,
+    ) {
+        self.update(|record| {
+            record.transport_projection = projection.to_owned();
+            record.preliminary_wire_after_utf16 =
+                preliminary_wire_after_utf16.min(MAX_RECORDED_UTF16);
+            record.fallback_failure = fallback_failure.to_owned();
+        });
+    }
+
+    pub(crate) fn transport_final_wire(&self, wire_after_utf16: usize) {
+        self.update(|record| {
+            record.wire_after_utf16 = wire_after_utf16.min(MAX_RECORDED_UTF16);
         });
     }
 
@@ -1097,6 +1148,7 @@ pub(crate) async fn detail(
         "wireBeforeUtf16": record.wire_before_utf16,
         "inlineCoreUtf16": record.inline_core_utf16,
         "wireAfterUtf16": record.wire_after_utf16,
+        "preliminaryWireAfterUtf16": record.preliminary_wire_after_utf16,
         "generatedDocumentBytes": record.generated_document_bytes,
         "generatedDocumentMessageCount": record.generated_document_message_count,
         "generatedDocumentState": record.generated_document_state,
@@ -1185,6 +1237,8 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["wireBeforeUtf16"] = serde_json::Value::from(record.wire_before_utf16);
     value["inlineCoreUtf16"] = serde_json::Value::from(record.inline_core_utf16);
     value["wireAfterUtf16"] = serde_json::Value::from(record.wire_after_utf16);
+    value["preliminaryWireAfterUtf16"] =
+        serde_json::Value::from(record.preliminary_wire_after_utf16);
     value["generatedDocumentBytes"] = serde_json::Value::from(record.generated_document_bytes);
     value["generatedDocumentMessageCount"] =
         serde_json::Value::from(record.generated_document_message_count);
