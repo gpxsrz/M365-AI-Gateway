@@ -71,9 +71,9 @@ Projection 前後的 fit check 都走同一個 canonical `message.text` builder�
 
 這個 projection 的公開 deterministic regression 另外使用 [`fixtures/issue-101-third-round.json`](../../fixtures/issue-101-third-round.json)。這是依去敏失敗形狀的結構與尺寸建立，不是私有 session content 的 exact replay；它保留已觀察的 role ordering、20 組已完成工具交換、最後兩個連續 user boundary、29 個 caller-tool definitions 與包含 escaping 的 schema 特徵。
 
-其中的 controls 變體在前面加入一筆觀察到的 `system` 角色 synthetic message，目標長度為 25,655 UTF-16 units；沒有杜撰 `developer` message。Qualification 會用實際 builder 同時量測 projection 前後的 `message.text` 與完整 payload 觀測值，再以相同的公開 `/hermes/v1/chat/completions` `session_key` 契約，在 stream 與 non-stream 驗證 caller tool call/result 的續接。測試只注入隔離的附件 preparation 結果與 loopback upstream WebSocket；實際 `LiveChatHub` 路徑、projection、canonical payload builder、最後 fit check、binding、checkpoint 與 SignalR result consumer 都不替換。
+其中的 controls 變體在前面加入一筆觀察到的 `system` 角色 synthetic message，目標長度為 25,655 UTF-16 units；沒有杜撰 `developer` message。Qualification 會用實際 builder 同時量測 projection 前後的 `message.text` 與完整 payload 觀測值，再以相同的公開 `/hermes/v1/chat/completions` `session_key` 契約，在 stream 與 non-stream 驗證 caller tool call/result 的續接，也驗證 tool error state 仍保留。測試只注入隔離的附件 preparation 結果與 loopback upstream WebSocket；實際 `LiveChatHub` 路徑、projection、canonical payload builder、最後 fit check、binding、checkpoint 與 SignalR result consumer 都不替換。另有 focused transport test 以同一 controls fixture 驗證同 binding reuse、source 改變時重新準備，以及 conversation/session binding 隔離。
 
-另有獨立的單一 user boundary 變體保留最後一筆真正 user message，檢查既有 inline selection；不會縮短兩個 boundary 的 controls fixture，也不會把任何 message 改成另一個 role。
+另有獨立的單一 user boundary 變體只移除兩筆尾端 user boundary 中較早的一筆，保留最後的 `role=user`，並加入公開 discriminator 讓 latest selection 可被精確核對；不會縮短兩個 boundary 的 controls fixture，也不會改變 user authority。
 
 不能安全 spill 時回：
 

@@ -22,7 +22,8 @@
     "construction": "Independent qualification variant retaining the final real user boundary; the two-boundary controls fixture is not shortened.",
     "message_count": 51,
     "inline_message_indexes": [0, 48, 49, 50],
-    "source_note": "This variant changes only the synthetic fixture shape for selection coverage; it does not convert a message into another role or alter the base fixture."
+    "latest_user_marker": "最新 synthetic user ask",
+    "source_note": "This variant removes the earlier of the two final user boundaries and marks the retained final role=user row with a public discriminator. It changes no role, ordering authority, or base fixture content."
   },
   "observed_failure": {
     "caller_role_envelope_utf16": 185795,
