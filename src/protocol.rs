@@ -5382,6 +5382,24 @@ mod tests {
         session_id: &'a str,
         attachments: &'a mut [Attachment],
     ) -> crate::chathub::AttachmentPreparationFuture<'a> {
+        issue_101_prepare_attachments_expect_error(conversation_id, session_id, attachments, false)
+    }
+
+    fn issue_101_prepare_attachments_with_error_state<'a>(
+        _: &'a Account,
+        conversation_id: &'a str,
+        session_id: &'a str,
+        attachments: &'a mut [Attachment],
+    ) -> crate::chathub::AttachmentPreparationFuture<'a> {
+        issue_101_prepare_attachments_expect_error(conversation_id, session_id, attachments, true)
+    }
+
+    fn issue_101_prepare_attachments_expect_error<'a>(
+        conversation_id: &'a str,
+        session_id: &'a str,
+        attachments: &'a mut [Attachment],
+        expected_error_state: bool,
+    ) -> crate::chathub::AttachmentPreparationFuture<'a> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
         Box::pin(async move {
@@ -5395,12 +5413,14 @@ mod tests {
                     .expect("full-context document upload input");
                 let document: Value =
                     serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
-                let error_state = document["messages"]
+                let error_count = document["messages"]
                     .as_array()
                     .expect("full-context document messages")
                     .iter()
-                    .any(|message| message["message"]["tool_result_is_error"] == true);
-                let (expected_body, expected_system_prompt) = if error_state {
+                    .filter(|message| message["message"]["tool_result_is_error"] == true)
+                    .count();
+                assert_eq!(error_count, usize::from(expected_error_state));
+                let (expected_body, expected_system_prompt) = if expected_error_state {
                     issue_101_third_round_controls_fixture_with_error_state()
                 } else {
                     issue_101_third_round_controls_fixture_request()
@@ -9689,8 +9709,12 @@ mod tests {
         let (oauth, token_server) = oauth_with_graph_token_server().await;
         let (mut gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth);
         let settings = gateway.settings.clone();
-        let live_chat =
-            LiveChatHub::new_for_test(settings, issue_101_prepare_attachments, websocket_base);
+        let attachment_preparer = if error_state {
+            issue_101_prepare_attachments_with_error_state
+        } else {
+            issue_101_prepare_attachments
+        };
+        let live_chat = LiveChatHub::new_for_test(settings, attachment_preparer, websocket_base);
         Arc::get_mut(&mut gateway)
             .expect("test gateway must be uniquely owned before routing")
             .chat = Arc::new(live_chat);
@@ -9977,6 +10001,11 @@ mod tests {
     #[tokio::test]
     async fn issue_101_controls_fixture_preserves_tool_error_state_non_stream() {
         assert_issue_101_controls_tool_continuation(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn issue_101_controls_fixture_preserves_tool_error_state_stream() {
+        assert_issue_101_controls_tool_continuation(true, true).await;
     }
 
     #[tokio::test]
