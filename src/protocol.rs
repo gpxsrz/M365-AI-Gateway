@@ -9245,6 +9245,18 @@ mod tests {
         (body, system_prompt)
     }
 
+    fn issue_101_third_round_controls_single_user_boundary_fixture_request() -> (Value, String) {
+        let (mut body, system_prompt) = issue_101_third_round_controls_fixture_request();
+        let messages = body["messages"].as_array_mut().unwrap();
+        assert_eq!(messages.len(), 52);
+        let removed_boundary = messages.pop().expect("two-boundary controls fixture");
+        assert_eq!(removed_boundary["role"], "user");
+        assert_eq!(messages.len(), 51);
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        body["messages"] = Value::Array(messages.to_vec());
+        (body, system_prompt)
+    }
+
     fn sse_values(body: &str) -> Vec<Value> {
         assert!(body.ends_with("data: [DONE]\n\n"));
         let mut done_count = 0;
@@ -9812,6 +9824,89 @@ mod tests {
         assert!(chat.0.lock().unwrap().is_none());
         assert!(gateway.checkpoints.list().unwrap().is_empty());
         assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_101_controls_single_user_boundary_keeps_latest_user_inline() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let (mut body, system_prompt) =
+            issue_101_third_round_controls_single_user_boundary_fixture_request();
+        body["session_key"] = Value::String("issue-101-controls-single-boundary".to_owned());
+        let source_messages = body["messages"].clone();
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
+        let app = Gateway::router(Arc::clone(&gateway));
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = chat
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("single-boundary controls fixture reached transport");
+        assert_eq!(request.tools.len(), 29);
+        let message_text = crate::chathub::outbound_message_text(
+            &request.text,
+            &request.tools,
+            &request.tool_choice,
+            request.tool_call_limit,
+        );
+        assert!(utf16_units(&message_text) <= 128_000);
+        let inline: Value = serde_json::from_str(&request.text).unwrap();
+        assert_eq!(
+            inline["transport_projection"]["inline_message_indexes"],
+            json!([0, 48, 49, 50])
+        );
+        assert_eq!(inline["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(inline["messages"][0]["role"], "system");
+        assert_eq!(inline["messages"][0]["content"], system_prompt);
+        assert_eq!(inline["messages"][1]["role"], "assistant");
+        assert_eq!(inline["messages"][2]["role"], "tool");
+        assert_eq!(
+            inline["messages"][1]["tool_calls"][0]["id"],
+            inline["messages"][2]["tool_call_id"]
+        );
+        assert_eq!(inline["messages"][3]["role"], "user");
+        assert_eq!(inline["messages"][3]["content"], "請繼續");
+
+        let attachment = request
+            .attachments
+            .iter()
+            .find(|attachment| attachment.generated_oversize_text)
+            .expect("single-boundary controls fixture generated a context document");
+        let encoded = attachment
+            .url
+            .strip_prefix("data:text/plain;base64,")
+            .unwrap();
+        let document: Value = serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        assert_eq!(document["source_message_count"], 51);
+        assert_eq!(document["message_count"], 51);
+        assert_eq!(document["messages"][0]["message"]["role"], "system");
+        assert_eq!(document["messages"][0]["message"]["content"], system_prompt);
+        assert_eq!(document["messages"][50]["message"]["role"], "user");
+        assert_eq!(document["messages"][50]["message"]["content"], "請繼續");
+        assert_eq!(
+            document["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["message_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            (0..51).map(|index| index as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(source_messages.as_array().unwrap().len(), 51);
+        token_server.abort();
     }
 
     #[tokio::test]

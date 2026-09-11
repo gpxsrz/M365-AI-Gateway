@@ -18,6 +18,12 @@
     "seed": "system control quote \" \\ path\n中文😀🚀",
     "source_note": "The control text is a public synthetic size-and-escaping reconstruction of the stored-prompt length; it is not the private prompt or a replayable request."
   },
+  "single_user_boundary_variant": {
+    "construction": "Independent qualification variant retaining the final real user boundary; the two-boundary controls fixture is not shortened.",
+    "message_count": 51,
+    "inline_message_indexes": [0, 48, 49, 50],
+    "source_note": "This variant changes only the synthetic fixture shape for selection coverage; it does not convert a message into another role or alter the base fixture."
+  },
   "observed_failure": {
     "caller_role_envelope_utf16": 185795,
     "text_input_limit_utf16": 128000,

@@ -73,6 +73,8 @@ The public deterministic regression for this projection additionally uses [`fixt
 
 Its controls variant prepends one synthetic `system` message at the observed 25,655 UTF-16-unit stored-prompt size; it does not invent a `developer` message. The qualification test measures both `message.text` and complete-payload observations before and after projection, then uses the same public `/hermes/v1/chat/completions` session-key contract for a caller tool-call/result continuation in stream and non-stream modes. The test injects only an isolated attachment-preparation result and loopback upstream WebSocket; the actual `LiveChatHub` path, projection, canonical payload builder, final fit check, binding, checkpoint, and SignalR result consumer run unchanged.
 
+An independent single-user-boundary variant retains the final real user message and checks the existing inline selection; it does not shorten the two-boundary controls fixture or relabel any message.
+
 When safe spill is impossible:
 
 ```text
