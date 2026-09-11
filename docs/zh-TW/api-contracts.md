@@ -71,6 +71,8 @@ Projection 前後的 fit check 都走同一個 canonical `message.text` builder�
 
 這個 projection 的公開 deterministic regression 另外使用 [`fixtures/issue-101-third-round.json`](../../fixtures/issue-101-third-round.json)。這是依去敏失敗形狀的結構與尺寸建立，不是私有 session content 的 exact replay；它保留已觀察的 role ordering、20 組已完成工具交換、最後兩個連續 user boundary、29 個 caller-tool definitions 與包含 escaping 的 schema 特徵。
 
+其中的 controls 變體在前面加入一筆觀察到的 `system` 角色 synthetic message，目標長度為 25,655 UTF-16 units；沒有杜撰 `developer` message。Qualification 會用實際 builder 同時量測 projection 前後的 `message.text` 與完整 payload 觀測值，再以相同的公開 `/hermes/v1/chat/completions` `session_key` 契約，在 stream 與 non-stream 驗證 caller tool call/result 的續接。只有附件 upload 與 upstream I/O 邊界隔離 mock；projection、canonical serialization、binding 與 checkpoint 仍走 production path。
+
 不能安全 spill 時回：
 
 ```text

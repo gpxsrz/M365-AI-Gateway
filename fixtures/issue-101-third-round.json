@@ -11,6 +11,13 @@
     "consecutive_final_user_boundaries": 2,
     "source_note": "Counts and bounded size targets are derived from an anonymized Hermes session structure readback; caller schema bodies were not persisted in that session and are represented by a deterministic escaping-heavy synthetic schema."
   },
+  "controls_variant": {
+    "assembly": "Hermes prepends the active system prompt as one role=system API message before the session rows",
+    "system_message_utf16_units": 25655,
+    "developer_message_present": false,
+    "seed": "system control quote \" \\ path\n中文😀🚀",
+    "source_note": "The control text is a public synthetic size-and-escaping reconstruction of the stored-prompt length; it is not the private prompt or a replayable request."
+  },
   "observed_failure": {
     "caller_role_envelope_utf16": 185795,
     "text_input_limit_utf16": 128000,

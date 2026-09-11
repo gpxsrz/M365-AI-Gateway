@@ -71,6 +71,8 @@ The public synthetic qualification input is [`fixtures/long-context-tool-calls.j
 
 The public deterministic regression for this projection additionally uses [`fixtures/issue-101-third-round.json`](../../fixtures/issue-101-third-round.json). It is a structure- and size-derived fixture from a sanitized failure shape, not an exact replay of private session content; it preserves the observed role ordering, 20 completed tool exchanges, two consecutive final user boundaries, 29 caller-tool definitions, and escaping-heavy schema characteristics.
 
+Its controls variant prepends one synthetic `system` message at the observed 25,655 UTF-16-unit stored-prompt size; it does not invent a `developer` message. The qualification test measures both `message.text` and complete-payload observations before and after projection, then uses the same public `/hermes/v1/chat/completions` session-key contract for a caller tool-call/result continuation in stream and non-stream modes. Only the attachment-upload and upstream-I/O boundary is isolated; projection, canonical serialization, binding, and checkpoint logic remain the production path.
+
 When safe spill is impossible:
 
 ```text
