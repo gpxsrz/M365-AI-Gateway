@@ -94,7 +94,23 @@ recommended_action=reduce_input_or_retry_when_document_spill_is_available
 
 `retryable=false` 表示相同 request body 不可直接重送；`retryable_after_reduction=true` 只表示 caller 改用較小輸入後可以建立新的 request。這不改變 429/503 的 retry 語意。
 
-常見 `spill_reason` 包含 attachment slots 已滿、沒有安全 candidate、無法縮回限制內、generated file 過大、文件授權／upload 失敗。
+若 projection 已成功但 generated TXT 的 Graph／SharePoint upload 失敗，這不是 caller input-size failure，而是獨立的 attachment transport error：
+
+```text
+HTTP 502
+type=upstream_error
+code=attachment_upload_failed
+retryable=<true|false>
+retryable_after_reduction=false
+spill_attempted=true
+spill_reason=<safe_bulk_candidate|full_context_document>
+attachment_failure=<bounded stage/class>
+recommended_action=<retry_same_request|inspect_attachment_failure>
+```
+
+Generated document 只在 attachment layer 對 create-upload-session 的 transport／408／429／5xx 做一次 bounded retry；chunk PUT 的同類失敗也只會在同一 upload session、同一 `Content-Range` 上重送一次。PUT 發生 transport error 後，會先讀同一 upload session 的 bounded `nextExpectedRanges`，只有確認同一 range 仍 missing 才重送。`Retry-After` 會被 bounded，PUT 不會帶 Graph bearer token。若 range 可能已經 commit，或 status 無法 reconcile，會 fail closed 為 `sharepoint_upload_transport_unknown`，不把未知結果當成成功，也不盲目重播；這個 final unknown class 不可由 caller retry。永久 4xx、untrusted upload URL、invalid JSON、incomplete DriveItem 與 reference validation failure 不重試。這些 attachment failure 不要求 caller reduction，也不改變真正無法 fit 的 `text_input_too_large` 或 `graph_authorization_unavailable` 契約。
+
+常見 `spill_reason` 包含 attachment slots 已滿、沒有安全 candidate、無法縮回限制內、generated file 過大或文件 projection 原因；upload stage/class 另由 `attachment_failure` 表示。`fallback_reason` 保留給後續 spill fallback transition 使用。
 
 若 bulk 已嘗試但接續的 full-context fallback 也失敗，公開錯誤保留既有 `spill_reason` 的第一階段相容語意，並在有第二階段結果時增加 `fallback_reason`；這兩者不可混看成同一個量。
 
@@ -120,7 +136,7 @@ Spill 不移除 hard limit。Attachment grounding 也不代表 model-context cos
 
 Full-context TXT 是 transport projection，不保證模型已讀完、正確使用文件或能取回任意位置；HTTP 200、upload 成功或模型自稱理解都不是 semantic acceptance。真實使用者驗收與 deterministic qualification 分開。
 
-管理員診斷 surface 會以 bounded live 欄位顯示 `transportProjection`、`messageTextBeforeUtf16`、`preliminaryMessageTextAfterUtf16`、`messageTextAfterUtf16`、`wireBeforeUtf16`、`inlineCoreUtf16`、`preliminaryWireAfterUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`。`messageText*` 是 fit policy 的量測；`wire*` 是完整 serialized payload 的觀測值，不會靜默被當成 128K gate。Durable v1 JSONL 的 `utf16Before`／`utf16After` 是 canonical `message.text` spill 量測；public overflow error 的 `received` 仍是 spill 前 caller role-envelope 量測。Durable v1 JSONL 會記錄 typed `spillDecision`、`spillReason` 與 bounded UTF-16 spill 前後量測，包含 `full_context_document`；transport projection 細節仍是 bounded live 欄位，且不保存文件內容。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
+管理員診斷 surface 會以 bounded 欄位顯示 `transportProjection`、`messageTextBeforeUtf16`、`preliminaryMessageTextAfterUtf16`、`messageTextAfterUtf16`、`wireBeforeUtf16`、`inlineCoreUtf16`、`preliminaryWireAfterUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`。`messageText*`、`wire*` 與 generated-document measurement 是 live projection；`fallbackFailure` 也會 durable 保留。`messageText*` 是 fit policy 的量測；`wire*` 是完整 serialized payload 的觀測值，不會靜默被當成 128K gate。Durable v1 JSONL 的 `utf16Before`／`utf16After` 是 canonical `message.text` spill 量測；public overflow error 的 `received` 仍是 spill 前 caller role-envelope 量測。Durable v1 JSONL 會記錄 typed `spillDecision`、`spillReason`、bounded UTF-16 spill 前後量測與 bounded `fallbackFailure` stage/class，包含 `full_context_document`；transport projection 細節仍是 bounded live 欄位，且不保存文件內容、upload URL、response body、token、private ID 或 attachment bytes。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
 
 ## Tools 與 structured output
 
@@ -283,6 +299,7 @@ Delivery 視為 at-least-once，所以 consumer 需以 event / operation identit
 | `409 transport_checkpoint_recovery_required` | 已有未知 external outcome，先 reconcile |
 | `409 hermes_execution_identity_error` | Hermes execution identity / provenance 無法安全建立 |
 | `429 upstream_throttle` | Shared breaker 投影或 upstream rate limit |
+| `502 attachment_upload_failed` | projection 成功後 generated document 的 attachment transport 失敗；看 `attachment_failure` 判斷 bounded stage/class |
 | `502 upstream_empty_response` | Upstream transport完成後沒有合法可見 output |
 | `503 interactive_capacity_busy` | 本地 shared-account admission 暫時無容量 |
 | `503 memory_capacity_deferred` | Memory waiting buffer 已滿或需延後 |

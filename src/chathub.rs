@@ -143,6 +143,102 @@ pub struct Attachment {
     pub generated_oversize_text: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentFailureKind {
+    GraphAuthorizationUnavailable,
+    LocalSpool,
+    AttachmentMetadataInvalid,
+    GraphUploadSessionTransport,
+    GraphUploadSessionHttp408,
+    GraphUploadSessionHttp429,
+    GraphUploadSessionHttp5xx,
+    GraphUploadSessionHttp4xx,
+    GraphUploadSessionInvalidJson,
+    UntrustedUploadUrl,
+    SharePointUploadTransportUnknown,
+    SharePointUploadHttp408,
+    SharePointUploadHttp429,
+    SharePointUploadHttp5xx,
+    SharePointUploadHttp4xx,
+    DriveItemInvalidJson,
+    DriveItemIncomplete,
+    ReferenceValidationFailed,
+    UnknownAttachmentTransport,
+}
+
+impl AttachmentFailureKind {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::GraphAuthorizationUnavailable => "graph_authorization_unavailable",
+            Self::LocalSpool => "local_spool_failure",
+            Self::AttachmentMetadataInvalid => "attachment_metadata_invalid",
+            Self::GraphUploadSessionTransport => "graph_upload_session_transport",
+            Self::GraphUploadSessionHttp408 => "graph_upload_session_http_408",
+            Self::GraphUploadSessionHttp429 => "graph_upload_session_http_429",
+            Self::GraphUploadSessionHttp5xx => "graph_upload_session_http_5xx",
+            Self::GraphUploadSessionHttp4xx => "graph_upload_session_http_4xx",
+            Self::GraphUploadSessionInvalidJson => "graph_upload_session_invalid_json",
+            Self::UntrustedUploadUrl => "untrusted_upload_url",
+            Self::SharePointUploadTransportUnknown => "sharepoint_upload_transport_unknown",
+            Self::SharePointUploadHttp408 => "sharepoint_upload_http_408",
+            Self::SharePointUploadHttp429 => "sharepoint_upload_http_429",
+            Self::SharePointUploadHttp5xx => "sharepoint_upload_http_5xx",
+            Self::SharePointUploadHttp4xx => "sharepoint_upload_http_4xx",
+            Self::DriveItemInvalidJson => "drive_item_invalid_json",
+            Self::DriveItemIncomplete => "drive_item_incomplete",
+            Self::ReferenceValidationFailed => "reference_validation_failed",
+            Self::UnknownAttachmentTransport => "unknown_attachment_transport",
+        }
+    }
+
+    pub(crate) fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::GraphUploadSessionTransport
+                | Self::GraphUploadSessionHttp408
+                | Self::GraphUploadSessionHttp429
+                | Self::GraphUploadSessionHttp5xx
+                | Self::SharePointUploadHttp408
+                | Self::SharePointUploadHttp429
+                | Self::SharePointUploadHttp5xx
+        )
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::GraphAuthorizationUnavailable => {
+                "Microsoft Graph authorization unavailable for document upload"
+            }
+            Self::LocalSpool => "document source could not be prepared in the private spool",
+            Self::AttachmentMetadataInvalid => "document upload metadata is invalid",
+            Self::GraphUploadSessionTransport => "Graph upload session request failed",
+            Self::GraphUploadSessionHttp408 => "Graph upload session timed out",
+            Self::GraphUploadSessionHttp429 => "Graph upload session was rate limited",
+            Self::GraphUploadSessionHttp5xx => "Graph upload session service failed",
+            Self::GraphUploadSessionHttp4xx => "Graph upload session rejected the request",
+            Self::GraphUploadSessionInvalidJson => "Graph upload session returned invalid JSON",
+            Self::UntrustedUploadUrl => "document upload URL is not a trusted SharePoint endpoint",
+            Self::SharePointUploadTransportUnknown => {
+                "SharePoint upload outcome is unknown after bounded retry"
+            }
+            Self::SharePointUploadHttp408 => "SharePoint upload timed out",
+            Self::SharePointUploadHttp429 => "SharePoint upload was rate limited",
+            Self::SharePointUploadHttp5xx => "SharePoint upload service failed",
+            Self::SharePointUploadHttp4xx => "SharePoint upload rejected the request",
+            Self::DriveItemInvalidJson => "final document upload returned invalid JSON",
+            Self::DriveItemIncomplete => "final document upload returned incomplete metadata",
+            Self::ReferenceValidationFailed => "document reference validation failed",
+            Self::UnknownAttachmentTransport => "attachment transport failed",
+        }
+    }
+}
+
+impl fmt::Display for AttachmentFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Tool {
     #[serde(rename = "type")]
@@ -290,6 +386,7 @@ pub enum ChatError {
     #[error("attachment transport: {message}")]
     Attachment {
         generated_oversize_text: bool,
+        failure: AttachmentFailureKind,
         message: String,
     },
     #[error("ChatHub message.text exceeds the UTF-16 limit ({message_text_units} > {limit})")]

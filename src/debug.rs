@@ -307,11 +307,11 @@ struct Record {
         deserialize_with = "deserialize_not_evaluated"
     )]
     generated_document_state: String,
-    #[serde(
-        skip_serializing,
-        default = "default_not_evaluated",
-        deserialize_with = "deserialize_not_evaluated"
-    )]
+    // This field already existed in the v1 Record shape. It is now written
+    // durably so a generated-document transport incident can be classified
+    // after restart. Older rollback readers already know this v1 field and
+    // their existing deserializer resets it conservatively.
+    #[serde(default = "default_not_evaluated")]
     fallback_failure: String,
     request_id: String,
     error_code: String,
@@ -828,6 +828,24 @@ fn valid_fallback_failure(value: &str) -> bool {
             | "graph_authorization_unavailable"
             | "document_upload_failed"
             | "attachment_upload_failed"
+            | "local_spool_failure"
+            | "attachment_metadata_invalid"
+            | "graph_upload_session_transport"
+            | "graph_upload_session_http_408"
+            | "graph_upload_session_http_429"
+            | "graph_upload_session_http_5xx"
+            | "graph_upload_session_http_4xx"
+            | "graph_upload_session_invalid_json"
+            | "untrusted_upload_url"
+            | "sharepoint_upload_transport_unknown"
+            | "sharepoint_upload_http_408"
+            | "sharepoint_upload_http_429"
+            | "sharepoint_upload_http_5xx"
+            | "sharepoint_upload_http_4xx"
+            | "drive_item_invalid_json"
+            | "drive_item_incomplete"
+            | "reference_validation_failed"
+            | "unknown_attachment_transport"
     )
 }
 
@@ -1576,7 +1594,7 @@ mod tests {
         assert!(value.get("toolCallSuppressed").is_none());
 
         // This is the exact v1 record shape an older rollback reader sees.
-        let reopened = Store::open(path, "test").unwrap();
+        let reopened = Store::open(path.clone(), "test").unwrap();
         let record = reopened
             .inner
             .lock()
@@ -1644,7 +1662,7 @@ mod tests {
         assert_eq!(live["generatedDocumentMessageCount"], 50);
         assert_eq!(live["generatedDocumentState"], "created");
 
-        let reopened = Store::open(path, "test").unwrap();
+        let reopened = Store::open(path.clone(), "test").unwrap();
         let durable = reopened.inner.lock().unwrap();
         assert_eq!(
             durable.records.front().unwrap().spill_reason,
@@ -1669,11 +1687,20 @@ mod tests {
             "created",
             "not_applicable",
         );
-        failed_trace.generated_document_failed("document_upload_failed");
+        failed_trace.generated_document_failed("sharepoint_upload_http_5xx");
         drop(failed_trace);
         let failed = store.records_for_test().pop().unwrap();
         assert_eq!(failed["generatedDocumentState"], "failed");
-        assert_eq!(failed["fallbackFailure"], "document_upload_failed");
+        assert_eq!(failed["fallbackFailure"], "sharepoint_upload_http_5xx");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let durable: serde_json::Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(durable["fallbackFailure"], "sharepoint_upload_http_5xx");
+        let reopened = Store::open(path, "test").unwrap();
+        let inner = reopened.inner.lock().unwrap();
+        assert_eq!(
+            inner.records.front().unwrap().fallback_failure,
+            "sharepoint_upload_http_5xx"
+        );
     }
 
     #[test]

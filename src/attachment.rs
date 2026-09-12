@@ -3,18 +3,18 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{StreamExt, stream};
 use rand::Rng;
-use reqwest::{Client, StatusCode, Url, multipart};
+use reqwest::{Client, StatusCode, Url, header::HeaderValue, multipart};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 
-use crate::chathub::{Account, Attachment, ChatError};
+use crate::chathub::{Account, Attachment, AttachmentFailureKind, ChatError};
 
 pub(crate) const MAX_ATTACHMENTS: usize = 3;
 pub(crate) const MAX_BYTES: u64 = 512 << 20;
@@ -23,6 +23,10 @@ pub(crate) const MAX_PREPARED_NAME_UTF16: usize = 2_048;
 pub(crate) const MAX_PREPARED_REFERENCE_URL_UTF16: usize = 4_096;
 const MAX_REDIRECTS: usize = 5;
 const DOCUMENT_CHUNK: usize = 983_040;
+const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
+const DOCUMENT_UPLOAD_MAX_ATTEMPTS: usize = 2;
+const DOCUMENT_UPLOAD_BACKOFF: Duration = Duration::from_millis(100);
+const DOCUMENT_UPLOAD_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 pub async fn prepare(
     account: &Account,
@@ -67,9 +71,13 @@ pub async fn prepare(
             _ => return Err(protocol("unsupported attachment type")),
         };
         if let Err(error) = result {
-            return Err(ChatError::Attachment {
-                generated_oversize_text,
-                message: error.to_string(),
+            return Err(match error {
+                ChatError::Attachment { .. } => error,
+                error => ChatError::Attachment {
+                    generated_oversize_text,
+                    failure: AttachmentFailureKind::UnknownAttachmentTransport,
+                    message: error.to_string(),
+                },
             });
         }
     }
@@ -82,90 +90,158 @@ async fn upload_document(
     session_id: &str,
     attachment: &mut Attachment,
 ) -> Result<(), ChatError> {
+    upload_document_at(
+        account,
+        conversation_id,
+        session_id,
+        attachment,
+        GRAPH_API_BASE,
+        validate_upload_url,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn prepare_document_at_for_test(
+    account: &Account,
+    conversation_id: &str,
+    session_id: &str,
+    attachment: &mut Attachment,
+    graph_api_base: &str,
+) -> Result<(), ChatError> {
+    upload_document_at(
+        account,
+        conversation_id,
+        session_id,
+        attachment,
+        graph_api_base,
+        validate_upload_url_for_test,
+    )
+    .await
+}
+
+#[cfg(test)]
+fn validate_upload_url_for_test(raw: &str) -> Result<(), ChatError> {
+    let url = Url::parse(raw).map_err(|_| protocol("test upload URL is invalid"))?;
+    if url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.username().is_empty()
+        && url.password().is_none()
+    {
+        Ok(())
+    } else {
+        validate_upload_url(raw)
+    }
+}
+
+type UploadUrlValidator = fn(&str) -> Result<(), ChatError>;
+
+async fn upload_document_at(
+    account: &Account,
+    conversation_id: &str,
+    session_id: &str,
+    attachment: &mut Attachment,
+    graph_api_base: &str,
+    upload_url_validator: UploadUrlValidator,
+) -> Result<(), ChatError> {
+    let generated_oversize_text = attachment.generated_oversize_text;
     if account.graph_access_token.trim().is_empty() {
-        return Err(protocol(
-            "document upload requires Microsoft Graph authorization",
+        return Err(attachment_failure(
+            generated_oversize_text,
+            AttachmentFailureKind::GraphAuthorizationUnavailable,
         ));
     }
-    let spool = spool(&attachment.url, &attachment.mime_type, &attachment.name).await?;
+    let spool = spool(&attachment.url, &attachment.mime_type, &attachment.name)
+        .await
+        .map_err(|_| {
+            attachment_failure(generated_oversize_text, AttachmentFailureKind::LocalSpool)
+        })?;
     let transport_name = document_name(&spool.name, attachment.generated_oversize_text);
     validate_prepared_metadata(
         &transport_name,
         MAX_PREPARED_NAME_UTF16,
         "document upload returned an oversized file name",
-    )?;
+    )
+    .map_err(|_| {
+        attachment_failure(
+            generated_oversize_text,
+            AttachmentFailureKind::AttachmentMetadataInvalid,
+        )
+    })?;
     let create_url = format!(
-        "https://graph.microsoft.com/v1.0/me/drive/special/copilotuploads:/{}:/createUploadSession",
+        "{graph_api_base}/me/drive/special/copilotuploads:/{}:/createUploadSession",
         percent_encode_path(&transport_name)
     );
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
-        .map_err(|_| protocol("document upload client is unavailable"))?;
-    let response = client
-        .post(create_url)
-        .bearer_auth(&account.graph_access_token)
-        .json(&json!({"item":{
-            "@microsoft.graph.conflictBehavior":"replace",
-            "name":transport_name
-        }}))
-        .send()
-        .await
-        .map_err(|_| protocol("create document upload session failed"))?;
-    if !response.status().is_success() {
-        return Err(protocol(&format!(
-            "create document upload session returned HTTP {}",
-            response.status().as_u16()
-        )));
-    }
-    let session: UploadSession = response
-        .json()
-        .await
-        .map_err(|_| protocol("document upload session returned invalid JSON"))?;
-    validate_upload_url(&session.upload_url)?;
+        .map_err(|_| {
+            attachment_failure(
+                generated_oversize_text,
+                AttachmentFailureKind::UnknownAttachmentTransport,
+            )
+        })?;
+    let session = create_upload_session_with_retries(
+        &client,
+        &create_url,
+        &account.graph_access_token,
+        &transport_name,
+        generated_oversize_text,
+    )
+    .await
+    .map_err(|failure| attachment_failure(generated_oversize_text, failure))?;
+    upload_url_validator(&session.upload_url).map_err(|_| {
+        attachment_failure(
+            generated_oversize_text,
+            AttachmentFailureKind::UntrustedUploadUrl,
+        )
+    })?;
 
-    let mut file = tokio::fs::File::open(&spool.path)
-        .await
-        .map_err(|_| protocol("cannot read the private document spool"))?;
+    let mut file = tokio::fs::File::open(&spool.path).await.map_err(|_| {
+        attachment_failure(generated_oversize_text, AttachmentFailureKind::LocalSpool)
+    })?;
     let mut offset = 0_u64;
     let mut ready = None;
     while offset < spool.size {
         let length = ((spool.size - offset) as usize).min(DOCUMENT_CHUNK);
         let mut chunk = vec![0_u8; length];
-        file.read_exact(&mut chunk)
-            .await
-            .map_err(|_| protocol("cannot read the private document spool"))?;
+        file.read_exact(&mut chunk).await.map_err(|_| {
+            attachment_failure(generated_oversize_text, AttachmentFailureKind::LocalSpool)
+        })?;
         let end = offset + length as u64 - 1;
-        let response = client
-            .put(&session.upload_url)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header(
-                reqwest::header::CONTENT_RANGE,
-                format!("bytes {offset}-{end}/{}", spool.size),
-            )
-            .body(chunk)
-            .send()
-            .await
-            .map_err(|_| protocol("document upload chunk failed"))?;
-        if !response.status().is_success() {
-            return Err(protocol(&format!(
-                "document upload chunk returned HTTP {}",
-                response.status().as_u16()
-            )));
-        }
+        let content_range = format!("bytes {offset}-{end}/{}", spool.size);
+        let response = upload_chunk_with_retries(
+            &client,
+            &session.upload_url,
+            &content_range,
+            &chunk,
+            offset,
+            end,
+            generated_oversize_text,
+        )
+        .await
+        .map_err(|failure| attachment_failure(generated_oversize_text, failure))?;
         if end + 1 == spool.size {
-            ready = Some(
-                response
-                    .json::<DriveItem>()
-                    .await
-                    .map_err(|_| protocol("final document upload returned invalid JSON"))?,
-            );
+            ready = Some(response.json::<DriveItem>().await.map_err(|_| {
+                attachment_failure(
+                    generated_oversize_text,
+                    AttachmentFailureKind::DriveItemInvalidJson,
+                )
+            })?);
         }
         offset = end + 1;
     }
-    let ready = ready.ok_or_else(|| protocol("document upload did not return a DriveItem"))?;
+    let ready = ready.ok_or_else(|| {
+        attachment_failure(
+            generated_oversize_text,
+            AttachmentFailureKind::DriveItemIncomplete,
+        )
+    })?;
     if ready.id.trim().is_empty() {
-        return Err(protocol("document upload returned an incomplete DriveItem"));
+        return Err(attachment_failure(
+            generated_oversize_text,
+            AttachmentFailureKind::DriveItemIncomplete,
+        ));
     }
     let reference = Url::parse(&ready.web_url)
         .ok()
@@ -175,9 +251,19 @@ async fn upload_document(
                 && url.username().is_empty()
                 && url.password().is_none()
         })
-        .ok_or_else(|| protocol("document upload returned an invalid reference URL"))?;
+        .ok_or_else(|| {
+            attachment_failure(
+                generated_oversize_text,
+                AttachmentFailureKind::ReferenceValidationFailed,
+            )
+        })?;
     let doc_id = if ready.spo_id.trim().is_empty() {
-        derive_local_file_id(&ready.id, &ready.parent_reference.drive_id)?
+        derive_local_file_id(&ready.id, &ready.parent_reference.drive_id).map_err(|_| {
+            attachment_failure(
+                generated_oversize_text,
+                AttachmentFailureKind::DriveItemIncomplete,
+            )
+        })?
     } else {
         ready.spo_id
     };
@@ -185,12 +271,24 @@ async fn upload_document(
         &doc_id,
         MAX_PREPARED_DOC_ID_UTF16,
         "document upload returned an oversized document id",
-    )?;
+    )
+    .map_err(|_| {
+        attachment_failure(
+            generated_oversize_text,
+            AttachmentFailureKind::DriveItemIncomplete,
+        )
+    })?;
     validate_prepared_metadata(
         reference.as_str(),
         MAX_PREPARED_REFERENCE_URL_UTF16,
         "document upload returned an oversized reference URL",
-    )?;
+    )
+    .map_err(|_| {
+        attachment_failure(
+            generated_oversize_text,
+            AttachmentFailureKind::ReferenceValidationFailed,
+        )
+    })?;
     attachment.doc_id = doc_id;
     attachment.name = spool.name.clone();
     attachment.transport_name = transport_name;
@@ -198,6 +296,209 @@ async fn upload_document(
     attachment.uploaded_conversation_id = conversation_id.to_owned();
     attachment.uploaded_session_id = session_id.to_owned();
     Ok(())
+}
+
+fn attachment_failure(generated_oversize_text: bool, failure: AttachmentFailureKind) -> ChatError {
+    ChatError::Attachment {
+        generated_oversize_text,
+        failure,
+        message: failure.message().to_owned(),
+    }
+}
+
+async fn create_upload_session_with_retries(
+    client: &Client,
+    create_url: &str,
+    graph_access_token: &str,
+    transport_name: &str,
+    generated_oversize_text: bool,
+) -> Result<UploadSession, AttachmentFailureKind> {
+    for attempt in 0..DOCUMENT_UPLOAD_MAX_ATTEMPTS {
+        let response = client
+            .post(create_url)
+            .bearer_auth(graph_access_token)
+            .json(&json!({"item":{
+                "@microsoft.graph.conflictBehavior":"replace",
+                "name":transport_name
+            }}))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if generated_oversize_text && attempt + 1 < DOCUMENT_UPLOAD_MAX_ATTEMPTS => {
+                wait_before_document_retry(retry_delay(attempt, None, SystemTime::now())).await;
+                continue;
+            }
+            Err(_) => return Err(AttachmentFailureKind::GraphUploadSessionTransport),
+        };
+        if response.status().is_success() {
+            return response
+                .json()
+                .await
+                .map_err(|_| AttachmentFailureKind::GraphUploadSessionInvalidJson);
+        }
+        let failure = graph_upload_http_failure(response.status());
+        if generated_oversize_text
+            && retryable_http_status(response.status())
+            && attempt + 1 < DOCUMENT_UPLOAD_MAX_ATTEMPTS
+        {
+            wait_before_document_retry(retry_delay(
+                attempt,
+                response.headers().get(reqwest::header::RETRY_AFTER),
+                SystemTime::now(),
+            ))
+            .await;
+            continue;
+        }
+        return Err(failure);
+    }
+    unreachable!("document upload session retry loop always returns")
+}
+
+async fn upload_chunk_with_retries(
+    client: &Client,
+    upload_url: &str,
+    content_range: &str,
+    chunk: &[u8],
+    offset: u64,
+    end: u64,
+    generated_oversize_text: bool,
+) -> Result<reqwest::Response, AttachmentFailureKind> {
+    // A transport error leaves the PUT outcome unknown. Reconcile the existing
+    // upload session before retrying the exact range; never blindly replay a
+    // possibly committed byte range.
+    for attempt in 0..DOCUMENT_UPLOAD_MAX_ATTEMPTS {
+        let response = client
+            .put(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_RANGE, content_range)
+            .body(chunk.to_vec())
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if generated_oversize_text && attempt + 1 < DOCUMENT_UPLOAD_MAX_ATTEMPTS => {
+                let status = upload_session_status(client, upload_url).await?;
+                if !range_is_missing(&status.next_expected_ranges, offset, end) {
+                    return Err(AttachmentFailureKind::SharePointUploadTransportUnknown);
+                }
+                wait_before_document_retry(retry_delay(attempt, None, SystemTime::now())).await;
+                continue;
+            }
+            Err(_) => return Err(AttachmentFailureKind::SharePointUploadTransportUnknown),
+        };
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let failure = sharepoint_upload_http_failure(response.status());
+        if generated_oversize_text
+            && retryable_http_status(response.status())
+            && attempt + 1 < DOCUMENT_UPLOAD_MAX_ATTEMPTS
+        {
+            wait_before_document_retry(retry_delay(
+                attempt,
+                response.headers().get(reqwest::header::RETRY_AFTER),
+                SystemTime::now(),
+            ))
+            .await;
+            continue;
+        }
+        return Err(failure);
+    }
+    unreachable!("document upload chunk retry loop always returns")
+}
+
+async fn upload_session_status(
+    client: &Client,
+    upload_url: &str,
+) -> Result<UploadStatus, AttachmentFailureKind> {
+    let response = client
+        .get(upload_url)
+        .send()
+        .await
+        .map_err(|_| AttachmentFailureKind::SharePointUploadTransportUnknown)?;
+    if !response.status().is_success() {
+        return Err(AttachmentFailureKind::SharePointUploadTransportUnknown);
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| AttachmentFailureKind::SharePointUploadTransportUnknown)
+}
+
+fn range_is_missing(ranges: &[String], offset: u64, end: u64) -> bool {
+    ranges.iter().any(|range| {
+        let Some((range_start, range_end)) = parse_expected_range(range) else {
+            return false;
+        };
+        range_start <= offset && range_end.is_none_or(|range_end| end <= range_end)
+    })
+}
+
+fn parse_expected_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let (start, end) = value.trim().split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(end.parse().ok()?)
+    };
+    Some((start, end))
+}
+
+fn retryable_http_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn graph_upload_http_failure(status: StatusCode) -> AttachmentFailureKind {
+    match status {
+        StatusCode::REQUEST_TIMEOUT => AttachmentFailureKind::GraphUploadSessionHttp408,
+        StatusCode::TOO_MANY_REQUESTS => AttachmentFailureKind::GraphUploadSessionHttp429,
+        status if status.is_server_error() => AttachmentFailureKind::GraphUploadSessionHttp5xx,
+        _ => AttachmentFailureKind::GraphUploadSessionHttp4xx,
+    }
+}
+
+fn sharepoint_upload_http_failure(status: StatusCode) -> AttachmentFailureKind {
+    match status {
+        StatusCode::REQUEST_TIMEOUT => AttachmentFailureKind::SharePointUploadHttp408,
+        StatusCode::TOO_MANY_REQUESTS => AttachmentFailureKind::SharePointUploadHttp429,
+        status if status.is_server_error() => AttachmentFailureKind::SharePointUploadHttp5xx,
+        _ => AttachmentFailureKind::SharePointUploadHttp4xx,
+    }
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<&HeaderValue>, now: SystemTime) -> Duration {
+    if let Some(retry_after) = retry_after.and_then(|value| parse_retry_after(value, now)) {
+        return retry_after.min(DOCUMENT_UPLOAD_MAX_RETRY_DELAY);
+    }
+    let multiplier = 1_u32.checked_shl(attempt.min(4) as u32).unwrap_or(u32::MAX);
+    DOCUMENT_UPLOAD_BACKOFF
+        .checked_mul(multiplier)
+        .unwrap_or(DOCUMENT_UPLOAD_MAX_RETRY_DELAY)
+        .min(DOCUMENT_UPLOAD_MAX_RETRY_DELAY)
+}
+
+fn parse_retry_after(value: &HeaderValue, now: SystemTime) -> Option<Duration> {
+    let value = value.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(DOCUMENT_UPLOAD_MAX_RETRY_DELAY));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        at.duration_since(now)
+            .unwrap_or_default()
+            .min(DOCUMENT_UPLOAD_MAX_RETRY_DELAY),
+    )
+}
+
+async fn wait_before_document_retry(delay: Duration) {
+    #[cfg(not(test))]
+    tokio::time::sleep(delay).await;
+    #[cfg(test)]
+    let _ = delay;
 }
 
 async fn upload_image(
@@ -850,6 +1151,13 @@ struct UploadSession {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UploadStatus {
+    #[serde(default)]
+    next_expected_ranges: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DriveItem {
     id: String,
     #[serde(default)]
@@ -870,6 +1178,279 @@ struct ParentReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[derive(Clone, Copy)]
+    enum TestUploadFailure {
+        CreateTransportUnknown,
+        Create429,
+        Create503,
+        PutTransportUnknown,
+        PutTransportUnknownAlways,
+        PutTransportCommitted,
+        Put429,
+        Put503,
+        PutForbidden,
+    }
+
+    struct TestUploadState {
+        failure: TestUploadFailure,
+        create_calls: AtomicUsize,
+        put_calls: AtomicUsize,
+        status_calls: AtomicUsize,
+        content_ranges: Mutex<Vec<String>>,
+        upload_url: String,
+    }
+
+    struct TestUploadServer {
+        address: std::net::SocketAddr,
+        state: Arc<TestUploadState>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestUploadServer {
+        async fn start(failure: TestUploadFailure) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = Arc::new(TestUploadState {
+                failure,
+                create_calls: AtomicUsize::new(0),
+                put_calls: AtomicUsize::new(0),
+                status_calls: AtomicUsize::new(0),
+                content_ranges: Mutex::new(Vec::new()),
+                upload_url: format!("http://{address}/upload"),
+            });
+            let task_state = Arc::clone(&state);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(handle_test_upload_connection(
+                        stream,
+                        Arc::clone(&task_state),
+                    ));
+                }
+            });
+            Self {
+                address,
+                state,
+                task,
+            }
+        }
+    }
+
+    impl Drop for TestUploadServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn handle_test_upload_connection(mut stream: TcpStream, state: Arc<TestUploadState>) {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0_u8; 4_096];
+            let count = match tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(count) => count,
+            };
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break position + 4;
+            }
+            if request.len() > 64 * 1024 {
+                return;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let mut lines = headers.split("\r\n");
+        let mut request_line = lines.next().unwrap_or_default().split_whitespace();
+        let method = request_line.next().unwrap_or_default();
+        let mut content_length = 0_usize;
+        let mut content_range = String::new();
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            match name.to_ascii_lowercase().as_str() {
+                "content-length" => content_length = value.trim().parse().unwrap_or(0),
+                "content-range" => content_range = value.trim().to_owned(),
+                _ => {}
+            }
+        }
+        let body_read = request.len().saturating_sub(header_end);
+        if body_read < content_length {
+            let mut body = vec![0_u8; content_length - body_read];
+            if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut body)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        if method == "POST" {
+            let call = state.create_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 && matches!(state.failure, TestUploadFailure::CreateTransportUnknown) {
+                return;
+            }
+            if call == 0 && matches!(state.failure, TestUploadFailure::Create429) {
+                send_test_upload_response(&mut stream, 429, true, "{}").await;
+                return;
+            }
+            if call == 0 && matches!(state.failure, TestUploadFailure::Create503) {
+                send_test_upload_response(&mut stream, 503, false, "{}").await;
+                return;
+            }
+            send_test_upload_response(
+                &mut stream,
+                200,
+                false,
+                &format!(r#"{{"uploadUrl":"{}"}}"#, state.upload_url),
+            )
+            .await;
+            return;
+        }
+        if method == "GET" {
+            state.status_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(
+                state.failure,
+                TestUploadFailure::PutTransportUnknown
+                    | TestUploadFailure::PutTransportUnknownAlways
+                    | TestUploadFailure::PutTransportCommitted
+            ) {
+                let body = if matches!(state.failure, TestUploadFailure::PutTransportCommitted) {
+                    r#"{"nextExpectedRanges":[]}"#
+                } else {
+                    r#"{"nextExpectedRanges":["0-"]}"#
+                };
+                send_test_upload_response(&mut stream, 200, false, body).await;
+            } else {
+                send_test_upload_response(&mut stream, 405, false, "{}").await;
+            }
+            return;
+        }
+        if method != "PUT" {
+            send_test_upload_response(&mut stream, 405, false, "{}").await;
+            return;
+        }
+
+        state.content_ranges.lock().unwrap().push(content_range);
+        let call = state.put_calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0
+            && matches!(
+                state.failure,
+                TestUploadFailure::PutTransportUnknown
+                    | TestUploadFailure::PutTransportUnknownAlways
+                    | TestUploadFailure::PutTransportCommitted
+            )
+        {
+            return;
+        }
+        if matches!(state.failure, TestUploadFailure::PutTransportUnknownAlways) {
+            return;
+        }
+        if call == 0 && matches!(state.failure, TestUploadFailure::Put429) {
+            send_test_upload_response(&mut stream, 429, true, "{}").await;
+            return;
+        }
+        if call == 0 && matches!(state.failure, TestUploadFailure::Put503) {
+            send_test_upload_response(&mut stream, 503, false, "{}").await;
+            return;
+        }
+        if call == 0 && matches!(state.failure, TestUploadFailure::PutForbidden) {
+            send_test_upload_response(&mut stream, 403, false, "{}").await;
+            return;
+        }
+        send_test_upload_response(
+            &mut stream,
+            201,
+            false,
+            r#"{"id":"item-id","webUrl":"https://tenant.sharepoint.com/sites/test/generated.txt","spoId":"spo-item-id"}"#,
+        )
+        .await;
+    }
+
+    async fn send_test_upload_response(
+        stream: &mut TcpStream,
+        status: u16,
+        retry_after: bool,
+        body: &str,
+    ) {
+        let reason = match status {
+            200 => "OK",
+            201 => "Created",
+            403 => "Forbidden",
+            405 => "Method Not Allowed",
+            429 => "Too Many Requests",
+            503 => "Service Unavailable",
+            _ => "Error",
+        };
+        let retry_after = if retry_after {
+            "Retry-After: 0\r\n"
+        } else {
+            ""
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{retry_after}\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    fn test_account() -> Account {
+        Account {
+            access_token: "access".to_owned(),
+            graph_access_token: "graph-access".to_owned(),
+            oid: "oid".to_owned(),
+            tid: "tid".to_owned(),
+        }
+    }
+
+    fn test_generated_attachment() -> Attachment {
+        Attachment {
+            kind: "file".to_owned(),
+            url: "data:text/plain;base64,SGVsbG8=".to_owned(),
+            name:
+                "m365-oversize-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.txt"
+                    .to_owned(),
+            mime_type: "text/plain".to_owned(),
+            generated_oversize_text: true,
+            ..Attachment::default()
+        }
+    }
+
+    async fn upload_against_test_server(
+        failure: TestUploadFailure,
+    ) -> (Result<(), ChatError>, Attachment, Arc<TestUploadState>) {
+        upload_against_test_server_with_generated(failure, true).await
+    }
+
+    async fn upload_against_test_server_with_generated(
+        failure: TestUploadFailure,
+        generated_oversize_text: bool,
+    ) -> (Result<(), ChatError>, Attachment, Arc<TestUploadState>) {
+        let server = TestUploadServer::start(failure).await;
+        let mut attachment = test_generated_attachment();
+        attachment.generated_oversize_text = generated_oversize_text;
+        let endpoint = format!("http://{}/v1.0", server.address);
+        let result = upload_document_at(
+            &test_account(),
+            "conversation",
+            "session",
+            &mut attachment,
+            &endpoint,
+            validate_upload_url_for_test,
+        )
+        .await;
+        let state = Arc::clone(&server.state);
+        (result, attachment, state)
+    }
 
     #[test]
     fn private_and_documentation_addresses_are_blocked() {
@@ -904,6 +1485,167 @@ mod tests {
         assert_eq!(document_name(original, true), original);
         assert_eq!(document_name(original, true), original);
         assert_ne!(document_name(original, false), original);
+    }
+
+    #[test]
+    fn attachment_retry_delay_honors_retry_after_without_exceeding_the_bound() {
+        assert_eq!(
+            retry_delay(
+                0,
+                Some(&HeaderValue::from_static("0")),
+                SystemTime::UNIX_EPOCH
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            retry_delay(
+                0,
+                Some(&HeaderValue::from_static("120")),
+                SystemTime::UNIX_EPOCH,
+            ),
+            DOCUMENT_UPLOAD_MAX_RETRY_DELAY
+        );
+        assert_eq!(
+            retry_delay(0, None, SystemTime::UNIX_EPOCH),
+            DOCUMENT_UPLOAD_BACKOFF
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let retry_at = httpdate::fmt_http_date(now + Duration::from_secs(1));
+        let retry_after = HeaderValue::from_str(&retry_at).unwrap();
+        assert_eq!(
+            retry_delay(0, Some(&retry_after), now),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_document_retries_transient_create_session_transport() {
+        let (result, attachment, state) =
+            upload_against_test_server(TestUploadFailure::CreateTransportUnknown).await;
+        result.unwrap();
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attachment.doc_id, "spo-item-id");
+        assert_eq!(attachment.transport_name, attachment.name);
+    }
+
+    #[tokio::test]
+    async fn generated_document_retries_transient_put_on_the_same_session_and_range() {
+        let (result, attachment, state) =
+            upload_against_test_server(TestUploadFailure::Put503).await;
+        result.unwrap();
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 2);
+        let ranges = state.content_ranges.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], ranges[1]);
+        assert_eq!(attachment.doc_id, "spo-item-id");
+    }
+
+    #[tokio::test]
+    async fn graph_429_is_bounded_and_retried_using_retry_after() {
+        let (result, _, state) = upload_against_test_server(TestUploadFailure::Create429).await;
+        result.unwrap();
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn graph_5xx_is_bounded_and_retried() {
+        let (result, _, state) = upload_against_test_server(TestUploadFailure::Create503).await;
+        result.unwrap();
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sharepoint_429_is_bounded_and_retried_using_retry_after() {
+        let (result, _, state) = upload_against_test_server(TestUploadFailure::Put429).await;
+        result.unwrap();
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn permanent_sharepoint_4xx_is_not_retried_and_is_typed() {
+        let (result, attachment, state) =
+            upload_against_test_server(TestUploadFailure::PutForbidden).await;
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            ChatError::Attachment {
+                failure: AttachmentFailureKind::SharePointUploadHttp4xx,
+                ..
+            }
+        ));
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 1);
+        assert!(attachment.doc_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordinary_document_upload_does_not_inherit_generated_retry_policy() {
+        let (result, _, state) =
+            upload_against_test_server_with_generated(TestUploadFailure::Put503, false).await;
+        assert!(matches!(
+            result,
+            Err(ChatError::Attachment {
+                failure: AttachmentFailureKind::SharePointUploadHttp5xx,
+                ..
+            })
+        ));
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_put_outcome_retries_the_same_range_without_new_artifact_session() {
+        let (result, attachment, state) =
+            upload_against_test_server(TestUploadFailure::PutTransportUnknown).await;
+        result.unwrap();
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.status_calls.load(Ordering::SeqCst), 1);
+        let ranges = state.content_ranges.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], ranges[1]);
+        assert_eq!(attachment.doc_id, "spo-item-id");
+    }
+
+    #[tokio::test]
+    async fn repeated_unknown_put_outcome_fails_closed_with_bounded_diagnostic() {
+        let (result, attachment, state) =
+            upload_against_test_server(TestUploadFailure::PutTransportUnknownAlways).await;
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            ChatError::Attachment {
+                failure: AttachmentFailureKind::SharePointUploadTransportUnknown,
+                ..
+            }
+        ));
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 2);
+        assert!(attachment.doc_id.is_empty());
+        assert!(attachment.reference_url.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_unknown_put_outcome_fails_closed_without_duplicate_range_replay() {
+        let (result, attachment, state) =
+            upload_against_test_server(TestUploadFailure::PutTransportCommitted).await;
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            ChatError::Attachment {
+                failure: AttachmentFailureKind::SharePointUploadTransportUnknown,
+                ..
+            }
+        ));
+        assert_eq!(state.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.status_calls.load(Ordering::SeqCst), 1);
+        assert!(attachment.doc_id.is_empty());
     }
 
     #[test]
@@ -971,6 +1713,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Graph authorization"));
+        assert!(matches!(
+            error,
+            ChatError::Attachment {
+                failure: AttachmentFailureKind::GraphAuthorizationUnavailable,
+                ..
+            }
+        ));
         assert!(ready[0].doc_id.is_empty());
         assert!(ready[0].reference_url.is_empty());
         assert!(ready[0].uploaded_conversation_id.is_empty());

@@ -94,7 +94,23 @@ recommended_action=reduce_input_or_retry_when_document_spill_is_available
 
 `retryable=false` means the unchanged request body must not be replayed; `retryable_after_reduction=true` only permits a newly reduced request. This does not change 429/503 retry semantics.
 
-Typical `spill_reason` values cover full attachment slots, no safe candidate, inability to fit inline, generated-file size, or document authorization/upload failure.
+When projection succeeds but the generated TXT Graph/SharePoint upload fails, this is not a caller input-size failure. It is a separate attachment transport error:
+
+```text
+HTTP 502
+type=upstream_error
+code=attachment_upload_failed
+retryable=<true|false>
+retryable_after_reduction=false
+spill_attempted=true
+spill_reason=<safe_bulk_candidate|full_context_document>
+attachment_failure=<bounded stage/class>
+recommended_action=<retry_same_request|inspect_attachment_failure>
+```
+
+For generated documents, the attachment layer performs one bounded retry for create-upload-session transport errors and 408/429/5xx responses; the same classes on a chunk PUT are retried once with the same upload session and `Content-Range`. After a transport error, it first reads the existing session's bounded `nextExpectedRanges` state and only resends when the exact range is still missing. `Retry-After` is bounded, and PUT requests do not carry the Graph bearer token. If the range may already have committed, or the status cannot be reconciled, it fails closed as `sharepoint_upload_transport_unknown` rather than being treated as success or blindly replayed; that final unknown class is not caller-retryable. Permanent 4xx responses, untrusted upload URLs, invalid JSON, incomplete DriveItems, and reference-validation failures are not retried. These attachment failures do not ask the caller to reduce input and do not change the existing `text_input_too_large` or `graph_authorization_unavailable` contracts.
+
+Typical `spill_reason` values cover full attachment slots, no safe candidate, inability to fit inline, generated-file size, or the document projection reason; the upload stage/class is reported separately in `attachment_failure`. `fallback_reason` remains reserved for a later spill fallback transition.
 
 When bulk spill was attempted but the following full-context fallback also fails, the public error preserves the existing first-stage `spill_reason` for compatibility and adds `fallback_reason` when the second-stage result is available. These fields must not be conflated.
 
@@ -120,7 +136,7 @@ Spill does not remove the hard limit. Attachment grounding is also neither zero 
 
 The full-context TXT is a transport projection. It does not prove that the model read or correctly used the document, and HTTP 200, upload success, or a model self-report is not semantic acceptance. Deterministic qualification and real-user acceptance remain separate.
 
-The admin diagnostic surface exposes bounded live fields such as `transportProjection`, `messageTextBeforeUtf16`, `preliminaryMessageTextAfterUtf16`, `messageTextAfterUtf16`, `wireBeforeUtf16`, `inlineCoreUtf16`, `preliminaryWireAfterUtf16`, `wireAfterUtf16`, generated-document bytes/message count/state, and `fallbackFailure`. The `messageText*` fields are the fit-policy measurement; the `wire*` fields are complete serialized-payload observations and are not silently treated as the 128K gate. In the durable v1 JSONL, `utf16Before` and `utf16After` are the canonical `message.text` spill measurements, while the public overflow error's `received` remains the pre-spill caller role-envelope measurement. The durable v1 JSONL records the typed `spillDecision`, `spillReason`, and bounded UTF-16 spill measurements, including `full_context_document`; transport projection details remain bounded live fields and never store the document body. After a process restart, missing live projection must not be treated as model acceptance evidence.
+The admin diagnostic surface exposes bounded fields such as `transportProjection`, `messageTextBeforeUtf16`, `preliminaryMessageTextAfterUtf16`, `messageTextAfterUtf16`, `wireBeforeUtf16`, `inlineCoreUtf16`, `preliminaryWireAfterUtf16`, `wireAfterUtf16`, generated-document bytes/message count/state, and `fallbackFailure`. The `messageText*`, `wire*`, and generated-document measurement fields are live projections; `fallbackFailure` is also retained durably. The `messageText*` fields are the fit-policy measurement; the `wire*` fields are complete serialized-payload observations and are not silently treated as the 128K gate. In the durable v1 JSONL, `utf16Before` and `utf16After` are the canonical `message.text` spill measurements, while the public overflow error's `received` remains the pre-spill caller role-envelope measurement. The durable v1 JSONL records the typed `spillDecision`, `spillReason`, bounded UTF-16 spill measurements, and bounded `fallbackFailure` stage/class, including `full_context_document`; transport projection details remain bounded live fields and never store document contents, upload URLs, response bodies, tokens, private IDs, or attachment bytes. After a process restart, missing live projection must not be treated as model acceptance evidence.
 
 ## Tools and structured output
 
@@ -283,6 +299,7 @@ Delivery is treated as at-least-once, so consumers need bounded deduplication by
 | `409 transport_checkpoint_recovery_required` | unknown external outcome must be reconciled first |
 | `409 hermes_execution_identity_error` | safe Hermes execution identity/provenance cannot be established |
 | `429 upstream_throttle` | shared-breaker projection or upstream rate limit |
+| `502 attachment_upload_failed` | generated-document attachment transport failed after projection; use `attachment_failure` for the bounded stage/class |
 | `502 upstream_empty_response` | transport completed without legal visible output |
 | `503 interactive_capacity_busy` | local shared-account admission has no current capacity |
 | `503 memory_capacity_deferred` | Memory waiting capacity is exhausted/deferred |

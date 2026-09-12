@@ -22,7 +22,10 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::{
-    chathub::{Account, Attachment, ChatError, ChatRequest, ChatResult, StreamEvent, Tool},
+    chathub::{
+        Account, Attachment, AttachmentFailureKind, ChatError, ChatRequest, ChatResult,
+        StreamEvent, Tool,
+    },
     checkpoint::{Binding, CheckpointMessage, CheckpointTurn},
     debug::{
         AdmissionResult, BreakerProjection, CallerDelivery, ProvenanceClass, SpillDecision,
@@ -1891,7 +1894,9 @@ enum ChatFailureClass<'a> {
         retry_after: Option<&'a str>,
         soft: bool,
     },
-    AutoSpillOverflow,
+    AutoSpillAttachment {
+        failure: AttachmentFailureKind,
+    },
     FinalMessageTextOverflow {
         message_text_units: usize,
         limit: usize,
@@ -2009,9 +2014,10 @@ fn classify_chat_failure<'a>(
         },
         ChatError::Attachment {
             generated_oversize_text: true,
+            failure,
             ..
         } if overflow_context.is_some_and(|context| context.auto_spilled) => {
-            ChatFailureClass::AutoSpillOverflow
+            ChatFailureClass::AutoSpillAttachment { failure: *failure }
         }
         ChatError::PayloadTooLarge {
             message_text_units,
@@ -2094,15 +2100,13 @@ fn chat_error_with_overflow(
     }
     if let ChatError::Attachment {
         generated_oversize_text,
+        failure,
         ..
     } = &error
+        && *generated_oversize_text
         && overflow_context.is_some_and(|context| context.auto_spilled)
     {
-        trace.generated_document_failed(if *generated_oversize_text {
-            "document_upload_failed"
-        } else {
-            "attachment_upload_failed"
-        });
+        trace.generated_document_failed(failure.code());
     }
     match classify_chat_failure(&error, overflow_context) {
         ChatFailureClass::RateLimited { retry_after, soft } => {
@@ -2124,13 +2128,21 @@ fn chat_error_with_overflow(
             }
             response
         }
-        ChatFailureClass::AutoSpillOverflow => {
-            permit.finish(StatusCode::BAD_REQUEST, None);
-            text_overflow_response(
-                overflow_context.expect("auto-spill attachment failure has overflow context"),
-                "document_upload_failed",
-                "輸入文字超過目前上限，且自動文件轉移無法完成",
-            )
+        ChatFailureClass::AutoSpillAttachment { failure } => {
+            let context =
+                overflow_context.expect("auto-spill attachment failure has overflow context");
+            if failure == AttachmentFailureKind::GraphAuthorizationUnavailable {
+                permit.finish(StatusCode::BAD_REQUEST, None);
+                text_overflow_response(
+                    context,
+                    failure.code(),
+                    "輸入文字超過目前上限，且自動文件轉移無法取得授權",
+                )
+            } else {
+                let status = attachment_failure_status(failure);
+                permit.finish(status, None);
+                attachment_failure_response(context, failure)
+            }
         }
         ChatFailureClass::FinalMessageTextOverflow {
             message_text_units,
@@ -2178,15 +2190,13 @@ fn send_stream_chat_error(
     }
     if let ChatError::Attachment {
         generated_oversize_text,
+        failure,
         ..
     } = &error
+        && *generated_oversize_text
         && overflow_context.is_some_and(|context| context.auto_spilled)
     {
-        trace.generated_document_failed(if *generated_oversize_text {
-            "document_upload_failed"
-        } else {
-            "attachment_upload_failed"
-        });
+        trace.generated_document_failed(failure.code());
     }
     match classify_chat_failure(&error, overflow_context) {
         ChatFailureClass::RateLimited { retry_after, soft } => {
@@ -2197,16 +2207,26 @@ fn send_stream_chat_error(
             }
             send_sse_error(trace, sender, "rate_limit_error", "ChatHub rate limited")
         }
-        ChatFailureClass::AutoSpillOverflow => {
-            permit.finish(StatusCode::BAD_REQUEST, None);
-            let sent = send_sse(
-                sender,
-                text_overflow_value(
-                    overflow_context.expect("auto-spill attachment failure has overflow context"),
-                    "document_upload_failed",
-                    "輸入文字超過目前上限，且自動文件轉移無法完成",
-                ),
-            );
+        ChatFailureClass::AutoSpillAttachment { failure } => {
+            let context =
+                overflow_context.expect("auto-spill attachment failure has overflow context");
+            if failure == AttachmentFailureKind::GraphAuthorizationUnavailable {
+                permit.finish(StatusCode::BAD_REQUEST, None);
+            } else {
+                permit.finish(attachment_failure_status(failure), None);
+            }
+            let sent = if failure == AttachmentFailureKind::GraphAuthorizationUnavailable {
+                send_sse(
+                    sender,
+                    text_overflow_value(
+                        context,
+                        failure.code(),
+                        "輸入文字超過目前上限，且自動文件轉移無法取得授權",
+                    ),
+                )
+            } else {
+                send_sse(sender, attachment_failure_value(context, failure))
+            };
             trace.caller_delivery(stream_error_delivery(sender, sent));
             sent
         }
@@ -2249,6 +2269,58 @@ fn text_overflow_value(context: &OverflowContext, spill_reason: &str, message: &
         message,
         "reduce_input_or_retry_when_document_spill_is_available",
     )
+}
+
+fn attachment_failure_status(failure: AttachmentFailureKind) -> StatusCode {
+    if failure == AttachmentFailureKind::GraphAuthorizationUnavailable {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+fn attachment_failure_response(
+    context: &OverflowContext,
+    failure: AttachmentFailureKind,
+) -> Response {
+    (
+        attachment_failure_status(failure),
+        Json(attachment_failure_value(context, failure)),
+    )
+        .into_response()
+}
+
+fn attachment_failure_value(context: &OverflowContext, failure: AttachmentFailureKind) -> Value {
+    let spill_reason = context
+        .spill_reason
+        .map(SpillReason::as_str)
+        .unwrap_or(SpillReason::FullContextDocument.as_str());
+    let message = if failure.retryable() {
+        "自動文件轉移的 Microsoft Graph/SharePoint attachment transport 暫時失敗，請重試相同 request"
+    } else {
+        "自動文件轉移的 Microsoft Graph/SharePoint attachment transport 失敗；請檢查 attachment failure"
+    };
+    json!({
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+            "code": "attachment_upload_failed",
+            "limit_type": "caller_text_utf16",
+            "limit": context.limit,
+            "received": context.received,
+            "retryable": failure.retryable(),
+            "retryable_after_reduction": false,
+            "spill_attempted": context.spill_attempted,
+            "spill_reason": spill_reason,
+            "attachment_failure": failure.code(),
+            "input_sha256": context.input_sha256,
+            "recommended_action": if failure.retryable() {
+                "retry_same_request"
+            } else {
+                "inspect_attachment_failure"
+            }
+        }
+    })
 }
 
 fn memory_text_overflow_response(context: &OverflowContext) -> Response {
@@ -5567,10 +5639,112 @@ mod tests {
                 assert_eq!(request.attachments.len(), 1);
                 Err(ChatError::Attachment {
                     generated_oversize_text: true,
+                    failure: AttachmentFailureKind::SharePointUploadTransportUnknown,
                     message: "synthetic document upload failure".to_owned(),
                 })
             })
         }
+    }
+
+    struct FailingOrdinaryAttachmentTransport;
+
+    impl ChatHubTransport for FailingOrdinaryAttachmentTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            request: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(request.attachments.len(), 1);
+                Err(ChatError::Attachment {
+                    generated_oversize_text: false,
+                    failure: AttachmentFailureKind::SharePointUploadHttp4xx,
+                    message: "ordinary attachment failure".to_owned(),
+                })
+            })
+        }
+    }
+
+    fn issue_104_real_prepare_attachments<'a>(
+        account: &'a Account,
+        conversation_id: &'a str,
+        session_id: &'a str,
+        attachments: &'a mut [Attachment],
+    ) -> crate::chathub::AttachmentPreparationFuture<'a> {
+        let graph_api_base = conversation_id
+            .strip_prefix("issue-104-base:")
+            .expect("Issue 104 test conversation must carry the local Graph base")
+            .to_owned();
+        Box::pin(async move {
+            for attachment in attachments {
+                crate::attachment::prepare_document_at_for_test(
+                    account,
+                    conversation_id,
+                    session_id,
+                    attachment,
+                    &graph_api_base,
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    }
+
+    struct Issue104UploadState {
+        create_calls: AtomicUsize,
+        put_calls: AtomicUsize,
+        upload_url: String,
+    }
+
+    async fn issue_104_upload_handler(
+        axum::extract::State(state): axum::extract::State<Arc<Issue104UploadState>>,
+        request: axum::extract::Request,
+    ) -> Response {
+        if request.method() == axum::http::Method::POST {
+            let call = state.create_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            return (StatusCode::OK, Json(json!({"uploadUrl": state.upload_url}))).into_response();
+        }
+        if request.method() == axum::http::Method::PUT {
+            let call = state.put_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            return (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": "issue-104-item",
+                    "webUrl": "https://tenant.sharepoint.com/sites/test/issue-104.txt",
+                    "spoId": "issue-104-spo-item"
+                })),
+            )
+                .into_response();
+        }
+        StatusCode::METHOD_NOT_ALLOWED.into_response()
+    }
+
+    async fn issue_104_upload_server() -> (
+        String,
+        Arc<Issue104UploadState>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Issue104UploadState {
+            create_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            upload_url: format!("http://{address}/upload"),
+        });
+        let app = Router::new()
+            .fallback(issue_104_upload_handler)
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/v1.0"), state, server)
     }
 
     struct PreparedPayloadRecordingTransport(Mutex<Option<ChatRequest>>);
@@ -11877,9 +12051,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversize_spill_document_upload_failure_returns_recoverable_overflow() {
+    async fn oversize_spill_document_upload_failure_returns_typed_attachment_error() {
         let (oauth, token_server) = oauth_with_graph_token_server().await;
-        let (app, raw_key) = app_with_chat_and_oauth(Arc::new(FailingAttachmentTransport), oauth);
+        let (gateway, raw_key) =
+            gateway_with_chat_and_oauth(Arc::new(FailingAttachmentTransport), oauth);
+        let app = Gateway::router(Arc::clone(&gateway));
         let response = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
@@ -11896,14 +12072,33 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
                 .unwrap();
-        assert_eq!(body["error"]["code"], "text_input_too_large");
-        assert_eq!(body["error"]["spill_reason"], "document_upload_failed");
+        assert_eq!(body["error"]["type"], "upstream_error");
+        assert_eq!(body["error"]["code"], "attachment_upload_failed");
+        assert_eq!(body["error"]["spill_reason"], "safe_bulk_candidate");
+        assert_eq!(
+            body["error"]["attachment_failure"],
+            "sharepoint_upload_transport_unknown"
+        );
+        assert!(body["error"]["fallback_reason"].is_null());
         assert_eq!(body["error"]["spill_attempted"], true);
         assert_eq!(body["error"]["retryable"], false);
+        assert_eq!(body["error"]["retryable_after_reduction"], false);
+        assert!(
+            !body
+                .to_string()
+                .contains("synthetic document upload failure")
+        );
+        let records = gateway.debug.records_for_test();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["upstreamResultClass"], "attachment_error");
+        assert_eq!(
+            records[0]["fallbackFailure"],
+            "sharepoint_upload_transport_unknown"
+        );
         token_server.abort();
     }
 
@@ -11937,12 +12132,154 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status, StatusCode::OK, "body={body}");
-        assert!(body.contains("\"code\":\"text_input_too_large\""));
-        assert!(body.contains("\"spill_reason\":\"document_upload_failed\""));
+        assert!(body.contains("\"code\":\"attachment_upload_failed\""));
+        assert!(body.contains("\"spill_reason\":\"safe_bulk_candidate\""));
+        assert!(body.contains("\"attachment_failure\":\"sharepoint_upload_transport_unknown\""));
+        assert!(!body.contains("\"fallback_reason\""));
         assert!(body.contains("\"retryable\":false"));
-        assert!(body.contains("\"retryable_after_reduction\":true"));
+        assert!(body.contains("\"retryable_after_reduction\":false"));
         assert!(body.ends_with("data: [DONE]\n\n"));
         token_server.abort();
+    }
+
+    #[tokio::test]
+    async fn ordinary_attachment_failure_does_not_become_generated_document_telemetry() {
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let (gateway, raw_key) =
+            gateway_with_chat_and_oauth(Arc::new(FailingOrdinaryAttachmentTransport), oauth);
+        let response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "messages":[{"role":"user","content":"A".repeat(128_100)}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "upstream_error");
+        assert!(body["error"]["attachment_failure"].is_null());
+        let records = gateway.debug.records_for_test();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["generatedDocumentState"], "created");
+        assert_eq!(records[0]["fallbackFailure"], "not_applicable");
+        token_server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovered_generated_document_reaches_upstream_once_without_request_retry() {
+        let (upload_base, upload_state, upload_server) = issue_104_upload_server().await;
+        let (websocket_base, upstream_payloads, upstream_server) =
+            issue_101_upstream_server_for(1).await;
+        let (gateway, _) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth());
+        let hub = LiveChatHub::new_for_test(
+            gateway.settings.clone(),
+            issue_104_real_prepare_attachments,
+            websocket_base,
+        );
+        let upstream_starts = Arc::new(AtomicUsize::new(0));
+        let request_upstream_attempts = Arc::new(AtomicUsize::new(0));
+        let request = ChatRequest {
+            text: "prompt".to_owned(),
+            conversation_id: format!("issue-104-base:{upload_base}"),
+            session_id: "issue-104-session".to_owned(),
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                url: "data:text/plain;base64,YQ==".to_owned(),
+                name: "m365-oversize-generated.txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                generated_oversize_text: true,
+                ..Attachment::default()
+            }],
+            outbound_text_limit_utf16: 128_000,
+            upstream_attempt_count: Arc::clone(&request_upstream_attempts),
+            upstream_start: Some(crate::chathub::UpstreamStartHook::new({
+                let upstream_starts = Arc::clone(&upstream_starts);
+                move || {
+                    upstream_starts.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }
+            })),
+            ..ChatRequest::default()
+        };
+        let account = Account {
+            access_token: "synthetic-access".to_owned(),
+            graph_access_token: "synthetic-graph-access".to_owned(),
+            oid: "synthetic-oid".to_owned(),
+            tid: "synthetic-tid".to_owned(),
+        };
+        let mut sink = |_: StreamEvent| Ok(());
+        let result = hub.chat(account, request, &mut sink).await;
+        assert!(result.is_ok(), "recovered request failed: {result:?}");
+        assert_eq!(upstream_starts.load(Ordering::Acquire), 1);
+        assert_eq!(request_upstream_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(upload_state.create_calls.load(Ordering::Acquire), 2);
+        assert_eq!(upload_state.put_calls.load(Ordering::Acquire), 2);
+        upstream_server.await.unwrap();
+        assert_eq!(upstream_payloads.lock().unwrap().len(), 1);
+        upload_server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_recovered_generated_document_reaches_upstream_once_without_request_retry() {
+        let (upload_base, upload_state, upload_server) = issue_104_upload_server().await;
+        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let (websocket_base, upstream_payloads, upstream_server) =
+            issue_101_upstream_server_for(1).await;
+        let (mut gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth);
+        let hub = LiveChatHub::new_for_test(
+            gateway.settings.clone(),
+            issue_104_real_prepare_attachments,
+            websocket_base,
+        );
+        Arc::get_mut(&mut gateway)
+            .expect("test gateway must have one owner before routing")
+            .chat = Arc::new(hub);
+        let response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "stream":true,
+                            "conversation_id":format!("issue-104-base:{upload_base}"),
+                            "messages":[{"role":"user","content":"A".repeat(128_100)}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.ends_with("data: [DONE]\n\n"), "body={body}");
+        assert!(!body.contains("attachment_upload_failed"), "body={body}");
+        assert_eq!(upload_state.create_calls.load(Ordering::Acquire), 2);
+        assert_eq!(upload_state.put_calls.load(Ordering::Acquire), 2);
+        upstream_server.await.unwrap();
+        assert_eq!(upstream_payloads.lock().unwrap().len(), 1);
+        token_server.abort();
+        upload_server.abort();
     }
 
     #[test]
