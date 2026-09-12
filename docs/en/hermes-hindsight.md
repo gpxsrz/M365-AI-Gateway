@@ -30,7 +30,7 @@ Do not confuse M365's configured UTF-16 transport policy with the Hermes/model t
 
 For non-Memory chat, M365 first tries inline and then moves only bulk `user` / `tool` text that makes the real outbound wire smaller. If that still cannot fit, it may place the current request's complete model-facing message projection in one deterministic `.txt` attachment while keeping the current user ask, system/developer control, tool definitions/protocol, and latest complete tool exchange inline. The document is not session history, memory, or a new governance authority, and it does not change Hermes checkpoint, ledger, compression, or replay contracts. Memory traffic does not use this auto-spill behavior.
 
-Hermes compression should therefore be driven by model-context quality rather than by an old M365 transport threshold. Effective context/compression values belong to the current Hermes profile and are not pinned to one upstream version in M365 public docs.
+Hermes compression should therefore be driven by model-context quality rather than by an old M365 transport threshold. When a full-context document is generated, Chat Completions usage reports `m365.usage_estimate_scope=full_context_document_and_inline_projection`; the document and non-overlapping inline projection are included in the transport estimate, so the caller can see context pressure. This does not change Hermes's compression policy. Effective context/compression values belong to the current Hermes profile and are not pinned to one upstream version in M365 public docs.
 
 ## Shared-account scheduling
 

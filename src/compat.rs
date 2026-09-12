@@ -762,12 +762,15 @@ fn responses_metadata(source: &Value) -> Value {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    metadata.insert("usage_source".to_owned(), json!("utf16_estimate"));
-    metadata.insert("usage_values_are_estimates".to_owned(), json!(true));
-    metadata.insert(
-        "usage_estimate_scope".to_owned(),
-        json!("visible_request_and_completion"),
-    );
+    metadata
+        .entry("usage_source".to_owned())
+        .or_insert_with(|| json!("utf16_estimate"));
+    metadata
+        .entry("usage_values_are_estimates".to_owned())
+        .or_insert_with(|| json!(true));
+    metadata
+        .entry("usage_estimate_scope".to_owned())
+        .or_insert_with(|| json!("visible_request_and_completion"));
     Value::Object(metadata)
 }
 
@@ -870,6 +873,8 @@ fn anthropic_metadata(source: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
     metadata.insert("usage_source".to_owned(), json!("unavailable_from_chathub"));
+    metadata.remove("usage_values_are_estimates");
+    metadata.remove("usage_estimate_scope");
     metadata.insert("usage_values_are_placeholders".to_owned(), json!(true));
     Value::Object(metadata)
 }
@@ -1122,6 +1127,27 @@ mod tests {
     }
 
     #[test]
+    fn responses_metadata_preserves_full_context_usage_scope() {
+        let source = json!({
+            "usage":{"prompt_tokens":64000,"completion_tokens":1,"total_tokens":64001},
+            "m365":{
+                "usage_source":"m365_transport_projection_estimate",
+                "usage_values_are_estimates":true,
+                "usage_estimate_scope":"full_context_document_and_inline_projection"
+            }
+        });
+        let metadata = responses_metadata(&source);
+        assert_eq!(
+            metadata["usage_source"],
+            "m365_transport_projection_estimate"
+        );
+        assert_eq!(
+            metadata["usage_estimate_scope"],
+            "full_context_document_and_inline_projection"
+        );
+    }
+
+    #[test]
     fn anthropic_tool_round_trip_keeps_identity() {
         let chat = anthropic_chat(AnthropicRequest {
             model: "claude-sonnet".to_owned(),
@@ -1159,12 +1185,18 @@ mod tests {
     async fn anthropic_projection_and_errors_use_current_envelopes() {
         let source = json!({
             "choices":[{"message":{"content":"done"}}],
-            "m365":{"requestId":"request_1"}
+            "m365":{
+                "requestId":"request_1",
+                "usage_source":"m365_transport_projection_estimate",
+                "usage_values_are_estimates":true,
+                "usage_estimate_scope":"full_context_document_and_inline_projection"
+            }
         });
         let value = body_json(project_anthropic("claude-test", false, source)).await;
         assert_eq!(value["usage"]["input_tokens"], 0);
         assert_eq!(value["m365"]["usage_source"], "unavailable_from_chathub");
         assert_eq!(value["m365"]["usage_values_are_placeholders"], true);
+        assert!(value["m365"]["usage_estimate_scope"].is_null());
 
         let error = body_json(anthropic_error_value(
             StatusCode::BAD_REQUEST,

@@ -123,6 +123,14 @@ async fn execute_chat_request_inner(
 ) -> Response {
     trace.caller_delivery(CallerDelivery::Failed);
     normalize_legacy_tools(&mut body);
+    if let Err(message) = validate_tool_choice(&mut body.tool_choice) {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_tool_choice",
+            message,
+        );
+    }
     if let Err(message) = validate_message_roles(&body.messages) {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -374,6 +382,8 @@ async fn execute_chat_request_inner(
         flattened
             .text
             .push_str(&memory_schema_instruction(body.response_format.as_ref()));
+        flattened.usage_input_utf16_units = utf16_units(&flattened.text);
+        flattened.usage_estimate_scope = UsageEstimateScope::VisibleRequestAndCompletion;
     }
     if let Err(message) = validate_attachments(&flattened.attachments) {
         return openai_error(
@@ -713,6 +723,8 @@ async fn execute_chat_request_inner(
         oid: stored.oid,
         tid: stored.tid,
     };
+    let usage_input_units = flattened.usage_input_utf16_units;
+    let usage_estimate_scope = flattened.usage_estimate_scope;
     let chat_request = ChatRequest {
         text: flattened.text,
         tone: resolved_tone.clone(),
@@ -741,6 +753,8 @@ async fn execute_chat_request_inner(
             gateway,
             account,
             chat_request,
+            usage_input_units,
+            usage_estimate_scope,
             model_id,
             resolved_tone,
             route_metadata,
@@ -762,6 +776,8 @@ async fn execute_chat_request_inner(
             gateway,
             account,
             chat_request,
+            usage_input_units,
+            usage_estimate_scope,
             model_id,
             resolved_tone,
             route_metadata,
@@ -839,6 +855,8 @@ async fn complete_chat(
     gateway: Arc<Gateway>,
     account: Account,
     request: ChatRequest,
+    usage_input_units: usize,
+    usage_estimate_scope: UsageEstimateScope,
     model_id: String,
     resolved_tone: String,
     route_metadata: Value,
@@ -864,7 +882,7 @@ async fn complete_chat(
     {
         request.upstream_start = Some(checkpoint_start_hook(&checkpoint));
     }
-    let input_units = utf16_units(&request.text);
+    let mut input_units = usage_input_units;
     let tools = request.tools.clone();
     let tool_choice = request.tool_choice.clone();
     let tool_limit = request.tool_call_limit;
@@ -968,6 +986,9 @@ async fn complete_chat(
                 &tools,
                 suppress_duplicate_tool_calls,
             );
+            if transport.projection.rejected {
+                return invalid_tool_call_response(permit);
+            }
             if transport.projection.overflowed {
                 permit.finish(StatusCode::BAD_GATEWAY, None);
                 return openai_error(
@@ -995,6 +1016,11 @@ async fn complete_chat(
                         );
                     }
                 };
+                input_units = usage_input_units_after_continuation(
+                    input_units,
+                    &fallback_request,
+                    &answer_request,
+                );
                 let answer_attempt_count = reset_upstream_attempts(&answer_request);
                 let answer_final_message_text_utf16 =
                     Arc::clone(&answer_request.final_message_text_utf16);
@@ -1101,6 +1127,9 @@ async fn complete_chat(
                     &tools,
                     suppress_duplicate_tool_calls,
                 );
+                if transport.projection.rejected {
+                    return invalid_tool_call_response(permit);
+                }
                 if transport.projection.overflowed {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     return openai_error(
@@ -1117,6 +1146,9 @@ async fn complete_chat(
                 {
                     return tool_choice_unsatisfied_response(permit);
                 }
+            }
+            if tool_choice_requires_call(&tool_choice) && transport.projection.calls.is_empty() {
+                return tool_choice_unsatisfied_response(permit);
             }
             let projection = transport.projection;
             if let Err(message) =
@@ -1191,6 +1223,9 @@ async fn complete_chat(
                     "images": result.images,
                     "throttling": result.throttling,
                     "semanticEvents": crate::chathub::semantic_events(&result.events),
+                    "usage_source": usage_estimate_scope.source(),
+                    "usage_values_are_estimates": true,
+                    "usage_estimate_scope": usage_estimate_scope.as_str(),
                 }
             }))
             .into_response()
@@ -1222,6 +1257,8 @@ async fn stream_chat(
     gateway: Arc<Gateway>,
     account: Account,
     request: ChatRequest,
+    usage_input_units: usize,
+    usage_estimate_scope: UsageEstimateScope,
     model_id: String,
     resolved_tone: String,
     route_metadata: Value,
@@ -1250,7 +1287,7 @@ async fn stream_chat(
     {
         request.upstream_start = Some(checkpoint_start_hook(&checkpoint));
     }
-    let input_units = utf16_units(&request.text);
+    let mut input_units = usage_input_units;
     let include_usage = stream_options.include_usage;
     tokio::spawn(async move {
         let _checkpoint_cleanup = checkpoint_cleanup;
@@ -1419,6 +1456,10 @@ async fn stream_chat(
                     &tools,
                     suppress_duplicate_tool_calls,
                 );
+                if transport.projection.rejected {
+                    send_invalid_tool_call_error(&trace, &sender, permit);
+                    return;
+                }
                 if transport.projection.overflowed {
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
@@ -1462,6 +1503,11 @@ async fn stream_chat(
                             return;
                         }
                     };
+                    input_units = usage_input_units_after_continuation(
+                        input_units,
+                        &fallback_request,
+                        &answer_request,
+                    );
                     let answer_attempt_count = reset_upstream_attempts(&answer_request);
                     let answer_final_message_text_utf16 =
                         Arc::clone(&answer_request.final_message_text_utf16);
@@ -1592,6 +1638,10 @@ async fn stream_chat(
                         &tools,
                         suppress_duplicate_tool_calls,
                     );
+                    if transport.projection.rejected {
+                        send_invalid_tool_call_error(&trace, &sender, permit);
+                        return;
+                    }
                     if transport.projection.overflowed {
                         permit.finish(StatusCode::BAD_GATEWAY, None);
                         send_sse_error(
@@ -1615,6 +1665,12 @@ async fn stream_chat(
                         let _ = send_sse_done(&trace, &sender);
                         return;
                     }
+                }
+                if tool_choice_requires_call(&tool_choice) && transport.projection.calls.is_empty()
+                {
+                    send_tool_choice_unsatisfied_error(&trace, &sender, permit);
+                    let _ = send_sse_done(&trace, &sender);
+                    return;
                 }
                 let projection = transport.projection;
                 if let Err(message) =
@@ -1726,9 +1782,9 @@ async fn stream_chat(
                         "choices": [],
                         "usage": usage(input_units, output_units),
                         "m365": {
-                            "usage_source": "utf16_estimate",
+                            "usage_source": usage_estimate_scope.source(),
                             "usage_values_are_estimates": true,
-                            "usage_estimate_scope": "visible_request_and_completion",
+                            "usage_estimate_scope": usage_estimate_scope.as_str(),
                         }
                     }));
                 }
@@ -2418,6 +2474,16 @@ fn completed_tool_answer_request(
     Ok(answer)
 }
 
+fn usage_input_units_after_continuation(
+    initial_units: usize,
+    initial_request: &ChatRequest,
+    continuation_request: &ChatRequest,
+) -> usize {
+    initial_units.saturating_add(
+        utf16_units(&continuation_request.text).saturating_sub(utf16_units(&initial_request.text)),
+    )
+}
+
 fn unsafe_tool_replay_value() -> Value {
     json!({
         "error": {
@@ -2433,6 +2499,34 @@ fn unsafe_tool_replay_value() -> Value {
 fn unsafe_tool_replay_response(permit: crate::traffic::Permit) -> Response {
     permit.finish(StatusCode::CONFLICT, None);
     (StatusCode::CONFLICT, Json(unsafe_tool_replay_value())).into_response()
+}
+
+const INVALID_TOOL_CALL_MESSAGE: &str =
+    "model returned a malformed caller tool candidate that was not safely executable";
+
+fn invalid_tool_call_response(permit: crate::traffic::Permit) -> Response {
+    permit.finish(StatusCode::BAD_GATEWAY, None);
+    openai_error(
+        StatusCode::BAD_GATEWAY,
+        "upstream_error",
+        "invalid_tool_call",
+        INVALID_TOOL_CALL_MESSAGE,
+    )
+}
+
+fn send_invalid_tool_call_error(
+    trace: &crate::debug::Trace,
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+    permit: crate::traffic::Permit,
+) {
+    permit.finish(StatusCode::BAD_GATEWAY, None);
+    send_sse_error(
+        trace,
+        sender,
+        "invalid_tool_call",
+        INVALID_TOOL_CALL_MESSAGE,
+    );
+    let _ = send_sse_done(trace, sender);
 }
 
 fn send_unsafe_tool_replay_error(
@@ -3642,6 +3736,58 @@ fn normalize_legacy_tools(body: &mut ChatCompletionRequest) {
     }
 }
 
+fn validate_tool_choice(value: &mut Value) -> Result<(), &'static str> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(mode) => {
+            let normalized = ["none", "auto", "required"]
+                .iter()
+                .find(|candidate| mode.eq_ignore_ascii_case(candidate));
+            let Some(normalized) = normalized else {
+                return Err("tool_choice must be none, auto, required, or a function choice");
+            };
+            *mode = (*normalized).to_owned();
+            Ok(())
+        }
+        Value::Object(object) => {
+            let kind = object.get("type").and_then(Value::as_str);
+            if object
+                .get("type")
+                .is_some_and(|kind| !matches!(kind.as_str(), Some("function" | "custom")))
+            {
+                return Err("tool_choice objects must have type=function or type=custom");
+            }
+            let nested_name = object
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str);
+            let legacy_name = object.get("name").and_then(Value::as_str);
+            if object.contains_key("function") && nested_name.is_none() {
+                return Err("tool_choice function objects require a string function.name");
+            }
+            if kind == Some("custom") && nested_name.is_some() {
+                return Err("custom tool_choice objects require a top-level name");
+            }
+            let name = match (nested_name, legacy_name) {
+                (Some(nested), Some(legacy)) if nested == legacy => nested,
+                (Some(_), Some(_)) => {
+                    return Err("tool_choice contains conflicting function names");
+                }
+                (Some(name), None) | (None, Some(name)) => name,
+                (None, None) => {
+                    return Err("tool_choice function objects require a function name");
+                }
+            };
+            if name.trim().is_empty() {
+                return Err("tool_choice function name must not be empty");
+            }
+            Ok(())
+        }
+        _ => Err("tool_choice must be a string or function object"),
+    }
+}
+
 const HERMES_EXECUTION_CONTROL_SCHEMA: &str = "m365-hermes-execution-control-provenance/v2";
 const HERMES_EXECUTION_IDENTITY_ERROR_SCHEMA: &str = "m365-hermes-execution-identity-error/v1";
 const HERMES_EXECUTION_CONTROL_CONTEXT_DOMAIN: &str = "m365-hermes-execution-control-context/v2";
@@ -3932,6 +4078,32 @@ struct FlattenedMessages {
     attachments: Vec<Attachment>,
     generated_document_bytes: usize,
     generated_document_message_count: usize,
+    usage_input_utf16_units: usize,
+    usage_estimate_scope: UsageEstimateScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UsageEstimateScope {
+    VisibleRequestAndCompletion,
+    FullContextDocumentAndInlineProjection,
+}
+
+impl UsageEstimateScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::VisibleRequestAndCompletion => "visible_request_and_completion",
+            Self::FullContextDocumentAndInlineProjection => {
+                "full_context_document_and_inline_projection"
+            }
+        }
+    }
+
+    const fn source(self) -> &'static str {
+        match self {
+            Self::VisibleRequestAndCompletion => "utf16_estimate",
+            Self::FullContextDocumentAndInlineProjection => "m365_transport_projection_estimate",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -4417,12 +4589,21 @@ fn spill_full_context_document_with_budget(
     if budget.message_text_units(&inline_text) > budget.limit {
         return Err(SpillFailure::CannotFitInline);
     }
+    let usage_input_utf16_units = full_context_usage_input_utf16_units(
+        &document,
+        &inline_text,
+        &normalized,
+        &selected,
+        budget,
+    );
     Ok((
         FlattenedMessages {
             text: inline_text,
             attachments,
             generated_document_bytes: document.len(),
             generated_document_message_count: normalized.len(),
+            usage_input_utf16_units,
+            usage_estimate_scope: UsageEstimateScope::FullContextDocumentAndInlineProjection,
         },
         SpillReason::FullContextDocument,
     ))
@@ -4503,6 +4684,28 @@ fn full_context_inline_text(
         "messages": messages,
     }))
     .map_err(|_| SpillFailure::ProjectionFailed)
+}
+
+fn full_context_usage_input_utf16_units(
+    document: &str,
+    inline_text: &str,
+    normalized: &[NormalizedMessage],
+    selected: &[bool],
+    budget: &TransportBudget<'_>,
+) -> usize {
+    let inline_units = budget.message_text_units(inline_text);
+    let overlapping_message_units = normalized
+        .iter()
+        .filter(|message| selected.get(message.source_index).copied().unwrap_or(false))
+        .map(|message| {
+            serde_json::to_string(&message.value)
+                .map(|value| utf16_units(&value))
+                .unwrap_or_default()
+        })
+        .sum::<usize>();
+    utf16_units(document)
+        .saturating_add(inline_units)
+        .saturating_sub(overlapping_message_units)
 }
 
 fn full_context_inline_indexes(messages: &[OpenAiMessage]) -> Vec<bool> {
@@ -4735,8 +4938,11 @@ fn flatten_messages(messages: &[OpenAiMessage]) -> Result<FlattenedMessages, &'s
             let mut attachments = Vec::new();
             let text = content_text(&message.content, &mut attachments)?;
             validate_attachments(&attachments)?;
+            let text = text.trim().to_owned();
             return Ok(FlattenedMessages {
-                text: text.trim().to_owned(),
+                usage_input_utf16_units: utf16_units(&text),
+                usage_estimate_scope: UsageEstimateScope::VisibleRequestAndCompletion,
+                text,
                 attachments,
                 generated_document_bytes: 0,
                 generated_document_message_count: 0,
@@ -4750,6 +4956,8 @@ fn flatten_messages(messages: &[OpenAiMessage]) -> Result<FlattenedMessages, &'s
             attachments,
             generated_document_bytes: 0,
             generated_document_message_count: 0,
+            usage_input_utf16_units: 0,
+            usage_estimate_scope: UsageEstimateScope::VisibleRequestAndCompletion,
         });
     }
     let text = serde_json::to_string(&json!({
@@ -4762,6 +4970,8 @@ fn flatten_messages(messages: &[OpenAiMessage]) -> Result<FlattenedMessages, &'s
     }))
     .map_err(|_| "messages cannot be encoded")?;
     Ok(FlattenedMessages {
+        usage_input_utf16_units: utf16_units(&text),
+        usage_estimate_scope: UsageEstimateScope::VisibleRequestAndCompletion,
         text,
         attachments,
         generated_document_bytes: 0,
@@ -9571,6 +9781,127 @@ mod tests {
         terminals[0]
     }
 
+    fn simulated_hermes_compressor_consumes_prompt_usage(
+        usage: &Value,
+        threshold_tokens: u64,
+    ) -> bool {
+        usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|prompt_tokens| prompt_tokens >= threshold_tokens)
+    }
+
+    fn independent_full_context_usage_input_utf16_units(captured: &ChatRequest) -> usize {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let attachment = captured
+            .attachments
+            .iter()
+            .find(|attachment| attachment.generated_oversize_text)
+            .expect("full-context document attachment");
+        let encoded_document = attachment
+            .url
+            .strip_prefix("data:text/plain;base64,")
+            .expect("data document");
+        let document_bytes = STANDARD.decode(encoded_document).unwrap();
+        let document_text = String::from_utf8(document_bytes).unwrap();
+        let document: Value = serde_json::from_str(&document_text).unwrap();
+        let document_messages = document["messages"].as_array().expect("document messages");
+        let document_indexes = document_messages
+            .iter()
+            .map(|entry| {
+                entry["message_index"]
+                    .as_u64()
+                    .expect("document message index")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            document_indexes.len(),
+            document_indexes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "document message indexes must be unique"
+        );
+        assert!(
+            document_indexes.windows(2).all(|pair| pair[0] < pair[1]),
+            "document messages must retain source order"
+        );
+        assert_eq!(
+            document["message_count"].as_u64(),
+            Some(document_messages.len() as u64)
+        );
+
+        let inline: Value = serde_json::from_str(&captured.text).unwrap();
+        let inline_indexes = inline["transport_projection"]["inline_message_indexes"]
+            .as_array()
+            .expect("inline indexes")
+            .iter()
+            .map(|index| index.as_u64().expect("numeric inline index"))
+            .collect::<Vec<_>>();
+        let inline_messages = inline["messages"].as_array().expect("inline messages");
+        assert_eq!(inline_indexes.len(), inline_messages.len());
+        assert_eq!(
+            inline_indexes.len(),
+            inline_indexes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "inline message indexes must be unique"
+        );
+        for (index, inline_message) in inline_indexes.iter().zip(inline_messages) {
+            assert!(
+                document_messages.iter().any(|entry| {
+                    entry["message_index"].as_u64() == Some(*index)
+                        && entry["message"] == *inline_message
+                }),
+                "inline message must be present exactly in the generated document"
+            );
+        }
+
+        let overlap_units = inline_messages
+            .iter()
+            .map(|message| {
+                serde_json::to_string(message)
+                    .unwrap()
+                    .encode_utf16()
+                    .count()
+            })
+            .sum::<usize>();
+        let document_only_units = document_messages
+            .iter()
+            .filter(|entry| !inline_indexes.contains(&entry["message_index"].as_u64().unwrap()))
+            .map(|entry| {
+                serde_json::to_string(&entry["message"])
+                    .unwrap()
+                    .encode_utf16()
+                    .count()
+            })
+            .sum::<usize>();
+        assert!(overlap_units > 0, "selected inline messages must overlap");
+        assert!(
+            document_only_units > 0,
+            "history must remain document-only for this regression"
+        );
+
+        // Recompute the transport estimate from the captured request and
+        // decoded document. This intentionally does not call the production
+        // full_context_usage_input_utf16_units helper.
+        let inline_wire = crate::chathub::outbound_message_text(
+            &captured.text,
+            &captured.tools,
+            &captured.tool_choice,
+            captured.tool_call_limit,
+        );
+        document_text
+            .encode_utf16()
+            .count()
+            .saturating_add(inline_wire.encode_utf16().count())
+            .saturating_sub(overlap_units)
+    }
+
     fn issue_101_user_request_from_outbound_message(text: &str) -> &str {
         text.split_once("\n\nUser request:\n")
             .map(|(_, request)| request)
@@ -11861,6 +12192,8 @@ mod tests {
             }],
             generated_document_bytes: 123,
             generated_document_message_count: 1,
+            usage_input_utf16_units: 128_100,
+            usage_estimate_scope: UsageEstimateScope::VisibleRequestAndCompletion,
         };
         assert!(matches!(
             spill_oversized_bulk_text(
@@ -12692,6 +13025,7 @@ mod tests {
         });
         if stream {
             body["stream"] = Value::Bool(true);
+            body["stream_options"] = json!({"include_usage":true});
         }
         body
     }
@@ -12717,7 +13051,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        if stream {
+        let observed_prompt_tokens = if stream {
             let body = String::from_utf8(
                 to_bytes(response.into_body(), 64 * 1024)
                     .await
@@ -12726,12 +13060,24 @@ mod tests {
             )
             .unwrap();
             let frames = sse_values(&body);
-            sole_sse_terminal(&frames, "tool_calls");
+            let terminals = frames
+                .iter()
+                .filter(|frame| frame["choices"][0]["finish_reason"].is_string())
+                .collect::<Vec<_>>();
+            assert_eq!(terminals.len(), 1);
+            assert_eq!(terminals[0]["choices"][0]["finish_reason"], "tool_calls");
+            let usage = frames
+                .iter()
+                .find(|frame| frame["usage"].is_object())
+                .expect("stream must include the terminal usage frame");
             let tool_call = frames
                 .iter()
                 .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls/0"))
                 .expect("stream must contain the projected caller tool call");
             assert_eq!(tool_call["function"]["name"], "read_file");
+            usage["usage"]["prompt_tokens"]
+                .as_u64()
+                .expect("stream prompt token estimate")
         } else {
             let value: Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -12741,12 +13087,20 @@ mod tests {
                 value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
                 "read_file"
             );
-        }
+            value["usage"]["prompt_tokens"]
+                .as_u64()
+                .expect("response prompt token estimate")
+        };
 
         let requests = chat.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].tools.len(), 2);
         assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
+        assert_eq!(
+            observed_prompt_tokens,
+            (utf16_units(&requests[1].text) as u64).div_ceil(4),
+            "final usage must include the duplicate-fallback continuation context"
+        );
     }
 
     #[tokio::test]
@@ -13810,6 +14164,399 @@ mod tests {
                 serde_json::from_str::<Value>(&body).unwrap()["usage"].clone()
             };
             usages.push(usage);
+        }
+        assert_eq!(usages[0], usages[1]);
+    }
+
+    #[tokio::test]
+    async fn escaped_matching_tool_fence_is_safely_normalized_to_a_structured_call() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only inspection.",
+                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
+            }
+        });
+        for stream in [false, true] {
+            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([r#"```inspect
+{"target":"service-a"}\n```"#])));
+            let mut request = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "messages":[{"role":"user","content":"Inspect service-a."}],
+                "tools":[tool.clone()],
+                "tool_choice":"auto"
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage":true});
+            }
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            if stream {
+                assert_eq!(status, StatusCode::OK);
+                assert!(body.contains("\"name\":\"inspect\""));
+                assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+                assert!(!body.contains("\"finish_reason\":\"stop\""));
+                assert!(body.ends_with("data: [DONE]\n\n"));
+            } else {
+                assert_eq!(status, StatusCode::OK, "body={body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(
+                    value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                    "inspect"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_matching_tool_fence_fails_closed_on_both_protocol_shapes() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only inspection.",
+                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
+            }
+        });
+        for stream in [false, true] {
+            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+                "```inspect\n{\"target\":\"service-a\"}\nextra\n```",
+            ])));
+            let mut request = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "messages":[{"role":"user","content":"Inspect service-a."}],
+                "tools":[tool.clone()],
+                "tool_choice":"auto"
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage":true});
+            }
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            if stream {
+                assert_eq!(status, StatusCode::OK);
+                assert!(body.contains("\"code\":\"invalid_tool_call\""));
+                assert!(!body.contains("\"finish_reason\":\"stop\""));
+                assert!(!body.contains("\"finish_reason\":\"tool_calls\""));
+                assert!(body.ends_with("data: [DONE]\n\n"));
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["error"]["code"], "invalid_tool_call");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_choice_is_rejected_before_any_upstream_call() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "parameters":{"type":"object"}
+            }
+        });
+        for stream in [false, true] {
+            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+                "```inspect\n{\"target\":\"service-a\"}\n```",
+            ])));
+            let request = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "messages":[{"role":"user","content":"Inspect service-a."}],
+                "tools":[tool.clone()],
+                "tool_choice":{}
+            });
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["code"], "invalid_tool_choice");
+        }
+    }
+
+    #[tokio::test]
+    async fn required_and_specific_choices_fail_closed_on_an_initial_non_call() {
+        for stream in [false, true] {
+            for choice in [
+                Value::String("required".to_owned()),
+                json!({"type":"function","function":{"name":"inspect"}}),
+            ] {
+                let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+                    "ordinary answer without a caller tool call",
+                ])));
+                let mut request = json!({
+                    "model":"gpt-5.6-terra",
+                    "stream":stream,
+                    "messages":[{"role":"user","content":"Inspect service-a."}],
+                    "tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}}],
+                    "tool_choice":choice
+                });
+                if stream {
+                    request["stream_options"] = json!({"include_usage":true});
+                }
+                let response = app
+                    .oneshot(
+                        Request::post("/hermes/v1/chat/completions")
+                            .header("x-api-key", raw_key)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = String::from_utf8(
+                    to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                if stream {
+                    assert_eq!(status, StatusCode::OK);
+                    assert!(body.contains("\"code\":\"tool_choice_unsatisfied\""));
+                    assert!(!body.contains("\"finish_reason\":\"stop\""));
+                } else {
+                    assert_eq!(status, StatusCode::CONFLICT);
+                    let value: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(value["error"]["code"], "tool_choice_unsatisfied");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_markdown_and_unknown_tools_remain_non_executable() {
+        for stream in [false, true] {
+            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+                "```terminal\n{\"command\":\"id\"}\n```",
+            ])));
+            let mut request = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "messages":[{"role":"user","content":"Show the example."}],
+                "tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}}],
+                "tool_choice":"auto"
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage":true});
+            }
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("terminal"));
+            assert!(!body.contains("\"tool_calls\""));
+            assert!(body.contains("\"finish_reason\":\"stop\""));
+        }
+    }
+
+    #[test]
+    fn tool_choice_validation_canonicalizes_modes_and_preserves_custom_tools() {
+        let mut uppercase = Value::String("NONE".to_owned());
+        validate_tool_choice(&mut uppercase).unwrap();
+        assert_eq!(uppercase, Value::String("none".to_owned()));
+
+        let mut custom = json!({"type":"custom","name":"exec"});
+        validate_tool_choice(&mut custom).unwrap();
+        assert!(validate_tool_choice(&mut json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn escaped_tool_candidate_survives_full_context_projection() {
+        for stream in [false, true] {
+            let mut request = issue_101_third_round_fixture_request();
+            request["stream"] = Value::Bool(stream);
+            if stream {
+                request["stream_options"] = json!({"include_usage":true});
+            }
+            let (oauth, token_server) = oauth_with_graph_token_server().await;
+            let escaped_call = "```third_round_tool_01\n{\"path\":\"service-a\"}\\n```";
+            let (app, raw_key) =
+                app_with_chat_and_oauth(Arc::new(SequenceTransport::new([escaped_call])), oauth);
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(status, StatusCode::OK, "stream={stream} body={body}");
+            if stream {
+                assert!(body.contains("\"name\":\"third_round_tool_01\""));
+                assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+                assert!(!body.contains("\"finish_reason\":\"stop\""));
+            } else {
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(
+                    value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                    "third_round_tool_01"
+                );
+            }
+            token_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    // This exercises the public Gateway contract and a deterministic consumer model;
+    // it does not start or mutate a Hermes process.
+    async fn full_context_usage_contract_drives_simulated_hermes_compressor_at_public_seam() {
+        let mut usages = Vec::new();
+        for stream in [false, true] {
+            let mut body = issue_101_third_round_fixture_request();
+            let messages = body["messages"].as_array_mut().unwrap();
+            let last = messages.last_mut().expect("fixture has a final user turn");
+            assert_eq!(last["role"], "user");
+            last["content"] =
+                Value::String(format!("context-pressure-padding {}", "p".repeat(20_000)));
+            body["stream"] = Value::Bool(stream);
+            if stream {
+                body["stream_options"] = json!({"include_usage":true});
+            }
+            let (oauth, token_server) = oauth_with_graph_token_server().await;
+            let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+            let (app, raw_key) = app_with_chat_and_oauth(chat.clone(), oauth);
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let response_body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "stream={stream} body={response_body}"
+            );
+            let (usage, metadata) = if stream {
+                let frame = sse_values(&response_body)
+                    .into_iter()
+                    .find(|frame| frame["usage"].is_object())
+                    .expect("full-context stream usage frame");
+                (frame["usage"].clone(), frame["m365"].clone())
+            } else {
+                let value: Value = serde_json::from_str(&response_body).unwrap();
+                (value["usage"].clone(), value["m365"].clone())
+            };
+            let prompt_tokens = usage["prompt_tokens"]
+                .as_u64()
+                .expect("prompt token estimate");
+            let compressor_threshold = 64_000;
+            assert!(
+                prompt_tokens >= compressor_threshold,
+                "full-context usage must expose context pressure: {prompt_tokens}"
+            );
+            assert!(simulated_hermes_compressor_consumes_prompt_usage(
+                &usage,
+                compressor_threshold
+            ));
+            assert_eq!(
+                metadata["usage_estimate_scope"],
+                "full_context_document_and_inline_projection"
+            );
+            let captured = chat
+                .0
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("public seam must send the prepared request");
+            let expected_input_units = independent_full_context_usage_input_utf16_units(&captured);
+            let old_post_spill_prompt_tokens = captured.text.encode_utf16().count().div_ceil(4);
+            assert!(
+                old_post_spill_prompt_tokens < compressor_threshold as usize,
+                "the pre-fix inline-only signal must stay below the simulated threshold"
+            );
+            assert_eq!(
+                prompt_tokens as usize,
+                expected_input_units.div_ceil(4),
+                "usage must independently account for document content and deduplicated inline messages"
+            );
+            usages.push(usage);
+            token_server.abort();
         }
         assert_eq!(usages[0], usages[1]);
     }

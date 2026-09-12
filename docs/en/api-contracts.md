@@ -47,7 +47,7 @@ An external `stream=false` request with stream-only options is invalid. An inter
 
 When the caller drops a streaming response, the gateway cancels the corresponding upstream work and releases account capacity rather than letting it run indefinitely in the background.
 
-Visible usage is an estimate of caller-visible input/output. It is not complete token accounting for Microsoft-internal grounding context.
+Visible usage is an estimate of caller-visible input/output. It is not complete token accounting for Microsoft-internal grounding context. Without a generated full-context document, `prompt_tokens` is a UTF-16 estimate of the visible request; when `m365-full-context/v1` is generated, the estimate includes the document content plus the non-overlapping inline model-facing projection. `m365.usage_estimate_scope=full_context_document_and_inline_projection` identifies that scope, and the value is still not the provider's actual tokenizer result.
 
 ## Input size and auto-spill
 

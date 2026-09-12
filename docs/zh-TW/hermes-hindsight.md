@@ -30,7 +30,7 @@
 
 非 Memory chat 先嘗試 inline，再只搬移會實際減少 outbound wire 的 bulk `user` / `tool` text；若仍超限，M365 可以把目前 request 的完整 model-facing message projection 放進一份 deterministic `.txt` attachment，同時把 current user ask、system/developer control、工具定義／協定與最近完整工具交換留 inline。這份文件不是 session history、memory 或新的治理 authority，且不改 Hermes 的 checkpoint、ledger、compression 或 replay 契約。Memory route 不做這種 auto-spill。
 
-因此 Hermes compression 應依 model context quality 設計，不要只為了躲 M365 UTF-16 wall 提前壓縮。實際 context/compression 值由目前 Hermes profile 自己管理，不在 M365 public docs 固定某個上游版本數字。
+因此 Hermes compression 應依 model context quality 設計，不要只為了躲 M365 UTF-16 wall 提前壓縮。產生 full-context 文件時，Chat Completions usage 會用 `m365.usage_estimate_scope=full_context_document_and_inline_projection` 表示這份完整 model-facing 文件；文件與不重複的 inline projection 都已納入 transport estimate，讓 caller 看得到 context pressure。這不改 Hermes 的 compression policy。實際 context/compression 值由目前 Hermes profile 自己管理，不在 M365 public docs 固定某個上游版本數字。
 
 ## Shared-account 排程
 

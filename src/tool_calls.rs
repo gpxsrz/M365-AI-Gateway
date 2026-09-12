@@ -17,6 +17,7 @@ pub struct ToolProjection {
     pub content: String,
     pub calls: Vec<DetectedToolCall>,
     pub overflowed: bool,
+    pub rejected: bool,
 }
 
 pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> ToolProjection {
@@ -25,6 +26,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
             content: text.to_owned(),
             calls: Vec::new(),
             overflowed: false,
+            rejected: false,
         };
     }
     let mut output = ToolProjection::default();
@@ -34,67 +36,123 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
     while cursor < lines.len() {
         let line = lines[cursor].trim();
         let Some(name) = line.strip_prefix("```").map(str::trim) else {
-            append_line(&mut output.content, lines[cursor]);
+            append_projection_content(&mut output, lines[cursor]);
             cursor += 1;
             continue;
         };
         if name.is_empty() || name.contains(char::is_whitespace) {
-            append_line(&mut output.content, lines[cursor]);
+            append_projection_content(&mut output, lines[cursor]);
             cursor += 1;
             continue;
         }
+        let choice_allows_name = choice_allows(choice, name);
+        let has_matching_tool = tools.iter().any(|tool| {
+            tool.function
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|candidate| candidate == name)
+        });
+        let allowed_tool = tool(tools, name).filter(|_| choice_allows_name);
         let Some(relative_end) = lines[cursor + 1..]
             .iter()
             .position(|candidate| candidate.trim() == "```")
         else {
-            append_line(&mut output.content, lines[cursor]);
-            cursor += 1;
+            if let Some(tool) = allowed_tool {
+                if let Some(arguments) = escaped_closing_fence_arguments(&lines[cursor + 1..])
+                    .and_then(parse_object_arguments)
+                {
+                    append_call(&mut output, tool, name, arguments, limit);
+                } else {
+                    output.rejected = true;
+                }
+                cursor = lines.len();
+            } else if choice_allows_name && has_matching_tool {
+                output.rejected = true;
+                cursor = lines.len();
+            } else {
+                // Unknown or disallowed fences are caller-visible Markdown, not
+                // executable candidates. Matching malformed candidates fail closed.
+                append_projection_content(&mut output, lines[cursor]);
+                cursor += 1;
+            }
             continue;
         };
         let end = cursor + 1 + relative_end;
         let raw_arguments = lines[cursor + 1..end].join("\n");
-        let recognized = tool(tools, name)
-            .filter(|_| choice_allows(choice, name))
-            .zip(
-                serde_json::from_str::<Value>(raw_arguments.trim())
-                    .ok()
-                    .filter(Value::is_object),
-            );
-        if let Some((tool, arguments)) = recognized {
-            if output.calls.len() < limit {
-                output.calls.push(DetectedToolCall {
-                    id: random_call_id(),
-                    kind: if tool.kind == "custom" {
-                        "custom".to_owned()
-                    } else {
-                        "function".to_owned()
-                    },
-                    function: json!({
-                        "name": name,
-                        "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_owned())
-                    }),
-                });
+        if let Some(tool) = allowed_tool {
+            if let Some(arguments) = parse_object_arguments(&raw_arguments) {
+                append_call(&mut output, tool, name, arguments, limit);
             } else {
-                output.overflowed = true;
+                output.rejected = true;
             }
+        } else if choice_allows_name && has_matching_tool {
+            output.rejected = true;
         } else {
+            // A known tool definition is required before textual Markdown can
+            // become a caller-tool projection.
             for original in &lines[cursor..=end] {
-                append_line(&mut output.content, original);
+                append_projection_content(&mut output, original);
             }
         }
         cursor = end + 1;
     }
     output.content = output.content.trim().to_owned();
+    if output.rejected {
+        output.calls.clear();
+    }
     output
 }
 
+fn parse_object_arguments(raw: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(raw.trim())
+        .ok()
+        .filter(Value::is_object)
+}
+
+fn escaped_closing_fence_arguments<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    (lines.len() == 1)
+        .then(|| lines[0])
+        .and_then(|raw| raw.strip_suffix(r"\n```").map(str::trim))
+}
+
+fn append_call(
+    output: &mut ToolProjection,
+    tool: &Tool,
+    name: &str,
+    arguments: Value,
+    limit: usize,
+) {
+    if output.calls.len() < limit {
+        output.calls.push(DetectedToolCall {
+            id: random_call_id(),
+            kind: if tool.kind == "custom" {
+                "custom".to_owned()
+            } else {
+                "function".to_owned()
+            },
+            function: json!({
+                "name": name,
+                "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_owned())
+            }),
+        });
+    } else {
+        output.overflowed = true;
+    }
+}
+
 fn tool<'a>(tools: &'a [Tool], name: &str) -> Option<&'a Tool> {
-    tools.iter().find(|tool| {
+    let mut matches = tools.iter().filter(|tool| {
         tool.function
             .get("name")
             .and_then(Value::as_str)
             .is_some_and(|candidate| candidate == name)
-    })
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 fn choice_allows(choice: &Value, name: &str) -> bool {
@@ -116,6 +174,17 @@ fn append_line(output: &mut String, line: &str) {
         output.push('\n');
     }
     output.push_str(line);
+}
+
+fn append_projection_content(output: &mut ToolProjection, line: &str) {
+    // A structured call must be the complete executable projection. Any
+    // non-whitespace material after it makes the candidate ambiguous (for
+    // example, a second Markdown/code example), so the caller must fail
+    // closed instead of executing only the first block.
+    if !output.calls.is_empty() && !line.trim().is_empty() {
+        output.rejected = true;
+    }
+    append_line(&mut output.content, line);
 }
 
 fn random_call_id() -> String {
@@ -154,6 +223,7 @@ mod tests {
             output.calls[0].function["arguments"],
             r#"{"path":"README.md"}"#
         );
+        assert!(!output.rejected);
     }
 
     #[test]
@@ -166,6 +236,7 @@ mod tests {
         );
         assert!(output.calls.is_empty());
         assert!(output.content.contains("delete_everything"));
+        assert!(!output.rejected);
     }
 
     #[test]
@@ -178,5 +249,99 @@ mod tests {
         );
         assert_eq!(output.calls.len(), 1);
         assert!(output.overflowed);
+    }
+
+    #[test]
+    fn a_call_followed_by_unknown_markdown_is_ambiguous_and_fails_closed() {
+        let output = project(
+            "```read_file\n{\"path\":\"README.md\"}\n```\n```python\nprint('example')\n```",
+            &tools(),
+            &Value::String("auto".to_owned()),
+            1,
+        );
+        assert!(output.calls.is_empty());
+        assert!(output.rejected);
+    }
+
+    #[test]
+    fn escaped_closing_fence_is_repaired_only_at_the_exact_tail() {
+        let output = project(
+            "```read_file\n{\"path\":\"README.md\"}\\n```",
+            &tools(),
+            &Value::String("auto".to_owned()),
+            1,
+        );
+        assert_eq!(output.calls.len(), 1);
+        assert!(output.content.is_empty());
+        assert!(!output.rejected);
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_matching_fence_is_rejected_without_a_call() {
+        for text in [
+            "```read_file\n{\"path\":\n```",
+            "```read_file\n{\"path\":\"README.md\"}\nextra\n```",
+            "```read_file\n{\"path\":\"README.md\"}\n```\nmore",
+            "```read_file\n{\"path\":\"README.md\"}\\n```\nmore",
+            "```read_file\n{\"path\":\"README.md\"}\\n``` ",
+            "```read_file\n{\n\"path\":\"README.md\"}\n\\n```",
+        ] {
+            let output = project(text, &tools(), &Value::String("auto".to_owned()), 1);
+            assert!(output.calls.is_empty(), "text={text}");
+            assert!(output.rejected, "text={text}");
+        }
+    }
+
+    #[test]
+    fn choice_none_and_unknown_markdown_never_execute() {
+        let none = project(
+            "```read_file\n{\"path\":\"README.md\"}\\n```",
+            &tools(),
+            &Value::String("none".to_owned()),
+            1,
+        );
+        assert!(none.calls.is_empty());
+        assert!(!none.rejected);
+
+        let unknown = project(
+            "```terminal\n{\"command\":\"id\"}\n```",
+            &tools(),
+            &Value::String("auto".to_owned()),
+            1,
+        );
+        assert!(unknown.calls.is_empty());
+        assert!(!unknown.rejected);
+        assert!(unknown.content.contains("terminal"));
+    }
+
+    #[test]
+    fn required_and_specific_choices_never_accept_an_invalid_matching_candidate() {
+        let text = "```read_file\n{\"path\":\n```";
+        for choice in [
+            Value::String("required".to_owned()),
+            json!({"type":"function","function":{"name":"read_file"}}),
+        ] {
+            let output = project(text, &tools(), &choice, 1);
+            assert!(output.calls.is_empty());
+            assert!(output.rejected);
+        }
+        let other_choice = json!({"type":"function","function":{"name":"other"}});
+        let output = project(text, &tools(), &other_choice, 1);
+        assert!(output.calls.is_empty());
+        assert!(!output.rejected);
+    }
+
+    #[test]
+    fn duplicate_tool_definitions_are_not_a_unique_execution_target() {
+        let mut duplicate = tools();
+        duplicate.push(duplicate[0].clone());
+        let output = project(
+            "```read_file\n{\"path\":\"README.md\"}\n```",
+            &duplicate,
+            &Value::String("auto".to_owned()),
+            1,
+        );
+        assert!(output.calls.is_empty());
+        assert!(output.rejected);
     }
 }

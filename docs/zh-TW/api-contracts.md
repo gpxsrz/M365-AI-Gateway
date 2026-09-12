@@ -47,7 +47,7 @@ Request 可以要求：
 
 Caller 丟棄 streaming response 時，Gateway 會取消同一 upstream work並釋放容量，不讓它無限留在背景。
 
-可見 usage 是 Gateway 對 caller-visible input/output 的估算，不能當成 Microsoft 內部 grounding context 的完整 token accounting。
+可見 usage 是 Gateway 對 caller-visible input/output 的估算，不能當成 Microsoft 內部 grounding context 的完整 token accounting。沒有產生 full-context 文件時，`prompt_tokens` 是 visible request 的 UTF-16 estimate；產生 `m365-full-context/v1` 文件時，會把文件內容和不重複計算的 inline model-facing projection 一起納入 conservative estimate。`m365.usage_estimate_scope=full_context_document_and_inline_projection` 會標明這個範圍，這仍不是 provider 的實際 tokenizer 結果。
 
 ## 輸入大小與 auto-spill
 
