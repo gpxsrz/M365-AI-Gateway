@@ -21,6 +21,7 @@ use crate::{
 };
 
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
+const NATIVE_ATTACHMENT_CONTEXT_FIELD: &str = "m365_native_attachment_context";
 const CUSTOM_EXEC_INSTRUCTION: &str = "You are operating through the caller's local OpenCode execution bridge. Use the caller-provided exec tool only for local filesystem and command execution. Do not use Microsoft 365 native execution or file-mutation tools for those operations. Microsoft 365 native Bing web search, citations, grounding, and read-only information retrieval remain allowed. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.";
 
 #[derive(Default, Deserialize)]
@@ -96,7 +97,7 @@ struct AnthropicTool {
 pub async fn responses(State(gateway): State<Arc<Gateway>>, request: Request) -> Response {
     let owner = api_key_owner(&request);
     let artifact_origin = crate::web::artifact_origin(&request);
-    let body = match read::<ResponsesRequest>(request).await {
+    let body = match read_without_native_context::<ResponsesRequest>(request).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -132,7 +133,7 @@ pub async fn responses(State(gateway): State<Arc<Gateway>>, request: Request) ->
 pub async fn anthropic_messages(State(gateway): State<Arc<Gateway>>, request: Request) -> Response {
     let owner = api_key_owner(&request);
     let artifact_origin = crate::web::artifact_origin(&request);
-    let body = match read::<AnthropicRequest>(request).await {
+    let body = match read_without_native_context::<AnthropicRequest>(request).await {
         Ok(body) => body,
         Err(response) => return anthropic_error_response(response).await,
     };
@@ -879,7 +880,9 @@ fn anthropic_metadata(source: &Value) -> Value {
     Value::Object(metadata)
 }
 
-async fn read<T: for<'de> Deserialize<'de>>(request: Request) -> Result<T, Response> {
+async fn read_without_native_context<T: for<'de> Deserialize<'de>>(
+    request: Request,
+) -> Result<T, Response> {
     let bytes = to_bytes(request.into_body(), BODY_LIMIT)
         .await
         .map_err(|_| {
@@ -890,7 +893,19 @@ async fn read<T: for<'de> Deserialize<'de>>(request: Request) -> Result<T, Respo
                 "request body is too large",
             )
         })?;
-    serde_json::from_slice(&bytes).map_err(|_| invalid("bad json"))
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid("bad json"))?;
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key(NATIVE_ATTACHMENT_CONTEXT_FIELD))
+    {
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "native_attachments_not_allowed",
+            "native attachment context is only accepted on the Hermes chat route",
+        ));
+    }
+    serde_json::from_value(value).map_err(|_| invalid("bad json"))
 }
 
 async fn response_json(response: Response) -> Result<(StatusCode, Value), Response> {

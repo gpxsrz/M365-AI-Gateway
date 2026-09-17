@@ -1,0 +1,15 @@
+name: m365-native-attachments
+version: "1.0.0"
+description: "Stage bounded original local attachments for the M365 native model route without changing Hermes messages."
+author: gpxsrz/M365-AI-Gateway
+requires_plugins:
+  - m365-recall-provenance
+requires_env:
+  - M365_HERMES_RECALL_PROVENANCE_SECRET
+  - M365_HERMES_PROVIDER
+  - M365_HERMES_GATEWAY_BASE_URL
+  - M365_HERMES_ATTACHMENT_ALLOWED_ROOTS
+hooks:
+  - on_session_end
+provides_tools:
+  - m365_native_attach

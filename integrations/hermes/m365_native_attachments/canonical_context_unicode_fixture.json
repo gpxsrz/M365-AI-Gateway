@@ -1,0 +1,22 @@
+{
+  "context": {
+    "schema": "m365-hermes-native-attachment-context/v1",
+    "session_key": "session-附件",
+    "turn_id": "turn-😀",
+    "attachments": [
+      {
+        "stage_ref": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "size": 7,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "original_filename": "報告.xlsx",
+        "extension": "xlsx",
+        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "attachment_id": "附件-1",
+        "source_message_id": "郵件-1"
+      }
+    ],
+    "error": null,
+    "signature": ""
+  },
+  "canonical": "m365-hermes-native-attachments/context/v1\nm365-hermes-native-attachment-context/v1\nsession-附件\nturn-😀\n\n1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n7\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n報告.xlsx\nxlsx\napplication/vnd.openxmlformats-officedocument.spreadsheetml.sheet\n附件-1\n郵件-1"
+}

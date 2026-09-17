@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -12,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,6 +40,20 @@ const PROTECTED_STREAM_MARKERS: [&str; 5] = [
 pub(crate) struct Record {
     pub token: String,
     pub filename: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StageRecord {
+    pub capability: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedStage {
+    pub path: PathBuf,
     pub size: u64,
     pub sha256: String,
 }
@@ -139,8 +154,10 @@ impl Store {
         let temporary = self.blobs.join(format!(".artifact-{blob_id}"));
         let blob = self.blobs.join(&blob_id);
         write_blob(&temporary, bytes)?;
-        fs::rename(&temporary, &blob)
-            .map_err(|error| storage(format!("store artifact bytes: {error}")))?;
+        if let Err(error) = fs::rename(&temporary, &blob) {
+            let _ = fs::remove_file(&temporary);
+            return Err(storage(format!("store artifact bytes: {error}")));
+        }
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let entry = Entry {
             token_sha256: token_sha256.clone(),
@@ -171,6 +188,139 @@ impl Store {
             .cloned()
             .ok_or_else(|| storage("artifact not found"))?;
         Ok(record(entry, token.to_owned()))
+    }
+
+    fn existing_record(&self, capability: &str, filename: &str) -> Option<Record> {
+        let mut state = self.state.lock().expect("artifact store poisoned");
+        self.cleanup_locked(&mut state);
+        state
+            .entries
+            .get(&digest(capability.as_bytes()))
+            .filter(|entry| entry.filename == safe_filename(filename))
+            .cloned()
+            .map(|entry| record(entry, capability.to_owned()))
+    }
+
+    pub(crate) async fn stage_body_with_capability(
+        &self,
+        filename: &str,
+        capability: &str,
+        body: Body,
+    ) -> Result<StageRecord, GatewayError> {
+        if !valid_capability(capability) {
+            return Err(storage("artifact capability is invalid"));
+        }
+        if let Some(record) = self.existing_record(capability, filename) {
+            return Ok(stage_record(record));
+        }
+        self.stage_body_with_limit_for_filename(
+            filename,
+            body,
+            MAX_FETCH_BYTES,
+            Some(capability.to_owned()),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stage_body_for_test(
+        &self,
+        filename: &str,
+        body: Body,
+    ) -> Result<StageRecord, GatewayError> {
+        self.stage_body_with_limit_for_filename(filename, body, MAX_FETCH_BYTES, None)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn stage_body_with_limit_for_test(
+        &self,
+        filename: &str,
+        body: Body,
+        max_bytes: u64,
+    ) -> Result<StageRecord, GatewayError> {
+        self.stage_body_with_limit_for_filename(filename, body, max_bytes, None)
+            .await
+    }
+
+    async fn stage_body_with_limit_for_filename(
+        &self,
+        filename: &str,
+        body: Body,
+        max_bytes: u64,
+        capability: Option<String>,
+    ) -> Result<StageRecord, GatewayError> {
+        let record = self
+            .store_stream(filename, max_bytes, body.into_data_stream(), capability)
+            .await?;
+        Ok(stage_record(record))
+    }
+
+    pub(crate) fn resolve_staged(
+        &self,
+        capability: &str,
+        expected_sha256: &str,
+        expected_size: u64,
+        expected_filename: &str,
+    ) -> Result<ResolvedStage, GatewayError> {
+        if !valid_capability(capability)
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || expected_sha256.len() != 64
+        {
+            return Err(storage("staged attachment capability invalid or expired"));
+        }
+        let mut state = self.state.lock().expect("artifact store poisoned");
+        self.cleanup_locked(&mut state);
+        let key = digest(capability.as_bytes());
+        let entry = state
+            .entries
+            .get(&key)
+            .filter(|entry| {
+                entry.size == expected_size
+                    && entry.sha256 == expected_sha256
+                    && entry.filename == safe_filename(expected_filename)
+            })
+            .cloned()
+            .ok_or_else(|| storage("staged attachment capability invalid or expired"))?;
+        let path = self.blobs.join(&entry.blob_id);
+        let metadata = fs::metadata(&path)
+            .map_err(|_| storage("staged attachment capability invalid or expired"))?;
+        if !metadata.is_file() || metadata.len() != entry.size {
+            return Err(storage("staged attachment capability invalid or expired"));
+        }
+        let mut file = fs::File::open(&path)
+            .map_err(|_| storage("staged attachment capability invalid or expired"))?;
+        let mut hasher = Sha256::new();
+        let copied = std::io::copy(&mut file, &mut hasher)
+            .map_err(|_| storage("staged attachment capability invalid or expired"))?;
+        if copied != entry.size || hex(&hasher.finalize()) != entry.sha256 {
+            return Err(storage("staged attachment integrity check failed"));
+        }
+        Ok(ResolvedStage {
+            path,
+            size: entry.size,
+            sha256: entry.sha256,
+        })
+    }
+
+    pub(crate) fn release_staged(&self, capability: &str, expected_filename: &str) {
+        let mut state = self.state.lock().expect("artifact store poisoned");
+        self.cleanup_locked(&mut state);
+        let key = digest(capability.as_bytes());
+        let Some(entry) = state.entries.get(&key).cloned() else {
+            return;
+        };
+        if entry.filename != safe_filename(expected_filename) {
+            return;
+        }
+        state.entries.remove(&key);
+        state.total_bytes = state.total_bytes.saturating_sub(entry.size);
+        if self.persist_locked(&state).is_err() {
+            state.total_bytes = state.total_bytes.saturating_add(entry.size);
+            state.entries.insert(key, entry);
+            return;
+        }
+        let _ = fs::remove_file(self.blobs.join(entry.blob_id));
     }
 
     #[cfg(test)]
@@ -215,8 +365,10 @@ impl Store {
         let key = digest(token.as_bytes());
         let entry = state
             .entries
-            .remove(&key)
+            .get(&key)
+            .cloned()
             .ok_or_else(|| storage("artifact not found"))?;
+        state.entries.remove(&key);
         state.total_bytes = state.total_bytes.saturating_sub(entry.size);
         if let Err(error) = self.persist_locked(&state) {
             state.total_bytes += entry.size;
@@ -238,37 +390,53 @@ impl Store {
         {
             return Err(storage("artifact output is empty or too large"));
         }
+        self.store_stream(filename, MAX_FETCH_BYTES, response.bytes_stream(), None)
+            .await
+    }
+
+    async fn store_stream<S, E>(
+        &self,
+        filename: &str,
+        max_bytes: u64,
+        mut source: S,
+        capability: Option<String>,
+    ) -> Result<Record, GatewayError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Display,
+    {
+        if max_bytes == 0 || max_bytes > MAX_FETCH_BYTES {
+            return Err(storage("artifact stream limit is invalid"));
+        }
         {
             let mut state = self.state.lock().expect("artifact store poisoned");
             self.cleanup_locked(&mut state);
             if state.entries.len() + state.pending_entries >= MAX_ENTRIES
-                || MAX_FETCH_BYTES
-                    > MAX_BYTES.saturating_sub(state.total_bytes + state.pending_bytes)
+                || max_bytes > MAX_BYTES.saturating_sub(state.total_bytes + state.pending_bytes)
             {
                 return Err(storage("artifact store capacity reached"));
             }
             state.pending_entries += 1;
-            state.pending_bytes += MAX_FETCH_BYTES;
+            state.pending_bytes += max_bytes;
         }
         let blob_id = random_hex(32);
         let temporary = self.blobs.join(format!(".artifact-stream-{blob_id}"));
         let standard = match create_blob(&temporary) {
             Ok(file) => file,
             Err(error) => {
-                self.release_pending();
+                self.release_pending(max_bytes);
                 return Err(error);
             }
         };
         let mut file = tokio::fs::File::from_std(standard);
-        let mut stream = response.bytes_stream();
         let mut size = 0_u64;
         let mut hasher = Sha256::new();
         let streamed = async {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| storage(format!("fetch artifact: {error}")))?;
+            while let Some(chunk) = source.next().await {
+                let chunk = chunk.map_err(|error| storage(format!("stream artifact: {error}")))?;
                 size = size.saturating_add(chunk.len() as u64);
-                if size > MAX_FETCH_BYTES {
-                    return Err(storage("artifact output is too large"));
+                if size > max_bytes {
+                    return Err(storage("artifact stream is too large"));
                 }
                 hasher.update(&chunk);
                 file.write_all(&chunk)
@@ -276,7 +444,7 @@ impl Store {
                     .map_err(|error| storage(format!("write artifact: {error}")))?;
             }
             if size == 0 {
-                return Err(storage("artifact output is empty"));
+                return Err(storage("artifact stream is empty"));
             }
             file.sync_all()
                 .await
@@ -284,12 +452,19 @@ impl Store {
         }
         .await;
         drop(file);
-        self.release_pending();
+        self.release_pending(max_bytes);
         if let Err(error) = streamed {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
-        self.commit_staged(filename, temporary, blob_id, size, hex(&hasher.finalize()))
+        self.commit_staged(
+            filename,
+            temporary,
+            blob_id,
+            size,
+            hex(&hasher.finalize()),
+            capability,
+        )
     }
 
     fn commit_staged(
@@ -299,6 +474,7 @@ impl Store {
         blob_id: String,
         size: u64,
         sha256: String,
+        capability: Option<String>,
     ) -> Result<Record, GatewayError> {
         let mut state = self.state.lock().expect("artifact store poisoned");
         self.cleanup_locked(&mut state);
@@ -307,11 +483,23 @@ impl Store {
             let _ = fs::remove_file(temporary);
             return Err(storage("artifact store capacity reached"));
         }
-        let token = random_id(32);
+        let token = capability.unwrap_or_else(|| random_id(32));
         let token_sha256 = digest(token.as_bytes());
+        if let Some(existing) = state.entries.get(&token_sha256).cloned() {
+            let same_record = existing.filename == safe_filename(filename)
+                && existing.size == size
+                && existing.sha256 == sha256;
+            let _ = fs::remove_file(temporary);
+            if same_record {
+                return Ok(record(existing, token));
+            }
+            return Err(storage("artifact capability already has different bytes"));
+        }
         let blob = self.blobs.join(&blob_id);
-        fs::rename(&temporary, &blob)
-            .map_err(|error| storage(format!("store artifact bytes: {error}")))?;
+        if let Err(error) = fs::rename(&temporary, &blob) {
+            let _ = fs::remove_file(&temporary);
+            return Err(storage(format!("store artifact bytes: {error}")));
+        }
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let entry = Entry {
             token_sha256: token_sha256.clone(),
@@ -333,10 +521,10 @@ impl Store {
         Ok(record(entry, token))
     }
 
-    fn release_pending(&self) {
+    fn release_pending(&self, reserved_bytes: u64) {
         let mut state = self.state.lock().expect("artifact store poisoned");
         state.pending_entries = state.pending_entries.saturating_sub(1);
-        state.pending_bytes = state.pending_bytes.saturating_sub(MAX_FETCH_BYTES);
+        state.pending_bytes = state.pending_bytes.saturating_sub(reserved_bytes);
     }
 
     fn cleanup_locked(&self, state: &mut State) {
@@ -378,6 +566,21 @@ fn record(entry: Entry, token: String) -> Record {
         size: entry.size,
         sha256: entry.sha256,
     }
+}
+
+fn stage_record(record: Record) -> StageRecord {
+    StageRecord {
+        capability: record.token,
+        size: record.size,
+        sha256: record.sha256,
+    }
+}
+
+fn valid_capability(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(crate) async fn materialize(
@@ -886,6 +1089,137 @@ fn storage(message: impl Into<String>) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hermes_stage_streams_bytes_into_private_artifact_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let body = Body::from_stream(stream::iter([
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"prefix-")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"sentinel")),
+        ]));
+
+        let staged = store
+            .stage_body_for_test("turn-binding-id", body)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.size, 15);
+        assert_eq!(
+            staged.sha256,
+            "d29ce2de5fbc55176db8d710d8022a0bbd5a5afd1067e0b4ffe71724f7ee27c8"
+        );
+        assert_eq!(store.stat(&staged.capability).unwrap().size, staged.size);
+        let resolved = store
+            .resolve_staged(
+                &staged.capability,
+                &staged.sha256,
+                staged.size,
+                "turn-binding-id",
+            )
+            .unwrap();
+        assert_eq!(fs::read(resolved.path).unwrap(), b"prefix-sentinel");
+    }
+
+    #[tokio::test]
+    async fn hermes_stage_capability_is_idempotent_across_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let capability = "I".repeat(43);
+        let store = Store::open(root.path()).unwrap();
+        let first = store
+            .stage_body_with_capability(
+                "turn-binding-id",
+                &capability,
+                Body::from(Bytes::from_static(b"idempotent-sentinel")),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .stage_body_with_capability(
+                "turn-binding-id",
+                &capability,
+                Body::from(Bytes::from_static(b"idempotent-sentinel")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.capability, capability);
+        assert_eq!(first.size, second.size);
+        assert_eq!(first.sha256, second.sha256);
+        drop(store);
+
+        let reopened = Store::open(root.path()).unwrap();
+        assert_eq!(reopened.stat(&capability).unwrap().size, first.size);
+        assert_eq!(
+            reopened
+                .resolve_staged(&capability, &first.sha256, first.size, "turn-binding-id")
+                .unwrap()
+                .size,
+            first.size
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_stage_test_limit_rejects_after_streaming_without_committing() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let body = Body::from_stream(stream::iter([
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"1234")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"5678")),
+        ]));
+
+        let result = store
+            .stage_body_with_limit_for_test("turn-binding-id", body, 7)
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            fs::read_dir(root.path().join("blobs"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".artifact-stream-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_stage_streams_a_100_mib_synthetic_without_materializing_the_body() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let chunk = Bytes::from(vec![b'Z'; 128 * 1024]);
+        let body = Body::from_stream(stream::iter(
+            std::iter::repeat_with(move || Ok::<Bytes, std::io::Error>(chunk.clone())).take(800),
+        ));
+
+        let staged = store
+            .stage_body_for_test("turn-binding-id", body)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.size, 100 * 1024 * 1024);
+        assert_eq!(staged.sha256.len(), 64);
+        let resolved = store
+            .resolve_staged(
+                &staged.capability,
+                &staged.sha256,
+                staged.size,
+                "turn-binding-id",
+            )
+            .unwrap();
+        assert_eq!(fs::metadata(&resolved.path).unwrap().len(), staged.size);
+        store.release_staged(&staged.capability, "turn-binding-id");
+        assert!(
+            store
+                .resolve_staged(
+                    &staged.capability,
+                    &staged.sha256,
+                    staged.size,
+                    "turn-binding-id",
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn private_artifact_store_round_trips_exact_bytes_across_restart() {

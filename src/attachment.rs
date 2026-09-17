@@ -12,6 +12,7 @@ use rand::Rng;
 use reqwest::{Client, StatusCode, Url, header::HeaderValue, multipart};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 use crate::chathub::{Account, Attachment, AttachmentFailureKind, ChatError};
@@ -28,15 +29,37 @@ const DOCUMENT_UPLOAD_MAX_ATTEMPTS: usize = 2;
 const DOCUMENT_UPLOAD_BACKOFF: Duration = Duration::from_millis(100);
 const DOCUMENT_UPLOAD_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+pub(crate) fn validate_attachment_slots(attachments: &[Attachment]) -> Result<(), &'static str> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err("active attachments exceed the shared limit of 3");
+    }
+    let generated_indexes: Vec<usize> = attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, attachment)| attachment.generated_oversize_text.then_some(index))
+        .collect();
+    if attachments.len() - generated_indexes.len() > MAX_ATTACHMENTS - 1 {
+        return Err("ordinary attachments exceed the two-slot limit");
+    }
+    if generated_indexes.len() > 1 {
+        return Err("generated spill attachments exceed the reserved slot");
+    }
+    if generated_indexes
+        .first()
+        .is_some_and(|index| *index != attachments.len() - 1)
+    {
+        return Err("generated spill must occupy the reserved third attachment slot");
+    }
+    Ok(())
+}
+
 pub async fn prepare(
     account: &Account,
     conversation_id: &str,
     session_id: &str,
     attachments: &mut [Attachment],
 ) -> Result<(), ChatError> {
-    if attachments.len() > MAX_ATTACHMENTS {
-        return Err(protocol("active attachments exceed the shared limit of 3"));
-    }
+    validate_attachment_slots(attachments).map_err(protocol)?;
     for (index, attachment) in attachments.iter_mut().enumerate() {
         let generated_oversize_text = attachment.generated_oversize_text;
         let result = match attachment.kind.as_str() {
@@ -151,11 +174,9 @@ async fn upload_document_at(
             AttachmentFailureKind::GraphAuthorizationUnavailable,
         ));
     }
-    let spool = spool(&attachment.url, &attachment.mime_type, &attachment.name)
-        .await
-        .map_err(|_| {
-            attachment_failure(generated_oversize_text, AttachmentFailureKind::LocalSpool)
-        })?;
+    let spool = spool_attachment(attachment).await.map_err(|_| {
+        attachment_failure(generated_oversize_text, AttachmentFailureKind::LocalSpool)
+    })?;
     let transport_name = document_name(&spool.name, attachment.generated_oversize_text);
     validate_prepared_metadata(
         &transport_name,
@@ -508,7 +529,7 @@ async fn upload_image(
     index: usize,
     attachment: &mut Attachment,
 ) -> Result<(), ChatError> {
-    let spool = spool(&attachment.url, &attachment.mime_type, &attachment.name).await?;
+    let spool = spool_attachment(attachment).await?;
     let detected = image_mime(&spool.path)?;
     if !compatible_mime(&spool.mime_type, detected) {
         return Err(protocol("image MIME type does not match its bytes"));
@@ -658,17 +679,78 @@ fn image_form_body(path: &Path, size: u64, mime: &str) -> Result<(reqwest::Body,
     Ok((reqwest::Body::wrap_stream(body_stream), encoded_size))
 }
 
+#[derive(Clone, Copy)]
+enum SpoolOwnership {
+    Borrowed,
+    Temporary,
+}
+
 struct Spool {
     path: PathBuf,
     size: u64,
     mime_type: String,
     name: String,
+    ownership: SpoolOwnership,
 }
 
 impl Drop for Spool {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if matches!(self.ownership, SpoolOwnership::Temporary) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+async fn spool_attachment(attachment: &Attachment) -> Result<Spool, ChatError> {
+    let Some(source) = attachment.staged.as_ref() else {
+        return spool(&attachment.url, &attachment.mime_type, &attachment.name).await;
+    };
+    let mut file = tokio::fs::File::open(&source.path)
+        .await
+        .map_err(|_| protocol("staged attachment is unavailable"))?;
+    let initial = file
+        .metadata()
+        .await
+        .map_err(|_| protocol("staged attachment is unavailable"))?;
+    if !initial.is_file()
+        || initial.len() == 0
+        || initial.len() > MAX_BYTES
+        || initial.len() != source.size
+    {
+        return Err(protocol("staged attachment changed before preparation"));
+    }
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
+            .map_err(|_| protocol("staged attachment could not be verified"))?;
+        if count == 0 {
+            break;
+        }
+        size = size.saturating_add(count as u64);
+        hasher.update(&buffer[..count]);
+    }
+    let final_metadata = file
+        .metadata()
+        .await
+        .map_err(|_| protocol("staged attachment could not be verified"))?;
+    if !final_metadata.is_file()
+        || final_metadata.len() != source.size
+        || size != source.size
+        || format!("{:x}", hasher.finalize()) != source.sha256
+    {
+        return Err(protocol("staged attachment integrity check failed"));
+    }
+    Ok(Spool {
+        path: source.path.clone(),
+        size: source.size,
+        mime_type: attachment.mime_type.clone(),
+        name: attachment.name.clone(),
+        ownership: SpoolOwnership::Borrowed,
+    })
 }
 
 async fn spool(raw: &str, claimed_mime: &str, name: &str) -> Result<Spool, ChatError> {
@@ -740,6 +822,7 @@ fn spool_data(
             claimed_mime.to_owned()
         },
         name: name.to_owned(),
+        ownership: SpoolOwnership::Temporary,
     })
 }
 
@@ -839,6 +922,7 @@ async fn spool_remote(
             } else {
                 name.to_owned()
             },
+            ownership: SpoolOwnership::Temporary,
         });
     }
     Err(protocol("too many attachment redirects"))
@@ -1178,6 +1262,8 @@ struct ParentReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chathub::StagedAttachmentSource;
+    use sha2::{Digest, Sha256};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -1187,6 +1273,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum TestUploadFailure {
+        Success,
         CreateTransportUnknown,
         Create429,
         Create503,
@@ -1204,6 +1291,7 @@ mod tests {
         put_calls: AtomicUsize,
         status_calls: AtomicUsize,
         content_ranges: Mutex<Vec<String>>,
+        uploaded_bytes: Mutex<Vec<u8>>,
         upload_url: String,
     }
 
@@ -1223,6 +1311,7 @@ mod tests {
                 put_calls: AtomicUsize::new(0),
                 status_calls: AtomicUsize::new(0),
                 content_ranges: Mutex::new(Vec::new()),
+                uploaded_bytes: Mutex::new(Vec::new()),
                 upload_url: format!("http://{address}/upload"),
             });
             let task_state = Arc::clone(&state);
@@ -1283,15 +1372,17 @@ mod tests {
                 _ => {}
             }
         }
-        let body_read = request.len().saturating_sub(header_end);
+        let mut body = request[header_end..].to_vec();
+        let body_read = body.len();
         if body_read < content_length {
-            let mut body = vec![0_u8; content_length - body_read];
-            if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut body)
+            let mut rest = vec![0_u8; content_length - body_read];
+            if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut rest)
                 .await
                 .is_err()
             {
                 return;
             }
+            body.extend_from_slice(&rest);
         }
 
         if method == "POST" {
@@ -1341,6 +1432,7 @@ mod tests {
         }
 
         state.content_ranges.lock().unwrap().push(content_range);
+        state.uploaded_bytes.lock().unwrap().clone_from(&body);
         let call = state.put_calls.fetch_add(1, Ordering::SeqCst);
         if call == 0
             && matches!(
@@ -1476,6 +1568,91 @@ mod tests {
         assert!(name.starts_with("Quarterly report-"));
         assert!(name.ends_with(".pdf"));
         assert!(!name.contains('/'));
+    }
+
+    #[test]
+    fn document_name_preserves_the_current_known_extension_set() {
+        for extension in ["xlsx", "pptx", "pdf"] {
+            let name = document_name(&format!("sentinel.{extension}"), false);
+            assert!(name.ends_with(&format!(".{extension}")), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_unknown_attachment_uploads_exact_bytes_with_txt_transport_name() {
+        let server = TestUploadServer::start(TestUploadFailure::Success).await;
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("outlook-export.weird");
+        let bytes = b"unknown-extension sentinel bytes";
+        std::fs::write(&source_path, bytes).unwrap();
+        let mut attachment = Attachment {
+            kind: "file".to_owned(),
+            name: "outlook-export.weird".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            staged: Some(StagedAttachmentSource {
+                path: source_path,
+                size: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }),
+            ..Attachment::default()
+        };
+        let endpoint = format!("http://{}/v1.0", server.address);
+        upload_document_at(
+            &test_account(),
+            "conversation",
+            "session",
+            &mut attachment,
+            &endpoint,
+            validate_upload_url_for_test,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            server.state.uploaded_bytes.lock().unwrap().as_slice(),
+            bytes
+        );
+        assert!(attachment.transport_name.ends_with(".txt"));
+        assert_eq!(attachment.name, "outlook-export.weird");
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_integrity_is_checked_before_graph_upload() {
+        let server = TestUploadServer::start(TestUploadFailure::Success).await;
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("changed.txt");
+        let original = b"original";
+        std::fs::write(&source_path, b"tampered").unwrap();
+        let mut attachment = Attachment {
+            kind: "file".to_owned(),
+            name: "changed.txt".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            staged: Some(StagedAttachmentSource {
+                path: source_path,
+                size: original.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(original)),
+            }),
+            ..Attachment::default()
+        };
+        let endpoint = format!("http://{}/v1.0", server.address);
+        let result = upload_document_at(
+            &test_account(),
+            "conversation",
+            "session",
+            &mut attachment,
+            &endpoint,
+            validate_upload_url_for_test,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ChatError::Attachment {
+                failure: AttachmentFailureKind::LocalSpool,
+                ..
+            })
+        ));
+        assert_eq!(server.state.create_calls.load(Ordering::SeqCst), 0);
+        assert!(server.state.uploaded_bytes.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1764,6 +1941,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("shared limit of 3"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_attachment_count_reserves_the_generated_spill_slot() {
+        let mut attachments = vec![
+            Attachment {
+                kind: "file".to_owned(),
+                ..Attachment::default()
+            },
+            Attachment {
+                kind: "file".to_owned(),
+                ..Attachment::default()
+            },
+            Attachment {
+                kind: "file".to_owned(),
+                ..Attachment::default()
+            },
+        ];
+        let account = Account {
+            access_token: String::new(),
+            graph_access_token: String::new(),
+            oid: String::new(),
+            tid: String::new(),
+        };
+        let error = prepare(&account, "conversation", "session", &mut attachments)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ordinary attachments"));
     }
 
     #[test]

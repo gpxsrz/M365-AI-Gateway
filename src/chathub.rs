@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fmt,
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -119,7 +120,7 @@ pub struct Account {
     pub tid: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Attachment {
     #[serde(rename = "type")]
     pub kind: String,
@@ -141,6 +142,47 @@ pub struct Attachment {
     pub reference_url: String,
     #[serde(skip)]
     pub generated_oversize_text: bool,
+    #[serde(skip)]
+    pub(crate) staged: Option<StagedAttachmentSource>,
+}
+
+impl fmt::Debug for Attachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Attachment")
+            .field("kind", &self.kind)
+            .field("name", &self.name)
+            .field("mime_type", &self.mime_type)
+            .field("detail", &self.detail)
+            .field("url", &"<redacted>")
+            .field("doc_id", &"<redacted>")
+            .field("file_type", &"<redacted>")
+            .field("uploaded_conversation_id", &"<redacted>")
+            .field("uploaded_session_id", &"<redacted>")
+            .field("transport_name", &"<redacted>")
+            .field("reference_url", &"<redacted>")
+            .field("generated_oversize_text", &self.generated_oversize_text)
+            .field("staged", &self.staged.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct StagedAttachmentSource {
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
+}
+
+impl fmt::Debug for StagedAttachmentSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StagedAttachmentSource")
+            .field("path", &"<redacted>")
+            .field("size", &self.size)
+            .field("sha256", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,7 +289,7 @@ pub struct Tool {
     pub function: Value,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ChatRequest {
     pub text: String,
     pub tone: String,
@@ -268,7 +310,49 @@ pub struct ChatRequest {
     #[doc(hidden)]
     pub prepared_attachments: Arc<Mutex<PreparedAttachmentState>>,
     #[doc(hidden)]
+    pub(crate) native_attachment_manager:
+        Option<Arc<crate::hermes_attachments::NativeAttachmentManager>>,
+    #[doc(hidden)]
+    pub(crate) native_attachment_metadata: Vec<crate::hermes_attachments::NativeAttachmentMetadata>,
+    #[doc(hidden)]
+    pub(crate) native_attachment_stage_refs: Vec<String>,
+    #[doc(hidden)]
+    pub(crate) native_attachment_indices: Vec<usize>,
+    #[doc(hidden)]
     pub(crate) upstream_start: Option<UpstreamStartHook>,
+}
+
+impl fmt::Debug for ChatRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatRequest")
+            .field("text_utf16_units", &self.text.encode_utf16().count())
+            .field("tone", &self.tone)
+            .field("conversation_id", &"<redacted>")
+            .field("session_id", &"<redacted>")
+            .field("started", &self.started)
+            .field("attachments", &self.attachments)
+            .field("tools", &self.tools)
+            .field("tool_choice", &self.tool_choice)
+            .field("tool_call_limit", &self.tool_call_limit)
+            .field("outbound_text_limit_utf16", &self.outbound_text_limit_utf16)
+            .field("mcp_server_url", &"<redacted>")
+            .field("disable_built_in_search", &self.disable_built_in_search)
+            .field(
+                "native_attachment_manager",
+                &self.native_attachment_manager.is_some(),
+            )
+            .field(
+                "native_attachment_metadata_count",
+                &self.native_attachment_metadata.len(),
+            )
+            .field(
+                "native_attachment_stage_ref_count",
+                &self.native_attachment_stage_refs.len(),
+            )
+            .field("native_attachment_indices", &self.native_attachment_indices)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -327,6 +411,14 @@ fn same_attachment_sources(left: &[Attachment], right: &[Attachment]) -> bool {
             && left.mime_type == right.mime_type
             && left.detail == right.detail
             && left.generated_oversize_text == right.generated_oversize_text
+            && left
+                .staged
+                .as_ref()
+                .map(|source| (&source.path, source.size, &source.sha256))
+                == right
+                    .staged
+                    .as_ref()
+                    .map(|source| (&source.path, source.size, &source.sha256))
     })
 }
 
@@ -394,6 +486,8 @@ pub enum ChatError {
         message_text_units: usize,
         limit: usize,
     },
+    #[error("ChatHub serialized payload exceeds the UTF-16 limit ({wire_units} > {limit})")]
+    OutboundPayloadTooLarge { wire_units: usize, limit: usize },
     #[error("ChatHub protocol: {0}")]
     Protocol(String),
 }
@@ -572,6 +666,15 @@ async fn live_chat(
         &mut request.attachments,
     )
     .await?;
+    if let Some(manager) = request.native_attachment_manager.as_ref() {
+        manager.record_prepared(
+            &request.attachments,
+            &request.native_attachment_indices,
+            &request.native_attachment_stage_refs,
+            &request.conversation_id,
+            &request.session_id,
+        );
+    }
     record_prepared_attachments(&request);
     if reuses_generated_attachment {
         request
@@ -600,6 +703,15 @@ async fn live_chat(
     {
         return Err(ChatError::PayloadTooLarge {
             message_text_units,
+            limit: request.outbound_text_limit_utf16,
+        });
+    }
+    if request.outbound_text_limit_utf16 > 0
+        && wire_units > request.outbound_text_limit_utf16
+        && !native_attachment_manifest(&request).is_empty()
+    {
+        return Err(ChatError::OutboundPayloadTooLarge {
+            wire_units,
             limit: request.outbound_text_limit_utf16,
         });
     }
@@ -1254,19 +1366,19 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
             {
                 return None;
             }
-            match attachment.kind.as_str() {
+            let annotation = match attachment.kind.as_str() {
                 "file"
                     if !attachment.transport_name.is_empty()
                         && !attachment.reference_url.is_empty() =>
                 {
-                    Some(json!({
+                    json!({
                         "id":attachment.doc_id,
                         "text":attachment.transport_name,
                         "url":attachment.reference_url,
                         "messageAnnotationType":"LocalFile"
-                    }))
+                    })
                 }
-                "image" => Some(json!({
+                "image" => json!({
                     "id":attachment.doc_id,
                     "messageAnnotationMetadata": {
                         "@type":"File",
@@ -1275,9 +1387,10 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
                         "fileName":attachment.name,
                     },
                     "messageAnnotationType":"ImageFile"
-                })),
-                _ => None,
-            }
+                }),
+                _ => return None,
+            };
+            Some(annotation)
         })
         .collect::<Vec<_>>();
     if !annotations.is_empty() {
@@ -1312,6 +1425,12 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
     {
         argument["toolChoice"] = request.tool_choice.clone();
     }
+    let manifest = native_attachment_manifest(request);
+    if !manifest.is_empty() {
+        argument["extraExtensionParameters"] = json!({
+            "m365NativeAttachmentManifest": manifest,
+        });
+    }
     let chat = json!({
         "arguments": [argument],
         "invocationId": "0",
@@ -1331,6 +1450,31 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
         serde_json::to_string(&chat).map_err(|error| ChatError::Protocol(error.to_string()))?,
         serde_json::to_string(&metrics).map_err(|error| ChatError::Protocol(error.to_string()))?
     ))
+}
+
+fn native_attachment_manifest(request: &ChatRequest) -> Vec<Value> {
+    request
+        .native_attachment_metadata
+        .iter()
+        .zip(&request.native_attachment_indices)
+        .filter_map(|(metadata, index)| {
+            let attachment = request.attachments.get(*index)?;
+            let transport_name = if attachment.kind == "file" {
+                attachment.transport_name.clone()
+            } else {
+                attachment.name.clone()
+            };
+            Some(json!({
+                "originalFilename": metadata.original_filename,
+                "extension": metadata.extension,
+                "mimeType": metadata.mime_type,
+                "sha256": metadata.sha256,
+                "attachmentId": metadata.attachment_id,
+                "sourceMessageId": metadata.source_message_id,
+                "transportName": transport_name,
+            }))
+        })
+        .collect()
 }
 
 fn plugins(request: &ChatRequest) -> Vec<Value> {
@@ -2284,6 +2428,83 @@ mod tests {
     }
 
     #[test]
+    fn native_attachment_payload_uses_a_deterministic_manifest() {
+        let request = ChatRequest {
+            text: "read".to_owned(),
+            tone: DEFAULT_TONE.to_owned(),
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                name: "sentinel.xlsx".to_owned(),
+                mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_owned(),
+                doc_id: "SPO_ready".to_owned(),
+                transport_name: "sentinel-random.xlsx".to_owned(),
+                reference_url: "https://tenant.sharepoint.com/report".to_owned(),
+                uploaded_conversation_id: "conversation".to_owned(),
+                uploaded_session_id: "session".to_owned(),
+                ..Attachment::default()
+            }],
+            native_attachment_metadata: vec![crate::hermes_attachments::NativeAttachmentMetadata {
+                original_filename: "sentinel.xlsx".to_owned(),
+                extension: "xlsx".to_owned(),
+                mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_owned(),
+                sha256: "a".repeat(64),
+                attachment_id: "attachment-1".to_owned(),
+                source_message_id: "message-1".to_owned(),
+            }],
+            native_attachment_indices: vec![0],
+            ..ChatRequest::default()
+        };
+        let payload = chat_payload(&request, "request").unwrap();
+        assert!(payload.contains("m365NativeAttachmentManifest"));
+        assert!(payload.contains("sentinel.xlsx"));
+        assert!(payload.contains("attachment-1"));
+        assert!(!payload.contains("/private/staged/path"));
+        assert!(!payload.contains("stage-0000000000000001"));
+    }
+
+    #[test]
+    fn debug_output_redacts_native_attachment_capabilities_and_private_urls() {
+        let request = ChatRequest {
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                name: "native.txt".to_owned(),
+                url: "data:text/plain;base64,c2VjcmV0".to_owned(),
+                doc_id: "private-doc-id".to_owned(),
+                reference_url: "https://private.sharepoint.example/native".to_owned(),
+                staged: Some(StagedAttachmentSource {
+                    path: PathBuf::from("/private/hermes-native-attachments/blob"),
+                    size: 6,
+                    sha256: "a".repeat(64),
+                }),
+                ..Attachment::default()
+            }],
+            native_attachment_stage_refs: vec!["S".repeat(43)],
+            native_attachment_metadata: vec![crate::hermes_attachments::NativeAttachmentMetadata {
+                original_filename: "native.txt".to_owned(),
+                extension: "txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                sha256: "a".repeat(64),
+                attachment_id: "attachment-id".to_owned(),
+                source_message_id: "source-message-id".to_owned(),
+            }],
+            ..ChatRequest::default()
+        };
+        let debug = format!("{request:?}");
+        for secret in [
+            "private-doc-id",
+            "https://private.sharepoint.example/native",
+            "/private/hermes-native-attachments/blob",
+            &"S".repeat(43),
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}");
+        }
+    }
+
+    #[test]
     fn payload_fit_check_includes_ready_attachment_annotations() {
         let request = ChatRequest {
             text: "read".to_owned(),
@@ -2394,6 +2615,79 @@ mod tests {
         assert!(!started.load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn live_chat_checks_native_manifest_in_final_utf16_fit() {
+        let started = Arc::new(AtomicBool::new(false));
+        let started_for_hook = Arc::clone(&started);
+        let request = ChatRequest {
+            text: "x".repeat(127_000),
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![Attachment {
+                kind: "file".to_owned(),
+                name: "native.txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                doc_id: "SPO_native".to_owned(),
+                transport_name: "native.txt".to_owned(),
+                reference_url: "https://tenant.sharepoint.com/native".to_owned(),
+                uploaded_conversation_id: "conversation".to_owned(),
+                uploaded_session_id: "session".to_owned(),
+                ..Attachment::default()
+            }],
+            native_attachment_metadata: vec![crate::hermes_attachments::NativeAttachmentMetadata {
+                original_filename: "o".repeat(512),
+                extension: "e".repeat(64),
+                mime_type: "m".repeat(128),
+                sha256: "a".repeat(64),
+                attachment_id: "i".repeat(512),
+                source_message_id: "s".repeat(512),
+            }],
+            native_attachment_indices: vec![0],
+            outbound_text_limit_utf16: 128_000,
+            upstream_start: Some(UpstreamStartHook::new(move || {
+                started_for_hook.store(true, Ordering::Release);
+                Err(ChatError::Protocol("upstream start reached".to_owned()))
+            })),
+            ..ChatRequest::default()
+        };
+        let message_units = outbound_message_text(
+            &request.text,
+            &request.tools,
+            &request.tool_choice,
+            request.tool_call_limit,
+        )
+        .encode_utf16()
+        .count();
+        assert!(message_units <= request.outbound_text_limit_utf16);
+        assert!(outbound_payload_utf16_units(&request) > request.outbound_text_limit_utf16);
+
+        let account = Account {
+            access_token: "access".to_owned(),
+            graph_access_token: String::new(),
+            oid: "oid".to_owned(),
+            tid: "tid".to_owned(),
+        };
+        let mut sink = |_: StreamEvent| Ok(());
+        let result = live_chat(
+            account,
+            request,
+            false,
+            &mut sink,
+            prepare_attachments,
+            WS_BASE,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ChatError::OutboundPayloadTooLarge {
+                wire_units,
+                limit: 128_000,
+            }) if wire_units > 128_000
+        ));
+        assert!(!started.load(Ordering::Acquire));
+    }
+
     #[test]
     fn prepared_attachment_snapshot_is_reused_only_for_the_same_bound_request() {
         let source = Attachment {
@@ -2451,5 +2745,52 @@ mod tests {
             "conversation",
             "session",
         ));
+    }
+
+    #[test]
+    fn prepared_native_attachment_snapshot_is_reused_without_duplication() {
+        let source = Attachment {
+            kind: "file".to_owned(),
+            name: "sentinel.xlsx".to_owned(),
+            mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                .to_owned(),
+            staged: Some(StagedAttachmentSource {
+                path: PathBuf::from("/private/staged/sentinel.xlsx"),
+                size: 3,
+                sha256: "a".repeat(64),
+            }),
+            ..Attachment::default()
+        };
+        let mut request = ChatRequest {
+            conversation_id: "conversation".to_owned(),
+            session_id: "session".to_owned(),
+            attachments: vec![source.clone()],
+            ..ChatRequest::default()
+        };
+        request.attachments[0].doc_id = "SPO_native".to_owned();
+        request.attachments[0].transport_name = "sentinel-random.txt".to_owned();
+        request.attachments[0].reference_url = "https://tenant.sharepoint.com/sentinel".to_owned();
+        request.attachments[0].uploaded_conversation_id = "conversation".to_owned();
+        request.attachments[0].uploaded_session_id = "session".to_owned();
+        record_prepared_attachments(&request);
+
+        let mut followup = request.clone();
+        followup.attachments[0].doc_id.clear();
+        followup.attachments[0].transport_name.clear();
+        followup.attachments[0].reference_url.clear();
+        followup.attachments[0].uploaded_conversation_id.clear();
+        followup.attachments[0].uploaded_session_id.clear();
+        inherit_prepared_attachments(&mut followup);
+        assert_eq!(followup.attachments.len(), 1);
+        assert_eq!(followup.attachments[0].doc_id, "SPO_native");
+        assert_eq!(
+            followup.attachments[0].transport_name,
+            "sentinel-random.txt"
+        );
+        followup.attachments[0].staged.as_mut().unwrap().path =
+            PathBuf::from("/private/staged/changed.xlsx");
+        followup.attachments[0].doc_id.clear();
+        inherit_prepared_attachments(&mut followup);
+        assert!(followup.attachments[0].doc_id.is_empty());
     }
 }

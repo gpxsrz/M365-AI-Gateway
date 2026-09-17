@@ -42,6 +42,7 @@ pub mod config;
 mod debug;
 mod deployments;
 pub mod error;
+mod hermes_attachments;
 mod hindsight;
 mod images;
 mod mcp;

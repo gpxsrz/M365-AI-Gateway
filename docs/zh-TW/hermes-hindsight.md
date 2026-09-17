@@ -59,6 +59,18 @@ Hermes integration 使用 repo 內 versioned `integrations/hermes/m365_recall_pr
 
 Execution identity 缺失、wire key 衝突或 provenance 無法證明時，應在 Microsoft upstream 前 fail closed，而不是讓 middleware 例外或文字 marker 猜測決定安全性。
 
+## Native original attachment bridge
+
+Native original attachments 只在 Hermes M365 chat route 啟用，使用 versioned `m365-native-attachments` plugin；它依賴 `m365-recall-provenance`，載入順序必須是 `m365-recall-provenance` → `m365-native-attachments`，不可修改 Hermes core。
+
+- `m365_native_attach` 一次接受一或兩個原始本機附件；普通附件最多佔兩個 slot。
+- Full-context spill 使用保留的第三個 slot，產生的 deterministic UTF-8 `.txt` 是 transport projection，不會取代或丟棄原始附件。
+- Plugin 只讀 allowed root 內的 regular file，拒絕 symlink、空檔、超大檔與檔案變動；Gateway endpoint 必須使用 HTTPS。
+- 沒有常見副檔名時，`.txt` 可作為明確的 transport workaround：bytes 仍以 native attachment stage 傳送，副檔名／MIME 只作 bounded metadata，不把內容轉成 chat body。
+- Native path 不以 OCR、`openpyxl` 或 `python-pptx` 作 primary reader；model 對附件的回答仍需由原始附件獨立驗證。
+
+Deployment/runtime wiring 只設定名稱，不把值寫進 repo 或 log：`M365_HERMES_RECALL_PROVENANCE_SECRET`、`M365_HERMES_PROVIDER`、`M365_HERMES_GATEWAY_BASE_URL`、`M365_HERMES_ATTACHMENT_ALLOWED_ROOTS`。Generic `/v1` 與 `/memory/v1` 不接受 native attachment context。
+
 ## Tool continuation 與 duplicate effect
 
 Hermes transport ledger 可以辨識已完成的 exact tool call，避免同一 transport effect 被重送，並在需要時要求一次保留 caller 工具契約的 bounded continuation；只阻止被安全檢查拒絕的候選。若續接再次只收到不安全重播，非串流回 typed HTTP `409 unsafe_tool_replay`，串流送出同一錯誤代碼後結束；若原本是 `required` 或特定工具選擇而沒有合法 call，則回 `tool_choice_unsatisfied`。兩者都不接受成功 final 或 checkpoint。

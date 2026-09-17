@@ -77,6 +77,7 @@ pub struct Gateway {
     pub(crate) hermes_recall_provenance_secret: String,
     pub(crate) mcp: crate::mcp::Server,
     pub(crate) artifacts: crate::artifact::Store,
+    pub(crate) hermes_attachments: Arc<crate::hermes_attachments::NativeAttachmentManager>,
     pub(crate) deployments: crate::deployments::Store,
     pub(crate) debug: crate::debug::Store,
 }
@@ -100,6 +101,13 @@ impl Gateway {
         let checkpoints = CheckpointStore::open(config.data_dir.join("transport-checkpoints.json"))
             .map_err(|error| GatewayError::Storage(error.to_string()))?;
         let artifacts = crate::artifact::Store::open(config.data_dir.join("artifacts"))?;
+        let hermes_attachments =
+            Arc::new(crate::hermes_attachments::NativeAttachmentManager::open(
+                &config.data_dir,
+                env::var("M365_HERMES_RECALL_PROVENANCE_SECRET")
+                    .unwrap_or_default()
+                    .trim(),
+            )?);
         let deployments = crate::deployments::Store::open(&config.data_dir)?;
         let settings = crate::runtime_settings::Store::open(&config.data_dir, &config)?;
         let configured_debug_path = env::var("M365_DEBUG_LOG")
@@ -159,6 +167,7 @@ impl Gateway {
                 .to_owned(),
             mcp: crate::mcp::Server::default(),
             artifacts,
+            hermes_attachments,
             deployments,
             debug,
         })
@@ -233,6 +242,18 @@ impl Gateway {
             .route(
                 "/hermes/v1/chat/completions",
                 post(crate::protocol::chat_completions),
+            )
+            .route(
+                crate::hermes_attachments::STAGE_PATH,
+                post(crate::hermes_attachments::stage),
+            )
+            .route(
+                crate::hermes_attachments::RELEASE_PATH,
+                post(crate::hermes_attachments::release),
+            )
+            .route(
+                crate::hermes_attachments::TURN_PATH,
+                post(crate::hermes_attachments::turn),
             )
             .route(
                 "/memory/v1/chat/completions",
@@ -341,6 +362,13 @@ impl Gateway {
             return next.run(request).await;
         }
         if protocol_path(&path) {
+            if crate::hermes_attachments::stage_path(&path)
+                && gateway
+                    .hermes_attachments
+                    .auth_header_present(request.headers())
+            {
+                return next.run(request).await;
+            }
             if artifact_capability_token(&path) {
                 return next.run(request).await;
             }
@@ -2324,7 +2352,9 @@ fn token_cache_path(data_dir: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, http::Request};
+    use futures_util::stream;
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
     use super::*;
@@ -2427,9 +2457,15 @@ mod tests {
             settings_lifecycle: Mutex::new(()),
             checkpoints: CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap(),
             hindsight_webhook_secret: String::new(),
-            hermes_recall_provenance_secret: String::new(),
+            hermes_recall_provenance_secret: "test-recall-provenance-secret".to_owned(),
             mcp: crate::mcp::Server::default(),
             artifacts: crate::artifact::Store::open(root.join("artifacts")).unwrap(),
+            hermes_attachments: Arc::new(
+                crate::hermes_attachments::NativeAttachmentManager::open_for_test(
+                    &root,
+                    "test-recall-provenance-secret",
+                ),
+            ),
             deployments: crate::deployments::Store::open(&root).unwrap(),
             debug: crate::debug::Store::default(),
         })
@@ -2466,6 +2502,202 @@ mod tests {
         assert_eq!(value["auth"], serde_json::json!(["pkce"]));
         assert_eq!(value["chat"], "chathub");
         assert_eq!(value["accountConnected"], false);
+    }
+
+    #[tokio::test]
+    async fn hermes_stage_route_streams_a_file_larger_than_the_chat_body_cap() {
+        let gateway = gateway();
+        let size = 16 * 1024 * 1024 + 1;
+        let bytes = vec![b'X'; size];
+        let expected_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let session_key = "session-key";
+        let turn_id = "turn-1";
+        let mut turn_request = Request::post(crate::hermes_attachments::TURN_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        turn_request
+            .headers_mut()
+            .extend(
+                gateway
+                    .hermes_attachments
+                    .turn_headers_for_test(session_key, turn_id, "bind"),
+            );
+        let turn_response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(turn_request)
+            .await
+            .unwrap();
+        assert_eq!(turn_response.status(), StatusCode::OK);
+        let stage_headers =
+            gateway
+                .hermes_attachments
+                .stage_headers_for_test(session_key, turn_id, size as u64);
+        let mut stage_request = Request::post(crate::hermes_attachments::STAGE_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from_stream(stream::iter([Ok::<
+                _,
+                std::convert::Infallible,
+            >(
+                axum::body::Bytes::from(bytes),
+            )])))
+            .unwrap();
+        stage_request.headers_mut().extend(stage_headers);
+        let response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(stage_request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(value["schema"], "m365-hermes-native-attachment-stage/v2");
+        assert_eq!(value["size"], size);
+        assert_eq!(value["sha256"], expected_sha256);
+        let capability = value["capability"].as_str().unwrap().to_owned();
+        assert_eq!(capability.len(), 43);
+        assert!(gateway.artifacts.stat(&capability).is_err());
+        let mut context = crate::hermes_attachments::NativeAttachmentContext {
+            schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
+            session_key: session_key.to_owned(),
+            turn_id: turn_id.to_owned(),
+            attachments: vec![crate::hermes_attachments::NativeAttachmentReference {
+                stage_ref: capability.clone(),
+                size: size as u64,
+                sha256: expected_sha256.clone(),
+                original_filename: "large.synthetic".to_owned(),
+                extension: "synthetic".to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                attachment_id: String::new(),
+                source_message_id: String::new(),
+            }],
+            error: None,
+            signature: String::new(),
+        };
+        context.signature = gateway.hermes_attachments.context_signature(&context);
+        let resolved = gateway
+            .hermes_attachments
+            .resolve_context(&context, session_key, 0)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&resolved.attachments[0].staged.as_ref().unwrap().path)
+                .unwrap()
+                .len(),
+            size as u64
+        );
+        let debug = serde_json::to_string(&gateway.debug.records_for_test()).unwrap();
+        assert!(!debug.contains(&capability));
+        assert!(!debug.contains("test-recall-provenance-secret"));
+        assert!(!debug.contains("x-m365-hermes-attachment-secret"));
+
+        let release_headers = gateway.hermes_attachments.release_headers_for_test(
+            session_key,
+            turn_id,
+            std::slice::from_ref(&capability),
+        );
+        let mut release_request = Request::post(crate::hermes_attachments::RELEASE_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"stage_refs": [capability]}).to_string(),
+            ))
+            .unwrap();
+        release_request.headers_mut().extend(release_headers);
+        let released = Gateway::router(Arc::clone(&gateway))
+            .oneshot(release_request)
+            .await
+            .unwrap();
+        assert_eq!(released.status(), StatusCode::OK);
+        assert!(
+            gateway
+                .hermes_attachments
+                .resolve_context(&context, session_key, 0)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_turn_authority_rejects_a_replayed_previous_turn() {
+        let gateway = gateway();
+        let staged = gateway
+            .hermes_attachments
+            .stage_for_test("session-key", "turn-a", b"turn-a")
+            .await;
+        let mut context = crate::hermes_attachments::NativeAttachmentContext {
+            schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
+            session_key: "session-key".to_owned(),
+            turn_id: "turn-a".to_owned(),
+            attachments: vec![crate::hermes_attachments::NativeAttachmentReference {
+                stage_ref: staged.capability.clone(),
+                size: staged.size,
+                sha256: staged.sha256.clone(),
+                original_filename: "turn-a.txt".to_owned(),
+                extension: "txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                attachment_id: String::new(),
+                source_message_id: String::new(),
+            }],
+            error: None,
+            signature: String::new(),
+        };
+        context.signature = gateway.hermes_attachments.context_signature(&context);
+
+        let mut bind_request = Request::post(crate::hermes_attachments::TURN_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let mut end_request = Request::post(crate::hermes_attachments::TURN_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        end_request
+            .headers_mut()
+            .extend(gateway.hermes_attachments.turn_headers_for_test(
+                "session-key",
+                "turn-a",
+                "end",
+            ));
+        let end_response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(end_request)
+            .await
+            .unwrap();
+        assert_eq!(end_response.status(), StatusCode::OK);
+        bind_request
+            .headers_mut()
+            .extend(gateway.hermes_attachments.turn_headers_for_test(
+                "session-key",
+                "turn-b",
+                "bind",
+            ));
+        let response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(bind_request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let replay_body = b"replayed stage";
+        let mut replay_request = Request::post(crate::hermes_attachments::STAGE_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(replay_body.as_slice()))
+            .unwrap();
+        replay_request
+            .headers_mut()
+            .extend(gateway.hermes_attachments.stage_headers_for_test(
+                "session-key",
+                "turn-a",
+                replay_body.len() as u64,
+            ));
+        let replay_response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(replay_request)
+            .await
+            .unwrap();
+        assert_eq!(replay_response.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            gateway
+                .hermes_attachments
+                .resolve_context(&context, "session-key", 0),
+            Err(crate::hermes_attachments::FailureReason::NativeAttachmentBindingInvalid)
+        ));
     }
 
     #[tokio::test]

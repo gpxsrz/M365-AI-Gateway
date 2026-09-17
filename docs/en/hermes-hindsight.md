@@ -59,6 +59,18 @@ Core rules:
 
 Missing execution identity, conflicting wire identity, or unprovable provenance should fail closed before Microsoft upstream rather than relying on middleware exceptions or text markers.
 
+## Native original attachment bridge
+
+Native original attachments are enabled only on the Hermes M365 chat route through the versioned `m365-native-attachments` plugin. It requires `m365-recall-provenance`, with load order `m365-recall-provenance` → `m365-native-attachments`; Hermes core is not modified.
+
+- `m365_native_attach` accepts one or two original local attachments per call; ordinary attachments use at most two slots.
+- Full-context spill reserves the third slot and creates a deterministic UTF-8 `.txt` transport projection; it does not replace or discard an original attachment.
+- The plugin reads only regular files under the configured allowed roots and rejects symlinks, empty files, oversized files, and files that change while being read. The Gateway endpoint must use HTTPS.
+- When a source has no useful common extension, `.txt` may be used as an explicit transport workaround: the original bytes still travel through native attachment staging, while the extension/MIME are bounded metadata; content is not moved into the chat body.
+- The native path does not use OCR, `openpyxl`, or `python-pptx` as a primary reader. Answers about the attachment still require independent verification against the original bytes.
+
+Deployment/runtime wiring exposes names only; values must not enter the repository or logs: `M365_HERMES_RECALL_PROVENANCE_SECRET`, `M365_HERMES_PROVIDER`, `M365_HERMES_GATEWAY_BASE_URL`, and `M365_HERMES_ATTACHMENT_ALLOWED_ROOTS`. Generic `/v1` and `/memory/v1` reject native attachment context.
+
 ## Tool continuation and duplicate effects
 
 The Hermes transport ledger may recognize an already completed exact tool call, suppress the same transport effect, and request one bounded continuation that preserves the caller's tool contract when needed; only candidates rejected by the safety check are removed. If the continuation again receives only an unsafe replay, non-streaming returns typed HTTP `409 unsafe_tool_replay`; streaming emits the same error code and ends. If the original choice was `required` or a specific tool choice and no legal call is produced, it returns `tool_choice_unsatisfied`. Neither accepts a successful final or checkpoint.

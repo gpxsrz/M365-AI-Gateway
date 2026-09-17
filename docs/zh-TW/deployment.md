@@ -15,6 +15,8 @@ web/login.html
 web/debug.html
 ```
 
+Hermes Native Attachment Bridge 是同一 release 的 plugin/runtime wiring，不是 Hermes core 變更。Production 需要保留 `m365-recall-provenance`，再載入 `m365-native-attachments`；只配置以下環境變數名稱並由既有 secret/env 機制提供值：`M365_HERMES_RECALL_PROVENANCE_SECRET`、`M365_HERMES_PROVIDER`、`M365_HERMES_GATEWAY_BASE_URL`、`M365_HERMES_ATTACHMENT_ALLOWED_ROOTS`。Gateway base URL 必須是 HTTPS，allowed roots 必須限制在 Outlook KB 原始附件目錄；不要把值、credential 或 private path 放入 repo。
+
 Transport checkpoint / integrity state 是 private durable runtime state，**不是**公開 release artifact；但 rollback 必須尊重它的 schema與 exact predeploy presence/bytes。
 
 ## 可以部署前要先有什麼

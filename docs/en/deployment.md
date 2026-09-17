@@ -15,6 +15,8 @@ web/login.html
 web/debug.html
 ```
 
+The Hermes Native Attachment Bridge is plugin/runtime wiring in the same release unit; it does not modify Hermes core. Production must retain `m365-recall-provenance` before loading `m365-native-attachments`. Configure names only, with values supplied by the existing secret/env mechanism: `M365_HERMES_RECALL_PROVENANCE_SECRET`, `M365_HERMES_PROVIDER`, `M365_HERMES_GATEWAY_BASE_URL`, and `M365_HERMES_ATTACHMENT_ALLOWED_ROOTS`. The Gateway base URL must use HTTPS, and allowed roots must be restricted to the Outlook KB original-attachment directory; values, credentials, and private paths do not belong in the repository.
+
 Transport checkpoint/integrity state is private durable runtime state, **not** a public release artifact. A rollback still has to respect its schema and exact predeploy presence/bytes.
 
 ## Prerequisites before deployment

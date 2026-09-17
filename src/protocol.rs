@@ -32,6 +32,7 @@ use crate::{
         SpillReason, UpstreamAttempt, UpstreamResult,
     },
     error::openai_error,
+    hermes_attachments::{FailureReason, NativeAttachmentContext, NativeAttachmentMetadata},
     tool_calls::{ToolProjection, project as project_tool_calls},
     traffic::{TrafficLimits, WorkloadClass},
     web::{ApiKeyOwner, Gateway},
@@ -143,6 +144,9 @@ async fn execute_chat_request_inner(
         );
     }
     if let Some(response) = hermes_execution_identity_denial(&path, &mut body) {
+        return response;
+    }
+    if let Some(response) = native_attachment_denial(&path, &body) {
         return response;
     }
     clear_untracked_transport_identity(&path, &mut body);
@@ -356,7 +360,11 @@ async fn execute_chat_request_inner(
         }
     }
     let mut flattened = match flatten_messages(&prompt_messages) {
-        Ok(flattened) if !flattened.text.trim().is_empty() || !flattened.attachments.is_empty() => {
+        Ok(flattened)
+            if !flattened.text.trim().is_empty()
+                || !flattened.attachments.is_empty()
+                || body.native_attachment_context.is_some() =>
+        {
             flattened
         }
         Ok(_) => {
@@ -379,6 +387,25 @@ async fn execute_chat_request_inner(
     flattened
         .attachments
         .extend(std::mem::take(&mut body.legacy_attachments));
+    let mut native_attachment_metadata: Vec<NativeAttachmentMetadata> = Vec::new();
+    let mut native_attachment_stage_refs = Vec::new();
+    let mut native_attachment_indices = Vec::new();
+    if let Some(context) = body.native_attachment_context.as_ref() {
+        let native_start = flattened.attachments.len();
+        let native = match gateway.hermes_attachments.resolve_context(
+            context,
+            &body.session_key,
+            native_start,
+        ) {
+            Ok(native) => native,
+            Err(reason) => return native_attachment_failure(reason),
+        };
+        native_attachment_metadata = native.metadata;
+        native_attachment_stage_refs = native.stage_refs;
+        native_attachment_indices =
+            (native_start..native_start + native.attachments.len()).collect();
+        flattened.attachments.extend(native.attachments);
+    }
     let memory_request = path.starts_with("/memory/");
     let memory_caller_evidence = memory_request.then(|| flattened.text.clone());
     if memory_request {
@@ -406,6 +433,8 @@ async fn execute_chat_request_inner(
         tools: &body.tools,
         tool_choice: &body.tool_choice,
         tool_call_limit,
+        native_attachment_metadata: &native_attachment_metadata,
+        native_attachment_indices: &native_attachment_indices,
     };
     let received_text_units = utf16_units(&flattened.text);
     let message_text_before_units = transport_budget.message_text_units(&flattened.text);
@@ -537,6 +566,15 @@ async fn execute_chat_request_inner(
             },
             message_text_before_units,
             message_text_before_units,
+        );
+    }
+    if !native_attachment_stage_refs.is_empty() {
+        gateway.hermes_attachments.apply_prepared_cache(
+            &mut flattened.attachments,
+            &native_attachment_indices,
+            &native_attachment_stage_refs,
+            &body.conversation_id,
+            &body.session_id,
         );
     }
     transport_observation.inline_core_utf16 = utf16_units(&flattened.text);
@@ -748,6 +786,11 @@ async fn execute_chat_request_inner(
         prepared_attachments: Arc::new(std::sync::Mutex::new(
             crate::chathub::PreparedAttachmentState::default(),
         )),
+        native_attachment_manager: (!native_attachment_stage_refs.is_empty())
+            .then(|| Arc::clone(&gateway.hermes_attachments)),
+        native_attachment_metadata,
+        native_attachment_stage_refs,
+        native_attachment_indices,
         upstream_start: None,
     };
     trace.upstream_attempt(UpstreamAttempt::Initial);
@@ -1901,6 +1944,10 @@ enum ChatFailureClass<'a> {
         message_text_units: usize,
         limit: usize,
     },
+    FinalWireOverflow {
+        wire_units: usize,
+        limit: usize,
+    },
     Upstream,
 }
 
@@ -1973,7 +2020,9 @@ fn chat_error_telemetry_class(error: &ChatError) -> UpstreamResult {
         ChatError::RateLimited { .. } => UpstreamResult::RateLimited429,
         ChatError::ServiceUnavailable => UpstreamResult::ServiceUnavailable503,
         ChatError::Attachment { .. } => UpstreamResult::AttachmentError,
-        ChatError::PayloadTooLarge { .. } => UpstreamResult::ContextLength,
+        ChatError::PayloadTooLarge { .. } | ChatError::OutboundPayloadTooLarge { .. } => {
+            UpstreamResult::ContextLength
+        }
         ChatError::Terminal { message, .. } => {
             classify_upstream_text(message, UpstreamResult::TerminalError)
         }
@@ -2026,6 +2075,12 @@ fn classify_chat_failure<'a>(
             message_text_units: *message_text_units,
             limit: *limit,
         },
+        ChatError::OutboundPayloadTooLarge { wire_units, limit } => {
+            ChatFailureClass::FinalWireOverflow {
+                wire_units: *wire_units,
+                limit: *limit,
+            }
+        }
         _ => ChatFailureClass::Upstream,
     }
 }
@@ -2077,6 +2132,58 @@ fn outbound_message_text_overflow_value(
             "limit_type": "outbound_message_text_utf16",
             "limit": limit,
             "received": message_text_units,
+        }),
+    );
+    value
+}
+
+fn outbound_wire_overflow_value(
+    wire_units: usize,
+    limit: usize,
+    overflow_context: Option<&OverflowContext>,
+) -> Value {
+    let Some(context) = overflow_context else {
+        return json!({
+            "error": {
+                "message": "the serialized outbound payload exceeds the UTF-16 limit after native attachment metadata",
+                "type": "invalid_request_error",
+                "code": "text_input_too_large",
+                "limit_type": "outbound_wire_utf16",
+                "limit": limit,
+                "received": wire_units,
+                "retryable": false,
+                "retryable_after_reduction": true,
+                "spill_attempted": false,
+                "spill_reason": "cannot_fit_inline",
+                "recommended_action": "reduce_input_or_start_a_new_user_turn"
+            }
+        });
+    };
+    let spill_reason = context
+        .spill_reason
+        .map(SpillReason::as_str)
+        .unwrap_or(SpillReason::CannotFitInline.as_str());
+    let mut value = overflow_value(
+        context,
+        "text_input_too_large",
+        spill_reason,
+        "輸入文字與 native 附件 metadata 準備後的最終封包仍超過 UTF-16 上限",
+        "reduce_input_or_start_a_new_user_turn",
+    );
+    let error = value
+        .get_mut("error")
+        .and_then(Value::as_object_mut)
+        .expect("overflow value always contains an error object");
+    error.insert(
+        "fallback_reason".to_owned(),
+        Value::String(SpillReason::CannotFitInline.as_str().to_owned()),
+    );
+    error.insert(
+        "final_outbound".to_owned(),
+        json!({
+            "limit_type": "outbound_wire_utf16",
+            "limit": limit,
+            "received": wire_units,
         }),
     );
     value
@@ -2153,6 +2260,18 @@ fn chat_error_with_overflow(
                 StatusCode::BAD_REQUEST,
                 Json(outbound_message_text_overflow_value(
                     message_text_units,
+                    limit,
+                    overflow_context,
+                )),
+            )
+                .into_response()
+        }
+        ChatFailureClass::FinalWireOverflow { wire_units, limit } => {
+            permit.finish(StatusCode::BAD_REQUEST, None);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(outbound_wire_overflow_value(
+                    wire_units,
                     limit,
                     overflow_context,
                 )),
@@ -2238,6 +2357,15 @@ fn send_stream_chat_error(
             let sent = send_sse(
                 sender,
                 outbound_message_text_overflow_value(message_text_units, limit, overflow_context),
+            );
+            trace.caller_delivery(stream_error_delivery(sender, sent));
+            sent
+        }
+        ChatFailureClass::FinalWireOverflow { wire_units, limit } => {
+            permit.finish(StatusCode::BAD_REQUEST, None);
+            let sent = send_sse(
+                sender,
+                outbound_wire_overflow_value(wire_units, limit, overflow_context),
             );
             trace.caller_delivery(stream_error_delivery(sender, sent));
             sent
@@ -2753,6 +2881,8 @@ pub(crate) struct ChatCompletionRequest {
     pub(crate) execution_control_provenance: Option<ExecutionControlProvenance>,
     #[serde(default, rename = "m365_execution_identity_error")]
     pub(crate) execution_identity_error: Option<Value>,
+    #[serde(default, rename = "m365_native_attachment_context")]
+    pub(crate) native_attachment_context: Option<NativeAttachmentContext>,
     #[serde(skip)]
     pub(crate) legacy_attachments: Vec<Attachment>,
     #[serde(skip)]
@@ -3043,6 +3173,24 @@ fn internal_qualification_request(
         final_wire_utf16: Arc::new(AtomicUsize::new(0)),
         prepared_attachments: base.prepared_attachments.clone(),
         outbound_text_limit_utf16: base.outbound_text_limit_utf16,
+        native_attachment_manager: keep_attachments
+            .then(|| base.native_attachment_manager.clone())
+            .flatten(),
+        native_attachment_metadata: if keep_attachments {
+            base.native_attachment_metadata.clone()
+        } else {
+            Vec::new()
+        },
+        native_attachment_stage_refs: if keep_attachments {
+            base.native_attachment_stage_refs.clone()
+        } else {
+            Vec::new()
+        },
+        native_attachment_indices: if keep_attachments {
+            base.native_attachment_indices.clone()
+        } else {
+            Vec::new()
+        },
         upstream_start: None,
     }
 }
@@ -4137,6 +4285,33 @@ fn hermes_execution_identity_denial(
     ))
 }
 
+fn native_attachment_denial(path: &str, body: &ChatCompletionRequest) -> Option<Response> {
+    body.native_attachment_context.as_ref()?;
+    if path != "/hermes/v1/chat/completions" {
+        return Some(native_attachment_failure(
+            FailureReason::NativeAttachmentsNotAllowed,
+        ));
+    }
+    None
+}
+
+fn native_attachment_failure(reason: FailureReason) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": {
+                "type": "invalid_state_error",
+                "code": reason.code(),
+                "message": reason.message(),
+                "retryable": false,
+                "retryable_after_reduction": false,
+                "recommended_action": "repair_native_attachment_state_or_start_a_new_user_turn"
+            }
+        })),
+    )
+        .into_response()
+}
+
 fn clear_untracked_transport_identity(path: &str, body: &mut ChatCompletionRequest) {
     if path == "/v1/chat/completions" || path.starts_with("/memory/v1/") {
         body.conversation_id.clear();
@@ -4218,6 +4393,8 @@ struct TransportBudget<'a> {
     tools: &'a [Tool],
     tool_choice: &'a Value,
     tool_call_limit: usize,
+    native_attachment_metadata: &'a [NativeAttachmentMetadata],
+    native_attachment_indices: &'a [usize],
 }
 
 impl TransportBudget<'_> {
@@ -4240,6 +4417,8 @@ impl TransportBudget<'_> {
             tools: self.tools.to_vec(),
             tool_choice: self.tool_choice.clone(),
             tool_call_limit: self.tool_call_limit,
+            native_attachment_metadata: self.native_attachment_metadata.to_vec(),
+            native_attachment_indices: self.native_attachment_indices.to_vec(),
             outbound_text_limit_utf16: self.limit,
             ..ChatRequest::default()
         };
@@ -4479,6 +4658,8 @@ fn spill_oversized_bulk_text(
         tools,
         tool_choice,
         tool_call_limit,
+        native_attachment_metadata: &[],
+        native_attachment_indices: &[],
     };
     spill_oversized_bulk_text_with_budget(messages, flattened, recalled_source, &budget)
 }
@@ -4610,6 +4791,8 @@ fn spill_full_context_document(
         tools,
         tool_choice,
         tool_call_limit,
+        native_attachment_metadata: &[],
+        native_attachment_indices: &[],
     };
     spill_full_context_document_with_budget(messages, flattened, &budget, context_scope)
 }
@@ -5216,10 +5399,7 @@ fn file_attachment(part: &Value) -> Result<Attachment, &'static str> {
 }
 
 fn validate_attachments(attachments: &[Attachment]) -> Result<(), &'static str> {
-    if attachments.len() > crate::attachment::MAX_ATTACHMENTS {
-        return Err("active attachments exceed the shared limit of 3");
-    }
-    Ok(())
+    crate::attachment::validate_attachment_slots(attachments)
 }
 
 fn validate_attachment_url(raw: &str) -> Result<(), &'static str> {
@@ -5490,6 +5670,7 @@ mod tests {
         },
         chathub::{Attachment, ChatFuture, ChatHubTransport, ChatResult, EventSink, LiveChatHub},
         checkpoint::CheckpointStore,
+        hermes_attachments::{NativeAttachmentContext, NativeAttachmentReference},
         oauth_flow::PkceManager,
     };
 
@@ -6034,6 +6215,8 @@ mod tests {
             tools: &tools,
             tool_choice: &tool_choice,
             tool_call_limit: 1,
+            native_attachment_metadata: &[],
+            native_attachment_indices: &[],
         };
         let (spilled, reason) = spill_full_context_document_with_budget(
             &messages,
@@ -6061,6 +6244,10 @@ mod tests {
             final_message_text_utf16: Arc::new(AtomicUsize::new(0)),
             final_wire_utf16: Arc::new(AtomicUsize::new(0)),
             prepared_attachments,
+            native_attachment_manager: None,
+            native_attachment_metadata: Vec::new(),
+            native_attachment_stage_refs: Vec::new(),
+            native_attachment_indices: Vec::new(),
             upstream_start: None,
         }
     }
@@ -6319,6 +6506,43 @@ mod tests {
         (Gateway::router(gateway), raw_key)
     }
 
+    async fn staged_native_context(
+        gateway: &Gateway,
+        session_key: &str,
+        turn_id: &str,
+        filename: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> NativeAttachmentContext {
+        let staged = gateway
+            .hermes_attachments
+            .stage_for_test(session_key, turn_id, bytes)
+            .await;
+        let mut context = NativeAttachmentContext {
+            schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
+            session_key: session_key.to_owned(),
+            turn_id: turn_id.to_owned(),
+            attachments: vec![NativeAttachmentReference {
+                stage_ref: staged.capability,
+                original_filename: filename.to_owned(),
+                size: staged.size,
+                sha256: staged.sha256,
+                extension: filename
+                    .rsplit_once('.')
+                    .map(|(_, extension)| extension)
+                    .unwrap_or_default()
+                    .to_owned(),
+                mime_type: mime_type.to_owned(),
+                attachment_id: format!("attachment-{filename}"),
+                source_message_id: "message-synthetic".to_owned(),
+            }],
+            error: None,
+            signature: String::new(),
+        };
+        context.signature = gateway.hermes_attachments.context_signature(&context);
+        context
+    }
+
     fn signed_recall_provenance(
         message_index: usize,
         clean_prefix: &str,
@@ -6510,6 +6734,12 @@ mod tests {
             hermes_recall_provenance_secret: "test-recall-provenance-secret".to_owned(),
             mcp: crate::mcp::Server::default(),
             artifacts: crate::artifact::Store::open(root.join("artifacts")).unwrap(),
+            hermes_attachments: Arc::new(
+                crate::hermes_attachments::NativeAttachmentManager::open_for_test(
+                    &root,
+                    "test-recall-provenance-secret",
+                ),
+            ),
             deployments: crate::deployments::Store::open(&root).unwrap(),
             debug: crate::debug::Store::open(
                 root.join("debug-telemetry.jsonl"),
@@ -9566,6 +9796,35 @@ mod tests {
     }
 
     #[test]
+    fn completed_tool_answer_continuation_retains_native_attachment_once() {
+        let native = Attachment {
+            kind: "file".to_owned(),
+            name: "sentinel.xlsx".to_owned(),
+            staged: Some(crate::chathub::StagedAttachmentSource {
+                path: PathBuf::from("/private/staged/sentinel.xlsx"),
+                size: 3,
+                sha256: "a".repeat(64),
+            }),
+            ..Attachment::default()
+        };
+        let request = ChatRequest {
+            text: "continue".to_owned(),
+            attachments: vec![native.clone()],
+            ..ChatRequest::default()
+        };
+        let answer = completed_tool_answer_request(
+            &request,
+            &ChatResult::default(),
+            &crate::agent_ledger::AgentLedger::default(),
+            128_000,
+        )
+        .expect("native attachment continuation should remain fit");
+        assert_eq!(answer.attachments.len(), 1);
+        assert_eq!(answer.attachments[0].name, native.name);
+        assert_eq!(answer.attachments[0].staged, native.staged);
+    }
+
+    #[test]
     fn internal_qualification_request_drops_checkpoint_start_hook() {
         let request = ChatRequest {
             upstream_start: Some(crate::chathub::UpstreamStartHook::new(|| Ok(()))),
@@ -9576,6 +9835,32 @@ mod tests {
             internal_qualification_request(&request, "validate this response".to_owned(), false);
 
         assert!(qualification.upstream_start.is_none());
+    }
+
+    #[test]
+    fn final_qualification_drops_native_attachments_when_keep_is_false() {
+        let native = Attachment {
+            kind: "file".to_owned(),
+            name: "native.txt".to_owned(),
+            staged: Some(crate::chathub::StagedAttachmentSource {
+                path: PathBuf::from("/private/staged/native.txt"),
+                size: 1,
+                sha256: "a".repeat(64),
+            }),
+            ..Attachment::default()
+        };
+        let ordinary = Attachment {
+            kind: "file".to_owned(),
+            name: "ordinary.txt".to_owned(),
+            ..Attachment::default()
+        };
+        let request = ChatRequest {
+            attachments: vec![native.clone(), ordinary],
+            ..ChatRequest::default()
+        };
+        let qualification =
+            internal_qualification_request(&request, "validate this response".to_owned(), false);
+        assert!(qualification.attachments.is_empty());
     }
 
     fn completed_duplicate_request(stream: bool, user_length: usize) -> Value {
@@ -11835,9 +12120,12 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
                 .unwrap();
-        assert_eq!(body["error"]["code"], "text_input_too_large");
-        assert_eq!(body["error"]["spill_reason"], "attachment_slots_full");
-        assert_eq!(body["error"]["spill_attempted"], true);
+        assert_eq!(body["error"]["code"], "invalid_messages");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("ordinary attachments"))
+        );
         assert!(chat.0.lock().unwrap().is_none());
     }
 
@@ -12559,6 +12847,94 @@ mod tests {
     }
 
     #[test]
+    fn two_native_attachments_leave_the_spill_slot_available() {
+        let messages = vec![OpenAiMessage::text("user", "A".repeat(128_100))];
+        let flattened = FlattenedMessages {
+            text: "A".repeat(128_100),
+            attachments: vec![
+                Attachment {
+                    kind: "file".to_owned(),
+                    name: "sentinel.xlsx".to_owned(),
+                    ..Attachment::default()
+                },
+                Attachment {
+                    kind: "file".to_owned(),
+                    name: "notes.unknown".to_owned(),
+                    ..Attachment::default()
+                },
+            ],
+            generated_document_bytes: 0,
+            generated_document_message_count: 0,
+            usage_input_utf16_units: 128_100,
+            usage_estimate_scope: UsageEstimateScope::VisibleRequestAndCompletion,
+        };
+        let (spilled, reason) = spill_oversized_bulk_text(
+            &messages,
+            &flattened,
+            128_000,
+            None,
+            &[],
+            &Value::String("none".to_owned()),
+            1,
+        )
+        .expect("two native files must preserve the third spill slot");
+        assert_eq!(reason, SpillReason::SafeBulkCandidate);
+        assert_eq!(
+            spilled.attachments.len(),
+            crate::attachment::MAX_ATTACHMENTS
+        );
+        assert!(spilled.attachments[2].generated_oversize_text);
+        assert!(spilled.attachments[2].name.ends_with(".txt"));
+    }
+
+    #[test]
+    fn existing_image_and_native_attachment_leave_the_spill_slot_available() {
+        let messages = vec![OpenAiMessage::text("user", "A".repeat(128_100))];
+        let flattened = FlattenedMessages {
+            text: "A".repeat(128_100),
+            attachments: vec![
+                Attachment {
+                    kind: "image".to_owned(),
+                    name: "sentinel.png".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                    ..Attachment::default()
+                },
+                Attachment {
+                    kind: "file".to_owned(),
+                    name: "sentinel.xlsx".to_owned(),
+                    staged: Some(crate::chathub::StagedAttachmentSource {
+                        path: PathBuf::from("/private/staged/sentinel.xlsx"),
+                        size: 3,
+                        sha256: "a".repeat(64),
+                    }),
+                    ..Attachment::default()
+                },
+            ],
+            generated_document_bytes: 0,
+            generated_document_message_count: 0,
+            usage_input_utf16_units: 128_100,
+            usage_estimate_scope: UsageEstimateScope::VisibleRequestAndCompletion,
+        };
+        let (spilled, _) = spill_oversized_bulk_text(
+            &messages,
+            &flattened,
+            128_000,
+            None,
+            &[],
+            &Value::String("none".to_owned()),
+            1,
+        )
+        .expect("an image plus one native file must preserve the spill slot");
+        assert_eq!(
+            spilled.attachments.len(),
+            crate::attachment::MAX_ATTACHMENTS
+        );
+        assert_eq!(spilled.attachments[0].kind, "image");
+        assert!(spilled.attachments[1].staged.is_some());
+        assert!(spilled.attachments[2].generated_oversize_text);
+    }
+
+    #[test]
     fn bulk_spill_skips_a_negative_gain_short_message() {
         let messages = vec![
             OpenAiMessage::text("system", "S".repeat(127_000)),
@@ -13033,6 +13409,64 @@ mod tests {
             anthropic["content"][0]["text"],
             "Deployment completed successfully."
         );
+    }
+
+    #[tokio::test]
+    async fn generic_compat_surfaces_reject_native_attachment_context() {
+        let native_context = json!({
+            "schema": "m365-hermes-native-attachment-context/v1",
+            "session_key": "session",
+            "turn_id": "turn",
+            "attachments": [],
+            "signature": "sha256=not-for-this-route"
+        });
+        let (responses_app, responses_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
+        let responses = responses_app
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("x-api-key", responses_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "input":"should be rejected",
+                            "m365_native_attachment_context":native_context
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(responses.status(), StatusCode::BAD_REQUEST);
+        let responses: Value =
+            serde_json::from_slice(&to_bytes(responses.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(responses["error"]["code"], "native_attachments_not_allowed");
+
+        let (anthropic_app, anthropic_key) = app_with_chat(Arc::new(UnsupportedSuccessTransport));
+        let anthropic = anthropic_app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("x-api-key", anthropic_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"claude-sonnet",
+                            "messages":[{"role":"user","content":"should be rejected"}],
+                            "m365_native_attachment_context":native_context
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anthropic.status(), StatusCode::BAD_REQUEST);
+        let anthropic: Value =
+            serde_json::from_slice(&to_bytes(anthropic.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(anthropic["error"]["code"], "native_attachments_not_allowed");
     }
 
     #[tokio::test]
@@ -14914,6 +15348,321 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn hermes_native_stage_reference_reaches_the_existing_chat_request_seam() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let bytes = b"\x89PNG\r\n\x1a\nsynthetic-sentinel";
+        let context = staged_native_context(
+            &gateway,
+            "session-key",
+            "turn-1",
+            "sentinel.png",
+            "image/png",
+            bytes,
+        )
+        .await;
+        let body = ChatCompletionRequest {
+            model: "gpt-5.6-terra".to_owned(),
+            messages: vec![OpenAiMessage::text("user", "inspect the image")],
+            session_key: "session-key".to_owned(),
+            native_attachment_context: Some(context),
+            ..ChatCompletionRequest::default()
+        };
+        let response = execute_chat_request(
+            gateway,
+            "/hermes/v1/chat/completions".to_owned(),
+            "owner".to_owned(),
+            String::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = chat
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("native reference must reach the shared chat seam");
+        assert_eq!(captured.attachments.len(), 1);
+        let attachment = &captured.attachments[0];
+        assert_eq!(attachment.kind, "image");
+        assert_eq!(attachment.url, "");
+        assert_eq!(attachment.name, "sentinel.png");
+        assert!(attachment.staged.is_some());
+    }
+
+    #[tokio::test]
+    async fn generic_route_rejects_hermes_native_references_before_upstream() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        for path in ["/v1/chat/completions", "/memory/v1/chat/completions"] {
+            let body = ChatCompletionRequest {
+                model: "gpt-5.6-terra".to_owned(),
+                messages: vec![OpenAiMessage::text("user", "not allowed")],
+                native_attachment_context: Some(NativeAttachmentContext {
+                    schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
+                    session_key: "session-key".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    attachments: Vec::new(),
+                    error: None,
+                    signature: String::new(),
+                }),
+                ..ChatCompletionRequest::default()
+            };
+            let response = execute_chat_request(
+                Arc::clone(&gateway),
+                path.to_owned(),
+                "owner".to_owned(),
+                String::new(),
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "path={path}");
+            assert!(chat.0.lock().unwrap().is_none(), "path={path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_native_capability_fails_before_microsoft_upstream() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        gateway
+            .hermes_attachments
+            .bind_turn_for_test("session-key", "turn-1");
+        let mut context = NativeAttachmentContext {
+            schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
+            session_key: "session-key".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            attachments: vec![NativeAttachmentReference {
+                stage_ref: "a".repeat(43),
+                original_filename: "sentinel.xlsx".to_owned(),
+                extension: "xlsx".to_owned(),
+                mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_owned(),
+                size: 1,
+                sha256: "a".repeat(64),
+                attachment_id: "attachment-1".to_owned(),
+                source_message_id: "message-1".to_owned(),
+            }],
+            error: None,
+            signature: String::new(),
+        };
+        context.signature = gateway.hermes_attachments.context_signature(&context);
+        let response = execute_chat_request(
+            Arc::clone(&gateway),
+            "/hermes/v1/chat/completions".to_owned(),
+            "owner".to_owned(),
+            String::new(),
+            ChatCompletionRequest {
+                model: "gpt-5.6-terra".to_owned(),
+                messages: vec![OpenAiMessage::text("user", "inspect")],
+                session_key: "session-key".to_owned(),
+                native_attachment_context: Some(context),
+                ..ChatCompletionRequest::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response_body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(
+            value["error"]["code"],
+            "native_attachment_capability_invalid_or_expired"
+        );
+        assert!(chat.0.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn hermes_native_failure_markers_fail_closed_before_microsoft_upstream() {
+        for reason in [
+            "native_attachment_state_lost",
+            "native_attachment_binding_invalid",
+            "native_attachment_context_malformed",
+            "native_attachment_capability_invalid_or_expired",
+            "native_attachment_slot_conflict",
+            "native_attachment_integrity_failed",
+            "native_attachments_not_allowed",
+        ] {
+            let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+            let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+            let mut context = NativeAttachmentContext {
+                schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
+                session_key: "session-key".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                attachments: Vec::new(),
+                error: Some(reason.to_owned()),
+                signature: String::new(),
+            };
+            context.signature = gateway.hermes_attachments.context_signature(&context);
+            let body = ChatCompletionRequest {
+                model: "gpt-5.6-terra".to_owned(),
+                messages: vec![OpenAiMessage::text("user", "attachment task")],
+                session_key: "session-key".to_owned(),
+                native_attachment_context: Some(context),
+                ..ChatCompletionRequest::default()
+            };
+            let response = execute_chat_request(
+                gateway,
+                "/hermes/v1/chat/completions".to_owned(),
+                "owner".to_owned(),
+                String::new(),
+                body,
+            )
+            .await;
+            let response_body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let value: Value = serde_json::from_slice(&response_body).unwrap();
+            assert_eq!(value["error"]["code"], reason, "reason={reason}");
+            assert_eq!(value["error"]["retryable"], false, "reason={reason}");
+            assert_eq!(
+                value["error"]["retryable_after_reduction"], false,
+                "reason={reason}"
+            );
+            assert!(chat.0.lock().unwrap().is_none(), "reason={reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hermes_native_attachment_respects_existing_slots_and_supports_streaming_modes() {
+        let (oauth_config, token_server) = oauth_with_graph_token_server().await;
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth_config);
+        let native = staged_native_context(
+            &gateway,
+            "session-key",
+            "turn-1",
+            "native.txt",
+            "text/plain",
+            b"native sentinel",
+        )
+        .await;
+        let existing_image = Attachment {
+            kind: "image".to_owned(),
+            url: "data:image/png;base64,iVBORw0KGgo=".to_owned(),
+            name: "existing.png".to_owned(),
+            mime_type: "image/png".to_owned(),
+            ..Attachment::default()
+        };
+        let response = execute_chat_request(
+            Arc::clone(&gateway),
+            "/hermes/v1/chat/completions".to_owned(),
+            "owner".to_owned(),
+            String::new(),
+            ChatCompletionRequest {
+                model: "gpt-5.6-terra".to_owned(),
+                messages: vec![OpenAiMessage::text("user", "inspect")],
+                session_key: "session-key".to_owned(),
+                native_attachment_context: Some(native.clone()),
+                legacy_attachments: vec![existing_image.clone()],
+                ..ChatCompletionRequest::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = chat.0.lock().unwrap().take().unwrap();
+        assert_eq!(captured.attachments.len(), 2);
+        assert_eq!(captured.attachments[1].name, "native.txt");
+
+        let response = execute_chat_request(
+            Arc::clone(&gateway),
+            "/hermes/v1/chat/completions".to_owned(),
+            "owner".to_owned(),
+            String::new(),
+            ChatCompletionRequest {
+                model: "gpt-5.6-terra".to_owned(),
+                messages: vec![OpenAiMessage::text("user", "inspect")],
+                session_key: "session-key".to_owned(),
+                native_attachment_context: Some(native.clone()),
+                legacy_attachments: vec![
+                    existing_image.clone(),
+                    Attachment {
+                        kind: "file".to_owned(),
+                        url: "https://files.example.invalid/existing.txt".to_owned(),
+                        name: "existing.txt".to_owned(),
+                        mime_type: "text/plain".to_owned(),
+                        ..Attachment::default()
+                    },
+                ],
+                ..ChatCompletionRequest::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(chat.0.lock().unwrap().is_none());
+
+        let second_staged = gateway
+            .hermes_attachments
+            .stage_for_test("session-key", "turn-1", b"second native")
+            .await;
+        let mut two_native = native;
+        two_native.attachments.push(NativeAttachmentReference {
+            stage_ref: second_staged.capability,
+            size: second_staged.size,
+            sha256: second_staged.sha256,
+            original_filename: "second-native.txt".to_owned(),
+            extension: "txt".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            attachment_id: "attachment-second-native".to_owned(),
+            source_message_id: "message-second-native".to_owned(),
+        });
+        two_native.signature = gateway.hermes_attachments.context_signature(&two_native);
+        let response = execute_chat_request(
+            Arc::clone(&gateway),
+            "/hermes/v1/chat/completions".to_owned(),
+            "owner".to_owned(),
+            String::new(),
+            ChatCompletionRequest {
+                model: "gpt-5.6-terra".to_owned(),
+                messages: vec![OpenAiMessage::text("user", "inspect")],
+                session_key: "session-key".to_owned(),
+                native_attachment_context: Some(two_native),
+                legacy_attachments: vec![existing_image],
+                ..ChatCompletionRequest::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(chat.0.lock().unwrap().is_none());
+        token_server.abort();
+
+        for stream in [false, true] {
+            let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+            let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+            let native = staged_native_context(
+                &gateway,
+                "session-key",
+                "turn-1",
+                "native.png",
+                "image/png",
+                b"\x89PNG\r\n\x1a\nsentinel",
+            )
+            .await;
+            let response = execute_chat_request(
+                gateway,
+                "/hermes/v1/chat/completions".to_owned(),
+                "owner".to_owned(),
+                String::new(),
+                ChatCompletionRequest {
+                    model: "gpt-5.6-terra".to_owned(),
+                    messages: vec![OpenAiMessage::text("user", "inspect")],
+                    stream,
+                    session_key: "session-key".to_owned(),
+                    native_attachment_context: Some(native),
+                    ..ChatCompletionRequest::default()
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+            let response_body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            if stream {
+                assert!(String::from_utf8_lossy(&response_body).contains("[DONE]"));
+            }
+            let captured = chat.0.lock().unwrap().clone().unwrap();
+            assert_eq!(captured.attachments.len(), 1, "stream={stream}");
+            assert_eq!(captured.attachments[0].name, "native.png");
+        }
     }
 
     #[test]
