@@ -32,13 +32,16 @@ class FakeContext:
 
 class RecallProvenanceTests(unittest.TestCase):
     def setUp(self):
-        plugin._forget("session", "turn")
+        with plugin._lock:
+            plugin._turns.clear()
+            plugin._routes.clear()
         self.execution_identity = "execution-session"
         self.environment = patch.dict(
             os.environ,
             {
                 "M365_HERMES_RECALL_PROVENANCE_SECRET": "test-secret",
                 "M365_HERMES_PROVIDER": "m365",
+                "M365_HERMES_GATEWAY_BASE_URL": "https://m365.example/hermes/v1",
             },
             clear=False,
         )
@@ -46,7 +49,248 @@ class RecallProvenanceTests(unittest.TestCase):
 
     def tearDown(self):
         self.environment.stop()
-        plugin._forget("session", "turn")
+        with plugin._lock:
+            plugin._turns.clear()
+            plugin._routes.clear()
+
+    def test_m365_route_requires_exact_effective_hermes_authority(self):
+        request = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "inspect\n\n<memory-context>\nsource\n</memory-context>",
+                }
+            ]
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "M365_HERMES_PROVIDER": "m365-copilot",
+                "M365_HERMES_GATEWAY_BASE_URL": "https://m365.example/hermes/v1",
+            },
+            clear=False,
+        ):
+            plugin.on_pre_llm_call(
+                session_id="formal-session", turn_id="formal-turn", user_message="inspect"
+            )
+            accepted = plugin.on_llm_request(
+                request=request,
+                session_id="formal-session",
+                turn_id="formal-turn",
+                provider="custom",
+                api_mode="chat_completions",
+                base_url="https://m365.example/hermes/v1",
+            )
+            self.assertIsNotNone(accepted)
+            self.assertIn(plugin._FIELD, accepted["request"]["extra_body"])
+
+            for provider, api_mode, base_url in (
+                ("m365-copilot", "chat_completions", ""),
+                ("m365-copilot", "chat_completions", "https://m365.example/v1"),
+                (
+                    "m365-copilot",
+                    "chat_completions",
+                    "https://m365.example:99999/hermes/v1",
+                ),
+                (
+                    "m365-copilot",
+                    "chat_completions",
+                    "https://m365.example:0/hermes/v1",
+                ),
+                ("custom", "responses", "https://m365.example/hermes/v1"),
+                ("openai", "chat_completions", "https://m365.example/hermes/v1"),
+            ):
+                with self.subTest(provider=provider, api_mode=api_mode, base_url=base_url):
+                    rejected = plugin.on_llm_request(
+                        request=request,
+                        session_id=f"negative-{provider}-{api_mode}-{base_url}",
+                        turn_id="negative-turn",
+                        provider=provider,
+                        api_mode=api_mode,
+                        base_url=base_url,
+                    )
+                    self.assertIsNone(rejected)
+
+            with patch.dict(
+                os.environ,
+                {"M365_HERMES_GATEWAY_BASE_URL": "https://m365.example"},
+            ):
+                plugin.on_pre_llm_call(
+                    session_id="base-session", turn_id="base-turn", user_message="inspect"
+                )
+                host_base = plugin.on_llm_request(
+                    request=request,
+                    session_id="base-session",
+                    turn_id="base-turn",
+                    provider="custom",
+                    api_mode="chat_completions",
+                    base_url="https://m365.example/hermes/v1",
+                )
+                self.assertIsNotNone(host_base)
+                self.assertIn(plugin._FIELD, host_base["request"]["extra_body"])
+                self.assertIsNone(
+                    plugin.on_llm_request(
+                        request=request,
+                        session_id="generic-session",
+                        turn_id="generic-turn",
+                        provider="custom",
+                        api_mode="chat_completions",
+                        base_url="https://m365.example/v1",
+                    )
+                )
+
+            with patch.dict(os.environ, {"M365_HERMES_PROVIDER": "custom"}):
+                self.assertIsNone(
+                    plugin.on_llm_request(
+                        request=request,
+                        session_id="custom-config-session",
+                        turn_id="custom-config-turn",
+                        provider="custom",
+                        api_mode="chat_completions",
+                        base_url="https://m365.example/hermes/v1",
+                    )
+                )
+
+    def test_active_turn_route_drift_removes_previous_provenance(self):
+        clean = "inspect"
+        request = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"{clean}\n\n<memory-context>\nsource\n</memory-context>",
+                }
+            ],
+            "extra_body": {"preserve": "caller-value"},
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "M365_HERMES_PROVIDER": "m365-copilot",
+                "M365_HERMES_GATEWAY_BASE_URL": "https://m365.example",
+            },
+        ):
+            plugin.on_pre_llm_call(
+                session_id="session", turn_id="turn", user_message=clean
+            )
+            accepted = plugin.on_llm_request(
+                request=request,
+                session_id="session",
+                turn_id="turn",
+                provider="custom",
+                api_mode="chat_completions",
+                base_url="https://m365.example/hermes/v1",
+            )
+            self.assertIsNotNone(accepted)
+            self.assertIn(plugin._FIELD, accepted["request"]["extra_body"])
+            with patch.dict(
+                os.environ,
+                {"M365_HERMES_GATEWAY_BASE_URL": "https://other.example"},
+            ):
+                drifted = plugin.on_llm_request(
+                    request=accepted["request"],
+                    session_id="session",
+                    turn_id="turn",
+                    provider="custom",
+                    api_mode="chat_completions",
+                    base_url="https://other.example/hermes/v1",
+                )
+
+        self.assertIsNotNone(drifted)
+        extra = drifted["request"]["extra_body"]
+        self.assertEqual(extra, {"preserve": "caller-value"})
+        self.assertNotIn(plugin._FIELD, extra)
+        self.assertNotIn(plugin._CONTROL_FIELD, extra)
+        self.assertNotIn("session_key", extra)
+        self.assertEqual(
+            drifted["reason"], "Hermes provenance omitted after invalid M365 route"
+        )
+
+    def test_invalid_route_removes_stale_provenance_without_local_state(self):
+        result = plugin.on_llm_request(
+            request={
+                "messages": [{"role": "user", "content": "sentinel"}],
+                "extra_body": {
+                    "session_key": "stale-session",
+                    plugin._FIELD: {"stale": True},
+                    plugin._CONTROL_FIELD: {"stale": True},
+                    "preserve": "caller-value",
+                },
+            },
+            session_id="untracked-session",
+            turn_id="untracked-turn",
+            provider="custom",
+            api_mode="chat_completions",
+            base_url="https://m365.example/v1",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["request"]["extra_body"], {"preserve": "caller-value"}
+        )
+
+    def test_valid_route_removes_stale_provenance_without_local_state(self):
+        with patch.dict(
+            os.environ,
+            {
+                "M365_HERMES_PROVIDER": "m365-copilot",
+                "M365_HERMES_GATEWAY_BASE_URL": "https://m365.example",
+            },
+        ):
+            result = plugin.on_llm_request(
+                request={
+                    "messages": [{"role": "user", "content": "sentinel"}],
+                    "extra_body": {
+                        "session_key": "untracked-session",
+                        plugin._FIELD: {"stale": True},
+                        plugin._CONTROL_FIELD: {"stale": True},
+                        "preserve": "caller-value",
+                    },
+                },
+                session_id="untracked-session",
+                turn_id="untracked-turn",
+                provider="m365-copilot",
+                api_mode="chat_completions",
+                base_url="https://m365.example/hermes/v1",
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["request"]["extra_body"], {"preserve": "caller-value"}
+        )
+
+    def test_valid_route_removes_stale_provenance_for_invalid_lifecycle_identity(self):
+        cases = (
+            ("malformed-messages", "untracked-turn", "not-a-list"),
+            ("invalid-turn", [], [{"role": "user", "content": "sentinel"}]),
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "M365_HERMES_PROVIDER": "m365-copilot",
+                "M365_HERMES_GATEWAY_BASE_URL": "https://m365.example",
+            },
+        ):
+            for session_id, turn_id, messages in cases:
+                with self.subTest(session_id=session_id, turn_id=turn_id):
+                    result = plugin.on_llm_request(
+                        request={
+                            "messages": messages,
+                            "extra_body": {
+                                "session_key": session_id,
+                                plugin._FIELD: {"stale": True},
+                                plugin._CONTROL_FIELD: {"stale": True},
+                                "preserve": "caller-value",
+                            },
+                        },
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        provider="m365-copilot",
+                        api_mode="chat_completions",
+                        base_url="https://m365.example/hermes/v1",
+                    )
+                    self.assertIsNotNone(result)
+                    self.assertEqual(
+                        result["request"]["extra_body"],
+                        {"preserve": "caller-value"},
+                    )
 
     @staticmethod
     def execution_control_from(result):
@@ -76,6 +320,7 @@ class RecallProvenanceTests(unittest.TestCase):
             turn_id="turn",
             provider="m365",
             api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
         )
         return content, result
 
@@ -117,6 +362,7 @@ class RecallProvenanceTests(unittest.TestCase):
             turn_id="turn",
             provider="m365",
             api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
         )
         self.assertIsNotNone(result)
         self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])
@@ -151,6 +397,7 @@ class RecallProvenanceTests(unittest.TestCase):
             api_call_count=2,
             provider="m365",
             api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
         )
         self.assertIsNotNone(result)
         metadata = result["request"]["extra_body"][plugin._CONTROL_FIELD]
@@ -211,6 +458,7 @@ class RecallProvenanceTests(unittest.TestCase):
             api_call_count=2,
             provider="m365",
             api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
         )
 
         self.assertIsNotNone(result)
@@ -230,6 +478,7 @@ class RecallProvenanceTests(unittest.TestCase):
             api_call_count=2,
             provider="m365",
             api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
         )
 
         self.assertIsNotNone(result)
@@ -268,6 +517,7 @@ class RecallProvenanceTests(unittest.TestCase):
             api_call_count=3,
             provider="m365",
             api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
         )
 
         metadata = self.execution_control_from(result)
@@ -308,6 +558,7 @@ class RecallProvenanceTests(unittest.TestCase):
             api_call_count=3,
             provider="m365",
             api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
         )
 
         metadata = self.execution_control_from(result)
@@ -325,6 +576,7 @@ class RecallProvenanceTests(unittest.TestCase):
             "api_call_count": 2,
             "provider": "m365",
             "api_mode": "chat_completions",
+            "base_url": "https://m365.example/hermes/v1",
         }
         missing_common = dict(common)
         missing_common["session_id"] = ""
@@ -428,6 +680,7 @@ class RecallProvenanceTests(unittest.TestCase):
             "api_call_count": 2,
             "provider": "m365",
             "api_mode": "chat_completions",
+            "base_url": "https://m365.example/hermes/v1",
         }
         for invalid in (None, 7, {"caller": "value"}, ["caller"]):
             with self.subTest(invalid=invalid):
@@ -464,6 +717,7 @@ class RecallProvenanceTests(unittest.TestCase):
             "api_call_count": 2,
             "provider": "m365",
             "api_mode": "chat_completions",
+            "base_url": "https://m365.example/hermes/v1",
         }
         for invalid in ("", "   ", "\t\n"):
             with self.subTest(invalid=invalid):
@@ -501,6 +755,7 @@ class RecallProvenanceTests(unittest.TestCase):
                     api_call_count=2,
                     provider="m365",
                     api_mode="chat_completions",
+                    base_url="https://m365.example/hermes/v1",
                 )
                 self.assertIsNotNone(result)
                 self.assertEqual(result["request"]["messages"], messages)
@@ -524,6 +779,7 @@ class RecallProvenanceTests(unittest.TestCase):
             "api_call_count": 2,
             "provider": "m365",
             "api_mode": "chat_completions",
+            "base_url": "https://m365.example/hermes/v1",
         }
         result = plugin.on_llm_request(**common)
         self.assertIsNone(self.execution_control_from(result))
@@ -574,6 +830,7 @@ class RecallProvenanceTests(unittest.TestCase):
                     api_call_count=2,
                     provider="m365",
                     api_mode="chat_completions",
+                    base_url="https://m365.example/hermes/v1",
                 )
                 self.assertIsNone(self.execution_control_from(result))
 
@@ -679,6 +936,7 @@ class RecallProvenanceTests(unittest.TestCase):
             ]
         }
         common = {"request": request, "provider": "m365", "api_mode": "chat_completions"}
+        common["base_url"] = "https://m365.example/hermes/v1"
         result = plugin.on_llm_request(session_id="session", turn_id="turn", **common)
         self.assertIsNotNone(result)
         self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])
@@ -705,6 +963,7 @@ class RecallProvenanceTests(unittest.TestCase):
                     turn_id="turn",
                     provider="m365",
                     api_mode="chat_completions",
+                    base_url="https://m365.example/hermes/v1",
                 )
                 self.assertIsNotNone(result)
                 self.assertNotIn(plugin._FIELD, result["request"]["extra_body"])

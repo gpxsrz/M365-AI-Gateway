@@ -50,6 +50,7 @@ _BINDING_DOMAIN = b"m365-hermes-native-attachments/binding/v1"
 _TURN_AUTH_DOMAIN = b"m365-hermes-native-attachments/turn/v1"
 _STAGE_ID_DOMAIN = b"m365-hermes-native-attachments/stage-id/v1"
 _GATEWAY_BASE_URL_ENV = "M365_HERMES_GATEWAY_BASE_URL"
+_FORMAL_M365_PROVIDER = "m365-copilot"
 _AUTH_HEADER = "X-M365-Hermes-Attachment-Auth"
 _SESSION_HEADER = "X-M365-Hermes-Session-Id"
 _TURN_HEADER = "X-M365-Hermes-Turn-Id"
@@ -134,9 +135,39 @@ def _turn_key(session_id: Any, turn_id: Any) -> TurnKey | None:
     return session, turn
 
 
-def _is_m365(provider: Any, api_mode: Any) -> bool:
-    configured = os.environ.get("M365_HERMES_PROVIDER", "").strip()
-    return bool(configured and provider == configured and api_mode == "chat_completions")
+def _m365_provider_candidate(provider: Any, configured: str) -> bool:
+    normalized = _text_identity(provider)
+    configured_normalized = configured.casefold()
+    return bool(
+        normalized
+        and (
+            (
+                configured_normalized != "custom"
+                and normalized.casefold() == configured_normalized
+            )
+            or (
+                normalized.casefold() == "custom"
+                and configured_normalized == _FORMAL_M365_PROVIDER
+            )
+        )
+    )
+
+
+def _is_m365(provider: Any, api_mode: Any, base_url: Any) -> bool:
+    """Recognize the configured M365 route after Hermes provider canonicalization.
+
+    Hermes exposes a named custom provider as effective ``provider="custom"`` to
+    middleware.  The plugin therefore binds activation to the configured M365
+    route authority, not to that lossy effective provider label or to a model
+    name.
+    """
+    configured = _text_identity(os.environ.get("M365_HERMES_PROVIDER", ""))
+    return bool(
+        configured
+        and _m365_provider_candidate(provider, configured)
+        and api_mode == "chat_completions"
+        and _gateway_target_identity(base_url) is not None
+    )
 
 
 def _attach_key() -> bytes:
@@ -346,37 +377,74 @@ def _outcome_for(key: TurnKey, outcome: dict[str, Any]) -> None:
         _outcomes.popitem(last=False)
 
 
+def _exact_gateway_base_identity(
+    base_url: Any, *, allow_host_base: bool = False
+) -> tuple[str, int, str] | None:
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None
+    candidate = base_url.strip()
+    try:
+        parsed = urlsplit(candidate)
+        path = parsed.path.rstrip("/")
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.port == 0
+            or (path != "/hermes/v1" and not (allow_host_base and not path))
+        ):
+            return None
+        _host, port, _target, secure = _request_target(candidate, "stage")
+        if not secure:
+            return None
+        return (
+            parsed.hostname.casefold(),
+            port if port is not None else 443,
+            "/hermes/v1",
+        )
+    except (_AttachmentFailure, TypeError, ValueError):
+        return None
+
+
 def _gateway_target_identity(base_url: Any) -> tuple[str, int, str] | None:
     configured = os.environ.get(_GATEWAY_BASE_URL_ENV, "").strip()
     if not isinstance(base_url, str) or not base_url.strip() or not configured:
         return None
-    try:
-        current = _request_target(base_url.strip(), "stage")
-        expected = _request_target(configured, "stage")
-    except _AttachmentFailure:
+    current_identity = _exact_gateway_base_identity(base_url)
+    expected_identity = _exact_gateway_base_identity(configured, allow_host_base=True)
+    if current_identity is None or expected_identity is None:
         return None
-    if not current[3] or not expected[3]:
-        return None
-    current_identity = (current[0].lower(), current[1] or 443, current[2])
-    expected_identity = (expected[0].lower(), expected[1] or 443, expected[2])
     return current_identity if current_identity == expected_identity else None
 
 
-def _remember_route(key: TurnKey, base_url: Any, request: Any = None) -> None:
+def _remember_route(key: TurnKey, base_url: Any, request: Any = None) -> bool:
     session_key = key[0]
     if isinstance(request, dict) and isinstance(request.get("extra_body"), dict):
         wire_session = request["extra_body"].get("session_key")
         if isinstance(wire_session, str) and wire_session.strip():
             session_key = wire_session.strip()
-    route = base_url.strip() if _gateway_target_identity(base_url) is not None else ""
+    route_identity = _gateway_target_identity(base_url)
+    route = base_url.strip() if route_identity is not None else ""
+    route_drift = False
     with _lock:
         if key in _ended:
-            return
+            return False
         state, evicted = _state_for(key)
-        state["route"] = route
-        state["session_key"] = session_key
+        previous_route = state.get("route", "")
+        if previous_route and route_identity is not None:
+            route_drift = _gateway_target_identity(previous_route) != route_identity
+        previous_session_key = state.get("session_key", "")
+        if previous_session_key and session_key != previous_session_key:
+            route_drift = True
+        if not route_drift:
+            state["route"] = route
+            state["session_key"] = session_key
     for route, evicted_session_key, turn_id, refs in evicted:
         _release_route(route, evicted_session_key, turn_id, refs)
+    return not route_drift
 
 
 def _remember_pending_end(key: TurnKey, route: str, session_key: str) -> None:
@@ -553,7 +621,24 @@ def on_llm_request(
     base_url: Any = "",
     **_: Any,
 ) -> dict[str, Any] | None:
-    if not _is_m365(provider, api_mode):
+    if not _is_m365(provider, api_mode, base_url):
+        key = _turn_key(session_id, turn_id)
+        if key is not None:
+            with _lock:
+                active_turn = key in _sessions or key in _outcomes or key in _ended
+            raw_extra = request.get("extra_body") if isinstance(request, dict) else None
+            has_native_context = (
+                isinstance(raw_extra, dict) and _CONTEXT_FIELD in raw_extra
+            )
+            if active_turn or has_native_context:
+                return _safe_failure_request(
+                    request, session_id, turn_id, "native_attachment_binding_invalid"
+                )
+        elif isinstance(request, dict) and isinstance(request.get("extra_body"), dict):
+            if _CONTEXT_FIELD in request["extra_body"]:
+                return _safe_failure_request(
+                    request, session_id, turn_id, "native_attachment_binding_invalid"
+                )
         return None
     key = _turn_key(session_id, turn_id)
     if key is None:
@@ -566,7 +651,10 @@ def on_llm_request(
                 return _safe_failure_request(
                     request, session_id, turn_id, "native_attachment_binding_invalid"
                 )
-        _remember_route(key, base_url, request)
+        if not _remember_route(key, base_url, request):
+            return _safe_failure_request(
+                request, session_id, turn_id, "native_attachment_binding_invalid"
+            )
         with _lock:
             outcome = copy.deepcopy(_outcomes.get(key))
             state = copy.deepcopy(_sessions.get(key))

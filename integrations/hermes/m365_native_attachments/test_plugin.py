@@ -121,6 +121,7 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             plugin._pending_ends.clear()
         with recall._lock:
             recall._turns.clear()
+            recall._routes.clear()
 
     def tearDown(self):
         self.environment.stop()
@@ -132,6 +133,7 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             plugin._pending_ends.clear()
         with recall._lock:
             recall._turns.clear()
+            recall._routes.clear()
 
     def _route(self, session="session", turn="turn", session_key=None):
         if session_key is None:
@@ -771,6 +773,330 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                     result = self._llm()
                 context = result["request"]["extra_body"][plugin._CONTEXT_FIELD]
                 self.assertEqual(context["error"], "native_attachment_binding_invalid")
+
+    def test_formal_gpt56_identity_requires_the_exact_m365_route(self):
+        production_environment = {
+            "M365_HERMES_PROVIDER": "m365-copilot",
+            "M365_HERMES_GATEWAY_BASE_URL": "https://m365.example",
+        }
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ,
+            {**production_environment, "M365_HERMES_ATTACHMENT_ALLOWED_ROOTS": root},
+        ):
+            session_id = "production-session"
+            turn_id = "production-turn"
+            request = {
+                "messages": [{"role": "user", "content": "fixture"}],
+                "extra_body": {"session_key": session_id},
+            }
+            with patch.object(plugin, "_turn_route", return_value=True) as turn_route:
+                activation = plugin.on_llm_request(
+                    request,
+                    provider="custom",
+                    api_mode="chat_completions",
+                    base_url="https://m365.example/hermes/v1",
+                    model="gpt-5.6-reasoning",
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+                with plugin._lock:
+                    route_established = (session_id, turn_id) in plugin._sessions
+            turn_route.assert_called_once_with(
+                "https://m365.example/hermes/v1", session_id, turn_id, "bind"
+            )
+
+            path = Path(root) / "fixture.txt"
+            path.write_bytes(b"fixture")
+            with patch.object(
+                plugin,
+                "_stage_file",
+                side_effect=self._stage_fake({str(path): b"fixture"}),
+            ) as stage_file, patch.object(plugin, "_release_route"):
+                failed = json.loads(
+                    plugin.m365_native_attach(
+                        {"files": [{"local_path": str(path)}]},
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                )
+            self.assertEqual(
+                {
+                    "activation": activation is not None,
+                    "route_established": route_established,
+                    "attachment_ok": failed.get("ok", False),
+                    "attachment_error": failed.get("error", {}).get("code"),
+                },
+                {
+                    "activation": True,
+                    "route_established": True,
+                    "attachment_ok": True,
+                    "attachment_error": None,
+                },
+                "formal M365 identity must activate native staging; current RED is "
+                f"activation={activation!r}, route_state={route_established}, result={failed!r}",
+            )
+            stage_file.assert_called_once()
+
+            for label, provider, api_mode, base_url in (
+                (
+                    "wrong provider on active native turn",
+                    "openai",
+                    "chat_completions",
+                    "https://m365.example/hermes/v1",
+                ),
+                (
+                    "generic route on active native turn",
+                    "custom",
+                    "chat_completions",
+                    "https://m365.example/v1",
+                ),
+                (
+                    "wrong API mode on active native turn",
+                    "custom",
+                    "responses",
+                    "https://m365.example/hermes/v1",
+                ),
+            ):
+                with self.subTest(active_mismatch=label):
+                    mismatched = plugin.on_llm_request(
+                        request,
+                        provider=provider,
+                        api_mode=api_mode,
+                        base_url=base_url,
+                        model="gpt-5.6-reasoning",
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                    self.assertIsNotNone(mismatched)
+                    self.assertEqual(
+                        mismatched["request"]["extra_body"][plugin._CONTEXT_FIELD][
+                            "error"
+                        ],
+                        "native_attachment_binding_invalid",
+                    )
+
+            negative_cases = (
+                (
+                    "arbitrary custom provider and unrelated URL",
+                    "custom:unrelated",
+                    "https://unrelated.example/hermes/v1",
+                    "chat_completions",
+                    "gpt-5.6-reasoning",
+                ),
+                (
+                    "effective custom provider and unrelated URL",
+                    "custom",
+                    "https://unrelated.example/hermes/v1",
+                    "chat_completions",
+                    "gpt-5.6-reasoning",
+                ),
+                (
+                    "generic v1 URL",
+                    "custom",
+                    "https://m365.example/v1",
+                    "chat_completions",
+                    "gpt-5.6-reasoning",
+                ),
+                (
+                    "wrong API mode",
+                    "custom",
+                    "https://m365.example/hermes/v1",
+                    "responses",
+                    "gpt-5.6-reasoning",
+                ),
+                (
+                    "spoofed model on unrelated URL",
+                    "openai",
+                    "https://unrelated.example/v1",
+                    "chat_completions",
+                    "gpt-5.6-reasoning",
+                ),
+                (
+                    "spoofed model on exact route with unrelated provider",
+                    "openai",
+                    "https://m365.example/hermes/v1",
+                    "chat_completions",
+                    "gpt-5.6-reasoning",
+                ),
+                (
+                    "malformed HTTPS authority",
+                    "custom",
+                    "https://m365.example:99999/hermes/v1",
+                    "chat_completions",
+                    "gpt-5.6-reasoning",
+                ),
+                (
+                    "zero HTTPS port",
+                    "custom",
+                    "https://m365.example:0/hermes/v1",
+                    "chat_completions",
+                    "gpt-5.6-reasoning",
+                ),
+            )
+            for index, (label, provider, base_url, api_mode, model) in enumerate(negative_cases):
+                key = (f"negative-session-{index}", f"negative-turn-{index}")
+                with plugin._lock:
+                    plugin._sessions.clear()
+                    plugin._outcomes.clear()
+                with self.subTest(case=label):
+                    self.assertIsNone(
+                        plugin.on_llm_request(
+                            request,
+                            provider=provider,
+                            api_mode=api_mode,
+                            base_url=base_url,
+                            model=model,
+                            session_id=key[0],
+                            turn_id=key[1],
+                        )
+                    )
+                    with plugin._lock:
+                        self.assertNotIn(key, plugin._sessions)
+
+            with patch.dict(
+                os.environ,
+                {"M365_HERMES_PROVIDER": "other-provider"},
+            ):
+                self.assertIsNone(
+                    plugin.on_llm_request(
+                        request,
+                        provider="custom",
+                        api_mode="chat_completions",
+                        base_url="https://m365.example/hermes/v1",
+                        model="gpt-5.6-reasoning",
+                        session_id="arbitrary-config-session",
+                        turn_id="arbitrary-config-turn",
+                    )
+                )
+
+            with patch.dict(
+                os.environ,
+                {"M365_HERMES_PROVIDER": "custom"},
+            ):
+                self.assertIsNone(
+                    plugin.on_llm_request(
+                        {"messages": [{"role": "user", "content": "fixture"}]},
+                        provider="custom",
+                        api_mode="chat_completions",
+                        base_url="https://m365.example/hermes/v1",
+                        model="gpt-5.6-reasoning",
+                        session_id="custom-config-session",
+                        turn_id="custom-config-turn",
+                    )
+                )
+
+            recall.on_pre_llm_call(
+                session_id=session_id,
+                turn_id="recall-turn",
+                user_message="read fixture",
+            )
+            recall_result = recall.on_llm_request(
+                request={
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "read fixture\n\n<memory-context>\nrecalled\n</memory-context>",
+                        }
+                    ]
+                },
+                provider="custom",
+                api_mode="chat_completions",
+                base_url="https://m365.example/hermes/v1",
+                session_id=session_id,
+                turn_id="recall-turn",
+                api_request_id="recall-turn:api:1",
+                api_call_count=1,
+            )
+            self.assertIsNotNone(recall_result)
+            self.assertIn(
+                "m365_recall_provenance",
+                recall_result["request"]["extra_body"],
+            )
+
+    def test_active_turn_route_drift_does_not_rebind_existing_staged_refs(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"M365_HERMES_ATTACHMENT_ALLOWED_ROOTS": root}
+        ):
+            path = Path(root) / "drift.txt"
+            path.write_bytes(b"drift")
+            with patch.object(
+                plugin,
+                "_stage_file",
+                side_effect=self._stage_fake({str(path): b"drift"}),
+            ), patch.object(plugin, "_release_route"):
+                self._route()
+                self.assertTrue(json.loads(self._attach(path))["ok"])
+                with plugin._lock:
+                    before = json.loads(json.dumps(plugin._sessions[("session", "turn")]))
+
+                with patch.object(plugin, "_turn_route", return_value=True) as turn_route:
+                    retargeted = plugin.on_llm_request(
+                        {
+                            "messages": [{"role": "user", "content": "sentinel"}],
+                            "extra_body": {"session_key": "other-session"},
+                        },
+                        provider="m365",
+                        api_mode="chat_completions",
+                        base_url="https://m365.example/hermes/v1",
+                        session_id="session",
+                        turn_id="turn",
+                    )
+
+                turn_route.assert_not_called()
+                self.assertEqual(
+                    retargeted["request"]["extra_body"][plugin._CONTEXT_FIELD]["error"],
+                    "native_attachment_binding_invalid",
+                )
+                with plugin._lock:
+                    self.assertEqual(plugin._sessions[("session", "turn")], before)
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "M365_HERMES_PROVIDER": "m365-copilot",
+                        "M365_HERMES_GATEWAY_BASE_URL": "https://other.example",
+                    },
+                ), patch.object(plugin, "_turn_route", return_value=True) as turn_route:
+                    result = plugin.on_llm_request(
+                        {
+                            "messages": [{"role": "user", "content": "sentinel"}],
+                            "extra_body": {"session_key": "session"},
+                        },
+                        provider="custom",
+                        api_mode="chat_completions",
+                        base_url="https://other.example/hermes/v1",
+                        session_id="session",
+                        turn_id="turn",
+                    )
+
+                turn_route.assert_not_called()
+                context = result["request"]["extra_body"][plugin._CONTEXT_FIELD]
+                self.assertEqual(context["error"], "native_attachment_binding_invalid")
+                with plugin._lock:
+                    self.assertEqual(plugin._sessions[("session", "turn")], before)
+
+    def test_invalid_route_rejects_stale_native_context_without_local_state(self):
+        result = plugin.on_llm_request(
+            {
+                "messages": [{"role": "user", "content": "sentinel"}],
+                "extra_body": {
+                    "session_key": "stale-session",
+                    plugin._CONTEXT_FIELD: {
+                        "session_key": "stale-session",
+                        "attachments": [{"stage_ref": "A" * 43}],
+                    },
+                },
+            },
+            provider="custom",
+            api_mode="chat_completions",
+            base_url="https://m365.example/v1",
+            session_id="untracked-session",
+            turn_id="untracked-turn",
+        )
+        self.assertIsNotNone(result)
+        context = result["request"]["extra_body"][plugin._CONTEXT_FIELD]
+        self.assertEqual(context["error"], "native_attachment_binding_invalid")
+        self.assertNotIn("stage_ref", json.dumps(context))
 
     def test_evicted_success_state_fails_closed_instead_of_inheriting_or_dropping(self):
         with tempfile.TemporaryDirectory() as root, patch.dict(

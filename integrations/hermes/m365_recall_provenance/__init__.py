@@ -10,6 +10,7 @@ import os
 import threading
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import urlsplit
 
 
 _SCHEMA = "m365-hermes-recall-provenance/v1"
@@ -24,9 +25,12 @@ _EMPTY_RECOVERY_USER_NUDGE = (
     "You just executed tool calls but returned an empty response. "
     "Please process the tool results above and continue with the task."
 )
+_FORMAL_M365_PROVIDER = "m365-copilot"
+_GATEWAY_BASE_URL_ENV = "M365_HERMES_GATEWAY_BASE_URL"
 _MAX_ACTIVE_TURNS = 256
 _CANONICAL_ROLES = frozenset(("system", "developer", "user", "assistant", "tool"))
 _turns: OrderedDict[tuple[str, str], str] = OrderedDict()
+_routes: OrderedDict[tuple[str, str], tuple[str, int, str]] = OrderedDict()
 _lock = threading.Lock()
 
 
@@ -39,6 +43,93 @@ def _key(session_id: str, turn_id: str) -> tuple[str, str] | None:
     ):
         return None
     return session_id.strip(), turn_id.strip()
+
+
+def _gateway_route_identity(
+    value: Any, *, allow_host_base: bool = False
+) -> tuple[str, int, str] | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+        path = parsed.path.rstrip("/")
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.port == 0
+            or (path != "/hermes/v1" and not (allow_host_base and not path))
+        ):
+            return None
+        return (
+            parsed.hostname.casefold(),
+            parsed.port if parsed.port is not None else 443,
+            "/hermes/v1",
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_m365_route(provider: Any, api_mode: Any, base_url: Any) -> bool:
+    configured = os.environ.get("M365_HERMES_PROVIDER", "").strip()
+    if not configured or api_mode != "chat_completions":
+        return False
+    configured_casefold = configured.casefold()
+    provider_matches = (
+        configured_casefold != "custom"
+        and isinstance(provider, str)
+        and provider.strip().casefold() == configured_casefold
+    )
+    custom_matches = (
+        isinstance(provider, str)
+        and provider.strip().casefold() == "custom"
+        and configured.casefold() == _FORMAL_M365_PROVIDER
+    )
+    if not (provider_matches or custom_matches):
+        return False
+    expected = _gateway_route_identity(
+        os.environ.get(_GATEWAY_BASE_URL_ENV, ""), allow_host_base=True
+    )
+    current = _gateway_route_identity(base_url)
+    return expected is not None and current == expected
+
+
+def _bind_turn_route(key: tuple[str, str], base_url: Any) -> bool:
+    current = _gateway_route_identity(base_url)
+    if current is None:
+        return False
+    with _lock:
+        if key not in _turns:
+            _routes.pop(key, None)
+            return True
+        pinned = _routes.get(key)
+        if pinned is None:
+            _routes[key] = current
+            _routes.move_to_end(key)
+            return True
+        return pinned == current
+
+
+def _omit_invalid_route_metadata(request: dict[str, Any]) -> dict[str, Any] | None:
+    raw_extra = request.get("extra_body")
+    if not isinstance(raw_extra, dict):
+        return None
+    fields = ("session_key", _FIELD, _CONTROL_FIELD, _IDENTITY_ERROR_FIELD)
+    if not any(field in raw_extra for field in fields):
+        return None
+    extra = dict(raw_extra)
+    for field in fields:
+        extra.pop(field, None)
+    updated = dict(request)
+    updated["extra_body"] = extra
+    return {
+        "request": updated,
+        "source": "m365-hermes-provenance",
+        "reason": "Hermes provenance omitted after invalid M365 route",
+    }
 
 
 def on_pre_llm_call(
@@ -54,7 +145,8 @@ def on_pre_llm_call(
         _turns[key] = user_message
         _turns.move_to_end(key)
         while len(_turns) > _MAX_ACTIVE_TURNS:
-            _turns.popitem(last=False)
+            evicted, _ = _turns.popitem(last=False)
+            _routes.pop(evicted, None)
 
 
 def _forget(session_id: str = "", turn_id: str = "", **_: Any) -> None:
@@ -62,10 +154,12 @@ def _forget(session_id: str = "", turn_id: str = "", **_: Any) -> None:
     with _lock:
         if key is not None:
             _turns.pop(key, None)
+            _routes.pop(key, None)
         elif isinstance(session_id, str) and session_id.strip():
             session = session_id.strip()
             for candidate in [key for key in _turns if key[0] == session]:
                 _turns.pop(candidate, None)
+                _routes.pop(candidate, None)
 
 
 def _signature_payload(metadata: dict[str, Any]) -> bytes:
@@ -383,15 +477,32 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
         return None
     secret = os.environ.get("M365_HERMES_RECALL_PROVENANCE_SECRET", "").strip()
     provider = os.environ.get("M365_HERMES_PROVIDER", "").strip()
-    if (
-        not secret
-        or not provider
-        or kwargs.get("provider") != provider
-        or kwargs.get("api_mode") != "chat_completions"
-    ):
+    route_valid = _is_m365_route(
+        kwargs.get("provider"), kwargs.get("api_mode"), kwargs.get("base_url")
+    )
+    raw_session_id = kwargs.get("session_id")
+    raw_turn_id = kwargs.get("turn_id")
+    session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+    turn_id = raw_turn_id if isinstance(raw_turn_id, str) else ""
+    key = _key(session_id, turn_id)
+    if not secret or not provider or not route_valid:
+        omitted = _omit_invalid_route_metadata(request)
+        if omitted is not None:
+            return omitted
         return None
+    tracked_turn = False
+    if key is not None:
+        with _lock:
+            tracked_turn = key in _turns
+    if not tracked_turn and (key is not None or session_id):
+        omitted = _omit_invalid_route_metadata(request)
+        if omitted is not None:
+            return omitted
     messages = request.get("messages")
     if not isinstance(messages, list):
+        omitted = _omit_invalid_route_metadata(request)
+        if omitted is not None:
+            return omitted
         return None
     updated = dict(request)
     raw_extra_body = request.get("extra_body")
@@ -412,11 +523,7 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
     else:
         extra_body = dict(raw_extra_body)
     changed = False
-    raw_session_id = kwargs.get("session_id")
-    raw_turn_id = kwargs.get("turn_id")
     raw_api_request_id = kwargs.get("api_request_id")
-    session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
-    turn_id = raw_turn_id if isinstance(raw_turn_id, str) else ""
     api_request_id = raw_api_request_id if isinstance(raw_api_request_id, str) else ""
     try:
         raw_api_call_count = kwargs.get("api_call_count")
@@ -466,7 +573,11 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
             extra_body["session_key"] = execution_session_key
             changed = True
 
-    key = _key(session_id, turn_id)
+    if tracked_turn and not _bind_turn_route(key, kwargs.get("base_url")):
+        omitted = _omit_invalid_route_metadata(request)
+        if omitted is not None:
+            return omitted
+        return None
     clean = None
     if key is not None:
         with _lock:
