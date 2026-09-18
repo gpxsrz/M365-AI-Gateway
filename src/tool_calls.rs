@@ -104,9 +104,65 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
 }
 
 fn parse_object_arguments(raw: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(raw.trim())
+    let raw = raw.trim();
+    serde_json::from_str::<Value>(raw)
         .ok()
         .filter(Value::is_object)
+        .or_else(|| {
+            let repaired = escape_json_string_control_chars(raw)?;
+            serde_json::from_str::<Value>(&repaired)
+                .ok()
+                .filter(Value::is_object)
+        })
+}
+
+fn escape_json_string_control_chars(raw: &str) -> Option<String> {
+    let mut repaired = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut changed = false;
+    for ch in raw.chars() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            repaired.push(ch);
+            continue;
+        }
+        if escaped {
+            repaired.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => {
+                repaired.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                repaired.push(ch);
+                in_string = false;
+            }
+            '\n' => {
+                repaired.push_str("\\n");
+                changed = true;
+            }
+            '\r' => {
+                repaired.push_str("\\r");
+                changed = true;
+            }
+            '\t' => {
+                repaired.push_str("\\t");
+                changed = true;
+            }
+            '\u{0000}'..='\u{001f}' => {
+                repaired.push_str(&format!("\\u{:04x}", ch as u32));
+                changed = true;
+            }
+            _ => repaired.push(ch),
+        }
+    }
+    changed.then_some(repaired)
 }
 
 fn escaped_closing_fence_arguments<'a>(lines: &[&'a str]) -> Option<&'a str> {
@@ -274,6 +330,21 @@ mod tests {
         assert_eq!(output.calls.len(), 1);
         assert!(output.content.is_empty());
         assert!(!output.rejected);
+    }
+
+    #[test]
+    fn literal_newlines_inside_json_string_are_repaired_without_changing_arguments() {
+        let output = project(
+            "```read_file\n{\"path\":\"line-one\nline-two\"}\n```",
+            &tools(),
+            &Value::String("auto".to_owned()),
+            1,
+        );
+        assert_eq!(output.calls.len(), 1);
+        assert!(!output.rejected);
+        let arguments: Value =
+            serde_json::from_str(output.calls[0].function["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["path"], "line-one\nline-two");
     }
 
     #[test]

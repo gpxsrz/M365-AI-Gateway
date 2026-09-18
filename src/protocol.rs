@@ -14999,6 +14999,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matching_tool_fence_with_literal_newline_in_json_string_is_safely_normalized() {
+        let tool = json!({
+            "type":"function",
+            "function":{
+                "name":"inspect",
+                "description":"Read-only inspection.",
+                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
+            }
+        });
+        for stream in [false, true] {
+            let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
+                "```inspect\n{\"target\":\"service-a\nline-two\"}\n```",
+            ])));
+            let mut request = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "messages":[{"role":"user","content":"Inspect service-a."}],
+                "tools":[tool.clone()],
+                "tool_choice":"auto"
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage":true});
+            }
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            if stream {
+                assert!(body.contains("\"name\":\"inspect\""));
+                assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+                assert!(body.ends_with("data: [DONE]\n\n"));
+            } else {
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+                let arguments =
+                    value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .unwrap();
+                let arguments: Value = serde_json::from_str(arguments).unwrap();
+                assert_eq!(arguments["target"], "service-a\nline-two");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn ambiguous_matching_tool_fence_fails_closed_on_both_protocol_shapes() {
         let tool = json!({
             "type":"function",
