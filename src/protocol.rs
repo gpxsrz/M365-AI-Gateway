@@ -1033,9 +1033,10 @@ async fn complete_chat(
                 suppress_duplicate_tool_calls,
             );
             if transport.projection.rejected {
-                return invalid_tool_call_response(permit);
+                return invalid_tool_call_response(&trace, &transport.projection, permit);
             }
             if transport.projection.overflowed {
+                trace.caller_tool_rejection(transport.projection.rejection.as_ref());
                 permit.finish(StatusCode::BAD_GATEWAY, None);
                 return openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -1174,9 +1175,10 @@ async fn complete_chat(
                     suppress_duplicate_tool_calls,
                 );
                 if transport.projection.rejected {
-                    return invalid_tool_call_response(permit);
+                    return invalid_tool_call_response(&trace, &transport.projection, permit);
                 }
                 if transport.projection.overflowed {
+                    trace.caller_tool_rejection(transport.projection.rejection.as_ref());
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     return openai_error(
                         StatusCode::BAD_GATEWAY,
@@ -1503,10 +1505,16 @@ async fn stream_chat(
                     suppress_duplicate_tool_calls,
                 );
                 if transport.projection.rejected {
-                    send_invalid_tool_call_error(&trace, &sender, permit);
+                    send_invalid_tool_call_error(
+                        &trace,
+                        &sender,
+                        transport.projection.rejection.as_ref(),
+                        permit,
+                    );
                     return;
                 }
                 if transport.projection.overflowed {
+                    trace.caller_tool_rejection(transport.projection.rejection.as_ref());
                     permit.finish(StatusCode::BAD_GATEWAY, None);
                     send_sse_error(
                         &trace,
@@ -1685,10 +1693,16 @@ async fn stream_chat(
                         suppress_duplicate_tool_calls,
                     );
                     if transport.projection.rejected {
-                        send_invalid_tool_call_error(&trace, &sender, permit);
+                        send_invalid_tool_call_error(
+                            &trace,
+                            &sender,
+                            transport.projection.rejection.as_ref(),
+                            permit,
+                        );
                         return;
                     }
                     if transport.projection.overflowed {
+                        trace.caller_tool_rejection(transport.projection.rejection.as_ref());
                         permit.finish(StatusCode::BAD_GATEWAY, None);
                         send_sse_error(
                             &trace,
@@ -2704,7 +2718,12 @@ fn unsafe_tool_replay_response(permit: crate::traffic::Permit) -> Response {
 const INVALID_TOOL_CALL_MESSAGE: &str =
     "model returned a malformed caller tool candidate that was not safely executable";
 
-fn invalid_tool_call_response(permit: crate::traffic::Permit) -> Response {
+fn invalid_tool_call_response(
+    trace: &crate::debug::Trace,
+    projection: &ToolProjection,
+    permit: crate::traffic::Permit,
+) -> Response {
+    trace.caller_tool_rejection(projection.rejection.as_ref());
     permit.finish(StatusCode::BAD_GATEWAY, None);
     openai_error(
         StatusCode::BAD_GATEWAY,
@@ -2717,8 +2736,10 @@ fn invalid_tool_call_response(permit: crate::traffic::Permit) -> Response {
 fn send_invalid_tool_call_error(
     trace: &crate::debug::Trace,
     sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+    rejection: Option<&crate::tool_calls::ToolRejection>,
     permit: crate::traffic::Permit,
 ) {
+    trace.caller_tool_rejection(rejection);
     permit.finish(StatusCode::BAD_GATEWAY, None);
     send_sse_error(
         trace,
@@ -14033,7 +14054,8 @@ mod tests {
             "```inspect\n{}\n```",
             "```read_file\n{\"path\":\"a\"}\n```\n```read_file\n{\"path\":\"b\"}\n```",
         ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(Arc::clone(&gateway));
         let response = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
@@ -14068,6 +14090,10 @@ mod tests {
             assert_eq!(value["error"]["code"], "invalid_tool_call");
         }
         assert_eq!(chat.requests.lock().unwrap().len(), 2);
+        let record = gateway.debug.records_for_test().pop().unwrap();
+        assert_eq!(record["toolCallRejectionClass"], "overflow");
+        assert!(record["toolCandidateBytes"].as_u64().unwrap() > 0);
+        assert!(record["toolCandidateLines"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

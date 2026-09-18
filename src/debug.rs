@@ -274,6 +274,20 @@ struct Record {
     caller_delivery: String,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_false")]
     tool_call_suppressed: bool,
+    // Caller-tool rejection shape is a bounded live projection. It is
+    // intentionally absent from the v1 JSONL record so rejected candidates
+    // never become a durable raw-payload substitute and rollback readers keep
+    // their frozen schema.
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
+    tool_call_rejection_class: String,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    tool_candidate_bytes: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    tool_candidate_lines: usize,
     // Transport details are a bounded live projection. They are deliberately
     // absent from the v1 JSONL record so an older rollback reader can still
     // read the authoritative durable surface.
@@ -572,6 +586,9 @@ impl Record {
             post_policy_reason: "not_evaluated".to_owned(),
             caller_delivery: CallerDelivery::NotEvaluated.as_str().to_owned(),
             tool_call_suppressed: false,
+            tool_call_rejection_class: "not_evaluated".to_owned(),
+            tool_candidate_bytes: 0,
+            tool_candidate_lines: 0,
             transport_projection: "not_evaluated".to_owned(),
             wire_before_utf16: 0,
             inline_core_utf16: 0,
@@ -713,6 +730,9 @@ impl Record {
                 self.caller_delivery.as_str(),
                 "not_evaluated" | "sent" | "failed" | "cancelled"
             )
+            && valid_tool_call_rejection_class(&self.tool_call_rejection_class)
+            && self.tool_candidate_bytes <= MAX_RECORDED_BYTES
+            && self.tool_candidate_lines <= MAX_RECORDED_UTF16
             && valid_transport_projection(&self.transport_projection)
             && self.wire_before_utf16 <= MAX_RECORDED_UTF16
             && self.inline_core_utf16 <= MAX_RECORDED_UTF16
@@ -804,6 +824,19 @@ fn valid_transport_projection(value: &str) -> bool {
     matches!(
         value,
         "not_evaluated" | "inline" | "bulk_spill" | "full_context_document" | "overflow"
+    )
+}
+
+fn valid_tool_call_rejection_class(value: &str) -> bool {
+    matches!(
+        value,
+        "not_evaluated"
+            | "invalid_json"
+            | "extra_prose_after_valid_call"
+            | "malformed_fence"
+            | "duplicate_or_ambiguous"
+            | "overflow"
+            | "other"
     )
 }
 
@@ -1074,6 +1107,25 @@ impl Trace {
         self.update(|record| record.tool_call_suppressed = true);
     }
 
+    pub(crate) fn caller_tool_rejection(
+        &self,
+        rejection: Option<&crate::tool_calls::ToolRejection>,
+    ) {
+        self.update(|record| {
+            if let Some(rejection) = rejection {
+                record.tool_call_rejection_class = rejection.class.as_str().to_owned();
+                record.tool_candidate_bytes = rejection.candidate_bytes.min(MAX_RECORDED_BYTES);
+                record.tool_candidate_lines = rejection.candidate_lines.min(MAX_RECORDED_UTF16);
+            } else {
+                record.tool_call_rejection_class = crate::tool_calls::ToolRejectionClass::Other
+                    .as_str()
+                    .to_owned();
+                record.tool_candidate_bytes = 0;
+                record.tool_candidate_lines = 0;
+            }
+        });
+    }
+
     pub(crate) fn http_status(&self, status: StatusCode) {
         self.update(|record| {
             record.status = status.as_u16();
@@ -1191,6 +1243,9 @@ pub(crate) async fn detail(
         "upstreamResultClass": record.upstream_result_class,
         "callerDelivery": record.caller_delivery,
         "toolCallSuppressed": record.tool_call_suppressed,
+        "toolCallRejectionClass": record.tool_call_rejection_class,
+        "toolCandidateBytes": record.tool_candidate_bytes,
+        "toolCandidateLines": record.tool_candidate_lines,
         "transportProjection": record.transport_projection,
         "wireBeforeUtf16": record.wire_before_utf16,
         "inlineCoreUtf16": record.inline_core_utf16,
@@ -1282,6 +1337,10 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["spillReason"] = serde_json::Value::String(public_spill_reason(record).to_owned());
     value["callerDelivery"] = serde_json::Value::String(record.caller_delivery.clone());
     value["toolCallSuppressed"] = serde_json::Value::Bool(record.tool_call_suppressed);
+    value["toolCallRejectionClass"] =
+        serde_json::Value::String(record.tool_call_rejection_class.clone());
+    value["toolCandidateBytes"] = serde_json::Value::from(record.tool_candidate_bytes);
+    value["toolCandidateLines"] = serde_json::Value::from(record.tool_candidate_lines);
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
     value["transportProjection"] = serde_json::Value::String(record.transport_projection.clone());
     value["wireBeforeUtf16"] = serde_json::Value::from(record.wire_before_utf16);
@@ -1584,7 +1643,13 @@ mod tests {
         let trace = store.start_request("POST", "/hermes/v1/chat/completions");
         trace.caller_delivery(CallerDelivery::Failed);
         trace.tool_call_suppressed();
+        trace.caller_tool_rejection(Some(&crate::tool_calls::ToolRejection {
+            class: crate::tool_calls::ToolRejectionClass::InvalidJson,
+            candidate_bytes: 17,
+            candidate_lines: 2,
+        }));
         drop(trace);
+        let live = store.records_for_test().pop().unwrap();
         drop(store);
 
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -1592,6 +1657,9 @@ mod tests {
         assert_eq!(value["schema"], SURFACE_ID);
         assert!(value.get("callerDelivery").is_none());
         assert!(value.get("toolCallSuppressed").is_none());
+        assert!(value.get("toolCallRejectionClass").is_none());
+        assert!(value.get("toolCandidateBytes").is_none());
+        assert!(value.get("toolCandidateLines").is_none());
 
         // This is the exact v1 record shape an older rollback reader sees.
         let reopened = Store::open(path.clone(), "test").unwrap();
@@ -1605,6 +1673,13 @@ mod tests {
             .clone();
         assert_eq!(record.caller_delivery, "not_evaluated");
         assert!(!record.tool_call_suppressed);
+        assert_eq!(record.tool_call_rejection_class, "not_evaluated");
+        assert_eq!(record.tool_candidate_bytes, 0);
+        assert_eq!(record.tool_candidate_lines, 0);
+
+        assert_eq!(live["toolCallRejectionClass"], "invalid_json");
+        assert_eq!(live["toolCandidateBytes"], 17);
+        assert_eq!(live["toolCandidateLines"], 2);
     }
 
     #[test]

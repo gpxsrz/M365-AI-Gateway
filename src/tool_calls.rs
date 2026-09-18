@@ -18,6 +18,47 @@ pub struct ToolProjection {
     pub calls: Vec<DetectedToolCall>,
     pub overflowed: bool,
     pub rejected: bool,
+    pub rejection: Option<ToolRejection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolRejectionClass {
+    InvalidJson,
+    ExtraProseAfterValidCall,
+    MalformedFence,
+    DuplicateOrAmbiguous,
+    Overflow,
+    Other,
+}
+
+impl ToolRejectionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidJson => "invalid_json",
+            Self::ExtraProseAfterValidCall => "extra_prose_after_valid_call",
+            Self::MalformedFence => "malformed_fence",
+            Self::DuplicateOrAmbiguous => "duplicate_or_ambiguous",
+            Self::Overflow => "overflow",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolRejection {
+    pub class: ToolRejectionClass,
+    pub candidate_bytes: usize,
+    pub candidate_lines: usize,
+}
+
+impl ToolRejection {
+    fn from_shape(class: ToolRejectionClass, candidate: &str) -> Self {
+        Self {
+            class,
+            candidate_bytes: candidate.len(),
+            candidate_lines: candidate.lines().count(),
+        }
+    }
 }
 
 pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> ToolProjection {
@@ -27,6 +68,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
             calls: Vec::new(),
             overflowed: false,
             rejected: false,
+            rejection: None,
         };
     }
     let mut output = ToolProjection::default();
@@ -58,16 +100,32 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
             .position(|candidate| candidate.trim() == "```")
         else {
             if let Some(tool) = allowed_tool {
-                if let Some(arguments) = escaped_closing_fence_arguments(&lines[cursor + 1..])
-                    .and_then(parse_object_arguments)
-                {
-                    append_call(&mut output, tool, name, arguments, limit);
-                } else {
-                    output.rejected = true;
+                match escaped_closing_fence_arguments(&lines[cursor + 1..]) {
+                    Some(raw) => match parse_object_arguments(raw) {
+                        Ok(arguments) => append_call(&mut output, tool, name, arguments, limit),
+                        Err(error) => {
+                            let class = match error {
+                                ArgumentParseFailure::NonObject => ToolRejectionClass::Other,
+                                ArgumentParseFailure::InvalidJson => {
+                                    ToolRejectionClass::InvalidJson
+                                }
+                            };
+                            reject(&mut output, class, raw);
+                        }
+                    },
+                    None => reject(
+                        &mut output,
+                        ToolRejectionClass::MalformedFence,
+                        &lines[cursor..].join("\n"),
+                    ),
                 }
                 cursor = lines.len();
             } else if choice_allows_name && has_matching_tool {
-                output.rejected = true;
+                reject(
+                    &mut output,
+                    ToolRejectionClass::DuplicateOrAmbiguous,
+                    lines[cursor],
+                );
                 cursor = lines.len();
             } else {
                 // Unknown or disallowed fences are caller-visible Markdown, not
@@ -80,13 +138,22 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
         let end = cursor + 1 + relative_end;
         let raw_arguments = lines[cursor + 1..end].join("\n");
         if let Some(tool) = allowed_tool {
-            if let Some(arguments) = parse_object_arguments(&raw_arguments) {
-                append_call(&mut output, tool, name, arguments, limit);
-            } else {
-                output.rejected = true;
+            match parse_object_arguments(&raw_arguments) {
+                Ok(arguments) => append_call(&mut output, tool, name, arguments, limit),
+                Err(error) => {
+                    let class = match error {
+                        ArgumentParseFailure::NonObject => ToolRejectionClass::Other,
+                        ArgumentParseFailure::InvalidJson => ToolRejectionClass::InvalidJson,
+                    };
+                    reject(&mut output, class, &raw_arguments);
+                }
             }
         } else if choice_allows_name && has_matching_tool {
-            output.rejected = true;
+            reject(
+                &mut output,
+                ToolRejectionClass::DuplicateOrAmbiguous,
+                &raw_arguments,
+            );
         } else {
             // A known tool definition is required before textual Markdown can
             // become a caller-tool projection.
@@ -99,21 +166,44 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
     output.content = output.content.trim().to_owned();
     if output.rejected {
         output.calls.clear();
+    } else if output.overflowed {
+        output.rejection = Some(ToolRejection::from_shape(
+            ToolRejectionClass::Overflow,
+            text,
+        ));
     }
     output
 }
 
-fn parse_object_arguments(raw: &str) -> Option<Value> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArgumentParseFailure {
+    InvalidJson,
+    NonObject,
+}
+
+fn parse_object_arguments(raw: &str) -> Result<Value, ArgumentParseFailure> {
     let raw = raw.trim();
-    serde_json::from_str::<Value>(raw)
-        .ok()
-        .filter(Value::is_object)
-        .or_else(|| {
-            let repaired = escape_json_string_control_chars(raw)?;
-            serde_json::from_str::<Value>(&repaired)
-                .ok()
-                .filter(Value::is_object)
-        })
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) if value.is_object() => Ok(value),
+        Ok(_) => Err(ArgumentParseFailure::NonObject),
+        Err(_) => {
+            let Some(repaired) = escape_json_string_control_chars(raw) else {
+                return Err(ArgumentParseFailure::InvalidJson);
+            };
+            match serde_json::from_str::<Value>(&repaired) {
+                Ok(value) if value.is_object() => Ok(value),
+                Ok(_) => Err(ArgumentParseFailure::NonObject),
+                Err(_) => Err(ArgumentParseFailure::InvalidJson),
+            }
+        }
+    }
+}
+
+fn reject(output: &mut ToolProjection, class: ToolRejectionClass, candidate: &str) {
+    output.rejected = true;
+    if output.rejection.is_none() {
+        output.rejection = Some(ToolRejection::from_shape(class, candidate));
+    }
 }
 
 fn escape_json_string_control_chars(raw: &str) -> Option<String> {
@@ -238,7 +328,12 @@ fn append_projection_content(output: &mut ToolProjection, line: &str) {
     // example, a second Markdown/code example), so the caller must fail
     // closed instead of executing only the first block.
     if !output.calls.is_empty() && !line.trim().is_empty() {
-        output.rejected = true;
+        let class = if line.trim_start().starts_with("```") {
+            ToolRejectionClass::DuplicateOrAmbiguous
+        } else {
+            ToolRejectionClass::ExtraProseAfterValidCall
+        };
+        reject(output, class, line);
     }
     append_line(&mut output.content, line);
 }
@@ -414,5 +509,46 @@ mod tests {
         );
         assert!(output.calls.is_empty());
         assert!(output.rejected);
+    }
+
+    #[test]
+    fn rejected_projection_reports_only_a_bounded_shape_class() {
+        let mut duplicate = tools();
+        duplicate.push(duplicate[0].clone());
+        let cases = [
+            (
+                "```read_file\n{\"path\":\n```",
+                tools(),
+                ToolRejectionClass::InvalidJson,
+            ),
+            (
+                "```read_file\n{\"path\":\"README.md\"}\n```\nexplanation",
+                tools(),
+                ToolRejectionClass::ExtraProseAfterValidCall,
+            ),
+            (
+                "```read_file\n{\"path\":\"README.md\"}",
+                tools(),
+                ToolRejectionClass::MalformedFence,
+            ),
+            (
+                "```read_file\n{\"path\":\"README.md\"}\n```",
+                duplicate,
+                ToolRejectionClass::DuplicateOrAmbiguous,
+            ),
+            (
+                "```read_file\n{\"path\":\"a\"}\n```\n```read_file\n{\"path\":\"b\"}\n```",
+                tools(),
+                ToolRejectionClass::Overflow,
+            ),
+            ("```read_file\n[1]\n```", tools(), ToolRejectionClass::Other),
+        ];
+        for (text, available_tools, expected) in cases {
+            let output = project(text, &available_tools, &Value::String("auto".to_owned()), 1);
+            let rejection = output.rejection.expect("diagnostic rejection shape");
+            assert_eq!(rejection.class, expected, "text={text}");
+            assert!(rejection.candidate_bytes <= text.len());
+            assert!(rejection.candidate_lines <= text.lines().count());
+        }
     }
 }
