@@ -1032,6 +1032,13 @@ async fn complete_chat(
                 &tools,
                 suppress_duplicate_tool_calls,
             );
+            observe_tool_projection(
+                &trace,
+                &transport.projection,
+                false,
+                "initial_response",
+                upstream_attempt_count.load(Ordering::Acquire),
+            );
             if transport.projection.rejected {
                 return invalid_tool_call_response(&trace, &transport.projection, permit);
             }
@@ -1173,6 +1180,13 @@ async fn complete_chat(
                     &agent_ledger,
                     &tools,
                     suppress_duplicate_tool_calls,
+                );
+                observe_tool_projection(
+                    &trace,
+                    &transport.projection,
+                    false,
+                    "final_answer_fallback",
+                    upstream_attempt_count.load(Ordering::Acquire),
                 );
                 if transport.projection.rejected {
                     return invalid_tool_call_response(&trace, &transport.projection, permit);
@@ -1504,6 +1518,13 @@ async fn stream_chat(
                     &tools,
                     suppress_duplicate_tool_calls,
                 );
+                observe_tool_projection(
+                    &trace,
+                    &transport.projection,
+                    true,
+                    "initial_response",
+                    upstream_attempt_count.load(Ordering::Acquire),
+                );
                 if transport.projection.rejected {
                     send_invalid_tool_call_error(
                         &trace,
@@ -1691,6 +1712,13 @@ async fn stream_chat(
                         &agent_ledger,
                         &tools,
                         suppress_duplicate_tool_calls,
+                    );
+                    observe_tool_projection(
+                        &trace,
+                        &transport.projection,
+                        true,
+                        "final_answer_fallback",
+                        upstream_attempt_count.load(Ordering::Acquire),
                     );
                     if transport.projection.rejected {
                         send_invalid_tool_call_error(
@@ -2717,6 +2745,18 @@ fn unsafe_tool_replay_response(permit: crate::traffic::Permit) -> Response {
 
 const INVALID_TOOL_CALL_MESSAGE: &str =
     "model returned a malformed caller tool candidate that was not safely executable";
+
+fn observe_tool_projection(
+    trace: &crate::debug::Trace,
+    projection: &ToolProjection,
+    stream: bool,
+    stage: &str,
+    retry_attempt_ordinal: usize,
+) {
+    if let Some(diagnostic) = projection.diagnostic.as_ref() {
+        trace.caller_tool_diagnostic(Some(diagnostic), stream, stage, retry_attempt_ordinal);
+    }
+}
 
 fn invalid_tool_call_response(
     trace: &crate::debug::Trace,
@@ -14091,9 +14131,20 @@ mod tests {
         }
         assert_eq!(chat.requests.lock().unwrap().len(), 2);
         let record = gateway.debug.records_for_test().pop().unwrap();
-        assert_eq!(record["toolCallRejectionClass"], "overflow");
+        assert_eq!(record["toolCallRejectionClass"], "more_calls_than_allowed");
+        assert_eq!(record["toolCandidateSha256"].as_str().unwrap().len(), 64);
         assert!(record["toolCandidateBytes"].as_u64().unwrap() > 0);
+        assert!(record["toolCandidateChars"].as_u64().unwrap() > 0);
         assert!(record["toolCandidateLines"].as_u64().unwrap() > 0);
+        assert!(record["toolFenceCount"].as_u64().unwrap() >= 2);
+        assert!(record["toolMatchingKnownToolFenceCount"].as_u64().unwrap() >= 2);
+        assert!(record["toolParseErrorOffset"].is_null());
+        assert_eq!(record["toolStream"], stream);
+        assert!(matches!(
+            record["toolProjectionStage"].as_str(),
+            Some("initial_response") | Some("final_answer_fallback")
+        ));
+        assert!(record["toolRetryAttemptOrdinal"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

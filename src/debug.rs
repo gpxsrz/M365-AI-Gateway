@@ -284,10 +284,34 @@ struct Record {
         deserialize_with = "deserialize_not_evaluated"
     )]
     tool_call_rejection_class: String,
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
+    tool_candidate_sha256: String,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     tool_candidate_bytes: usize,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    tool_candidate_chars: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     tool_candidate_lines: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    tool_fence_count: usize,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    tool_matching_known_tool_fence_count: usize,
+    #[serde(skip_serializing, default)]
+    tool_parse_error_offset: Option<usize>,
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
+    tool_projection_stage: String,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_false")]
+    tool_stream: bool,
+    #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
+    tool_retry_attempt_ordinal: usize,
     // Transport details are a bounded live projection. They are deliberately
     // absent from the v1 JSONL record so an older rollback reader can still
     // read the authoritative durable surface.
@@ -587,8 +611,16 @@ impl Record {
             caller_delivery: CallerDelivery::NotEvaluated.as_str().to_owned(),
             tool_call_suppressed: false,
             tool_call_rejection_class: "not_evaluated".to_owned(),
+            tool_candidate_sha256: "not_evaluated".to_owned(),
             tool_candidate_bytes: 0,
+            tool_candidate_chars: 0,
             tool_candidate_lines: 0,
+            tool_fence_count: 0,
+            tool_matching_known_tool_fence_count: 0,
+            tool_parse_error_offset: None,
+            tool_projection_stage: "not_evaluated".to_owned(),
+            tool_stream: false,
+            tool_retry_attempt_ordinal: 0,
             transport_projection: "not_evaluated".to_owned(),
             wire_before_utf16: 0,
             inline_core_utf16: 0,
@@ -731,8 +763,17 @@ impl Record {
                 "not_evaluated" | "sent" | "failed" | "cancelled"
             )
             && valid_tool_call_rejection_class(&self.tool_call_rejection_class)
+            && valid_tool_candidate_sha256(&self.tool_candidate_sha256)
             && self.tool_candidate_bytes <= MAX_RECORDED_BYTES
+            && self.tool_candidate_chars <= MAX_RECORDED_UTF16
             && self.tool_candidate_lines <= MAX_RECORDED_UTF16
+            && self.tool_fence_count <= MAX_RECORDED_UTF16
+            && self.tool_matching_known_tool_fence_count <= self.tool_fence_count
+            && self
+                .tool_parse_error_offset
+                .is_none_or(|offset| offset <= MAX_RECORDED_BYTES)
+            && valid_tool_projection_stage(&self.tool_projection_stage)
+            && self.tool_retry_attempt_ordinal <= 64
             && valid_transport_projection(&self.transport_projection)
             && self.wire_before_utf16 <= MAX_RECORDED_UTF16
             && self.inline_core_utf16 <= MAX_RECORDED_UTF16
@@ -831,12 +872,31 @@ fn valid_tool_call_rejection_class(value: &str) -> bool {
     matches!(
         value,
         "not_evaluated"
-            | "invalid_json"
+            | "strict_json_valid"
+            | "literal_control_char_inside_json_string"
+            | "malformed_json_structure"
+            | "unclosed_string"
+            | "illegal_escape"
+            | "extra_prose_before_call"
             | "extra_prose_after_valid_call"
             | "malformed_fence"
             | "duplicate_or_ambiguous"
-            | "overflow"
+            | "more_calls_than_allowed"
+            | "known_tool_disallowed_by_tool_choice"
+            | "unknown_tool_fence"
             | "other"
+    )
+}
+
+fn valid_tool_candidate_sha256(value: &str) -> bool {
+    value == "not_evaluated"
+        || (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn valid_tool_projection_stage(value: &str) -> bool {
+    matches!(
+        value,
+        "not_evaluated" | "initial_response" | "final_answer_fallback"
     )
 }
 
@@ -904,6 +964,37 @@ impl Drop for TraceInner {
 #[derive(Clone)]
 pub(crate) struct Trace {
     inner: Arc<TraceInner>,
+}
+
+fn apply_tool_diagnostic(
+    record: &mut Record,
+    diagnostic: Option<&crate::tool_calls::ToolDiagnostic>,
+) {
+    if let Some(diagnostic) = diagnostic {
+        record.tool_call_rejection_class = diagnostic.class.as_str().to_owned();
+        record.tool_candidate_sha256 = diagnostic.candidate_sha256.clone();
+        record.tool_candidate_bytes = diagnostic.candidate_bytes.min(MAX_RECORDED_BYTES);
+        record.tool_candidate_chars = diagnostic.candidate_chars.min(MAX_RECORDED_UTF16);
+        record.tool_candidate_lines = diagnostic.candidate_lines.min(MAX_RECORDED_UTF16);
+        record.tool_fence_count = diagnostic.fence_count.min(MAX_RECORDED_UTF16);
+        record.tool_matching_known_tool_fence_count = diagnostic
+            .matching_known_tool_fence_count
+            .min(MAX_RECORDED_UTF16);
+        record.tool_parse_error_offset = diagnostic
+            .parse_error_offset
+            .map(|offset| offset.min(MAX_RECORDED_BYTES));
+    } else {
+        record.tool_call_rejection_class = crate::tool_calls::ToolRejectionClass::Other
+            .as_str()
+            .to_owned();
+        record.tool_candidate_sha256 = "not_evaluated".to_owned();
+        record.tool_candidate_bytes = 0;
+        record.tool_candidate_chars = 0;
+        record.tool_candidate_lines = 0;
+        record.tool_fence_count = 0;
+        record.tool_matching_known_tool_fence_count = 0;
+        record.tool_parse_error_offset = None;
+    }
 }
 
 impl Trace {
@@ -1113,16 +1204,28 @@ impl Trace {
     ) {
         self.update(|record| {
             if let Some(rejection) = rejection {
-                record.tool_call_rejection_class = rejection.class.as_str().to_owned();
-                record.tool_candidate_bytes = rejection.candidate_bytes.min(MAX_RECORDED_BYTES);
-                record.tool_candidate_lines = rejection.candidate_lines.min(MAX_RECORDED_UTF16);
+                apply_tool_diagnostic(record, Some(rejection));
             } else {
-                record.tool_call_rejection_class = crate::tool_calls::ToolRejectionClass::Other
-                    .as_str()
-                    .to_owned();
-                record.tool_candidate_bytes = 0;
-                record.tool_candidate_lines = 0;
+                apply_tool_diagnostic(record, None);
             }
+            if record.tool_projection_stage == "not_evaluated" {
+                record.tool_projection_stage = "initial_response".to_owned();
+            }
+        });
+    }
+
+    pub(crate) fn caller_tool_diagnostic(
+        &self,
+        diagnostic: Option<&crate::tool_calls::ToolDiagnostic>,
+        stream: bool,
+        stage: &str,
+        retry_attempt_ordinal: usize,
+    ) {
+        self.update(|record| {
+            apply_tool_diagnostic(record, diagnostic);
+            record.tool_projection_stage = stage.to_owned();
+            record.tool_stream = stream;
+            record.tool_retry_attempt_ordinal = retry_attempt_ordinal.clamp(1, 64);
         });
     }
 
@@ -1244,8 +1347,16 @@ pub(crate) async fn detail(
         "callerDelivery": record.caller_delivery,
         "toolCallSuppressed": record.tool_call_suppressed,
         "toolCallRejectionClass": record.tool_call_rejection_class,
+        "toolCandidateSha256": record.tool_candidate_sha256,
         "toolCandidateBytes": record.tool_candidate_bytes,
+        "toolCandidateChars": record.tool_candidate_chars,
         "toolCandidateLines": record.tool_candidate_lines,
+        "toolFenceCount": record.tool_fence_count,
+        "toolMatchingKnownToolFenceCount": record.tool_matching_known_tool_fence_count,
+        "toolParseErrorOffset": record.tool_parse_error_offset,
+        "toolProjectionStage": record.tool_projection_stage,
+        "toolStream": record.tool_stream,
+        "toolRetryAttemptOrdinal": record.tool_retry_attempt_ordinal,
         "transportProjection": record.transport_projection,
         "wireBeforeUtf16": record.wire_before_utf16,
         "inlineCoreUtf16": record.inline_core_utf16,
@@ -1339,8 +1450,20 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["toolCallSuppressed"] = serde_json::Value::Bool(record.tool_call_suppressed);
     value["toolCallRejectionClass"] =
         serde_json::Value::String(record.tool_call_rejection_class.clone());
+    value["toolCandidateSha256"] = serde_json::Value::String(record.tool_candidate_sha256.clone());
     value["toolCandidateBytes"] = serde_json::Value::from(record.tool_candidate_bytes);
+    value["toolCandidateChars"] = serde_json::Value::from(record.tool_candidate_chars);
     value["toolCandidateLines"] = serde_json::Value::from(record.tool_candidate_lines);
+    value["toolFenceCount"] = serde_json::Value::from(record.tool_fence_count);
+    value["toolMatchingKnownToolFenceCount"] =
+        serde_json::Value::from(record.tool_matching_known_tool_fence_count);
+    value["toolParseErrorOffset"] = record
+        .tool_parse_error_offset
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    value["toolProjectionStage"] = serde_json::Value::String(record.tool_projection_stage.clone());
+    value["toolStream"] = serde_json::Value::Bool(record.tool_stream);
+    value["toolRetryAttemptOrdinal"] = serde_json::Value::from(record.tool_retry_attempt_ordinal);
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
     value["transportProjection"] = serde_json::Value::String(record.transport_projection.clone());
     value["wireBeforeUtf16"] = serde_json::Value::from(record.wire_before_utf16);
@@ -1644,9 +1767,14 @@ mod tests {
         trace.caller_delivery(CallerDelivery::Failed);
         trace.tool_call_suppressed();
         trace.caller_tool_rejection(Some(&crate::tool_calls::ToolRejection {
-            class: crate::tool_calls::ToolRejectionClass::InvalidJson,
+            class: crate::tool_calls::ToolRejectionClass::MalformedJsonStructure,
+            candidate_sha256: "a".repeat(64),
             candidate_bytes: 17,
+            candidate_chars: 17,
             candidate_lines: 2,
+            fence_count: 2,
+            matching_known_tool_fence_count: 1,
+            parse_error_offset: Some(7),
         }));
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
@@ -1658,8 +1786,16 @@ mod tests {
         assert!(value.get("callerDelivery").is_none());
         assert!(value.get("toolCallSuppressed").is_none());
         assert!(value.get("toolCallRejectionClass").is_none());
+        assert!(value.get("toolCandidateSha256").is_none());
         assert!(value.get("toolCandidateBytes").is_none());
+        assert!(value.get("toolCandidateChars").is_none());
         assert!(value.get("toolCandidateLines").is_none());
+        assert!(value.get("toolFenceCount").is_none());
+        assert!(value.get("toolMatchingKnownToolFenceCount").is_none());
+        assert!(value.get("toolParseErrorOffset").is_none());
+        assert!(value.get("toolProjectionStage").is_none());
+        assert!(value.get("toolStream").is_none());
+        assert!(value.get("toolRetryAttemptOrdinal").is_none());
 
         // This is the exact v1 record shape an older rollback reader sees.
         let reopened = Store::open(path.clone(), "test").unwrap();
@@ -1674,12 +1810,25 @@ mod tests {
         assert_eq!(record.caller_delivery, "not_evaluated");
         assert!(!record.tool_call_suppressed);
         assert_eq!(record.tool_call_rejection_class, "not_evaluated");
+        assert_eq!(record.tool_candidate_sha256, "not_evaluated");
         assert_eq!(record.tool_candidate_bytes, 0);
+        assert_eq!(record.tool_candidate_chars, 0);
         assert_eq!(record.tool_candidate_lines, 0);
+        assert_eq!(record.tool_fence_count, 0);
+        assert_eq!(record.tool_matching_known_tool_fence_count, 0);
+        assert_eq!(record.tool_parse_error_offset, None);
+        assert_eq!(record.tool_projection_stage, "not_evaluated");
+        assert!(!record.tool_stream);
+        assert_eq!(record.tool_retry_attempt_ordinal, 0);
 
-        assert_eq!(live["toolCallRejectionClass"], "invalid_json");
+        assert_eq!(live["toolCallRejectionClass"], "malformed_json_structure");
+        assert_eq!(live["toolCandidateSha256"].as_str().unwrap().len(), 64);
         assert_eq!(live["toolCandidateBytes"], 17);
+        assert_eq!(live["toolCandidateChars"], 17);
         assert_eq!(live["toolCandidateLines"], 2);
+        assert_eq!(live["toolFenceCount"], 2);
+        assert_eq!(live["toolMatchingKnownToolFenceCount"], 1);
+        assert_eq!(live["toolParseErrorOffset"], 7);
     }
 
     #[test]

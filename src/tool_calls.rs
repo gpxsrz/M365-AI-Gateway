@@ -1,6 +1,7 @@
 use rand::Rng;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::chathub::Tool;
 
@@ -18,56 +19,90 @@ pub struct ToolProjection {
     pub calls: Vec<DetectedToolCall>,
     pub overflowed: bool,
     pub rejected: bool,
+    pub diagnostic: Option<ToolDiagnostic>,
     pub rejection: Option<ToolRejection>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolRejectionClass {
-    InvalidJson,
+    StrictJsonValid,
+    LiteralControlCharInsideJsonString,
+    MalformedJsonStructure,
+    UnclosedString,
+    IllegalEscape,
+    ExtraProseBeforeCall,
     ExtraProseAfterValidCall,
     MalformedFence,
     DuplicateOrAmbiguous,
-    Overflow,
+    MoreCallsThanAllowed,
+    KnownToolDisallowedByToolChoice,
+    UnknownToolFence,
     Other,
 }
 
 impl ToolRejectionClass {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::InvalidJson => "invalid_json",
+            Self::StrictJsonValid => "strict_json_valid",
+            Self::LiteralControlCharInsideJsonString => "literal_control_char_inside_json_string",
+            Self::MalformedJsonStructure => "malformed_json_structure",
+            Self::UnclosedString => "unclosed_string",
+            Self::IllegalEscape => "illegal_escape",
+            Self::ExtraProseBeforeCall => "extra_prose_before_call",
             Self::ExtraProseAfterValidCall => "extra_prose_after_valid_call",
             Self::MalformedFence => "malformed_fence",
             Self::DuplicateOrAmbiguous => "duplicate_or_ambiguous",
-            Self::Overflow => "overflow",
+            Self::MoreCallsThanAllowed => "more_calls_than_allowed",
+            Self::KnownToolDisallowedByToolChoice => "known_tool_disallowed_by_tool_choice",
+            Self::UnknownToolFence => "unknown_tool_fence",
             Self::Other => "other",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ToolRejection {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolDiagnostic {
     pub class: ToolRejectionClass,
+    pub candidate_sha256: String,
     pub candidate_bytes: usize,
+    pub candidate_chars: usize,
     pub candidate_lines: usize,
+    pub fence_count: usize,
+    pub matching_known_tool_fence_count: usize,
+    pub parse_error_offset: Option<usize>,
 }
 
-impl ToolRejection {
-    fn from_shape(class: ToolRejectionClass, candidate: &str) -> Self {
+pub type ToolRejection = ToolDiagnostic;
+
+impl ToolDiagnostic {
+    fn from_shape(
+        class: ToolRejectionClass,
+        candidate: &str,
+        full_text: &str,
+        tools: &[Tool],
+        parse_error_offset: Option<usize>,
+    ) -> Self {
         Self {
             class,
+            candidate_sha256: format!("{:x}", Sha256::digest(candidate.as_bytes())),
             candidate_bytes: candidate.len(),
+            candidate_chars: candidate.chars().count(),
             candidate_lines: candidate.lines().count(),
+            fence_count: fence_count(full_text),
+            matching_known_tool_fence_count: matching_known_tool_fence_count(full_text, tools),
+            parse_error_offset,
         }
     }
 }
 
 pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> ToolProjection {
-    if tools.is_empty() || choice.as_str() == Some("none") {
+    if tools.is_empty() {
         return ToolProjection {
             content: text.to_owned(),
             calls: Vec::new(),
             overflowed: false,
             rejected: false,
+            diagnostic: None,
             rejection: None,
         };
     }
@@ -75,15 +110,28 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
     let lines = text.lines().collect::<Vec<_>>();
     let mut cursor = 0;
     let limit = limit.max(1);
+    let mut pre_call_content = false;
     while cursor < lines.len() {
         let line = lines[cursor].trim();
         let Some(name) = line.strip_prefix("```").map(str::trim) else {
-            append_projection_content(&mut output, lines[cursor]);
+            append_projection_content(
+                &mut output,
+                lines[cursor],
+                &mut pre_call_content,
+                text,
+                tools,
+            );
             cursor += 1;
             continue;
         };
         if name.is_empty() || name.contains(char::is_whitespace) {
-            append_projection_content(&mut output, lines[cursor]);
+            append_projection_content(
+                &mut output,
+                lines[cursor],
+                &mut pre_call_content,
+                text,
+                tools,
+            );
             cursor += 1;
             continue;
         }
@@ -102,21 +150,21 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
             if let Some(tool) = allowed_tool {
                 match escaped_closing_fence_arguments(&lines[cursor + 1..]) {
                     Some(raw) => match parse_object_arguments(raw) {
-                        Ok(arguments) => append_call(&mut output, tool, name, arguments, limit),
-                        Err(error) => {
-                            let class = match error {
-                                ArgumentParseFailure::NonObject => ToolRejectionClass::Other,
-                                ArgumentParseFailure::InvalidJson => {
-                                    ToolRejectionClass::InvalidJson
-                                }
-                            };
-                            reject(&mut output, class, raw);
+                        ArgumentParseOutcome::Success { value, class } => {
+                            set_diagnostic(&mut output, class, raw, text, tools, None);
+                            append_call(&mut output, tool, name, value, limit);
+                        }
+                        ArgumentParseOutcome::Failure { class, offset } => {
+                            reject(&mut output, class, raw, text, tools, offset);
                         }
                     },
                     None => reject(
                         &mut output,
                         ToolRejectionClass::MalformedFence,
                         &lines[cursor..].join("\n"),
+                        text,
+                        tools,
+                        None,
                     ),
                 }
                 cursor = lines.len();
@@ -125,12 +173,46 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                     &mut output,
                     ToolRejectionClass::DuplicateOrAmbiguous,
                     lines[cursor],
+                    text,
+                    tools,
+                    None,
                 );
                 cursor = lines.len();
+            } else if has_matching_tool {
+                set_diagnostic(
+                    &mut output,
+                    ToolRejectionClass::KnownToolDisallowedByToolChoice,
+                    lines[cursor],
+                    text,
+                    tools,
+                    None,
+                );
+                append_projection_content(
+                    &mut output,
+                    lines[cursor],
+                    &mut pre_call_content,
+                    text,
+                    tools,
+                );
+                cursor += 1;
             } else {
                 // Unknown or disallowed fences are caller-visible Markdown, not
                 // executable candidates. Matching malformed candidates fail closed.
-                append_projection_content(&mut output, lines[cursor]);
+                set_diagnostic(
+                    &mut output,
+                    ToolRejectionClass::UnknownToolFence,
+                    lines[cursor],
+                    text,
+                    tools,
+                    None,
+                );
+                append_projection_content(
+                    &mut output,
+                    lines[cursor],
+                    &mut pre_call_content,
+                    text,
+                    tools,
+                );
                 cursor += 1;
             }
             continue;
@@ -139,13 +221,12 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
         let raw_arguments = lines[cursor + 1..end].join("\n");
         if let Some(tool) = allowed_tool {
             match parse_object_arguments(&raw_arguments) {
-                Ok(arguments) => append_call(&mut output, tool, name, arguments, limit),
-                Err(error) => {
-                    let class = match error {
-                        ArgumentParseFailure::NonObject => ToolRejectionClass::Other,
-                        ArgumentParseFailure::InvalidJson => ToolRejectionClass::InvalidJson,
-                    };
-                    reject(&mut output, class, &raw_arguments);
+                ArgumentParseOutcome::Success { value, class } => {
+                    set_diagnostic(&mut output, class, &raw_arguments, text, tools, None);
+                    append_call(&mut output, tool, name, value, limit);
+                }
+                ArgumentParseOutcome::Failure { class, offset } => {
+                    reject(&mut output, class, &raw_arguments, text, tools, offset);
                 }
             }
         } else if choice_allows_name && has_matching_tool {
@@ -153,65 +234,207 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                 &mut output,
                 ToolRejectionClass::DuplicateOrAmbiguous,
                 &raw_arguments,
+                text,
+                tools,
+                None,
             );
+        } else if has_matching_tool {
+            set_diagnostic(
+                &mut output,
+                ToolRejectionClass::KnownToolDisallowedByToolChoice,
+                &raw_arguments,
+                text,
+                tools,
+                None,
+            );
+            for original in &lines[cursor..=end] {
+                append_projection_content(
+                    &mut output,
+                    original,
+                    &mut pre_call_content,
+                    text,
+                    tools,
+                );
+            }
         } else {
             // A known tool definition is required before textual Markdown can
             // become a caller-tool projection.
+            set_diagnostic(
+                &mut output,
+                ToolRejectionClass::UnknownToolFence,
+                &raw_arguments,
+                text,
+                tools,
+                None,
+            );
             for original in &lines[cursor..=end] {
-                append_projection_content(&mut output, original);
+                append_projection_content(
+                    &mut output,
+                    original,
+                    &mut pre_call_content,
+                    text,
+                    tools,
+                );
             }
         }
         cursor = end + 1;
     }
-    output.content = output.content.trim().to_owned();
+    output.content = if choice.as_str() == Some("none") {
+        text.to_owned()
+    } else {
+        output.content.trim().to_owned()
+    };
     if output.rejected {
         output.calls.clear();
     } else if output.overflowed {
-        output.rejection = Some(ToolRejection::from_shape(
-            ToolRejectionClass::Overflow,
+        let diagnostic = ToolRejection::from_shape(
+            ToolRejectionClass::MoreCallsThanAllowed,
             text,
+            text,
+            tools,
+            None,
+        );
+        output.diagnostic = Some(diagnostic.clone());
+        output.rejection = Some(diagnostic);
+    } else if !output.calls.is_empty() && pre_call_content {
+        output.diagnostic = Some(ToolDiagnostic::from_shape(
+            ToolRejectionClass::ExtraProseBeforeCall,
+            text,
+            text,
+            tools,
+            None,
         ));
     }
     output
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArgumentParseFailure {
-    InvalidJson,
-    NonObject,
+enum ArgumentParseOutcome {
+    Success {
+        value: Value,
+        class: ToolRejectionClass,
+    },
+    Failure {
+        class: ToolRejectionClass,
+        offset: Option<usize>,
+    },
 }
 
-fn parse_object_arguments(raw: &str) -> Result<Value, ArgumentParseFailure> {
+struct JsonStringScan {
+    repaired: String,
+    changed: bool,
+    unclosed_string: bool,
+    illegal_escape_offset: Option<usize>,
+}
+
+fn parse_object_arguments(raw: &str) -> ArgumentParseOutcome {
     let raw = raw.trim();
     match serde_json::from_str::<Value>(raw) {
-        Ok(value) if value.is_object() => Ok(value),
-        Ok(_) => Err(ArgumentParseFailure::NonObject),
-        Err(_) => {
-            let Some(repaired) = escape_json_string_control_chars(raw) else {
-                return Err(ArgumentParseFailure::InvalidJson);
-            };
-            match serde_json::from_str::<Value>(&repaired) {
-                Ok(value) if value.is_object() => Ok(value),
-                Ok(_) => Err(ArgumentParseFailure::NonObject),
-                Err(_) => Err(ArgumentParseFailure::InvalidJson),
+        Ok(value) if value.is_object() => ArgumentParseOutcome::Success {
+            value,
+            class: ToolRejectionClass::StrictJsonValid,
+        },
+        Ok(_) => ArgumentParseOutcome::Failure {
+            class: ToolRejectionClass::Other,
+            offset: None,
+        },
+        Err(error) => {
+            let scan = scan_json_string(raw);
+            if scan.changed {
+                match serde_json::from_str::<Value>(&scan.repaired) {
+                    Ok(value) if value.is_object() => ArgumentParseOutcome::Success {
+                        value,
+                        class: ToolRejectionClass::LiteralControlCharInsideJsonString,
+                    },
+                    Ok(_) => ArgumentParseOutcome::Failure {
+                        class: ToolRejectionClass::Other,
+                        offset: Some(parse_error_offset(raw, &error)),
+                    },
+                    Err(repaired_error) => ArgumentParseOutcome::Failure {
+                        class: scan_failure_class(&scan),
+                        offset: scan
+                            .illegal_escape_offset
+                            .or_else(|| Some(parse_error_offset(raw, &repaired_error))),
+                    },
+                }
+            } else {
+                ArgumentParseOutcome::Failure {
+                    class: scan_failure_class(&scan),
+                    offset: scan
+                        .illegal_escape_offset
+                        .or_else(|| Some(parse_error_offset(raw, &error))),
+                }
             }
         }
     }
 }
 
-fn reject(output: &mut ToolProjection, class: ToolRejectionClass, candidate: &str) {
-    output.rejected = true;
-    if output.rejection.is_none() {
-        output.rejection = Some(ToolRejection::from_shape(class, candidate));
+fn scan_failure_class(scan: &JsonStringScan) -> ToolRejectionClass {
+    if scan.illegal_escape_offset.is_some() {
+        ToolRejectionClass::IllegalEscape
+    } else if scan.unclosed_string {
+        ToolRejectionClass::UnclosedString
+    } else {
+        ToolRejectionClass::MalformedJsonStructure
     }
 }
 
-fn escape_json_string_control_chars(raw: &str) -> Option<String> {
+fn parse_error_offset(raw: &str, error: &serde_json::Error) -> usize {
+    let line = error.line().saturating_sub(1);
+    let column = error.column().saturating_sub(1);
+    let mut line_start = 0;
+    for _ in 0..line {
+        let Some(relative) = raw[line_start..].find('\n') else {
+            return raw.len();
+        };
+        line_start = line_start.saturating_add(relative + 1);
+    }
+    line_start.saturating_add(column).min(raw.len())
+}
+
+fn set_diagnostic(
+    output: &mut ToolProjection,
+    class: ToolRejectionClass,
+    candidate: &str,
+    full_text: &str,
+    tools: &[Tool],
+    parse_error_offset: Option<usize>,
+) {
+    if output.diagnostic.is_none() {
+        output.diagnostic = Some(ToolDiagnostic::from_shape(
+            class,
+            candidate,
+            full_text,
+            tools,
+            parse_error_offset,
+        ));
+    }
+}
+
+fn reject(
+    output: &mut ToolProjection,
+    class: ToolRejectionClass,
+    candidate: &str,
+    full_text: &str,
+    tools: &[Tool],
+    parse_error_offset: Option<usize>,
+) {
+    output.rejected = true;
+    if output.rejection.is_none() {
+        let diagnostic =
+            ToolRejection::from_shape(class, candidate, full_text, tools, parse_error_offset);
+        output.diagnostic = Some(diagnostic.clone());
+        output.rejection = Some(diagnostic);
+    }
+}
+
+fn scan_json_string(raw: &str) -> JsonStringScan {
     let mut repaired = String::with_capacity(raw.len());
     let mut in_string = false;
     let mut escaped = false;
+    let mut unicode_remaining = 0;
     let mut changed = false;
-    for ch in raw.chars() {
+    let mut illegal_escape_offset = None;
+    for (offset, ch) in raw.char_indices() {
         if !in_string {
             if ch == '"' {
                 in_string = true;
@@ -220,8 +443,23 @@ fn escape_json_string_control_chars(raw: &str) -> Option<String> {
             continue;
         }
         if escaped {
+            if ch == 'u' {
+                unicode_remaining = 4;
+            } else if !matches!(ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')
+                && illegal_escape_offset.is_none()
+            {
+                illegal_escape_offset = Some(offset);
+            }
             repaired.push(ch);
             escaped = false;
+            continue;
+        }
+        if unicode_remaining > 0 {
+            if !ch.is_ascii_hexdigit() && illegal_escape_offset.is_none() {
+                illegal_escape_offset = Some(offset);
+            }
+            unicode_remaining -= 1;
+            repaired.push(ch);
             continue;
         }
         match ch {
@@ -245,14 +483,19 @@ fn escape_json_string_control_chars(raw: &str) -> Option<String> {
                 repaired.push_str("\\t");
                 changed = true;
             }
-            '\u{0000}'..='\u{001f}' => {
+            ch if (ch as u32) <= 0x1f => {
                 repaired.push_str(&format!("\\u{:04x}", ch as u32));
                 changed = true;
             }
             _ => repaired.push(ch),
         }
     }
-    changed.then_some(repaired)
+    JsonStringScan {
+        repaired,
+        changed,
+        unclosed_string: in_string,
+        illegal_escape_offset,
+    }
 }
 
 fn escaped_closing_fence_arguments<'a>(lines: &[&'a str]) -> Option<&'a str> {
@@ -322,7 +565,42 @@ fn append_line(output: &mut String, line: &str) {
     output.push_str(line);
 }
 
-fn append_projection_content(output: &mut ToolProjection, line: &str) {
+fn fence_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.trim_start().as_bytes().starts_with(&[96, 96, 96]))
+        .count()
+}
+
+fn matching_known_tool_fence_count(text: &str, tools: &[Tool]) -> usize {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let bytes = trimmed.as_bytes();
+            bytes.starts_with(&[96, 96, 96]).then(|| &trimmed[3..])
+        })
+        .filter(|name| {
+            !name.is_empty()
+                && !name.contains(char::is_whitespace)
+                && tools.iter().any(|tool| {
+                    tool.function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|candidate| candidate == *name)
+                })
+        })
+        .count()
+}
+
+fn append_projection_content(
+    output: &mut ToolProjection,
+    line: &str,
+    pre_call_content: &mut bool,
+    full_text: &str,
+    tools: &[Tool],
+) {
+    if output.calls.is_empty() && !line.trim().is_empty() {
+        *pre_call_content = true;
+    }
     // A structured call must be the complete executable projection. Any
     // non-whitespace material after it makes the candidate ambiguous (for
     // example, a second Markdown/code example), so the caller must fail
@@ -333,7 +611,7 @@ fn append_projection_content(output: &mut ToolProjection, line: &str) {
         } else {
             ToolRejectionClass::ExtraProseAfterValidCall
         };
-        reject(output, class, line);
+        reject(output, class, line, full_text, tools, None);
     }
     append_line(&mut output.content, line);
 }
@@ -519,7 +797,7 @@ mod tests {
             (
                 "```read_file\n{\"path\":\n```",
                 tools(),
-                ToolRejectionClass::InvalidJson,
+                ToolRejectionClass::MalformedJsonStructure,
             ),
             (
                 "```read_file\n{\"path\":\"README.md\"}\n```\nexplanation",
@@ -539,7 +817,7 @@ mod tests {
             (
                 "```read_file\n{\"path\":\"a\"}\n```\n```read_file\n{\"path\":\"b\"}\n```",
                 tools(),
-                ToolRejectionClass::Overflow,
+                ToolRejectionClass::MoreCallsThanAllowed,
             ),
             ("```read_file\n[1]\n```", tools(), ToolRejectionClass::Other),
         ];
@@ -549,6 +827,119 @@ mod tests {
             assert_eq!(rejection.class, expected, "text={text}");
             assert!(rejection.candidate_bytes <= text.len());
             assert!(rejection.candidate_lines <= text.lines().count());
+        }
+    }
+
+    #[test]
+    fn projection_diagnostic_distinguishes_safe_rejection_taxonomy_and_shape() {
+        let mut duplicate = tools();
+        duplicate.push(duplicate[0].clone());
+        let cases = [
+            (
+                "```read_file\n{\"path\":\"ok\"}\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::StrictJsonValid,
+            ),
+            (
+                "```read_file\n{\"path\":\"line-one\nline-two\"}\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::LiteralControlCharInsideJsonString,
+            ),
+            (
+                "```read_file\n{\"path\":\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::MalformedJsonStructure,
+            ),
+            (
+                "```read_file\n{\"path\":\"unterminated}\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::UnclosedString,
+            ),
+            (
+                "```read_file\n{\"path\":\"bad\\q\"}\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::IllegalEscape,
+            ),
+            (
+                "prefix\n```read_file\n{\"path\":\"ok\"}\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::ExtraProseBeforeCall,
+            ),
+            (
+                "```read_file\n{\"path\":\"ok\"}\n```\nexplanation",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::ExtraProseAfterValidCall,
+            ),
+            (
+                "```read_file\n{\"path\":\"ok\"}",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::MalformedFence,
+            ),
+            (
+                "```read_file\n{\"path\":\"ok\"}\n```",
+                duplicate,
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::DuplicateOrAmbiguous,
+            ),
+            (
+                "```read_file\n{\"path\":\"a\"}\n```\n```read_file\n{\"path\":\"b\"}\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::MoreCallsThanAllowed,
+            ),
+            (
+                "```read_file\n{\"path\":\"ok\"}\n```",
+                tools(),
+                Value::String("none".to_owned()),
+                ToolRejectionClass::KnownToolDisallowedByToolChoice,
+            ),
+            (
+                "```unknown_tool\n{}\n```",
+                tools(),
+                Value::String("auto".to_owned()),
+                ToolRejectionClass::UnknownToolFence,
+            ),
+        ];
+        for (text, available_tools, choice, expected) in cases {
+            let output = project(text, &available_tools, &choice, 1);
+            let diagnostic = output.diagnostic.as_ref().expect("diagnostic shape");
+            assert_eq!(diagnostic.class, expected, "text={text}");
+            assert_eq!(diagnostic.candidate_sha256.len(), 64);
+            assert!(diagnostic.candidate_bytes <= text.len());
+            assert!(diagnostic.candidate_chars <= text.chars().count());
+            assert!(diagnostic.fence_count <= text.lines().count());
+            assert!(diagnostic.matching_known_tool_fence_count <= diagnostic.fence_count);
+            if matches!(
+                expected,
+                ToolRejectionClass::MalformedJsonStructure
+                    | ToolRejectionClass::UnclosedString
+                    | ToolRejectionClass::IllegalEscape
+                    | ToolRejectionClass::MalformedFence
+                    | ToolRejectionClass::DuplicateOrAmbiguous
+                    | ToolRejectionClass::ExtraProseAfterValidCall
+            ) {
+                assert!(output.rejected, "text={text}");
+                assert!(output.calls.is_empty(), "text={text}");
+            }
+            if expected == ToolRejectionClass::MoreCallsThanAllowed {
+                assert!(output.overflowed, "text={text}");
+            }
+            if matches!(
+                expected,
+                ToolRejectionClass::MalformedJsonStructure
+                    | ToolRejectionClass::UnclosedString
+                    | ToolRejectionClass::IllegalEscape
+            ) {
+                assert!(diagnostic.parse_error_offset.is_some(), "text={text}");
+            }
         }
     }
 }
