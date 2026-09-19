@@ -70,9 +70,182 @@ pub struct ToolDiagnostic {
     pub fence_count: usize,
     pub matching_known_tool_fence_count: usize,
     pub parse_error_offset: Option<usize>,
+    pub escape_witness: Option<EscapeWitness>,
 }
 
 pub type ToolRejection = ToolDiagnostic;
+
+const MAX_ESCAPE_WITNESS_BYTES: usize = 64 * 1024;
+
+/// One bounded lexical observation, never an argument or a repair instruction.
+/// Labels are static; only the ASCII escape marker (not surrounding text) is literal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EscapeWitness {
+    kind: &'static str,
+    candidate_utf8_offset: usize,
+    escape_introducer_utf8_offset: usize,
+    strict_parse_error_utf8_offset: usize,
+    lexical_inside_string: bool,
+    string_open_utf8_offset: Option<usize>,
+    string_preceding_class: &'static str,
+    preceding_backslash_count: usize,
+    backslash_count_capped: bool,
+    preceding_backslash_parity: &'static str,
+    escape_marker_ascii: Option<u8>,
+    unicode_digit_ordinal: Option<usize>,
+    offending_byte_class: &'static str,
+    single_escape_neutralized_object: &'static str,
+    tool_name_sha256: Option<String>,
+}
+
+struct EscapeLocation {
+    kind: &'static str,
+    slash: usize,
+    offending: usize,
+    opening: Option<usize>,
+    slash_count: usize,
+    unicode_digit: Option<usize>,
+}
+
+// Independent diagnostic scan: it never supplies bytes to parse_object_arguments.
+fn escape_location(raw: &str) -> Option<EscapeLocation> {
+    let bytes = raw.as_bytes();
+    let mut opening = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            opening = if opening.is_some() { None } else { Some(i) };
+            i += 1;
+        } else if bytes[i] == b'\\' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'\\' {
+                i += 1;
+            }
+            let count = i - start;
+            let location = |kind, slash, offending, unicode_digit| EscapeLocation {
+                kind,
+                slash,
+                offending,
+                opening,
+                slash_count: count,
+                unicode_digit,
+            };
+            if opening.is_none() {
+                return Some(location("backslash_outside_string", start, start, None));
+            }
+            if count % 2 == 0 {
+                continue;
+            }
+            let slash = i - 1;
+            let Some(marker) = bytes.get(i).copied() else {
+                return Some(location("trailing_backslash", slash, i, None));
+            };
+            if marker == b'u' {
+                i += 1;
+                for digit in 1..=4 {
+                    let Some(ch) = raw[i..].chars().next() else {
+                        return Some(location("unicode_incomplete", slash, i, Some(digit)));
+                    };
+                    if !ch.is_ascii_hexdigit() {
+                        return Some(location("unicode_non_hex", slash, i, Some(digit)));
+                    }
+                    i += 1;
+                }
+            } else if matches!(marker, b'"' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') {
+                i += 1;
+            } else {
+                return Some(location("invalid_simple_escape", slash, i, None));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn diagnostic_byte_class(byte: Option<u8>) -> &'static str {
+    match byte {
+        None => "eof",
+        Some(b'"') => "quote",
+        Some(b'\\') => "backslash",
+        Some(b':') => "colon",
+        Some(b',') => "comma",
+        Some(b'{') => "object_open",
+        Some(b'}') => "object_close",
+        Some(b'[') => "array_open",
+        Some(b']') => "array_close",
+        Some(b' ' | b'\t' | b'\n' | b'\r') => "whitespace",
+        Some(b'0'..=b'9') => "digit",
+        Some(b'a'..=b'f' | b'A'..=b'F') => "hex_letter",
+        Some(b'a'..=b'z' | b'A'..=b'Z') => "non_hex_letter",
+        Some(0..=31 | 127) => "control",
+        Some(128..=255) => "non_ascii",
+        Some(_) => "ascii_other",
+    }
+}
+
+fn escape_witness(raw: &str, full_text: &str, tools: &[Tool]) -> Option<EscapeWitness> {
+    if raw.len() > MAX_ESCAPE_WITNESS_BYTES {
+        return None;
+    }
+    // Unlike the legacy offset, these offsets use the untrimmed hashed candidate.
+    let trimmed = raw.trim();
+    let leading_bytes = raw.len() - raw.trim_start().len();
+    let error = serde_json::from_str::<Value>(trimmed).err()?;
+    let location = escape_location(raw)?;
+    let bytes = raw.as_bytes();
+    let marker = bytes.get(location.slash + 1).copied().filter(u8::is_ascii);
+    let mut neutralized = bytes.to_vec();
+    neutralized[location.slash] = b'_';
+    // Replacing an ASCII byte preserves UTF-8; match the parser's trimming rule.
+    let neutralized = std::str::from_utf8(&neutralized).ok()?;
+    let probe = match serde_json::from_str::<Value>(neutralized.trim()) {
+        Ok(value) if value.is_object() => "valid_object",
+        Ok(_) => "non_object",
+        Err(_) => "still_invalid",
+    };
+    let mut names = full_text.lines().filter_map(|line| {
+        let name = line.trim().strip_prefix("```")?.trim();
+        tools
+            .iter()
+            .any(|tool| tool.function.get("name").and_then(Value::as_str) == Some(name))
+            .then_some(name)
+    });
+    let name = names.next();
+    let tool_name_sha256 = if names.next().is_none() {
+        name.map(|name| format!("{:x}", Sha256::digest(name.as_bytes())))
+    } else {
+        None
+    };
+    Some(EscapeWitness {
+        kind: location.kind,
+        candidate_utf8_offset: location.offending,
+        escape_introducer_utf8_offset: location.slash,
+        strict_parse_error_utf8_offset: leading_bytes + parse_error_offset(trimmed, &error),
+        lexical_inside_string: location.opening.is_some(),
+        string_open_utf8_offset: location.opening,
+        string_preceding_class: diagnostic_byte_class(location.opening.and_then(|open| {
+            bytes[..open]
+                .iter()
+                .rev()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace())
+        })),
+        preceding_backslash_count: location.slash_count.min(16),
+        backslash_count_capped: location.slash_count > 16,
+        preceding_backslash_parity: if location.slash_count % 2 == 0 {
+            "even"
+        } else {
+            "odd"
+        },
+        escape_marker_ascii: marker,
+        unicode_digit_ordinal: location.unicode_digit,
+        offending_byte_class: diagnostic_byte_class(bytes.get(location.offending).copied()),
+        single_escape_neutralized_object: probe,
+        tool_name_sha256,
+    })
+}
 
 impl ToolDiagnostic {
     fn from_shape(
@@ -91,6 +264,16 @@ impl ToolDiagnostic {
             fence_count: fence_count(full_text),
             matching_known_tool_fence_count: matching_known_tool_fence_count(full_text, tools),
             parse_error_offset,
+            escape_witness: if matches!(
+                class,
+                ToolRejectionClass::IllegalEscape
+                    | ToolRejectionClass::MalformedJsonStructure
+                    | ToolRejectionClass::UnclosedString
+            ) {
+                escape_witness(candidate, full_text, tools)
+            } else {
+                None
+            },
         }
     }
 }
@@ -828,6 +1011,130 @@ mod tests {
             assert!(rejection.candidate_bytes <= text.len());
             assert!(rejection.candidate_lines <= text.lines().count());
         }
+    }
+
+    #[test]
+    fn escape_witness_is_bounded_lexical_evidence_not_semantic_repair() {
+        for (raw, kind, digit, marker, inside, probe) in [
+            (
+                r#"{"path":"\u12G4"}"#,
+                "unicode_non_hex",
+                Some(3),
+                Some(b'u'),
+                true,
+                "valid_object",
+            ),
+            (
+                r#"{"path":"\u12"}"#,
+                "unicode_non_hex",
+                Some(3),
+                Some(b'u'),
+                true,
+                "valid_object",
+            ),
+            (
+                r#"{"path":"\u12"#,
+                "unicode_incomplete",
+                Some(3),
+                Some(b'u'),
+                true,
+                "still_invalid",
+            ),
+            (
+                r#"{"path":"\"#,
+                "trailing_backslash",
+                None,
+                None,
+                true,
+                "still_invalid",
+            ),
+            (
+                r#"{"path":"\秘密"}"#,
+                "invalid_simple_escape",
+                None,
+                None,
+                true,
+                "valid_object",
+            ),
+            (
+                r#"{"path":\q}"#,
+                "backslash_outside_string",
+                None,
+                Some(b'q'),
+                false,
+                "still_invalid",
+            ),
+            (
+                r#"{"path":"\q",}"#,
+                "invalid_simple_escape",
+                None,
+                Some(b'q'),
+                true,
+                "still_invalid",
+            ),
+        ] {
+            let output = project(
+                &format!("```read_file\n{raw}\n```"),
+                &tools(),
+                &json!("auto"),
+                1,
+            );
+            assert!(output.calls.is_empty());
+            assert!(output.rejected);
+            let witness = output.diagnostic.unwrap().escape_witness.unwrap();
+            assert_eq!(witness.kind, kind);
+            assert_eq!(witness.unicode_digit_ordinal, digit);
+            assert_eq!(witness.escape_marker_ascii, marker);
+            assert_eq!(witness.lexical_inside_string, inside);
+            assert_eq!(witness.single_escape_neutralized_object, probe);
+            assert!(!serde_json::to_string(&witness).unwrap().contains("秘密"));
+        }
+        for count in 1..=33 {
+            let raw = format!("{{\"path\":\"{}q\"}}", "\\".repeat(count));
+            let output = project(
+                &format!("```read_file\n{raw}\n```"),
+                &tools(),
+                &json!("auto"),
+                1,
+            );
+            let diagnostic = output.diagnostic.unwrap();
+            if count % 2 == 0 {
+                assert_eq!(output.calls.len(), 1);
+                assert_eq!(diagnostic.class, ToolRejectionClass::StrictJsonValid);
+                assert!(diagnostic.escape_witness.is_none());
+            } else {
+                assert!(output.calls.is_empty());
+                let witness = diagnostic.escape_witness.unwrap();
+                assert_eq!(witness.preceding_backslash_count, count.min(16));
+                assert_eq!(witness.backslash_count_capped, count > 16);
+                assert_eq!(witness.preceding_backslash_parity, "odd");
+            }
+        }
+        let short = r#"{"path":"\q"}"#;
+        let at_limit = format!(
+            "{}{}",
+            " ".repeat(MAX_ESCAPE_WITNESS_BYTES - short.len()),
+            short
+        );
+        assert!(escape_witness(&at_limit, "", &tools()).is_some());
+        assert!(escape_witness(&format!(" {at_limit}"), "", &tools()).is_none());
+    }
+
+    #[test]
+    fn escape_witness_offsets_use_hashed_bytes_with_parser_trimming() {
+        let output = project(
+            "```read_file\n \u{2003}{\"path\":\"☃\\q\"} \n```",
+            &tools(),
+            &json!("auto"),
+            1,
+        );
+        let diagnostic = output.diagnostic.unwrap();
+        assert_eq!(diagnostic.class, ToolRejectionClass::IllegalEscape);
+        let witness = serde_json::to_value(diagnostic.escape_witness.unwrap()).unwrap();
+        assert_eq!(witness["escapeIntroducerUtf8Offset"], 16);
+        assert_eq!(witness["candidateUtf8Offset"], 17);
+        assert_eq!(witness["strictParseErrorUtf8Offset"], 17);
+        assert_eq!(witness["singleEscapeNeutralizedObject"], "valid_object");
     }
 
     #[test]

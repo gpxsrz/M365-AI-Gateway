@@ -15136,6 +15136,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn escape_witness_is_live_only_on_all_hermes_projection_paths() {
+        for stream in [false, true] {
+            for fallback in [false, true] {
+                for (candidate, class, kind, marker, inside, probe) in [
+                    (
+                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\q\"}\n```",
+                        "illegal_escape",
+                        "invalid_simple_escape",
+                        113,
+                        true,
+                        "valid_object",
+                    ),
+                    (
+                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\x\"}\n```",
+                        "illegal_escape",
+                        "invalid_simple_escape",
+                        120,
+                        true,
+                        "valid_object",
+                    ),
+                    (
+                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\u12G4\"}\n```",
+                        "illegal_escape",
+                        "unicode_non_hex",
+                        117,
+                        true,
+                        "valid_object",
+                    ),
+                    (
+                        "```read_file\n{\"path\":\"C:\\PRIVATE-SENTINEL\"}\n```",
+                        "illegal_escape",
+                        "invalid_simple_escape",
+                        80,
+                        true,
+                        "valid_object",
+                    ),
+                    (
+                        "```read_file\n{\"path\":\"print(\\x41) PRIVATE-SENTINEL\"}\n```",
+                        "illegal_escape",
+                        "invalid_simple_escape",
+                        120,
+                        true,
+                        "valid_object",
+                    ),
+                    (
+                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\\\\\q\"}\n```",
+                        "illegal_escape",
+                        "invalid_simple_escape",
+                        113,
+                        true,
+                        "valid_object",
+                    ),
+                    (
+                        "```read_file\n{\"path\":\\q}\n```",
+                        "malformed_json_structure",
+                        "backslash_outside_string",
+                        113,
+                        false,
+                        "still_invalid",
+                    ),
+                    (
+                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\q\",}\n```",
+                        "illegal_escape",
+                        "invalid_simple_escape",
+                        113,
+                        true,
+                        "still_invalid",
+                    ),
+                ] {
+                    let results = if fallback {
+                        vec!["```inspect\n{}\n```", candidate]
+                    } else {
+                        vec![candidate]
+                    };
+                    let chat = Arc::new(DuplicateFallbackTransport::new(results));
+                    let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+                    let app = Gateway::router(gateway.clone());
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::post("/hermes/v1/chat/completions")
+                                .header("x-api-key", raw_key)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    serde_json::to_vec(
+                                        &duplicate_fallback_with_legal_followup_request(stream),
+                                    )
+                                    .unwrap(),
+                                ))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        if stream {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_GATEWAY
+                        }
+                    );
+                    let body = String::from_utf8(
+                        to_bytes(response.into_body(), 64 * 1024)
+                            .await
+                            .unwrap()
+                            .to_vec(),
+                    )
+                    .unwrap();
+                    assert!(body.contains("invalid_tool_call"));
+                    assert!(!body.contains("PRIVATE-SENTINEL"));
+                    assert!(!body.contains("toolEscapeWitness"));
+                    assert!(!body.contains("finish_reason"));
+                    assert_eq!(
+                        chat.requests.lock().unwrap().len(),
+                        if fallback { 2 } else { 1 }
+                    );
+
+                    let login = gateway
+                        .admin
+                        .login("password", "127.0.0.1", OffsetDateTime::now_utc())
+                        .unwrap();
+                    let response = app
+                        .oneshot(
+                            Request::get("/api/admin/debug/logs")
+                                .header(header::HOST, "127.0.0.1")
+                                .header(
+                                    header::COOKIE,
+                                    format!("m365_admin_session={}", login.token),
+                                )
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let live = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    assert!(!String::from_utf8_lossy(&live).contains("PRIVATE-SENTINEL"));
+                    let live: Value = serde_json::from_slice(&live).unwrap();
+                    let record = live["records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|record| record["path"] == "/hermes/v1/chat/completions")
+                        .unwrap();
+                    assert_eq!(record["toolCallRejectionClass"], class);
+                    assert_eq!(record["toolStream"], stream);
+                    assert_eq!(
+                        record["toolProjectionStage"],
+                        if fallback {
+                            "final_answer_fallback"
+                        } else {
+                            "initial_response"
+                        }
+                    );
+                    let witness = &record["toolEscapeWitness"];
+                    assert_eq!(witness["kind"], kind);
+                    assert_eq!(witness["escapeMarkerAscii"], marker);
+                    assert_eq!(witness["lexicalInsideString"], inside);
+                    assert_eq!(witness["singleEscapeNeutralizedObject"], probe);
+                    assert_eq!(witness["toolNameSha256"].as_str().unwrap().len(), 64);
+                    assert!(serde_json::to_vec(witness).unwrap().len() < 1024);
+                    let durable =
+                        std::fs::read_to_string(gateway.debug.path_for_test().unwrap()).unwrap();
+                    assert!(!durable.contains("PRIVATE-SENTINEL"));
+                    assert!(!durable.contains("toolEscapeWitness"));
+                    assert!(!durable.contains("escapeMarkerAscii"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn ambiguous_matching_tool_fence_fails_closed_on_both_protocol_shapes() {
         let tool = json!({
             "type":"function",

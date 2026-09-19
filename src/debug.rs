@@ -25,6 +25,7 @@ const COMPACT_EVERY: usize = 100;
 const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECORDED_UTF16: usize = 1_000_000;
 const MAX_RECORDED_BYTES: usize = 64 * 1024 * 1024;
+const ESCAPE_WITNESS_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const SURFACE_ID: &str = "m365-privacy-telemetry/v1";
 
 #[derive(Clone, Copy)]
@@ -302,6 +303,11 @@ struct Record {
     tool_matching_known_tool_fence_count: usize,
     #[serde(skip_serializing, default)]
     tool_parse_error_offset: Option<usize>,
+    // This bounded witness must not enter (or be injected from) durable JSONL.
+    #[serde(skip)]
+    tool_escape_witness: Option<crate::tool_calls::EscapeWitness>,
+    #[serde(skip)]
+    tool_escape_witness_at: Option<Instant>,
     #[serde(
         skip_serializing,
         default = "default_not_evaluated",
@@ -618,6 +624,8 @@ impl Record {
             tool_fence_count: 0,
             tool_matching_known_tool_fence_count: 0,
             tool_parse_error_offset: None,
+            tool_escape_witness: None,
+            tool_escape_witness_at: None,
             tool_projection_stage: "not_evaluated".to_owned(),
             tool_stream: false,
             tool_retry_attempt_ordinal: 0,
@@ -983,6 +991,8 @@ fn apply_tool_diagnostic(
         record.tool_parse_error_offset = diagnostic
             .parse_error_offset
             .map(|offset| offset.min(MAX_RECORDED_BYTES));
+        record.tool_escape_witness = diagnostic.escape_witness.clone();
+        record.tool_escape_witness_at = record.tool_escape_witness.as_ref().map(|_| Instant::now());
     } else {
         record.tool_call_rejection_class = crate::tool_calls::ToolRejectionClass::Other
             .as_str()
@@ -994,6 +1004,8 @@ fn apply_tool_diagnostic(
         record.tool_fence_count = 0;
         record.tool_matching_known_tool_fence_count = 0;
         record.tool_parse_error_offset = None;
+        record.tool_escape_witness = None;
+        record.tool_escape_witness_at = None;
     }
 }
 
@@ -1311,7 +1323,8 @@ pub(crate) async fn detail(
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let id = query.get("id").map(String::as_str).unwrap_or_default();
-    let inner = gateway.debug.inner.lock().expect("debug store poisoned");
+    let mut inner = gateway.debug.inner.lock().expect("debug store poisoned");
+    expire(&mut inner);
     let Some(record) = inner.records.iter().find(|record| record.id == id) else {
         return openai_error(
             StatusCode::NOT_FOUND,
@@ -1354,6 +1367,7 @@ pub(crate) async fn detail(
         "toolFenceCount": record.tool_fence_count,
         "toolMatchingKnownToolFenceCount": record.tool_matching_known_tool_fence_count,
         "toolParseErrorOffset": record.tool_parse_error_offset,
+        "toolEscapeWitness": live_escape_witness(record),
         "toolProjectionStage": record.tool_projection_stage,
         "toolStream": record.tool_stream,
         "toolRetryAttemptOrdinal": record.tool_retry_attempt_ordinal,
@@ -1425,7 +1439,8 @@ pub(crate) async fn clear_session(State(gateway): State<Arc<Gateway>>) -> Respon
 }
 
 pub(crate) async fn export(State(gateway): State<Arc<Gateway>>) -> Response {
-    let inner = gateway.debug.inner.lock().expect("debug store poisoned");
+    let mut inner = gateway.debug.inner.lock().expect("debug store poisoned");
+    expire(&mut inner);
     Json(json!({
         "schema": SURFACE_ID,
         "source": {
@@ -1464,6 +1479,7 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["toolProjectionStage"] = serde_json::Value::String(record.tool_projection_stage.clone());
     value["toolStream"] = serde_json::Value::Bool(record.tool_stream);
     value["toolRetryAttemptOrdinal"] = serde_json::Value::from(record.tool_retry_attempt_ordinal);
+    value["toolEscapeWitness"] = json!(live_escape_witness(record));
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
     value["transportProjection"] = serde_json::Value::String(record.transport_projection.clone());
     value["wireBeforeUtf16"] = serde_json::Value::from(record.wire_before_utf16);
@@ -1516,7 +1532,21 @@ fn throttle_kind(record: &Record) -> &'static str {
     }
 }
 
+fn live_escape_witness(record: &Record) -> Option<&crate::tool_calls::EscapeWitness> {
+    record.tool_escape_witness.as_ref().filter(|_| {
+        record
+            .tool_escape_witness_at
+            .is_some_and(|at| at.elapsed() < ESCAPE_WITNESS_TTL)
+    })
+}
+
 fn expire(inner: &mut Inner) {
+    for record in &mut inner.records {
+        if live_escape_witness(record).is_none() {
+            record.tool_escape_witness = None;
+            record.tool_escape_witness_at = None;
+        }
+    }
     let expired = inner
         .session
         .expires_at
@@ -1759,6 +1789,56 @@ mod tests {
     }
 
     #[test]
+    fn escape_witness_expires_and_never_survives_durable_roundtrip() {
+        let tools = vec![crate::chathub::Tool {
+            kind: "function".to_owned(),
+            function: json!({"name":"read_file","parameters":{"type":"object"}}),
+        }];
+        let projection = crate::tool_calls::project(
+            "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\q\"}\n```",
+            &tools,
+            &json!("auto"),
+            1,
+        );
+        let mut record = Record::new("POST", "/hermes/v1/chat/completions");
+        apply_tool_diagnostic(&mut record, projection.diagnostic.as_ref());
+        assert_eq!(
+            public_record(&record)["toolEscapeWitness"]["escapeMarkerAscii"],
+            113
+        );
+        let mut durable = serde_json::to_value(&record).unwrap();
+        assert!(durable.get("toolEscapeWitness").is_none());
+        assert!(!durable.to_string().contains("PRIVATE-SENTINEL"));
+        // Older schema readers see the identical v1 shape; even injected new fields
+        // cannot resurrect a witness during restart/rollback.
+        let decoded: Record = serde_json::from_value(durable.clone()).unwrap();
+        assert!(decoded.tool_escape_witness.is_none());
+        assert!(decoded.tool_escape_witness_at.is_none());
+        durable["toolEscapeWitness"] = json!({"raw":"PRIVATE-SENTINEL"});
+        assert!(serde_json::from_value::<Record>(durable).is_err());
+
+        let store = Store::default();
+        record.tool_escape_witness_at = Some(Instant::now() - ESCAPE_WITNESS_TTL);
+        assert!(public_record(&record)["toolEscapeWitness"].is_null());
+        store.push(record.clone());
+        {
+            let mut inner = store.inner.lock().unwrap();
+            expire(&mut inner);
+            assert!(inner.records[0].tool_escape_witness.is_none());
+            assert!(inner.records[0].tool_escape_witness_at.is_none());
+        }
+        record.tool_escape_witness_at = Some(Instant::now());
+        let witnessed_id = record.id.clone();
+        store.push(record);
+        for _ in 0..MAX_RECORDS {
+            store.push(Record::new("GET", "/health"));
+        }
+        let inner = store.inner.lock().unwrap();
+        assert_eq!(inner.records.len(), MAX_RECORDS);
+        assert!(inner.records.iter().all(|record| record.id != witnessed_id));
+    }
+
+    #[test]
     fn live_outcome_projection_does_not_extend_the_v1_durable_record() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("debug-telemetry.jsonl");
@@ -1775,6 +1855,7 @@ mod tests {
             fence_count: 2,
             matching_known_tool_fence_count: 1,
             parse_error_offset: Some(7),
+            escape_witness: None,
         }));
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
