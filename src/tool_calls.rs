@@ -75,6 +75,54 @@ pub struct ToolDiagnostic {
 
 pub type ToolRejection = ToolDiagnostic;
 
+// This selects an observed syntax-only window; it never repairs argument bytes.
+pub(crate) fn syntax_correction_tool<'a>(
+    text: &'a str,
+    tools: &[Tool],
+    choice: &Value,
+    limit: usize,
+) -> Option<&'a str> {
+    let (name, _) = single_tool_fence(text)?;
+    tool(tools, name).filter(|_| choice_allows(choice, name))?;
+    let projection = project(text, tools, choice, limit);
+    let diagnostic = projection.rejection.as_ref()?;
+    let witness = diagnostic.escape_witness.as_ref()?;
+    (diagnostic.class == ToolRejectionClass::IllegalEscape
+        && projection.calls.is_empty()
+        && !projection.overflowed
+        && diagnostic.fence_count == 2
+        && diagnostic.matching_known_tool_fence_count == 1
+        && witness.kind == "invalid_simple_escape"
+        && witness.escape_marker_ascii == Some(b']')
+        && witness.lexical_inside_string
+        && witness.string_preceding_class == "colon"
+        && witness.preceding_backslash_count == 1
+        && !witness.backslash_count_capped
+        && witness.single_escape_neutralized_object == "valid_object")
+        .then_some(name)
+}
+
+pub(crate) fn is_strict_correction(text: &str, expected_tool: &str) -> bool {
+    let Some((name, arguments)) = single_tool_fence(text) else {
+        return false;
+    };
+    name == expected_tool
+        && serde_json::from_str::<Value>(arguments.trim()).is_ok_and(|value| value.is_object())
+}
+
+fn single_tool_fence(text: &str) -> Option<(&str, &str)> {
+    let (opening, rest) = text.trim().split_once('\n')?;
+    let name = opening.trim().strip_prefix("```")?.trim();
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let (arguments, closing) = rest.rsplit_once('\n')?;
+    if closing.trim() != "```" || arguments.lines().any(|line| line.trim().starts_with("```")) {
+        return None;
+    }
+    Some((name, arguments))
+}
+
 const MAX_ESCAPE_WITNESS_BYTES: usize = 64 * 1024;
 
 /// One bounded lexical observation, never an argument or a repair instruction.

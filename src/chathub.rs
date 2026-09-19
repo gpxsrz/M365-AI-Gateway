@@ -449,6 +449,128 @@ pub struct ChatResult {
     pub artifacts: Vec<Artifact>,
 }
 
+impl ChatResult {
+    /// Recognizes only the complete raw transcript collected through type 3.
+    /// This does not attest to activity outside the existing transport boundary.
+    pub(crate) fn has_complete_text_only_transcript(&self) -> bool {
+        fn only_keys(value: &Value, keys: &[&str]) -> bool {
+            value
+                .as_object()
+                .is_some_and(|object| object.keys().all(|key| keys.contains(&key.as_str())))
+        }
+
+        fn optional_string(value: &Value, key: &str, allowed: &[&str]) -> bool {
+            value
+                .get(key)
+                .is_none_or(|value| value.as_str().is_some_and(|text| allowed.contains(&text)))
+        }
+
+        fn text_message(value: &Value) -> bool {
+            only_keys(
+                value,
+                &[
+                    "author",
+                    "text",
+                    "messageType",
+                    "contentType",
+                    "contentOrigin",
+                ],
+            ) && value.get("author").and_then(Value::as_str) == Some("bot")
+                && value.get("text").is_some_and(Value::is_string)
+                && optional_string(value, "messageType", &["", "Chat"])
+                && optional_string(value, "contentType", &[""])
+                && optional_string(value, "contentOrigin", &["", "Model", "BotConnection"])
+        }
+
+        if self.text.trim().is_empty()
+            || self.events.is_empty()
+            || self.events.len() > 4096
+            || !self.images.is_empty()
+            || !self.artifacts.is_empty()
+            || self.throttling.is_some()
+            || !matches!(self.raw_result.as_str(), "" | "Success")
+        {
+            return false;
+        }
+
+        // Reuse the artifact collector's 64K structural budget across this check,
+        // including constructed results, without copying any payload.
+        let mut nodes = self.events.len();
+        let mut received_text = false;
+        for (index, event) in self.events.iter().enumerate() {
+            let kind = event.get("type").and_then(Value::as_u64);
+            if index + 1 == self.events.len() {
+                return received_text && kind == Some(3) && only_keys(event, &["type"]);
+            }
+            match kind {
+                Some(6) if only_keys(event, &["type"]) => {}
+                Some(1) => {
+                    if !only_keys(event, &["type", "target", "arguments"])
+                        || event.get("target").and_then(Value::as_str) != Some("update")
+                    {
+                        return false;
+                    }
+                    let Some(arguments) = event.get("arguments").and_then(Value::as_array) else {
+                        return false;
+                    };
+                    for argument in arguments {
+                        nodes += 1;
+                        if nodes > 64 * 1024
+                            || !only_keys(argument, &["writeAtCursor", "messages"])
+                            || argument
+                                .get("writeAtCursor")
+                                .is_some_and(|value| !value.is_string())
+                        {
+                            return false;
+                        }
+                        received_text |= argument
+                            .get("writeAtCursor")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty());
+                        if let Some(messages) = argument.get("messages") {
+                            let Some(messages) = messages.as_array() else {
+                                return false;
+                            };
+                            for message in messages {
+                                nodes += 1;
+                                if nodes > 64 * 1024 || !text_message(message) {
+                                    return false;
+                                }
+                                received_text |= message
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty());
+                            }
+                        }
+                    }
+                }
+                Some(2) => {
+                    let Some(item) = event.get("item") else {
+                        return false;
+                    };
+                    let Some(result) = item.get("result") else {
+                        return false;
+                    };
+                    if !only_keys(event, &["type", "item"])
+                        || !only_keys(item, &["result"])
+                        || !only_keys(result, &["message", "value"])
+                        || !result.get("message").is_some_and(Value::is_string)
+                        || !optional_string(result, "value", &["", "Success"])
+                    {
+                        return false;
+                    }
+                    received_text |= result
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty());
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Artifact {
     pub reference_id: String,
@@ -2006,6 +2128,184 @@ fn uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn text_only_loopback(frames: Vec<Value>) -> Result<ChatResult, ChatError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(socket.next().await.unwrap().unwrap().is_text());
+            socket.send(Message::Text("{}\x1e".into())).await.unwrap();
+            assert!(socket.next().await.unwrap().unwrap().is_text());
+            for frame in frames {
+                socket
+                    .send(Message::Text(format!("{frame}\x1e").into()))
+                    .await
+                    .unwrap();
+            }
+            socket.close(None).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::for_test(directory.path().to_owned());
+        let settings = runtime_settings::Store::open(directory.path(), &config).unwrap();
+        let hub =
+            LiveChatHub::new_for_test(settings, prepare_attachments, format!("ws://{address}"));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            hub.chat(
+                Account {
+                    access_token: "synthetic".into(),
+                    graph_access_token: String::new(),
+                    oid: "synthetic".into(),
+                    tid: "synthetic".into(),
+                },
+                ChatRequest {
+                    text: "Synthetic transcript qualification".into(),
+                    conversation_id: "synthetic-conversation".into(),
+                    session_id: "synthetic-session".into(),
+                    ..ChatRequest::default()
+                },
+                &mut |_: StreamEvent| Ok(()),
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_accepts_live_full_text_and_deltas() {
+        for frames in [
+            vec![
+                json!({"type":2,"item":{"result":{"message":"GeneratedCode is literal text, not an event."}}}),
+                json!({"type":3}),
+            ],
+            vec![
+                json!({"type":1,"target":"update","arguments":[{"writeAtCursor":"ToolCall is "}]}),
+                json!({"type":1,"target":"update","arguments":[{"writeAtCursor":"literal text."}]}),
+                json!({"type":3}),
+            ],
+            vec![
+                json!({"type":6}),
+                json!({"type":1,"target":"update","arguments":[{"messages":[{
+                    "author":"bot","text":"MemoryUpdate TriggerPlugin are literal text.",
+                    "messageType":"","contentType":"","contentOrigin":"Model"
+                }]}]}),
+                json!({"type":2,"item":{"result":{"message":"Synthetic final text","value":"Success"}}}),
+                json!({"type":3}),
+            ],
+        ] {
+            let result = text_only_loopback(frames).await.unwrap();
+            assert!(result.has_complete_text_only_transcript());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_rejects_live_nontext_before_and_after_candidate() {
+        let mut excluded = vec![
+            json!({}),
+            json!({"type":99}),
+            json!({"type":6,"action":"synthetic"}),
+            json!({"type":1,"target":"unknown","arguments":[]}),
+            json!({"type":1,"target":"update","arguments":[{"action":"synthetic"}]}),
+            json!({"type":1,"target":"update","arguments":[{"writeAtCursor":null}]}),
+            json!({"type":1,"target":"update","arguments":[{"messages":null}]}),
+            json!({"type":2,"item":{"result":{"message":"synthetic"},"unknown":true}}),
+            json!({"type":2,"item":{"result":{"message":"synthetic","value":"Unknown"}}}),
+        ];
+        for message in [
+            json!({"author":"bot","text":"synthetic","messageType":"GeneratedCode","contentOrigin":"CodeInterpreter"}),
+            json!({"author":"bot","text":"synthetic","contentOrigin":"CodeInterpreter"}),
+            json!({"author":"bot","text":"synthetic","messageType":"Progress"}),
+            json!({"author":"bot","text":"synthetic","contentType":"ToolCall"}),
+            json!({"author":"bot","text":"synthetic","messageType":"MemoryUpdate"}),
+            json!({"author":"bot","text":"synthetic","messageType":"TriggerPlugin"}),
+            json!({"author":"bot","text":"synthetic","messageType":"Unknown"}),
+            json!({"author":"bot","text":"synthetic","action":"synthetic"}),
+        ] {
+            excluded.push(json!({"type":1,"target":"update","arguments":[{"messages":[message]}]}));
+        }
+        for event in excluded {
+            for before in [true, false] {
+                let candidate =
+                    json!({"type":2,"item":{"result":{"message":"Synthetic candidate"}}});
+                let frames = if before {
+                    vec![event.clone(), candidate, json!({"type":3})]
+                } else {
+                    vec![candidate, event.clone(), json!({"type":3})]
+                };
+                let result = text_only_loopback(frames).await.unwrap();
+                assert!(!result.has_complete_text_only_transcript());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_requires_live_successful_terminal() {
+        let candidate = json!({"type":2,"item":{"result":{"message":"Synthetic candidate"}}});
+        assert!(matches!(
+            text_only_loopback(vec![candidate.clone()]).await,
+            Err(ChatError::Protocol(_))
+        ));
+        assert!(matches!(
+            text_only_loopback(vec![candidate, json!({"type":3,"error":"synthetic error"})]).await,
+            Err(ChatError::Terminal { .. })
+        ));
+    }
+
+    #[test]
+    fn complete_text_only_transcript_rejects_unknown_constructed_result_state() {
+        let plain = ChatResult {
+            text: "Synthetic candidate".into(),
+            events: vec![
+                json!({"type":2,"item":{"result":{"message":"Synthetic candidate"}}}),
+                json!({"type":3}),
+            ],
+            ..ChatResult::default()
+        };
+        assert!(plain.has_complete_text_only_transcript());
+        let mut altered = plain.clone();
+        altered.text = " \n\t".into();
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.events.clear();
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.events.pop();
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.events.insert(0, json!({"type":3}));
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.events = vec![json!({"type":3})];
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.events[1] = json!({"type":3,"error":null});
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.images.push("synthetic".into());
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.artifacts.push(Artifact::default());
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.throttling = Some(json!({"remaining":1}));
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.raw_result = "unknown".into();
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain.clone();
+        altered.events.splice(0..0, vec![json!({"type":6}); 4096]);
+        assert!(!altered.has_complete_text_only_transcript());
+        altered = plain;
+        altered.events.insert(
+            0,
+            json!({"type":1,"target":"update","arguments":vec![json!({});64*1024]}),
+        );
+        assert!(!altered.has_complete_text_only_transcript());
+    }
 
     #[test]
     fn generated_artifacts_require_structured_code_interpreter_metadata() {

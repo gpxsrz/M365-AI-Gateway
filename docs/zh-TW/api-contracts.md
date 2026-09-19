@@ -149,6 +149,12 @@ Full-context TXT 是 transport projection，不保證模型已讀完、正確使
 - `response_format` / `json_schema` 是 caller contract。Transport projection 後會再驗一次；Gateway 不會用 HTTP 200 回不符合 schema 的 prose。
 - ChatHub 成功但 qualification / artifact materialization 後仍沒有可見內容，non-stream 回 `502 upstream_empty_response`；stream 回 error event 後 `[DONE]`，不送假的空成功。
 
+只有 `/hermes/v1/chat/completions` 的初次 rejected caller candidate 可以進入一次由模型負責的 syntax correction。範圍限於完整且唯一已知、符合 tool choice 的工具 fence，JSON string value 內孤立的非法 `\]`，diagnostic-only neutralization 後結構為合法 object，且 provider transcript 已完整結束並確認只有已知純文字事件。任何 native／未知事件或 artifact 都不符合。帶有 `response_format`、缺少或漂移的 conversation binding、MCP 設定或 correction input 超限的 request 不啟用；未知證據仍 fail closed。這個資格檢查描述已完成的第一次回應，不是禁用所有 native capability 的 provider policy。Correction 不啟用 search 或 external MCP，但 provider 既有的 native capability 仍在；第二次回應若出現 native／未知事件，就拒絕 caller acceptance。拒絕不能撤銷 provider 可能已經執行的操作。
+
+同一帳號、模型、conversation 與 session 接收明確的 transport feedback；rejected candidate 只存在記憶體。Gateway 不選擇 decoded argument、不拼接字串、不重新上傳附件，也不改寫 caller canonical history。模型的新提案必須是同一工具的唯一 strict JSON object、沒有 prose，並通過原有 tool choice、數量與 ledger 檢查。只有接受的新提案能進 checkpoint 與 caller response。再次 malformed、authority 漂移或 unsafe duplicate 都直接 fail closed，不進第三次 generation 或 final-answer fallback。Stream 與 non-stream 使用相同 gate；stream caller 中斷會取消等待中的 correction。這會多一次模型 generation，usage estimate 包含新增 outbound text；不代表 context 成本為零，也不能證明模型意圖完全不變。
+
+Authenticated live diagnostic 保留第一次 rejection witness，另外提供 `toolCorrectionAttempted`、`toolCorrectionOutcome`、`toolCorrectionFailureClass` 與原 candidate hash。Correction 欄位不寫 durable JSONL；不保存 rejected candidate、feedback prompt 或 raw provider frame。沿用 live store 的容量上限，restart 後欄位消失。Parser acceptance 沒有放寬。
+
 Tool round 耗盡是 terminal safety condition：
 
 ```text
