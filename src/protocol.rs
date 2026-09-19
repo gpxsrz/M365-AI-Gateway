@@ -10959,6 +10959,191 @@ mod tests {
     }
 
     #[test]
+    fn issue_102_continuation_shape_uses_serialized_utf16_boundaries() {
+        let (messages, tools, fixture) = issue_102_continuation_shape_fixture();
+        let measurement = &fixture["measurement_basis"];
+        assert_eq!(messages.len(), measurement["message_count"]);
+        assert_eq!(tools.len(), measurement["caller_tool_definition_count"]);
+        assert_eq!(messages[0].role, "developer");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .count(),
+            28
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .count(),
+            28
+        );
+
+        let content_units = messages.iter().fold(0, |total, message| {
+            total
+                + message
+                    .content
+                    .as_str()
+                    .map(utf16_units)
+                    .unwrap_or_default()
+        });
+        assert_eq!(
+            content_units,
+            measurement["content_utf16_units_total"].as_u64().unwrap() as usize
+        );
+
+        let flattened = flatten_messages(&messages).expect("synthetic shape must flatten");
+        let (normalized, attachments) =
+            normalized_messages(&messages, true, true).expect("synthetic shape must normalize");
+        assert!(attachments.is_empty());
+        let document = full_context_document(&normalized, messages.len(), "issue-102-test")
+            .expect("synthetic full context must serialize");
+        let document: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(document["source_message_count"], 58);
+        assert_eq!(document["message_count"], 58);
+        for (index, entry) in document["messages"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(entry["message_index"], index);
+            assert_eq!(entry["message"]["role"], messages[index].role);
+        }
+        for index in 0..28 {
+            let assistant_index = 2 + index * 2;
+            let tool_index = assistant_index + 1;
+            let call_id = format!("issue-102-call-{index:02}");
+            assert_eq!(
+                document["messages"][assistant_index]["message"]["tool_calls"][0]["id"],
+                call_id
+            );
+            assert_eq!(
+                document["messages"][tool_index]["message"]["tool_call_id"],
+                call_id
+            );
+        }
+
+        let candidates = spill_candidates(&messages, None);
+        assert_eq!(candidates.len(), 28);
+        let spill = spill_document(&candidates);
+        for candidate in candidates {
+            assert!(spill.contains(&format!("tool_call_id: {}", candidate.tool_call_id)));
+            assert!(spill.contains(&format!("sha256: {}", candidate.section_sha)));
+            assert!(spill.contains(&candidate.text));
+        }
+
+        let request = ChatRequest {
+            text: flattened.text.clone(),
+            tools,
+            tool_choice: Value::String("auto".to_owned()),
+            tool_call_limit: fixture["construction"]["tool_call_limit"].as_u64().unwrap() as usize,
+            outbound_text_limit_utf16: measurement["text_input_limit_utf16"].as_u64().unwrap()
+                as usize,
+            ..ChatRequest::default()
+        };
+        let ledger = crate::agent_ledger::AgentLedger::default();
+        let candidate =
+            completed_tool_answer_request(&request, &ChatResult::default(), &ledger, usize::MAX)
+                .expect("synthetic continuation must serialize");
+        let serialized_units = utf16_units(&crate::chathub::outbound_message_text(
+            &candidate.text,
+            &candidate.tools,
+            &candidate.tool_choice,
+            candidate.tool_call_limit,
+        ));
+        assert!(serialized_units > 128_000);
+        assert!(candidate.text.starts_with(&request.text));
+        assert!(candidate.text.contains("中文😀🚀"));
+        assert!(candidate.text.contains("issue-102-call-27"));
+
+        let configured_limit = completed_tool_answer_request(
+            &request,
+            &ChatResult::default(),
+            &ledger,
+            request.outbound_text_limit_utf16,
+        );
+        match configured_limit {
+            Err(ContinuationProjectionError::CannotFitInline {
+                message_text_units,
+                limit,
+            }) => {
+                assert_eq!(message_text_units, serialized_units);
+                assert_eq!(limit, 128_000);
+            }
+            Ok(_) => panic!("over-limit configured continuation was accepted"),
+        }
+
+        let below = completed_tool_answer_request(
+            &request,
+            &ChatResult::default(),
+            &ledger,
+            serialized_units - 1,
+        );
+        match below {
+            Err(ContinuationProjectionError::CannotFitInline {
+                message_text_units,
+                limit,
+            }) => {
+                assert_eq!(message_text_units, serialized_units);
+                assert_eq!(limit, serialized_units - 1);
+            }
+            Ok(_) => panic!("under-limit continuation was accepted"),
+        }
+        let at_boundary = completed_tool_answer_request(
+            &request,
+            &ChatResult::default(),
+            &ledger,
+            serialized_units,
+        )
+        .expect("exact serialized UTF-16 boundary must fit");
+        assert_eq!(
+            utf16_units(&crate::chathub::outbound_message_text(
+                &at_boundary.text,
+                &at_boundary.tools,
+                &at_boundary.tool_choice,
+                at_boundary.tool_call_limit,
+            )),
+            serialized_units
+        );
+
+        let overflow = continuation_overflow_value(serialized_units, serialized_units - 1, None);
+        assert_eq!(overflow["error"]["code"], "text_input_too_large");
+        assert_eq!(
+            overflow["error"]["limit_type"],
+            "outbound_message_text_utf16"
+        );
+        assert_eq!(overflow["error"]["retryable"], false);
+        assert_eq!(overflow["error"]["received"], serialized_units);
+        assert_eq!(request.text, flattened.text);
+
+        let ordinary = vec![
+            Attachment {
+                kind: "file".to_owned(),
+                ..Attachment::default()
+            },
+            Attachment {
+                kind: "file".to_owned(),
+                ..Attachment::default()
+            },
+        ];
+        crate::attachment::validate_attachment_slots(&ordinary).unwrap();
+        let mut with_spill = ordinary.clone();
+        with_spill.push(Attachment {
+            kind: "file".to_owned(),
+            generated_oversize_text: true,
+            ..Attachment::default()
+        });
+        crate::attachment::validate_attachment_slots(&with_spill).unwrap();
+        let mut too_many_ordinary = ordinary;
+        too_many_ordinary.push(Attachment {
+            kind: "file".to_owned(),
+            ..Attachment::default()
+        });
+        assert_eq!(
+            crate::attachment::validate_attachment_slots(&too_many_ordinary),
+            Err("ordinary attachments exceed the two-slot limit")
+        );
+    }
+
+    #[test]
     fn internal_qualification_request_drops_checkpoint_start_hook() {
         let request = ChatRequest {
             upstream_start: Some(crate::chathub::UpstreamStartHook::new(|| Ok(()))),
@@ -11147,6 +11332,119 @@ mod tests {
         }
         assert_eq!(utf16_units(&value), target);
         value
+    }
+
+    fn issue_102_continuation_shape_fixture() -> (Vec<OpenAiMessage>, Vec<Tool>, Value) {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../fixtures/issue-102-continuation-shape.json"
+        ))
+        .expect("Issue #102 continuation fixture is valid JSON");
+        let construction = &fixture["construction"];
+        let seed = construction["unicode_seed"]
+            .as_str()
+            .expect("Issue #102 Unicode seed");
+        let developer_units = fixture["developer_utf16_units"]
+            .as_u64()
+            .expect("Issue #102 developer size") as usize;
+        let user_units = fixture["user_utf16_units"]
+            .as_u64()
+            .expect("Issue #102 user size") as usize;
+        let argument_units = fixture["tool_call_argument_utf16_units"]
+            .as_array()
+            .expect("Issue #102 argument sizes");
+        let result_units = fixture["tool_result_utf16_units"]
+            .as_array()
+            .expect("Issue #102 result sizes");
+        let repeated = construction["repeated_exchange_count"]
+            .as_u64()
+            .expect("Issue #102 exchange count") as usize;
+        assert_eq!(argument_units.len(), repeated);
+        assert_eq!(result_units.len(), repeated);
+
+        let mut messages = Vec::with_capacity(2 + repeated * 2);
+        messages.push(OpenAiMessage::text(
+            "developer",
+            repeat_to_utf16(&format!("developer control {seed} "), developer_units),
+        ));
+        messages.push(OpenAiMessage::text(
+            "user",
+            repeat_to_utf16(&format!("user request {seed} "), user_units),
+        ));
+        for index in 0..repeated {
+            let call_id = format!("issue-102-call-{index:02}");
+            let argument_units = argument_units[index].as_u64().unwrap() as usize;
+            let base_arguments = json!({
+                "path": format!("synthetic-{index}"),
+                "edge": seed,
+                "padding": ""
+            });
+            let base_argument_text = serde_json::to_string(&base_arguments).unwrap();
+            let base_argument_units = utf16_units(&base_argument_text);
+            assert!(argument_units >= base_argument_units);
+            let arguments = serde_json::to_string(&json!({
+                "path": format!("synthetic-{index}"),
+                "edge": seed,
+                "padding": "a".repeat(argument_units - base_argument_units)
+            }))
+            .unwrap();
+            assert_eq!(utf16_units(&arguments), argument_units);
+            assert!(serde_json::from_str::<Value>(&arguments).is_ok());
+            messages.push(OpenAiMessage {
+                role: "assistant".to_owned(),
+                content: Value::Null,
+                tool_calls: vec![json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": format!("issue_102_tool_{index:02}"),
+                        "arguments": arguments,
+                    }
+                })],
+                ..OpenAiMessage::default()
+            });
+            messages.push(OpenAiMessage {
+                role: "tool".to_owned(),
+                tool_call_id: call_id,
+                content: Value::String(repeat_to_utf16(
+                    &format!("{{\"status\":\"completed\",\"result\":\"{seed}\"}}"),
+                    result_units[index].as_u64().unwrap() as usize,
+                )),
+                ..OpenAiMessage::default()
+            });
+        }
+
+        let native = &fixture["native_attachment_tool"];
+        let native_index = native["index"].as_u64().expect("native tool index") as usize;
+        let tool_count = fixture["measurement_basis"]["caller_tool_definition_count"]
+            .as_u64()
+            .expect("Issue #102 tool count") as usize;
+        let tools = (0..tool_count)
+            .map(|index| {
+                let function = if index == native_index {
+                    json!({
+                        "name": native["name"],
+                        "description": native["description"],
+                        "parameters": native["parameters"]
+                    })
+                } else {
+                    json!({
+                        "name": format!("issue_102_tool_{index:02}"),
+                        "description": format!("Synthetic read-only tool {index:02} {seed}"),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    })
+                };
+                Tool {
+                    kind: "function".to_owned(),
+                    function,
+                }
+            })
+            .collect();
+        (messages, tools, fixture)
     }
 
     fn issue_101_third_round_fixture_request() -> Value {
@@ -11526,7 +11824,7 @@ mod tests {
             1,
         ));
         assert_eq!(source_units, 166_465);
-        assert_eq!(initial_message_text_units, 245_418);
+        assert_eq!(initial_message_text_units, 245_400);
         let measurement_request = ChatRequest {
             text: flattened.text.clone(),
             tone: "Gpt_5_6_Reasoning".to_owned(),
@@ -11539,7 +11837,7 @@ mod tests {
             crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(
                 &measurement_request,
             );
-        assert_eq!(initial_payload_units, 369_519);
+        assert_eq!(initial_payload_units, 369_501);
 
         let (oauth, token_server) = oauth_with_graph_token_server().await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -11580,9 +11878,9 @@ mod tests {
             &request.tool_choice,
             request.tool_call_limit,
         ));
-        assert_eq!(projected_message_text_units, 80_867);
+        assert_eq!(projected_message_text_units, 80_849);
         let projected_payload_units = crate::chathub::outbound_payload_utf16_units(&request);
-        assert_eq!(projected_payload_units, 181_376);
+        assert_eq!(projected_payload_units, 181_358);
         assert_eq!(
             crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(&request),
             projected_payload_units
@@ -11594,12 +11892,12 @@ mod tests {
         assert_eq!(live[0]["status"], 200);
         assert_eq!(live[0]["spillDecision"], "performed");
         assert_eq!(live[0]["spillReason"], "full_context_document");
-        assert_eq!(live[0]["messageTextBeforeUtf16"], 245_418);
-        assert_eq!(live[0]["preliminaryMessageTextAfterUtf16"], 80_867);
-        assert_eq!(live[0]["messageTextAfterUtf16"], 80_867);
-        assert_eq!(live[0]["wireBeforeUtf16"], 369_519);
-        assert_eq!(live[0]["preliminaryWireAfterUtf16"], 182_350);
-        assert_eq!(live[0]["wireAfterUtf16"], 181_376);
+        assert_eq!(live[0]["messageTextBeforeUtf16"], 245_400);
+        assert_eq!(live[0]["preliminaryMessageTextAfterUtf16"], 80_849);
+        assert_eq!(live[0]["messageTextAfterUtf16"], 80_849);
+        assert_eq!(live[0]["wireBeforeUtf16"], 369_501);
+        assert_eq!(live[0]["preliminaryWireAfterUtf16"], 182_332);
+        assert_eq!(live[0]["wireAfterUtf16"], 181_358);
         let encoded = request.attachments[0]
             .url
             .strip_prefix("data:text/plain;base64,")
@@ -11725,11 +12023,11 @@ mod tests {
         assert_eq!(source_units, if error_state { 193_517 } else { 193_518 });
         assert_eq!(
             initial_message_text_units,
-            if error_state { 272_470 } else { 272_471 }
+            if error_state { 272_452 } else { 272_453 }
         );
         assert_eq!(
             initial_payload_units,
-            if error_state { 398_761 } else { 398_762 }
+            if error_state { 398_743 } else { 398_744 }
         );
         assert!(initial_message_text_units > 128_000);
         assert!(initial_payload_units > initial_message_text_units);
@@ -11912,10 +12210,10 @@ mod tests {
             .expect("second ChatHub message.text");
         let first_message_text_units = utf16_units(first_message_text);
         let second_message_text_units = utf16_units(second_message_text);
-        assert_eq!(first_message_text_units, 107_936);
+        assert_eq!(first_message_text_units, 107_918);
         assert_eq!(
             second_message_text_units,
-            if error_state { 79_694 } else { 79_695 }
+            if error_state { 79_676 } else { 79_677 }
         );
         assert!(first_message_text.contains("third_round_tool_01"));
         assert!(first_message_text.contains("parameter description"));
@@ -12009,7 +12307,7 @@ mod tests {
             first_message_text_units
         );
         assert_eq!(live[0]["messageTextAfterUtf16"], first_message_text_units);
-        assert_eq!(live[0]["preliminaryWireAfterUtf16"], 211_609);
+        assert_eq!(live[0]["preliminaryWireAfterUtf16"], 211_591);
         assert_eq!(live[1]["status"], 200);
         assert!(live[1]["messageTextAfterUtf16"].as_u64().unwrap() <= 128_000);
         assert_eq!(live[0]["wireAfterUtf16"], utf16_units(&payloads[0]));

@@ -1326,7 +1326,15 @@ class NativeAttachmentPluginTests(unittest.TestCase):
         self.assertIn("m365_native_attach", context.tools)
         self.assertEqual(set(context.hooks), {"on_session_end"})
         self.assertEqual(set(context.middleware), {"tool_request", "llm_request"})
-        self.assertEqual(context.tools["m365_native_attach"]["schema"]["properties"]["files"]["maxItems"], 2)
+        definition = context.tools["m365_native_attach"]["schema"]
+        self.assertEqual(
+            set(definition), {"name", "description", "parameters"}
+        )
+        self.assertEqual(definition["name"], "m365_native_attach")
+        self.assertTrue(definition["description"])
+        self.assertEqual(
+            definition["parameters"]["properties"]["files"]["maxItems"], 2
+        )
         self.assertIn("M365_HERMES_GATEWAY_BASE_URL", context.tools["m365_native_attach"]["requires_env"])
         self.assertFalse(hasattr(plugin, "on_post_api_request"))
 

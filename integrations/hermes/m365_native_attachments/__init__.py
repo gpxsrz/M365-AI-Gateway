@@ -1126,12 +1126,19 @@ _TOOL_SCHEMA = {
     },
 }
 
+_TOOL_DESCRIPTION = "Stage one or two original local attachments for the M365 native model."
+_TOOL_DEFINITION = {
+    "name": "m365_native_attach",
+    "description": _TOOL_DESCRIPTION,
+    "parameters": _TOOL_SCHEMA,
+}
+
 
 def register(ctx: Any) -> None:
     ctx.register_tool(
         name="m365_native_attach",
         toolset="m365",
-        schema=_TOOL_SCHEMA,
+        schema=_TOOL_DEFINITION,
         handler=m365_native_attach,
         requires_env=[
             "M365_HERMES_RECALL_PROVENANCE_SECRET",
@@ -1139,7 +1146,7 @@ def register(ctx: Any) -> None:
             "M365_HERMES_GATEWAY_BASE_URL",
             "M365_HERMES_ATTACHMENT_ALLOWED_ROOTS",
         ],
-        description="Stage one or two original local attachments for the M365 native model.",
+        description=_TOOL_DESCRIPTION,
     )
     ctx.register_middleware("tool_request", on_tool_request)
     ctx.register_middleware("llm_request", on_llm_request)

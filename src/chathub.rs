@@ -1667,8 +1667,14 @@ pub(crate) fn outbound_message_text(
         return text.to_owned();
     }
     let limit = limit.max(1);
+    let block_label = if limit == 1 { "block" } else { "blocks" };
+    let multiple_block_guidance = if limit == 1 {
+        "Multiple tool blocks are not allowed in this turn; emit only one block."
+    } else {
+        "Multiple blocks are allowed only for mutually independent, clearly read-only operations."
+    };
     format!(
-        "You are an execution agent. The tools below are real tools exposed by the caller, not hypothetical M365 plugins.\nCaller execution tools are separate from Microsoft native Bing web search, citations, grounding, and read-only information retrieval. Native Bing and those native read-only capabilities remain allowed when caller tools are registered. When a turn needs both native grounding and a caller tool, use the native capability and still emit the caller decision in the required fenced format.\nWhen the user's request requires caller-side tools, emit at most {limit} fenced tool blocks. Each block's info string must be the exact tool name and its body must be a JSON object of arguments. Multiple blocks are allowed only for mutually independent, clearly read-only operations. Commands, mutations, dependent operations, and uncertain operations must be emitted one at a time. Do not say that the tool is unavailable. Do not wrap calls in XML or explanatory prose. Wait for every emitted tool result before claiming completion.\n\n<tools>\n{}\n</tools>\n\nUser request:\n{text}",
+        "You are an execution agent. The tools below are real tools exposed by the caller, not hypothetical M365 plugins.\nCaller execution tools are separate from Microsoft native Bing web search, citations, grounding, and read-only information retrieval. Native Bing and those native read-only capabilities remain allowed when caller tools are registered. When a turn needs both native grounding and a caller tool, use the native capability and still emit the caller decision in the required fenced format.\nWhen the user's request requires caller-side tools, emit at most {limit} fenced tool {block_label}. Each block's info string must be the exact tool name and its body must be a JSON object of arguments. {multiple_block_guidance} Commands, mutations, dependent operations, and uncertain operations must be emitted one at a time. Do not say that the tool is unavailable. Do not wrap calls in XML or explanatory prose. Wait for every emitted tool result before claiming completion.\n\n<tools>\n{}\n</tools>\n\nUser request:\n{text}",
         definitions.join("\n\n")
     )
 }
@@ -2873,6 +2879,28 @@ mod tests {
                 .count(),
             prefix_units + special.encode_utf16().count()
         );
+    }
+
+    #[test]
+    fn outbound_message_text_matches_the_effective_tool_call_limit() {
+        let tools = vec![Tool {
+            kind: "function".to_owned(),
+            function: json!({
+                "name": "inspect",
+                "description": "read one record",
+                "parameters": {"type": "object"}
+            }),
+        }];
+        let choice = Value::String("auto".to_owned());
+
+        let one = outbound_message_text("read", &tools, &choice, 1);
+        assert!(one.contains("emit at most 1 fenced tool block"));
+        assert!(one.contains("Multiple tool blocks are not allowed in this turn"));
+        assert!(!one.contains("Multiple blocks are allowed"));
+
+        let two = outbound_message_text("read", &tools, &choice, 2);
+        assert!(two.contains("emit at most 2 fenced tool blocks"));
+        assert!(two.contains("Multiple blocks are allowed only for mutually independent"));
     }
 
     #[tokio::test]

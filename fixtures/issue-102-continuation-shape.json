@@ -1,0 +1,83 @@
+{
+  "schema": "m365-issue-102-continuation-shape/v1",
+  "purpose": "Public synthetic continuation qualification only; no private capture, credentials, replayable payload, or live task data.",
+  "measurement_basis": {
+    "source": "bounded structural readback of a failed Hermes request",
+    "message_count": 58,
+    "role_counts": {
+      "developer": 1,
+      "user": 1,
+      "assistant": 28,
+      "tool": 28
+    },
+    "content_utf16_units_by_role": {
+      "developer": 27324,
+      "user": 1533,
+      "assistant": 0,
+      "tool": 254422
+    },
+    "content_utf16_units_total": 283279,
+    "caller_tool_definition_count": 29,
+    "malformed_native_tool_index_before_adapter_fix": 3,
+    "native_tool_calls_observed": 0,
+    "largest_tool_result_utf16_units": 61876,
+    "second_largest_tool_result_utf16_units": 27846,
+    "hermes_estimated_tokens": 87778,
+    "text_input_limit_utf16": 128000
+  },
+  "construction": {
+    "prefix_roles": ["developer", "user"],
+    "repeated_roles": ["assistant_tool", "tool"],
+    "repeated_exchange_count": 28,
+    "tool_call_limit": 2,
+    "unicode_seed": "synthetic quote \" \\ path\n中文😀🚀"
+  },
+  "developer_utf16_units": 27324,
+  "user_utf16_units": 1533,
+  "tool_call_argument_utf16_units": [
+    128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128
+  ],
+  "tool_result_utf16_units": [
+    61876, 27846, 14700, 6000, 6000, 6000, 6000, 6000,
+    6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000,
+    6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000,
+    6000, 6000, 6000, 6000
+  ],
+  "native_attachment_tool": {
+    "index": 3,
+    "name": "m365_native_attach",
+    "description": "Synthetic corrected function definition for the native attachment adapter.",
+    "parameters": {
+      "type": "object",
+      "required": ["files"],
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "required": ["local_path"],
+            "additionalProperties": false,
+            "properties": {
+              "local_path": {"type": "string"},
+              "attachment_id": {"type": "string"},
+              "source_message_id": {"type": "string"},
+              "expected_sha256": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "spill_contract": {
+    "ordinary_attachment_limit": 2,
+    "reserved_generated_spill_slots": 1,
+    "total_attachment_limit": 3,
+    "generated_spill_must_be_last": true
+  }
+}
