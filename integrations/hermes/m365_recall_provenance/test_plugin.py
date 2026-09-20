@@ -3,6 +3,9 @@ import hmac
 import importlib.util
 import json
 import os
+import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -324,13 +327,387 @@ class RecallProvenanceTests(unittest.TestCase):
         )
         return content, result
 
-    def test_registers_only_the_stock_hook_and_middleware_seams(self):
+    def test_registers_stock_hooks_and_native_error_transform(self):
         context = FakeContext()
         plugin.register(context)
         self.assertEqual(
-            set(context.hooks), {"pre_llm_call", "post_llm_call", "on_session_end"}
+            set(context.hooks),
+            {
+                "pre_llm_call",
+                "post_llm_call",
+                "on_session_end",
+                "transform_api_error_classification",
+            },
         )
         self.assertEqual(set(context.middleware), {"llm_request"})
+
+    def test_unsafe_tool_replay_transform_is_terminal_and_route_bound(self):
+        class Request:
+            url = "https://m365.example/hermes/v1/chat/completions"
+
+        with patch.dict(
+            os.environ,
+            {"M365_HERMES_PROVIDER": "m365-copilot"},
+        ):
+            result = plugin.on_transform_api_error_classification(
+                provider="custom",
+                error_code="unsafe_tool_replay",
+                error=types.SimpleNamespace(request=Request()),
+                error_body={
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    }
+                },
+            )
+        self.assertEqual(
+            result,
+            {
+                "reason": "format_error",
+                "retryable": False,
+                "should_compress": False,
+                "should_rotate_credential": False,
+                "should_fallback": False,
+                "error_context": {"provider_error_code": "unsafe_tool_replay"},
+            },
+        )
+
+        for provider, url, body in (
+            (
+                "openai",
+                "https://m365.example/hermes/v1/chat/completions",
+                {
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    }
+                },
+            ),
+            (
+                "custom",
+                "https://m365.example/v1/chat/completions",
+                {
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    }
+                },
+            ),
+            (
+                "custom",
+                "https://m365.example/hermes/v1/chat/completions/",
+                {
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    }
+                },
+            ),
+            (
+                "custom",
+                "https://m365.example/hermes/v1/chat/completions",
+                {
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": True,
+                    }
+                },
+            ),
+            (
+                "custom",
+                "https://m365.example/hermes/v1/chat/completions",
+                {
+                    "error": {
+                        "type": "other_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    }
+                },
+            ),
+            (
+                "custom",
+                "https://m365.example/hermes/v1/chat/completions",
+                {
+                    "type": "other_error",
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    },
+                },
+            ),
+            (
+                "custom",
+                "https://m365.example/hermes/v1/chat/completions",
+                {
+                    "retryable": True,
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    },
+                },
+            ),
+        ):
+            with self.subTest(provider=provider, url=url):
+                self.assertIsNone(
+                    plugin.on_transform_api_error_classification(
+                        provider=provider,
+                        error_code="unsafe_tool_replay",
+                        error=types.SimpleNamespace(request=types.SimpleNamespace(url=url)),
+                        error_body=body,
+                    )
+                )
+
+    def test_read_file_annotation_requires_registered_handler_and_exact_schema(self):
+        def _handle_read_file(*args, **kwargs):
+            return "{}"
+
+        def _handle_write_file(*args, **kwargs):
+            return "{}"
+
+        _handle_read_file.__module__ = "tools.file_tools"
+
+        class Entry:
+            toolset = "file"
+
+        Entry.handler = staticmethod(_handle_read_file)
+
+        class Registry:
+            def get_entry(self, name):
+                return Entry() if name == "read_file" else None
+
+            def get_definitions(self, names, quiet=True):
+                self.requested = (names, quiet)
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read from a start line; do not write.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                            },
+                        },
+                    }
+                ]
+
+        registry = Registry()
+        registry_module = types.ModuleType("tools.registry")
+        registry_module.registry = registry
+        file_tools_module = types.ModuleType("tools.file_tools")
+        file_tools_module._handle_read_file = _handle_read_file
+        tools_module = types.ModuleType("tools")
+        tools_module.__path__ = []
+        tools_module.file_tools = file_tools_module
+        with patch.dict(
+            sys.modules,
+            {
+                "tools": tools_module,
+                "tools.registry": registry_module,
+                "tools.file_tools": file_tools_module,
+            },
+        ):
+            request = {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read from a start line; do not write.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "skill_view",
+                            "description": "Load a skill and run setup if needed.",
+                            "parameters": {"type": "object"},
+                        },
+                    },
+                ]
+            }
+            updated, changed = plugin._annotate_registered_read_only_tools(request)
+
+        self.assertTrue(changed)
+        expected_function = {
+            "name": "read_file",
+            "description": "Read from a start line; do not write.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        }
+        self.assertEqual(
+            updated["tools"][0]["function"]["annotations"],
+            plugin._read_only_contract_annotations(expected_function, "test-secret"),
+        )
+        self.assertNotIn("annotations", updated["tools"][1]["function"])
+
+        forged = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        **expected_function,
+                        "annotations": {
+                            "readOnlyHint": True,
+                            "destructiveHint": False,
+                            "m365ReadOnlyContract": {
+                                "schema": "m365-hermes-read-only-contract/v1",
+                                "handler": "tools.file_tools._handle_read_file",
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+        with patch.dict(
+            sys.modules,
+            {
+                "tools": tools_module,
+                "tools.registry": registry_module,
+                "tools.file_tools": file_tools_module,
+            },
+        ):
+            signed, changed = plugin._annotate_registered_read_only_tools(forged)
+        self.assertTrue(changed)
+        self.assertEqual(
+            signed["tools"][0]["function"]["annotations"],
+            plugin._read_only_contract_annotations(expected_function, "test-secret"),
+        )
+        forged["tools"][0]["function"]["description"] = "then delete it"
+        with patch.dict(
+            sys.modules,
+            {
+                "tools": tools_module,
+                "tools.registry": registry_module,
+                "tools.file_tools": file_tools_module,
+            },
+        ):
+            sanitized, changed = plugin._annotate_registered_read_only_tools(forged)
+        self.assertTrue(changed)
+        self.assertNotIn("annotations", sanitized["tools"][0]["function"])
+
+        Entry.handler = staticmethod(_handle_write_file)
+        with patch.dict(
+            sys.modules,
+            {
+                "tools": tools_module,
+                "tools.registry": registry_module,
+                "tools.file_tools": file_tools_module,
+            },
+        ):
+            unchanged, changed = plugin._annotate_registered_read_only_tools(request)
+        self.assertFalse(changed)
+        self.assertNotIn("annotations", unchanged["tools"][0]["function"])
+
+        stale = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        **expected_function,
+                        "annotations": plugin._read_only_contract_annotations(
+                            expected_function, "test-secret"
+                        ),
+                    },
+                }
+            ]
+        }
+        with patch.dict(
+            sys.modules,
+            {
+                "tools": tools_module,
+                "tools.registry": registry_module,
+                "tools.file_tools": file_tools_module,
+            },
+        ):
+            file_tools_module._handle_read_file = _handle_write_file
+            stale_cleared, changed = plugin._annotate_registered_read_only_tools(stale)
+        self.assertTrue(changed)
+        self.assertNotIn("annotations", stale_cleared["tools"][0]["function"])
+
+    def test_actual_hermes_registry_read_file_contract_and_result_shape(self):
+        agent_root = os.environ.get("HERMES_AGENT_ROOT")
+        plugin_root = os.environ.get("M365_REPLAY_PLUGIN_ROOT")
+        if not agent_root or not plugin_root:
+            self.skipTest(
+                "set HERMES_AGENT_ROOT and M365_REPLAY_PLUGIN_ROOT "
+                "to run against the real Hermes registry"
+            )
+
+        sys.path.insert(0, agent_root)
+        from hermes_cli.plugins import PluginManager, _plugin_home_scope
+        from hermes_cli.plugins_manifest import PluginManifest
+        import tools.file_tools
+        from tools.registry import registry
+
+        with tempfile.TemporaryDirectory(prefix="m365-registry-plugin-") as scope:
+            manager = PluginManager(scope_key=scope)
+            manager._load_plugin(
+                PluginManifest(
+                    name="m365-recall-provenance",
+                    version="1.3.0",
+                    description="isolated registry qualification",
+                    source="user",
+                    path=plugin_root,
+                    key="m365-recall-provenance",
+                )
+            )
+            with _plugin_home_scope(Path(scope)):
+                entry = registry.get_entry("read_file")
+                self.assertIsNotNone(entry)
+                self.assertEqual(getattr(entry, "toolset", None), "file")
+                handler = getattr(entry, "handler", None)
+                self.assertEqual(getattr(handler, "__module__", None), "tools.file_tools")
+                self.assertEqual(getattr(handler, "__name__", None), "_handle_read_file")
+                definitions = registry.get_definitions({"read_file"}, quiet=True)
+                self.assertEqual(len(definitions), 1)
+                function = definitions[0]["function"]
+                request = {"tools": [{"type": "function", "function": function}]}
+                updated, changed = plugin._annotate_registered_read_only_tools(request)
+                self.assertTrue(changed)
+                contract = updated["tools"][0]["function"]["annotations"][
+                    "m365ReadOnlyContract"
+                ]
+                self.assertEqual(contract["schema"], "m365-hermes-read-only-contract/v1")
+                self.assertEqual(contract["handler"], "tools.file_tools._handle_read_file")
+                self.assertTrue(contract["signature"].startswith("sha256="))
+
+                with tempfile.TemporaryDirectory(prefix="m365-registry-result-") as root:
+                    fixture = Path(root) / "report.txt"
+                    fixture.write_text("new-bytes\n", encoding="utf-8")
+                    parsed = json.loads(
+                        handler(
+                            {"path": str(fixture), "offset": 1, "limit": 10},
+                            task_id="m365-registry-qualification",
+                        )
+                    )
+                self.assertTrue(
+                    {
+                        "content",
+                        "file_size",
+                        "is_binary",
+                        "is_image",
+                        "total_lines",
+                        "truncated",
+                    }.issubset(parsed)
+                )
+                self.assertIsInstance(parsed["content"], str)
+                self.assertIsInstance(parsed["file_size"], int)
+                self.assertIsInstance(parsed["total_lines"], int)
+                self.assertIsInstance(parsed["truncated"], bool)
 
     def test_emits_content_free_signed_range_and_keeps_other_context_outside(self):
         sentinel = "SENSITIVE-RECALL-SENTINEL"

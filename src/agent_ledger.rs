@@ -181,9 +181,20 @@ impl AgentLedger {
                         && evidence.name == name
                         && evidence.arguments_digest == argument_digest
                 });
+                let completed_reissue_allowed = duplicate_completed
+                    && allow_completed_reissue(name)
+                    && self
+                        .completed
+                        .iter()
+                        .filter(|evidence| {
+                            is_digest(&evidence.arguments_digest)
+                                && evidence.name == name
+                                && evidence.arguments_digest == argument_digest
+                        })
+                        .all(|evidence| evidence.result_status() == ToolResultStatus::Success);
                 let duplicate = duplicate_in_batch
                     || duplicate_pending
-                    || (duplicate_completed && !allow_completed_reissue(name));
+                    || (duplicate_completed && !completed_reissue_allowed);
                 suppressed |= duplicate;
                 !duplicate
             })
@@ -438,9 +449,24 @@ pub(crate) fn active_messages(messages: &[OpenAiMessage]) -> &[OpenAiMessage] {
     last_user.map_or(messages, |index| &messages[index..])
 }
 
-fn tool_result_status(explicit: bool, _name: &str, result: &str) -> ToolResultStatus {
+fn tool_result_status(explicit: bool, name: &str, result: &str) -> ToolResultStatus {
     if explicit {
         return ToolResultStatus::Failed;
+    }
+    if name == "read_file" {
+        let Ok(object) = serde_json::from_str::<serde_json::Map<String, Value>>(result.trim())
+        else {
+            return ToolResultStatus::Unknown;
+        };
+        if is_successful_read_file_result(&object) {
+            return ToolResultStatus::Success;
+        }
+        if object.get("error").is_some_and(|error| {
+            !error.is_null() && error.as_str().is_none_or(|text| !text.trim().is_empty())
+        }) {
+            return ToolResultStatus::Failed;
+        }
+        return ToolResultStatus::Unknown;
     }
     if let Ok(object) = serde_json::from_str::<serde_json::Map<String, Value>>(result.trim())
         && object.contains_key("output")
@@ -565,6 +591,16 @@ fn tool_result_status(explicit: bool, _name: &str, result: &str) -> ToolResultSt
         };
     }
     ToolResultStatus::Unknown
+}
+
+fn is_successful_read_file_result(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("content").is_some_and(Value::is_string)
+        && object.get("file_size").and_then(Value::as_u64).is_some()
+        && object.get("total_lines").and_then(Value::as_u64).is_some()
+        && object.get("is_binary").is_some_and(Value::is_boolean)
+        && object.get("is_image").is_some_and(Value::is_boolean)
+        && object.get("truncated").is_some_and(Value::is_boolean)
+        && object.get("error").is_none_or(Value::is_null)
 }
 
 fn arguments_digest(arguments: &str) -> String {
@@ -719,6 +755,50 @@ mod tests {
         );
         assert_eq!(incomplete.completed[0].result_length, 0);
         assert!(incomplete.completed[0].result_digest.is_empty());
+    }
+
+    #[test]
+    fn actual_hermes_read_file_result_is_success_only_for_complete_shape() {
+        let success = build(&[
+            call("c1", "read_file", r#"{"path":"report.txt"}"#),
+            result(
+                "c1",
+                r#"{"content":"new-bytes\n","file_size":10,"is_binary":false,"is_image":false,"total_lines":1,"truncated":false}"#,
+            ),
+        ]);
+        assert_eq!(
+            success.completed[0].result_status(),
+            ToolResultStatus::Success
+        );
+
+        for (content, expected) in [
+            (
+                r#"{"content":"new-bytes\n","file_size":10,"total_lines":1,"truncated":false}"#,
+                ToolResultStatus::Unknown,
+            ),
+            (
+                r#"{"content":"new-bytes\n","file_size":10,"is_binary":false,"is_image":false,"total_lines":1,"truncated":false,"error":"write failed"}"#,
+                ToolResultStatus::Failed,
+            ),
+            (
+                r#"{"success":true,"content":"new-bytes\n"}"#,
+                ToolResultStatus::Unknown,
+            ),
+            (
+                r#"{"output":"new-bytes","exit_code":0,"status":"completed"}"#,
+                ToolResultStatus::Unknown,
+            ),
+        ] {
+            let ledger = build(&[
+                call("c2", "read_file", r#"{"path":"report.txt"}"#),
+                result("c2", content),
+            ]);
+            assert_eq!(
+                ledger.completed[0].result_status(),
+                expected,
+                "content={content}"
+            );
+        }
     }
 
     #[test]
@@ -949,7 +1029,10 @@ mod tests {
             &[
                 OpenAiMessage::text("user", "Read the current file."),
                 call("c1", "read_file", r#"{"path":"report.txt"}"#),
-                result("c1", "report-v1"),
+                result(
+                    "c1",
+                    r#"{"content":"report-v1","file_size":9,"is_binary":false,"is_image":false,"total_lines":1,"truncated":false}"#,
+                ),
             ],
         );
         let candidate = DetectedToolCall {
@@ -976,6 +1059,39 @@ mod tests {
                 name == "read_file"
             });
         assert_eq!(calls.len(), 1);
+        assert!(suppressed);
+    }
+
+    #[test]
+    fn unknown_read_only_result_cannot_authorize_a_reissue() {
+        let ledger = execution_ledger(
+            &AgentLedger::default(),
+            &[
+                OpenAiMessage::text("user", "Read the current file."),
+                call("c1", "read_file", r#"{"path":"report.txt"}"#),
+                result(
+                    "c1",
+                    r#"{"path":"report.txt","sha256":"opaque","status":"completed"}"#,
+                ),
+            ],
+        );
+        assert_eq!(ledger.completed.len(), 1);
+        assert_eq!(
+            ledger.completed[0].result_status(),
+            ToolResultStatus::Unknown
+        );
+
+        let candidate = DetectedToolCall {
+            id: "c2".to_owned(),
+            kind: "function".to_owned(),
+            function: json!({
+                "name": "read_file",
+                "arguments": "{\"path\":\"report.txt\"}"
+            }),
+        };
+        let (calls, suppressed) =
+            ledger.filter_known_calls(vec![candidate], |name| name == "read_file");
+        assert!(calls.is_empty());
         assert!(suppressed);
     }
 

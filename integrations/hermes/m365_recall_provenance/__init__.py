@@ -27,6 +27,9 @@ _EMPTY_RECOVERY_USER_NUDGE = (
 )
 _FORMAL_M365_PROVIDER = "m365-copilot"
 _GATEWAY_BASE_URL_ENV = "M365_HERMES_GATEWAY_BASE_URL"
+_READ_ONLY_CONTRACT_SCHEMA = "m365-hermes-read-only-contract/v1"
+_READ_ONLY_CONTRACT_HANDLER = "tools.file_tools._handle_read_file"
+_READ_ONLY_SECRET_ENV = "M365_HERMES_RECALL_PROVENANCE_SECRET"
 _MAX_ACTIVE_TURNS = 256
 _CANONICAL_ROLES = frozenset(("system", "developer", "user", "assistant", "tool"))
 _turns: OrderedDict[tuple[str, str], str] = OrderedDict()
@@ -74,27 +77,227 @@ def _gateway_route_identity(
 
 
 def _is_m365_route(provider: Any, api_mode: Any, base_url: Any) -> bool:
-    configured = os.environ.get("M365_HERMES_PROVIDER", "").strip()
-    if not configured or api_mode != "chat_completions":
-        return False
-    configured_casefold = configured.casefold()
-    provider_matches = (
-        configured_casefold != "custom"
-        and isinstance(provider, str)
-        and provider.strip().casefold() == configured_casefold
-    )
-    custom_matches = (
-        isinstance(provider, str)
-        and provider.strip().casefold() == "custom"
-        and configured.casefold() == _FORMAL_M365_PROVIDER
-    )
-    if not (provider_matches or custom_matches):
+    if api_mode != "chat_completions" or not _m365_provider_matches(provider):
         return False
     expected = _gateway_route_identity(
         os.environ.get(_GATEWAY_BASE_URL_ENV, ""), allow_host_base=True
     )
     current = _gateway_route_identity(base_url)
     return expected is not None and current == expected
+
+
+def _m365_provider_matches(provider: Any) -> bool:
+    configured = os.environ.get("M365_HERMES_PROVIDER", "").strip()
+    if not configured or not isinstance(provider, str):
+        return False
+    configured_casefold = configured.casefold()
+    provider_casefold = provider.strip().casefold()
+    return (
+        configured_casefold != "custom"
+        and provider_casefold == configured_casefold
+    ) or (
+        provider_casefold == "custom"
+        and configured_casefold == _FORMAL_M365_PROVIDER
+    )
+
+
+def _api_request_route_identity(value: Any) -> tuple[str, int, str] | None:
+    """Normalize the exact OpenAI SDK request path back to the configured Gateway route."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.port == 0
+            or parsed.path != "/hermes/v1/chat/completions"
+        ):
+            return None
+        return (
+            parsed.hostname.casefold(),
+            parsed.port if parsed.port is not None else 443,
+            "/hermes/v1",
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _api_error_request_url(error: Any) -> str | None:
+    for owner in (error, getattr(error, "response", None)):
+        request = getattr(owner, "request", None)
+        url = getattr(request, "url", None)
+        if url is not None:
+            return str(url)
+    return None
+
+
+def _is_exact_unsafe_tool_replay(error_body: Any) -> bool:
+    if not isinstance(error_body, dict):
+        return False
+    nested = error_body.get("error")
+    candidates = [nested] if isinstance(nested, dict) else []
+    candidates.append(error_body)
+    candidate = next(
+        (value for value in candidates if value.get("code") == "unsafe_tool_replay"),
+        None,
+    )
+    if candidate is None:
+        return False
+    if (
+        candidate.get("type") != "tool_protocol_error"
+        or type(candidate.get("retryable")) is not bool
+        or candidate.get("retryable") is not False
+    ):
+        return False
+    # Reject a nested target hidden inside an envelope that contradicts it at the
+    # outer level. This keeps a loosely shaped provider payload fail-closed.
+    for value in candidates:
+        if not isinstance(value, dict):
+            continue
+        if "type" in value and value["type"] != "tool_protocol_error":
+            return False
+        if "code" in value and value["code"] != "unsafe_tool_replay":
+            return False
+        if "retryable" in value and (
+            type(value["retryable"]) is not bool or value["retryable"] is not False
+        ):
+            return False
+    return True
+
+
+def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | None:
+    """Claim only the authenticated M365 terminal replay error."""
+    if not _m365_provider_matches(kwargs.get("provider")):
+        return None
+    if kwargs.get("error_code") not in (None, "", "unsafe_tool_replay"):
+        return None
+    error = kwargs.get("error")
+    route = _api_request_route_identity(_api_error_request_url(error))
+    expected = _gateway_route_identity(
+        os.environ.get(_GATEWAY_BASE_URL_ENV, ""), allow_host_base=True
+    )
+    if route is None or expected is None or route != expected:
+        return None
+    if not _is_exact_unsafe_tool_replay(kwargs.get("error_body")):
+        return None
+    return {
+        "reason": "format_error",
+        "retryable": False,
+        "should_compress": False,
+        "should_rotate_credential": False,
+        "should_fallback": False,
+        "error_context": {"provider_error_code": "unsafe_tool_replay"},
+    }
+
+
+def _registered_read_file_definition() -> dict[str, Any] | None:
+    """Return the exact active read_file definition only for Hermes' stock handler."""
+    try:
+        from tools import file_tools
+        from tools.registry import registry
+
+        entry = registry.get_entry("read_file")
+        handler = getattr(entry, "handler", None)
+        if (
+            entry is None
+            or getattr(entry, "toolset", None) != "file"
+            or handler is not getattr(file_tools, "_handle_read_file", None)
+            or getattr(handler, "__module__", None) != "tools.file_tools"
+            or getattr(handler, "__name__", None) != "_handle_read_file"
+        ):
+            return None
+        definitions = registry.get_definitions({"read_file"}, quiet=True)
+        if len(definitions) != 1 or not isinstance(definitions[0], dict):
+            return None
+        function = definitions[0].get("function")
+        if not isinstance(function, dict) or function.get("name") != "read_file":
+            return None
+        return function
+    except Exception:
+        return None
+
+
+def _read_only_contract_annotations(
+    function: dict[str, Any], secret: str | None = None
+) -> dict[str, Any] | None:
+    secret = (
+        os.environ.get(_READ_ONLY_SECRET_ENV, "").strip()
+        if secret is None
+        else secret.strip()
+    )
+    if not secret:
+        return None
+    unsigned = dict(function)
+    unsigned.pop("annotations", None)
+    signature = "sha256=" + hmac.new(
+        secret.encode("utf-8"), _json_bytes(unsigned), hashlib.sha256
+    ).hexdigest()
+    return {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "m365ReadOnlyContract": {
+            "schema": _READ_ONLY_CONTRACT_SCHEMA,
+            "handler": _READ_ONLY_CONTRACT_HANDLER,
+            "signature": signature,
+        },
+    }
+
+
+def _annotate_registered_read_only_tools(
+    request: dict[str, Any],
+    secret: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Project one signed, verified Hermes read-only contract into the request."""
+    tools = request.get("tools")
+    if not isinstance(tools, list):
+        return request, False
+    expected = _registered_read_file_definition()
+    if expected is not None:
+        expected = dict(expected)
+        expected.pop("annotations", None)
+    updated_tools = list(tools)
+    changed = False
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict) or function.get("name") != "read_file":
+            continue
+        candidate = dict(function)
+        candidate.pop("annotations", None)
+        updated_function = dict(candidate)
+        if expected is None:
+            # A missing or drifted stock registry is not authority. Remove any
+            # stale projection so the Gateway cannot accept an old signature.
+            if "annotations" not in function:
+                continue
+        elif candidate == expected:
+            annotations = _read_only_contract_annotations(candidate, secret)
+            if annotations is None:
+                # No shared secret means the Gateway must not accept a read-only
+                # contract, even when the registry schema itself matches.
+                if "annotations" not in function:
+                    continue
+            else:
+                updated_function["annotations"] = annotations
+        elif "annotations" not in function:
+            continue
+        if updated_function == function:
+            continue
+        updated_tool = dict(tool)
+        updated_tool["function"] = updated_function
+        updated_tools[index] = updated_tool
+        changed = True
+    if not changed:
+        return request, False
+    updated = dict(request)
+    updated["tools"] = updated_tools
+    return updated, True
 
 
 def _bind_turn_route(key: tuple[str, str], base_url: Any) -> bool:
@@ -504,6 +707,7 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
         if omitted is not None:
             return omitted
         return None
+    request, tools_changed = _annotate_registered_read_only_tools(request, secret)
     updated = dict(request)
     raw_extra_body = request.get("extra_body")
     if raw_extra_body is None:
@@ -522,7 +726,7 @@ def on_llm_request(**kwargs: Any) -> dict[str, Any] | None:
         }
     else:
         extra_body = dict(raw_extra_body)
-    changed = False
+    changed = tools_changed
     raw_api_request_id = kwargs.get("api_request_id")
     api_request_id = raw_api_request_id if isinstance(raw_api_request_id, str) else ""
     try:
@@ -645,4 +849,7 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", _forget)
     ctx.register_hook("on_session_end", _forget)
+    ctx.register_hook(
+        "transform_api_error_classification", on_transform_api_error_classification
+    )
     ctx.register_middleware("llm_request", on_llm_request)

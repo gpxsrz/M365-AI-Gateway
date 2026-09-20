@@ -424,7 +424,9 @@ async fn execute_chat_request_inner(
         );
     }
     let text_input_limit = gateway.settings.current().text_input_limit_utf16;
-    let tool_call_limit = request_tool_call_limit(&gateway, &body);
+    let hermes_route = path == "/hermes/v1/chat/completions";
+    let allow_tool_syntax_correction = hermes_route;
+    let tool_call_limit = request_tool_call_limit(&gateway, &body, hermes_route);
     let transport_budget = TransportBudget {
         limit: text_input_limit,
         tone: &resolved_tone,
@@ -813,7 +815,8 @@ async fn execute_chat_request_inner(
             checkpoint_response_id,
             agent_ledger,
             suppress_duplicate_tool_calls,
-            path == "/hermes/v1/chat/completions",
+            hermes_route,
+            allow_tool_syntax_correction,
             overflow_context,
             trace,
         )
@@ -836,7 +839,8 @@ async fn execute_chat_request_inner(
             checkpoint_response_id,
             agent_ledger,
             suppress_duplicate_tool_calls,
-            path == "/hermes/v1/chat/completions",
+            hermes_route,
+            allow_tool_syntax_correction,
             overflow_context,
             trace,
         )
@@ -916,6 +920,7 @@ async fn complete_chat(
     checkpoint_response_id: String,
     agent_ledger: crate::agent_ledger::AgentLedger,
     suppress_duplicate_tool_calls: bool,
+    hermes_route: bool,
     allow_tool_syntax_correction: bool,
     overflow_context: Option<OverflowContext>,
     trace: crate::debug::Trace,
@@ -1076,6 +1081,8 @@ async fn complete_chat(
                 &agent_ledger,
                 &tools,
                 suppress_duplicate_tool_calls,
+                hermes_route,
+                &gateway.hermes_recall_provenance_secret,
             );
             if !syntax_corrected {
                 observe_tool_projection(
@@ -1231,6 +1238,8 @@ async fn complete_chat(
                     &agent_ledger,
                     &tools,
                     suppress_duplicate_tool_calls,
+                    hermes_route,
+                    &gateway.hermes_recall_provenance_secret,
                 );
                 observe_tool_projection(
                     &trace,
@@ -1390,6 +1399,7 @@ async fn stream_chat(
     checkpoint_response_id: String,
     agent_ledger: crate::agent_ledger::AgentLedger,
     suppress_duplicate_tool_calls: bool,
+    hermes_route: bool,
     allow_tool_syntax_correction: bool,
     overflow_context: Option<OverflowContext>,
     trace: crate::debug::Trace,
@@ -1631,6 +1641,8 @@ async fn stream_chat(
                     &agent_ledger,
                     &tools,
                     suppress_duplicate_tool_calls,
+                    hermes_route,
+                    &gateway.hermes_recall_provenance_secret,
                 );
                 if !syntax_corrected {
                     observe_tool_projection(
@@ -1665,6 +1677,7 @@ async fn stream_chat(
                 if syntax_corrected && transport.suppressed {
                     trace.tool_correction_finished(Some("unsafe_tool_replay"));
                     send_unsafe_tool_replay_error(&trace, &sender, permit);
+                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
                 if transport.completed_call_suppressed {
@@ -1833,6 +1846,8 @@ async fn stream_chat(
                         &agent_ledger,
                         &tools,
                         suppress_duplicate_tool_calls,
+                        hermes_route,
+                        &gateway.hermes_recall_provenance_secret,
                     );
                     observe_tool_projection(
                         &trace,
@@ -2691,6 +2706,8 @@ fn apply_transport_projection(
     ledger: &crate::agent_ledger::AgentLedger,
     tools: &[Tool],
     suppress_duplicates: bool,
+    hermes_route: bool,
+    read_only_secret: &str,
 ) -> TransportProjection {
     if !suppress_duplicates {
         return TransportProjection {
@@ -2707,7 +2724,7 @@ fn apply_transport_projection(
                     .get("name")
                     .and_then(Value::as_str)
                     .is_some_and(|candidate| candidate == name)
-                && tool_is_clearly_read_only(&tool.function)
+                && tool_is_clearly_read_only(&tool.function, hermes_route, read_only_secret)
         })
     });
     projection.calls = calls;
@@ -4075,7 +4092,11 @@ fn parse_stream_options(value: &Value, stream: bool) -> Result<StreamOptions, &'
     Ok(options)
 }
 
-fn request_tool_call_limit(gateway: &Gateway, body: &ChatCompletionRequest) -> usize {
+fn request_tool_call_limit(
+    gateway: &Gateway,
+    body: &ChatCompletionRequest,
+    hermes_route: bool,
+) -> usize {
     let configured =
         crate::runtime_settings::configured_tool_call_limit(&gateway.settings.current());
     if configured < 2 || body.parallel_tool_calls == Some(false) {
@@ -4094,7 +4115,13 @@ fn request_tool_call_limit(gateway: &Gateway, body: &ChatCompletionRequest) -> u
             continue;
         }
         selectable += 1;
-        if !names.insert(name) || !tool_is_clearly_read_only(&tool.function) {
+        if !names.insert(name)
+            || !tool_is_clearly_read_only(
+                &tool.function,
+                hermes_route,
+                &gateway.hermes_recall_provenance_secret,
+            )
+        {
             return 1;
         }
     }
@@ -4115,10 +4142,36 @@ fn tool_choice_allows(choice: &Value, name: &str) -> bool {
     }
 }
 
-fn tool_is_clearly_read_only(function: &Value) -> bool {
+const M365_READ_ONLY_CONTRACT_SCHEMA: &str = "m365-hermes-read-only-contract/v1";
+const M365_READ_ONLY_CONTRACT_HANDLER: &str = "tools.file_tools._handle_read_file";
+
+fn canonical_read_only_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_read_only_json(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_read_only_json).collect()),
+        other => other.clone(),
+    }
+}
+
+fn read_only_contract_payload(function: &Value) -> Option<Vec<u8>> {
+    let mut unsigned = function.clone();
+    unsigned.as_object_mut()?.remove("annotations");
+    serde_json::to_vec(&canonical_read_only_json(&unsigned)).ok()
+}
+
+fn tool_is_clearly_read_only(function: &Value, hermes_route: bool, read_only_secret: &str) -> bool {
     let Some(object) = function.as_object() else {
         return false;
     };
+    let name = object.get("name").and_then(Value::as_str);
     let annotations = object.get("annotations").and_then(Value::as_object);
     if annotations.and_then(|value| value.get("readOnlyHint")) != Some(&Value::Bool(true))
         || annotations
@@ -4126,6 +4179,33 @@ fn tool_is_clearly_read_only(function: &Value) -> bool {
             .is_some_and(|value| value != &Value::Bool(false))
     {
         return false;
+    }
+    // skill_view may load setup, credentials, or other state and is never a
+    // replay-authorizing read-only tool, even when a caller forges hints.
+    if name == Some("skill_view") {
+        return false;
+    }
+    if hermes_route && name == Some("read_file") {
+        let Some(contract) = annotations
+            .and_then(|value| value.get("m365ReadOnlyContract"))
+            .and_then(Value::as_object)
+        else {
+            return false;
+        };
+        let Some(signature) = contract.get("signature").and_then(Value::as_str) else {
+            return false;
+        };
+        if contract.get("schema").and_then(Value::as_str) != Some(M365_READ_ONLY_CONTRACT_SCHEMA)
+            || contract.get("handler").and_then(Value::as_str)
+                != Some(M365_READ_ONLY_CONTRACT_HANDLER)
+            || read_only_secret.is_empty()
+        {
+            return false;
+        }
+        let Some(payload) = read_only_contract_payload(function) else {
+            return false;
+        };
+        return crate::hindsight::valid_signature(read_only_secret, signature, &payload);
     }
     let parameters = object.get("parameters").unwrap_or(&Value::Null).to_string();
     [
@@ -6034,6 +6114,20 @@ mod tests {
         oauth_flow::PkceManager,
     };
 
+    fn signed_read_only_contract(function: &mut Value) {
+        let payload = read_only_contract_payload(function).unwrap();
+        let signature = crate::hindsight::signature("test-recall-provenance-secret", &payload);
+        function["annotations"] = json!({
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "m365ReadOnlyContract": {
+                "schema": M365_READ_ONLY_CONTRACT_SCHEMA,
+                "handler": M365_READ_ONLY_CONTRACT_HANDLER,
+                "signature": signature,
+            }
+        });
+    }
+
     struct FixedTransport;
 
     impl ChatHubTransport for FixedTransport {
@@ -7463,6 +7557,10 @@ mod tests {
             );
             assert!(body.contains("unsafe_tool_replay"));
             assert!(!body.contains("finish_reason"));
+            if stream {
+                assert_eq!(body.matches("data: [DONE]").count(), 1);
+                assert!(body.ends_with("data: [DONE]\n\n"));
+            }
             assert_eq!(chat.requests.lock().unwrap().len(), 2);
             assert!(gateway.checkpoints.list().unwrap().is_empty());
             let record = gateway.debug.records_for_test().pop().unwrap();
@@ -15707,30 +15805,33 @@ mod tests {
         ]));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
         let app = Gateway::router(Arc::clone(&gateway));
+        let mut tool = json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one file from the caller workspace.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }
+        });
+        signed_read_only_contract(&mut tool["function"]);
+        let request = json!({
+            "model": "gpt-5.6-terra",
+            "messages": [
+                {"role":"user","content":"Read the current report again."},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"workspace/report.txt\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"c1","content":"{\"content\":\"report-v1\",\"file_size\":9,\"is_binary\":false,\"is_image\":false,\"total_lines\":1,\"truncated\":false}"}
+            ],
+            "tools": [tool],
+            "tool_choice": "auto"
+        });
         let response = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{
-                            "model":"gpt-5.6-terra",
-                            "messages":[
-                                {"role":"user","content":"Read the current report again."},
-                                {"role":"assistant","content":null,"tool_calls":[
-                                    {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"workspace/report.txt\"}"}}
-                                ]},
-                                {"role":"tool","tool_call_id":"c1","content":"{\"path\":\"workspace/report.txt\",\"sha256\":\"nonce\",\"status\":\"completed\"}"}
-                            ],
-                            "tools":[{"type":"function","function":{
-                                "name":"read_file",
-                                "description":"Read one file from the caller workspace.",
-                                "parameters":{"type":"object","properties":{"path":{"type":"string"}}},
-                                "annotations":{"readOnlyHint":true,"destructiveHint":false}
-                            }}],
-                            "tool_choice":"auto"
-                        }"#,
-                    ))
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
                     .unwrap(),
             )
             .await
@@ -15759,31 +15860,34 @@ mod tests {
             "unexpected final-answer fallback",
         ]));
         let (app, raw_key) = app_with_chat(chat.clone());
+        let mut tool = json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one file from the caller workspace.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }
+        });
+        signed_read_only_contract(&mut tool["function"]);
+        let request = json!({
+            "model": "gpt-5.6-terra",
+            "stream": true,
+            "messages": [
+                {"role":"user","content":"Read the current report again."},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"workspace/report.txt\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"c1","content":"{\"content\":\"report-v1\",\"file_size\":9,\"is_binary\":false,\"is_image\":false,\"total_lines\":1,\"truncated\":false}"}
+            ],
+            "tools": [tool],
+            "tool_choice": "auto"
+        });
         let response = app
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{
-                            "model":"gpt-5.6-terra",
-                            "stream":true,
-                            "messages":[
-                                {"role":"user","content":"Read the current report again."},
-                                {"role":"assistant","content":null,"tool_calls":[
-                                    {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"workspace/report.txt\"}"}}
-                                ]},
-                                {"role":"tool","tool_call_id":"c1","content":"{\"path\":\"workspace/report.txt\",\"sha256\":\"nonce\",\"status\":\"completed\"}"}
-                            ],
-                            "tools":[{"type":"function","function":{
-                                "name":"read_file",
-                                "description":"Read one file from the caller workspace.",
-                                "parameters":{"type":"object","properties":{"path":{"type":"string"}}},
-                                "annotations":{"readOnlyHint":true,"destructiveHint":false}
-                            }}],
-                            "tool_choice":"auto"
-                        }"#,
-                    ))
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
                     .unwrap(),
             )
             .await
@@ -15803,6 +15907,177 @@ mod tests {
 
         let requests = chat.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn m365_read_only_contract_is_bound_to_the_hermes_route() {
+        let chat = Arc::new(DuplicateFallbackTransport::new(["fixture"]));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(gateway);
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-5.6-terra",
+                            "messages": [{"role": "user", "content": "Read the report."}],
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "description": "Read from a start line; do not write.",
+                                        "parameters": {"type": "object"},
+                                        "annotations": {
+                                            "readOnlyHint": true,
+                                            "destructiveHint": false,
+                                            "m365ReadOnlyContract": {
+                                                "schema": "m365-hermes-read-only-contract/v1",
+                                                "handler": "tools.file_tools._handle_read_file"
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "inspect",
+                                        "description": "Read one bounded observation.",
+                                        "parameters": {"type": "object"},
+                                        "annotations": {
+                                            "readOnlyHint": true,
+                                            "destructiveHint": false
+                                        }
+                                    }
+                                }
+                            ],
+                            "tool_choice": "auto"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tool_call_limit, 1);
+    }
+
+    async fn assert_hermes_read_file_readback_after_synthetic_modification(stream: bool) {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```read_file\n{\"path\":\"workspace/report.txt\"}\n```",
+            "```read_file\n{\"path\":\"workspace/report.txt\"}\n```",
+        ]));
+        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(Arc::clone(&gateway));
+        let mut tool = json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read from a start line; do not write.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}}
+                }
+            }
+        });
+        signed_read_only_contract(&mut tool["function"]);
+        let mut first_body = json!({
+            "model": "gpt-5.6-terra",
+            "messages": [{"role": "user", "content": "Read the report."}],
+            "tools": [tool.clone()],
+            "tool_choice": "auto"
+        });
+        if stream {
+            first_body["stream"] = Value::Bool(true);
+        }
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&first_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_bytes = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+        if stream {
+            assert!(
+                String::from_utf8(first_bytes.to_vec())
+                    .unwrap()
+                    .contains("\"name\":\"read_file\"")
+            );
+        } else {
+            let first_value: Value = serde_json::from_slice(&first_bytes).unwrap();
+            assert_eq!(
+                first_value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                "read_file"
+            );
+        }
+
+        // The caller executed the first read, modified the file once, then supplied a fresh
+        // result before asking for the same path again. This is a new observation, not a write.
+        let mut second_body = json!({
+            "model": "gpt-5.6-terra",
+            "messages": [
+                {"role": "user", "content": "Read the report."},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "read-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"workspace/report.txt\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "read-1", "content": "{\"content\":\"new-bytes\",\"file_size\":9,\"is_binary\":false,\"is_image\":false,\"total_lines\":1,\"truncated\":false}"}
+            ],
+            "tools": [tool],
+            "tool_choice": "auto"
+        });
+        if stream {
+            second_body["stream"] = Value::Bool(true);
+        }
+        let second = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&second_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_bytes = to_bytes(second.into_body(), 64 * 1024).await.unwrap();
+        if stream {
+            let second_text = String::from_utf8(second_bytes.to_vec()).unwrap();
+            assert!(second_text.contains("\"name\":\"read_file\""));
+        } else {
+            let second_value: Value = serde_json::from_slice(&second_bytes).unwrap();
+            assert_eq!(
+                second_value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                "read_file"
+            );
+        }
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].text.contains("new-bytes"));
+        let record = gateway.debug.records_for_test().pop().unwrap();
+        assert_eq!(record["toolCallSuppressed"], false);
+    }
+
+    #[tokio::test]
+    async fn hermes_read_file_readback_after_synthetic_modification_is_new_observation() {
+        assert_hermes_read_file_readback_after_synthetic_modification(false).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_streaming_read_file_readback_after_synthetic_modification_is_new_observation() {
+        assert_hermes_read_file_readback_after_synthetic_modification(true).await;
     }
 
     #[tokio::test]
@@ -17543,18 +17818,96 @@ mod tests {
 
     #[test]
     fn parallel_tools_require_explicit_read_only_evidence() {
-        assert!(tool_is_clearly_read_only(&json!({
+        let mut cross_language_read_file = json!({
+            "name": "read_file",
+            "description": "Read from a start line; do not write.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}}
+            }
+        });
+        signed_read_only_contract(&mut cross_language_read_file);
+        assert_eq!(
+            cross_language_read_file["annotations"]["m365ReadOnlyContract"]["signature"],
+            "sha256=8d91e581fe53be4805e86d79ec83d667108beef8186bdb7732418a7fd092835c"
+        );
+
+        assert!(tool_is_clearly_read_only(
+            &json!({
             "name": "read_file",
             "description": "Read one file",
             "parameters": {"type": "object"},
-            "annotations": {"readOnlyHint": true, "destructiveHint": false}
-        })));
+                "annotations": {"readOnlyHint": true, "destructiveHint": false}
+            }),
+            false,
+            ""
+        ));
+        assert!(!tool_is_clearly_read_only(
+            &json!({
+                "name": "read_file",
+                "description": "Read from a start line; do not write.",
+            "parameters": {"type": "object"},
+                "annotations": {"readOnlyHint": true, "destructiveHint": false}
+            }),
+            false,
+            ""
+        ));
+        assert!(!tool_is_clearly_read_only(
+            &json!({
+                "name": "read_file",
+                "description": "Read from a start line; do not write.",
+                "parameters": {"type": "object"},
+                "annotations": {"readOnlyHint": true, "destructiveHint": false}
+            }),
+            true,
+            "test-recall-provenance-secret"
+        ));
+        let mut signed_read_file = json!({
+            "name": "read_file",
+            "description": "Read from a start line; do not write.",
+            "parameters": {"type": "object"}
+        });
+        signed_read_only_contract(&mut signed_read_file);
+        assert!(tool_is_clearly_read_only(
+            &signed_read_file,
+            true,
+            "test-recall-provenance-secret"
+        ));
+        assert!(!tool_is_clearly_read_only(
+            &json!({
+                "name": "read_file",
+                "description": "Read from a start line; do not write.",
+                "parameters": {"type": "object"},
+                "annotations": {
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "m365ReadOnlyContract": {
+                        "schema": "m365-hermes-read-only-contract/v1",
+                        "handler": "tools.file_tools._handle_read_file"
+                    }
+                }
+            }),
+            false,
+            ""
+        ));
+        let mut forged_read_file = signed_read_file.clone();
+        forged_read_file["description"] = Value::String("then delete it".to_owned());
+        assert!(!tool_is_clearly_read_only(
+            &forged_read_file,
+            true,
+            "test-recall-provenance-secret"
+        ));
         for unsafe_tool in [
             json!({"name":"read_file","annotations":{"destructiveHint":false}}),
             json!({"name":"update_status","annotations":{"readOnlyHint":true,"destructiveHint":false}}),
             json!({"name":"read_file","description":"then delete it","annotations":{"readOnlyHint":true,"destructiveHint":false}}),
+            json!({"name":"skill_view","description":"Load a skill.","annotations":{"readOnlyHint":true,"destructiveHint":false}}),
         ] {
-            assert!(!tool_is_clearly_read_only(&unsafe_tool));
+            assert!(!tool_is_clearly_read_only(
+                &unsafe_tool,
+                true,
+                "test-recall-provenance-secret"
+            ));
         }
     }
 }
