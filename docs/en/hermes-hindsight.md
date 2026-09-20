@@ -28,7 +28,7 @@ Do not confuse M365's configured UTF-16 transport policy with the Hermes/model t
 - M365 `textInputLimitUTF16`: text policy before transport;
 - Hermes/model context: token-based context quality and compression policy.
 
-For non-Memory chat, M365 first tries inline and then moves only bulk `user` / `tool` text that makes the real outbound wire smaller. If that still cannot fit, it may place the current request's complete model-facing message projection in one deterministic `.txt` attachment while keeping the current user ask, system/developer control, tool definitions/protocol, and latest complete tool exchange inline. The document is not session history, memory, or a new governance authority, and it does not change Hermes checkpoint, ledger, compression, or replay contracts. Memory traffic does not use this auto-spill behavior.
+For non-Memory chat, M365 first evaluates the canonical inline text. When the effective text limit is exceeded, it directly places the current request's complete model-facing message projection in one deterministic `m365-full-context/v1` `.txt` attachment while keeping the current user ask, system/developer control, tool definitions/protocol, and required latest complete tool exchange inline. It does not use a largest-first bulk-candidate strategy. The document is not session history, memory, or a new governance authority, and it does not change Hermes checkpoint, ledger, compression, or replay contracts. Memory traffic does not use this auto-spill behavior.
 
 Hermes compression should therefore be driven by model-context quality rather than by an old M365 transport threshold. When a full-context document is generated, Chat Completions usage reports `m365.usage_estimate_scope=full_context_document_and_inline_projection`; the document and non-overlapping inline projection are included in the transport estimate, so the caller can see context pressure. This does not change Hermes's compression policy. Effective context/compression values belong to the current Hermes profile and are not pinned to one upstream version in M365 public docs.
 
@@ -105,7 +105,7 @@ Webhook secrets, raw Memory content, and account identity must not appear in UI,
 ## Overflow and Memory
 
 - M365's configured UTF-16 transport policy is not the model token context; its exact current value is maintained in [`runtime-settings.md`](runtime-settings.md).
-- Non-Memory bulk text may spill into an attachment only when safety constraints hold.
+- Non-Memory overflow may use one full-context TXT attachment only when the bounded projection preserves the required inline controls and identity.
 - Memory traffic preserves Hindsight-compatible `context_length_exceeded` recovery and does not auto-spill.
 - Attachment grounding is neither zero context cost nor arbitrary byte-addressable storage.
 - M365 protects transport only. Hindsight bank/mission semantics remain governed by current Hindsight APIs and configuration.

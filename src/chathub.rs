@@ -319,6 +319,12 @@ pub struct ChatRequest {
     #[doc(hidden)]
     pub(crate) native_attachment_indices: Vec<usize>,
     #[doc(hidden)]
+    pub(crate) continuation_messages: Option<Arc<Vec<crate::protocol::OpenAiMessage>>>,
+    #[doc(hidden)]
+    pub(crate) continuation_recall_range: Option<crate::protocol::ContinuationRecallRange>,
+    #[doc(hidden)]
+    pub(crate) continuation_usage: Option<crate::protocol::ContinuationUsage>,
+    #[doc(hidden)]
     pub(crate) upstream_start: Option<UpstreamStartHook>,
 }
 
@@ -608,8 +614,6 @@ pub enum ChatError {
         message_text_units: usize,
         limit: usize,
     },
-    #[error("ChatHub serialized payload exceeds the UTF-16 limit ({wire_units} > {limit})")]
-    OutboundPayloadTooLarge { wire_units: usize, limit: usize },
     #[error("ChatHub protocol: {0}")]
     Protocol(String),
 }
@@ -825,15 +829,6 @@ async fn live_chat(
     {
         return Err(ChatError::PayloadTooLarge {
             message_text_units,
-            limit: request.outbound_text_limit_utf16,
-        });
-    }
-    if request.outbound_text_limit_utf16 > 0
-        && wire_units > request.outbound_text_limit_utf16
-        && !native_attachment_manifest(&request).is_empty()
-    {
-        return Err(ChatError::OutboundPayloadTooLarge {
-            wire_units,
             limit: request.outbound_text_limit_utf16,
         });
     }
@@ -2135,7 +2130,10 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
 
-    async fn text_only_loopback(frames: Vec<Value>) -> Result<ChatResult, ChatError> {
+    async fn loopback_chat(
+        request: ChatRequest,
+        frames: Vec<Value>,
+    ) -> Result<ChatResult, ChatError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2166,19 +2164,30 @@ mod tests {
                     oid: "synthetic".into(),
                     tid: "synthetic".into(),
                 },
-                ChatRequest {
-                    text: "Synthetic transcript qualification".into(),
-                    conversation_id: "synthetic-conversation".into(),
-                    session_id: "synthetic-session".into(),
-                    ..ChatRequest::default()
-                },
+                request,
                 &mut |_: StreamEvent| Ok(()),
             ),
         )
         .await
         .unwrap();
-        server.await.unwrap();
+        if result.is_err() {
+            server.abort();
+        }
+        let _ = server.await;
         result
+    }
+
+    async fn text_only_loopback(frames: Vec<Value>) -> Result<ChatResult, ChatError> {
+        loopback_chat(
+            ChatRequest {
+                text: "Synthetic transcript qualification".into(),
+                conversation_id: "synthetic-conversation".into(),
+                session_id: "synthetic-session".into(),
+                ..ChatRequest::default()
+            },
+            frames,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -2974,7 +2983,7 @@ mod tests {
             outbound_text_limit_utf16: 128_000,
             upstream_start: Some(UpstreamStartHook::new(move || {
                 started_for_hook.store(true, Ordering::Release);
-                Err(ChatError::Protocol("upstream start reached".to_owned()))
+                Ok(())
             })),
             ..ChatRequest::default()
         };
@@ -2989,31 +2998,17 @@ mod tests {
         assert!(message_units <= request.outbound_text_limit_utf16);
         assert!(outbound_payload_utf16_units(&request) > request.outbound_text_limit_utf16);
 
-        let account = Account {
-            access_token: "access".to_owned(),
-            graph_access_token: String::new(),
-            oid: "oid".to_owned(),
-            tid: "tid".to_owned(),
-        };
-        let mut sink = |_: StreamEvent| Ok(());
-        let result = live_chat(
-            account,
+        let result = loopback_chat(
             request,
-            false,
-            &mut sink,
-            prepare_attachments,
-            WS_BASE,
+            vec![
+                json!({"type":2,"item":{"result":{"message":"native attachment accepted"}}}),
+                json!({"type":3}),
+            ],
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(ChatError::OutboundPayloadTooLarge {
-                wire_units,
-                limit: 128_000,
-            }) if wire_units > 128_000
-        ));
-        assert!(!started.load(Ordering::Acquire));
+        assert_eq!(result.unwrap().text, "native attachment accepted");
+        assert!(started.load(Ordering::Acquire));
     }
 
     #[test]

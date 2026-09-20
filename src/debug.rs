@@ -77,6 +77,8 @@ pub(crate) enum SpillDecision {
     Denied,
 }
 
+// Retained for authoritative parsing of pre-V1 full-context telemetry records.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SpillReason {
     NotEvaluated,

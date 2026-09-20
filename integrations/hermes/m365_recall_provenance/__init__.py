@@ -170,11 +170,95 @@ def _is_exact_unsafe_tool_replay(error_body: Any) -> bool:
     return True
 
 
+def _exact_text_input_too_large_context(error_body: Any) -> dict[str, Any] | None:
+    """Validate the Gateway's terminal text-overflow envelope without trusting prose."""
+    if not isinstance(error_body, dict):
+        return None
+    nested = error_body.get("error")
+    if "error" in error_body and not isinstance(nested, dict):
+        return None
+    candidates = [nested] if isinstance(nested, dict) else []
+    candidates.append(error_body)
+    candidate = next(
+        (value for value in candidates if value.get("code") == "text_input_too_large"),
+        None,
+    )
+    if candidate is None:
+        return None
+    if (
+        candidate.get("type") != "invalid_request_error"
+        or type(candidate.get("retryable")) is not bool
+        or candidate.get("retryable") is not False
+    ):
+        return None
+    if (
+        type(candidate.get("retryable_after_reduction")) is not bool
+        or candidate["retryable_after_reduction"] is not True
+    ):
+        return None
+    limit_type = candidate.get("limit_type")
+    if limit_type not in {
+        "caller_text_utf16",
+        "outbound_message_text_utf16",
+    }:
+        return None
+    if "limit" not in candidate or "received" not in candidate:
+        return None
+    limit = candidate.get("limit")
+    received = candidate.get("received")
+    if (
+        type(limit) is not int
+        or type(received) is not int
+        or limit <= 0
+        or received <= 0
+    ):
+        return None
+
+    for field in ("preliminary_outbound", "final_outbound"):
+        measurement = candidate.get(field)
+        if measurement is None:
+            continue
+        if (
+            not isinstance(measurement, dict)
+            or set(measurement) != {"limit_type", "limit", "received"}
+            or measurement["limit_type"] != "outbound_message_text_utf16"
+            or type(measurement["limit"]) is not int
+            or type(measurement["received"]) is not int
+            or measurement["limit"] <= 0
+            or measurement["received"] <= measurement["limit"]
+        ):
+            return None
+
+    # Direct and nested forms may mirror the same Gateway fields, but a
+    # contradiction must never be allowed to select the terminal class.
+    mirrored = (
+        "type",
+        "code",
+        "retryable",
+        "retryable_after_reduction",
+        "limit_type",
+        "limit",
+        "received",
+        "preliminary_outbound",
+        "final_outbound",
+    )
+    for value in candidates:
+        for field in mirrored:
+            if field in value and field in candidate and value[field] != candidate[field]:
+                return None
+
+    context: dict[str, Any] = {"provider_error_code": "text_input_too_large"}
+    for field in ("limit_type", "limit", "received"):
+        context[field] = candidate[field]
+    return context
+
+
 def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | None:
-    """Claim only the authenticated M365 terminal replay error."""
+    """Claim only authenticated M365 terminal replay or text-overflow errors."""
     if not _m365_provider_matches(kwargs.get("provider")):
         return None
-    if kwargs.get("error_code") not in (None, "", "unsafe_tool_replay"):
+    error_code = kwargs.get("error_code")
+    if error_code not in (None, "", "unsafe_tool_replay", "text_input_too_large"):
         return None
     error = kwargs.get("error")
     route = _api_request_route_identity(_api_error_request_url(error))
@@ -183,7 +267,16 @@ def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | Non
     )
     if route is None or expected is None or route != expected:
         return None
-    if not _is_exact_unsafe_tool_replay(kwargs.get("error_body")):
+    error_body = kwargs.get("error_body")
+    if error_code in (None, "", "unsafe_tool_replay") and _is_exact_unsafe_tool_replay(
+        error_body
+    ):
+        error_context = {"provider_error_code": "unsafe_tool_replay"}
+    elif error_code in (None, "", "text_input_too_large"):
+        error_context = _exact_text_input_too_large_context(error_body)
+        if error_context is None:
+            return None
+    else:
         return None
     return {
         "reason": "format_error",
@@ -191,7 +284,7 @@ def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | Non
         "should_compress": False,
         "should_rotate_credential": False,
         "should_fallback": False,
-        "error_context": {"provider_error_code": "unsafe_tool_replay"},
+        "error_context": error_context,
     }
 
 

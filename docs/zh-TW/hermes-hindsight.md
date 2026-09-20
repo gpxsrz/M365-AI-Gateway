@@ -28,7 +28,7 @@
 - M365 `textInputLimitUTF16`：送往 transport 前的文字政策。
 - Hermes / model context：token-based context quality / compression policy。
 
-非 Memory chat 先嘗試 inline，再只搬移會實際減少 outbound wire 的 bulk `user` / `tool` text；若仍超限，M365 可以把目前 request 的完整 model-facing message projection 放進一份 deterministic `.txt` attachment，同時把 current user ask、system/developer control、工具定義／協定與最近完整工具交換留 inline。這份文件不是 session history、memory 或新的治理 authority，且不改 Hermes 的 checkpoint、ledger、compression 或 replay 契約。Memory route 不做這種 auto-spill。
+非 Memory chat 先評估 canonical inline text。若有效文字上限超過，M365 直接把目前 request 的完整 model-facing message projection 放進一份 deterministic `m365-full-context/v1` `.txt` attachment，同時把 current user ask、system/developer control、工具定義／協定與必要的最近完整工具交換留 inline。不採用 largest-first bulk candidate 策略。這份文件不是 session history、memory 或新的治理 authority，且不改 Hermes 的 checkpoint、ledger、compression 或 replay 契約。Memory route 不做這種 auto-spill。
 
 因此 Hermes compression 應依 model context quality 設計，不要只為了躲 M365 UTF-16 wall 提前壓縮。產生 full-context 文件時，Chat Completions usage 會用 `m365.usage_estimate_scope=full_context_document_and_inline_projection` 表示這份完整 model-facing 文件；文件與不重複的 inline projection 都已納入 transport estimate，讓 caller 看得到 context pressure。這不改 Hermes 的 compression policy。實際 context/compression 值由目前 Hermes profile 自己管理，不在 M365 public docs 固定某個上游版本數字。
 
@@ -105,7 +105,7 @@ Webhook secret、raw Memory content 與帳號 identity 不得進 UI、log 或 pu
 ## Overflow 與 Memory
 
 - M365 configured UTF-16 transport policy 不是 model token context；精確 current value 只在 [`runtime-settings.md`](runtime-settings.md) 維護。
-- 非 Memory bulk text 可以在 safety 條件成立時 spill 成 attachment。
+- 非 Memory 超限時，只有在 bounded projection 能保留必要 inline control 與 identity 時，才會使用一份 full-context TXT attachment。
 - Memory route 維持 Hindsight-compatible `context_length_exceeded` recovery，不 auto-spill。
 - Attachment grounding 不是零 context cost，也不是任意 byte-addressable storage。
 - M365 只保護 transport；Hindsight bank mission / retain mission 等上游語意以 Hindsight 自己的 current API/config 為準。

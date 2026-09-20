@@ -53,19 +53,18 @@ Caller 丟棄 streaming response 時，Gateway 會取消同一 upstream work並�
 
 Effective 文字限制是 `textInputLimitUTF16`，單位為 UTF-16 code units；精確 current default/value 只在 [`runtime-settings.md`](runtime-settings.md) 維護。
 
-非 Memory request 超限時，若能在不移動 system/developer/assistant control、tool identity 與真正 current user ask 的前提下安全外移 bulk text，Gateway 可以把舊 user evidence、tool result 或可信 integration 綁定的 source-material range轉成 deterministic UTF-8 `.txt` attachment，再重新量測 inline text。
+非 Memory request 先由 Gateway 評估 canonical inline projection。若有效文字上限超過，Gateway 直接建立一份 deterministic UTF-8 `m365-full-context/v1` TXT transport projection，同時保留 current user ask、system/developer control、tool identity 與必要 inline protocol；不採用 largest-first bulk candidate 策略。
 
-Fallback 依序嘗試：
+Projection 契約是：
 
 1. 原本的 inline request。
-2. 只採用會讓真正 outbound wire 變短的 bulk spill；短內容若換成較長引用會被跳過。
-3. 若仍超限，建立一份 `m365-full-context/v1`、UTF-8、deterministic 的單一 TXT transport projection。文件只承載這次 request 實際要交給模型的 model-facing 訊息序列，不是 session history、memory store 或 Task / Run layer。
+2. 若有效文字上限超過，建立一份 `m365-full-context/v1`、UTF-8、deterministic 的單一 TXT transport projection。文件只承載這次 request 實際要交給模型的 model-facing 訊息序列，不是 session history、memory store 或 Task / Run layer。
 
 完整文件保留原始 role、順序、content、assistant tool calls 與完整 arguments、`tool_call_id`、tool result / error 標記及原始 message index。必要 inline 核心仍保留 system/developer control、最新真正 user request、目前工具定義／呼叫協定，以及最近一個完整且連續的多 tool-call/result exchange；pending 或 malformed exchange 不會被自行拼造。文件和 inline 重疊的 message 以相同 index 表示同一份資料，不是兩次操作。Synthetic recovery 會明確標記，不會變成新的真人要求。
 
 Effective 128K `textInputLimitUTF16` gate 約束的是 canonical ChatHub `message.text` 的 UTF-16 code units，由 `outbound_message_text()` 建立；其中包含 caller tool protocol、caller tool definitions 與 request text。這個限制不會自動套到外層 serialized ChatHub JSON、plugins、annotations 或 transport bytes。Gateway 仍會另外量測完整 serialized payload 作為 bounded diagnostics；本契約沒有宣稱存在另一個同為 128K 的 ChatHub payload limit。Attachment preparation 仍由 producer enforce 自己的 metadata bounds，`LiveChatHub` 也會在 upstream-start hook 前記錄準備完成後的 exact payload。
 
-Projection 前後的 fit check 都走同一個 canonical `message.text` builder。Bulk spill 與 full-context TXT 因此是在真正受限制的欄位中騰出空間，不會因重複的工具 schema 或 envelope metadata 讓無關的診斷 payload 變大就拒絕。Final-answer continuation 會繼承 caller 原本的 tool definitions、`tool_choice` 與 `tool_call_limit`，並在同一個 builder 中加入 transport continuation context、prepared attachment annotations 與 conversation/session binding；只移除被安全檢查拒絕的候選，不撤銷整組工具契約。若 bounded projection 後 message text 仍無法 fit，request 會在 upstream 前安全結束，依階段回報 `preliminary_outbound` 或 `final_outbound`。若一次 bounded continuation 又只收到被拒絕的重播，非串流回 typed HTTP `409 tool_protocol_error / unsafe_tool_replay`；串流則送出同一個 typed SSE error 後結束。若原本是 `required` 或特定工具選擇而續接沒有合法 call，兩種模式也都回 typed `tool_choice_unsatisfied`，不接受成功 final 或 checkpoint。既有 `received` 欄位仍表示搬移前 caller role-envelope 長度，不是搬移後剩餘的 message-text 長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。這個 fallback 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
+Projection 前後的 fit check 都走同一個 canonical `message.text` builder。Full-context TXT 因此是在真正受限制的欄位中騰出空間，不會因重複的工具 schema 或 envelope metadata 讓無關的診斷 payload 變大就拒絕。Final-answer continuation 會繼承 caller 原本的 tool definitions、`tool_choice` 與 `tool_call_limit`，並在同一個 builder 中加入 transport continuation context、prepared attachment annotations 與 conversation/session binding；只移除被安全檢查拒絕的候選，不撤銷整組工具契約。若 bounded projection 後 message text 仍無法 fit，request 會在 upstream 前安全結束，依階段回報 `preliminary_outbound` 或 `final_outbound`。若一次 bounded continuation 又只收到被拒絕的重播，非串流回 typed HTTP `409 tool_protocol_error / unsafe_tool_replay`；串流則送出同一個 typed SSE error 後結束。若原本是 `required` 或特定工具選擇而續接沒有合法 call，兩種模式也都回 typed `tool_choice_unsatisfied`，不接受成功 final 或 checkpoint。既有 `received` 欄位仍表示搬移前 caller role-envelope 長度，不是搬移後剩餘的 message-text 長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。Projection 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
 
 公開 synthetic qualification input 是 [`fixtures/long-context-tool-calls.json`](../../fixtures/long-context-tool-calls.json)：50 個 model-facing messages、已完成的 tool-call/result pairs、compressed summary、29 個 tool definitions，以及 deterministic 的長 Python／shell argument expansion。它不含 private capture，只用於 transport qualification。
 
@@ -103,16 +102,14 @@ code=attachment_upload_failed
 retryable=<true|false>
 retryable_after_reduction=false
 spill_attempted=true
-spill_reason=<safe_bulk_candidate|full_context_document>
+spill_reason=full_context_document
 attachment_failure=<bounded stage/class>
 recommended_action=<retry_same_request|inspect_attachment_failure>
 ```
 
 Generated document 只在 attachment layer 對 create-upload-session 的 transport／408／429／5xx 做一次 bounded retry；chunk PUT 的同類失敗也只會在同一 upload session、同一 `Content-Range` 上重送一次。PUT 發生 transport error 後，會先讀同一 upload session 的 bounded `nextExpectedRanges`，只有確認同一 range 仍 missing 才重送。`Retry-After` 會被 bounded，PUT 不會帶 Graph bearer token。若 range 可能已經 commit，或 status 無法 reconcile，會 fail closed 為 `sharepoint_upload_transport_unknown`，不把未知結果當成成功，也不盲目重播；這個 final unknown class 不可由 caller retry。永久 4xx、untrusted upload URL、invalid JSON、incomplete DriveItem 與 reference validation failure 不重試。這些 attachment failure 不要求 caller reduction，也不改變真正無法 fit 的 `text_input_too_large` 或 `graph_authorization_unavailable` 契約。
 
-常見 `spill_reason` 包含 attachment slots 已滿、沒有安全 candidate、無法縮回限制內、generated file 過大或文件 projection 原因；upload stage/class 另由 `attachment_failure` 表示。`fallback_reason` 保留給後續 spill fallback transition 使用。
-
-若 bulk 已嘗試但接續的 full-context fallback 也失敗，公開錯誤保留既有 `spill_reason` 的第一階段相容語意，並在有第二階段結果時增加 `fallback_reason`；這兩者不可混看成同一個量。
+目前 automatic spill 使用 `full_context_document`；bounded inline projection 無法 fit 時維持 typed failure，upload stage/class 另由 `attachment_failure` 表示。`fallback_reason` 保留給後續 typed failure transition，不能當成重送相同 request 的許可。
 
 Fallback 建立的 generated attachment 使用內容 identity，以及 conversation＋session binding；同一內容可重試而得到可預期名稱，內容、conversation 或 session 改變時必須產生／重新驗證新版本，不能把 generated TXT 當普通 user attachment 或再包進下一份文件。既有 user attachment 不會為了騰 slot 被丟棄；slot 滿、缺檔、過期、取消或 upload 失敗都會走 typed reduction / attachment error。
 

@@ -464,6 +464,213 @@ class RecallProvenanceTests(unittest.TestCase):
                     )
                 )
 
+    def test_text_input_too_large_transform_is_terminal_and_exact(self):
+        request = types.SimpleNamespace(
+            request=types.SimpleNamespace(
+                url="https://m365.example/hermes/v1/chat/completions"
+            )
+        )
+        direct = {
+            "type": "invalid_request_error",
+            "code": "text_input_too_large",
+            "limit_type": "caller_text_utf16",
+            "limit": 128000,
+            "received": 128001,
+            "retryable": False,
+            "retryable_after_reduction": True,
+        }
+        nested = {"error": dict(direct)}
+
+        for error_code, body in ((None, direct), ("", nested), ("text_input_too_large", nested)):
+            with self.subTest(error_code=error_code, nested="error" in body):
+                result = plugin.on_transform_api_error_classification(
+                    provider="m365",
+                    error_code=error_code,
+                    error=request,
+                    error_body=body,
+                )
+                self.assertEqual(
+                    result,
+                    {
+                        "reason": "format_error",
+                        "retryable": False,
+                        "should_compress": False,
+                        "should_rotate_credential": False,
+                        "should_fallback": False,
+                        "error_context": {
+                            "provider_error_code": "text_input_too_large",
+                            "limit_type": "caller_text_utf16",
+                            "limit": 128000,
+                            "received": 128001,
+                        },
+                    },
+                )
+
+        within_limit = {**direct, "received": 128000}
+        below_limit = {**direct, "received": 127999}
+        for body in (within_limit, below_limit):
+            with self.subTest(valid_received=body["received"]):
+                result = plugin.on_transform_api_error_classification(
+                    provider="m365",
+                    error_code="text_input_too_large",
+                    error=request,
+                    error_body=body,
+                )
+                self.assertIsNotNone(result)
+                self.assertEqual(result["reason"], "format_error")
+                self.assertFalse(result["retryable"])
+
+        for field in (
+            "retryable_after_reduction",
+            "limit_type",
+            "limit",
+            "received",
+        ):
+            malformed = dict(direct)
+            del malformed[field]
+            with self.subTest(missing_field=field):
+                self.assertIsNone(
+                    plugin.on_transform_api_error_classification(
+                        provider="m365",
+                        error_code="text_input_too_large",
+                        error=request,
+                        error_body=malformed,
+                    )
+                )
+
+        for body in (
+            {
+                **direct,
+                "retryable_after_reduction": False,
+            },
+            {**direct, "retryable": True},
+            {**direct, "type": "provider_error"},
+            {**direct, "limit_type": "model_tokens"},
+            {**direct, "received": 0},
+            {**direct, "limit": 0},
+            {**direct, "limit": "128000"},
+            {**direct, "preliminary_outbound": {"limit_type": "caller_text_utf16", "limit": 128000, "received": 128001}},
+            {**direct, "final_outbound": {"limit_type": "outbound_message_text_utf16", "limit": 128000, "received": 128000}},
+            {
+                "type": "provider_error",
+                "error": direct,
+            },
+            {
+                "error": {**direct, "code": "other_400"},
+            },
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(
+                    plugin.on_transform_api_error_classification(
+                        provider="m365",
+                        error_code="text_input_too_large",
+                        error=request,
+                        error_body=body,
+                    )
+                )
+
+        for provider, url, error_code, body in (
+            (
+                "openai",
+                request.request.url,
+                "text_input_too_large",
+                nested,
+            ),
+            (
+                "custom",
+                "https://m365.example/v1/chat/completions",
+                "text_input_too_large",
+                nested,
+            ),
+            (
+                "custom",
+                request.request.url,
+                "rate_limit",
+                {"error": {"code": "rate_limit", "retryable": True}},
+            ),
+            (
+                "custom",
+                request.request.url,
+                "",
+                {"error": {"type": "api_error", "code": "timeout"}},
+            ),
+            (
+                "custom",
+                request.request.url,
+                "upload_failed",
+                {"error": {"code": "sharepoint_upload_transport_unknown"}},
+            ),
+        ):
+            with self.subTest(provider=provider, url=url, error_code=error_code):
+                self.assertIsNone(
+                    plugin.on_transform_api_error_classification(
+                        provider=provider,
+                        error_code=error_code,
+                        error=types.SimpleNamespace(
+                            request=types.SimpleNamespace(url=url)
+                        ),
+                        error_body=body,
+                    )
+                )
+
+    def test_real_hermes_manager_delivers_terminal_text_overflow_classification(self):
+        agent_root = os.environ.get("HERMES_AGENT_ROOT")
+        plugin_root = os.environ.get("M365_REPLAY_PLUGIN_ROOT")
+        if not agent_root or not plugin_root:
+            self.skipTest(
+                "set HERMES_AGENT_ROOT and M365_REPLAY_PLUGIN_ROOT "
+                "to run against the real Hermes PluginManager"
+            )
+
+        sys.path.insert(0, agent_root)
+        from hermes_cli.plugins import PluginManager, _plugin_home_scope
+        from hermes_cli.plugins_manifest import PluginManifest
+
+        with tempfile.TemporaryDirectory(prefix="m365-classifier-plugin-") as scope:
+            manager = PluginManager(scope_key=scope)
+            manager._load_plugin(
+                PluginManifest(
+                    name="m365-recall-provenance",
+                    version="1.3.0",
+                    description="isolated classifier qualification",
+                    source="user",
+                    path=plugin_root,
+                    key="m365-recall-provenance",
+                )
+            )
+            with _plugin_home_scope(Path(scope)):
+                results = manager.invoke_hook(
+                    "transform_api_error_classification",
+                    provider="m365",
+                    model="gpt-5.6-reasoning",
+                    status_code=400,
+                    error_type="BadRequestError",
+                    error_code="text_input_too_large",
+                    error_message="input is too long",
+                    error_body={"error": {
+                        "type": "invalid_request_error",
+                        "code": "text_input_too_large",
+                        "limit_type": "outbound_message_text_utf16",
+                        "limit": 128000,
+                        "received": 128001,
+                        "retryable": False,
+                        "retryable_after_reduction": True,
+                    }},
+                    error=types.SimpleNamespace(
+                        request=types.SimpleNamespace(
+                            url="https://m365.example/hermes/v1/chat/completions"
+                        )
+                    ),
+                    approx_tokens=1,
+                    context_length=200000,
+                    num_messages=1,
+                )
+            self.assertEqual(len(results), 1)
+            self.assertFalse(results[0]["retryable"])
+            self.assertFalse(results[0]["should_compress"])
+            self.assertFalse(results[0]["should_rotate_credential"])
+            self.assertFalse(results[0]["should_fallback"])
+
     def test_read_file_annotation_requires_registered_handler_and_exact_schema(self):
         def _handle_read_file(*args, **kwargs):
             return "{}"
