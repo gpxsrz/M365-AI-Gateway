@@ -110,6 +110,50 @@ impl ToolEvidence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SuppressionReason {
+    SameBatchDuplicate,
+    PendingSameCall,
+    CompletedNotAuthorizedReadback,
+    CompletedResultNotVerified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct SuppressionDetail {
+    pub(crate) registered_tool_name: String,
+    pub(crate) candidate_ordinal: usize,
+    pub(crate) arguments_digest: String,
+    pub(crate) matched_prior_call_id: Option<String>,
+    pub(crate) result_received: bool,
+    pub(crate) result_classification: ToolResultStatus,
+    pub(crate) blocking_reason: SuppressionReason,
+    pub(crate) candidate_not_dispatched: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KnownCallFilterResult {
+    pub(crate) calls: Vec<DetectedToolCall>,
+    pub(crate) suppression_details: Vec<SuppressionDetail>,
+}
+
+impl KnownCallFilterResult {
+    pub(crate) fn suppressed(&self) -> bool {
+        !self.suppression_details.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReplayFeedback {
+    text: String,
+}
+
+impl ReplayFeedback {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct AgentLedger {
     pub(crate) completed: Vec<ToolEvidence>,
@@ -146,71 +190,130 @@ impl AgentLedger {
         &self,
         calls: Vec<DetectedToolCall>,
         allow_completed_reissue: F,
-    ) -> (Vec<DetectedToolCall>, bool)
+    ) -> KnownCallFilterResult
     where
         F: Fn(&str) -> bool,
     {
         let mut batch = HashSet::new();
-        let mut suppressed = false;
-        let calls = calls
-            .into_iter()
-            .filter(|call| {
-                let name = call
-                    .function
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let arguments = call
-                    .function
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let argument_digest = arguments_digest(arguments);
-                let identity = format!("{name}\0{argument_digest}");
-                let duplicate_in_batch = !batch.insert(identity);
-                // A pending effect is never safe to replay. A completed read-only
-                // effect may be a new observation, but only its caller contract
-                // can authorize that distinction.
-                let duplicate_pending = self.pending.iter().any(|evidence| {
+        let mut filtered = Vec::new();
+        let mut suppression_details = Vec::new();
+        for (candidate_ordinal, call) in calls.into_iter().enumerate() {
+            let name = call
+                .function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = call
+                .function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let argument_digest = arguments_digest(arguments);
+            let identity = format!("{name}\0{argument_digest}");
+            let duplicate_in_batch = !batch.insert(identity);
+            // A pending effect is never safe to replay. A completed read-only
+            // effect may be a new observation, but only its caller contract
+            // can authorize that distinction.
+            let duplicate_pending = self.pending.iter().any(|evidence| {
+                is_digest(&evidence.arguments_digest)
+                    && evidence.name == name
+                    && evidence.arguments_digest == argument_digest
+            });
+            let duplicate_completed = self.completed.iter().any(|evidence| {
+                is_digest(&evidence.arguments_digest)
+                    && evidence.name == name
+                    && evidence.arguments_digest == argument_digest
+            });
+            let completed_contract_allows = duplicate_completed && allow_completed_reissue(name);
+            let completed_result_verified = duplicate_completed
+                && self
+                    .completed
+                    .iter()
+                    .filter(|evidence| {
+                        is_digest(&evidence.arguments_digest)
+                            && evidence.name == name
+                            && evidence.arguments_digest == argument_digest
+                    })
+                    .all(|evidence| evidence.result_status() == ToolResultStatus::Success);
+            let completed_reissue_allowed = completed_contract_allows && completed_result_verified;
+            let duplicate = duplicate_in_batch
+                || duplicate_pending
+                || (duplicate_completed && !completed_reissue_allowed);
+            if !duplicate {
+                filtered.push(call);
+                continue;
+            }
+
+            let blocking_reason = if duplicate_in_batch {
+                SuppressionReason::SameBatchDuplicate
+            } else if duplicate_pending {
+                SuppressionReason::PendingSameCall
+            } else if !completed_contract_allows {
+                SuppressionReason::CompletedNotAuthorizedReadback
+            } else {
+                debug_assert!(!completed_result_verified);
+                SuppressionReason::CompletedResultNotVerified
+            };
+            let matched = if duplicate_pending {
+                self.pending.iter().find(|evidence| {
                     is_digest(&evidence.arguments_digest)
                         && evidence.name == name
                         && evidence.arguments_digest == argument_digest
-                });
-                let duplicate_completed = self.completed.iter().any(|evidence| {
-                    is_digest(&evidence.arguments_digest)
-                        && evidence.name == name
-                        && evidence.arguments_digest == argument_digest
-                });
-                let completed_reissue_allowed = duplicate_completed
-                    && allow_completed_reissue(name)
-                    && self
-                        .completed
-                        .iter()
-                        .filter(|evidence| {
+                })
+            } else {
+                self.completed
+                    .iter()
+                    .filter(|evidence| {
+                        is_digest(&evidence.arguments_digest)
+                            && evidence.name == name
+                            && evidence.arguments_digest == argument_digest
+                    })
+                    .find(|evidence| {
+                        blocking_reason == SuppressionReason::CompletedResultNotVerified
+                            && evidence.result_status() != ToolResultStatus::Success
+                    })
+                    .or_else(|| {
+                        self.completed.iter().find(|evidence| {
                             is_digest(&evidence.arguments_digest)
                                 && evidence.name == name
                                 && evidence.arguments_digest == argument_digest
                         })
-                        .all(|evidence| evidence.result_status() == ToolResultStatus::Success);
-                let duplicate = duplicate_in_batch
-                    || duplicate_pending
-                    || (duplicate_completed && !completed_reissue_allowed);
-                suppressed |= duplicate;
-                !duplicate
-            })
-            .collect();
-        (calls, suppressed)
+                    })
+            };
+            suppression_details.push(SuppressionDetail {
+                registered_tool_name: name.to_owned(),
+                candidate_ordinal: candidate_ordinal + 1,
+                arguments_digest: argument_digest.clone(),
+                matched_prior_call_id: matched.map(|evidence| evidence.id.clone()),
+                result_received: matched.is_some_and(|evidence| evidence.has_result),
+                result_classification: matched
+                    .map_or(ToolResultStatus::Unknown, ToolEvidence::result_status),
+                blocking_reason,
+                candidate_not_dispatched: true,
+            });
+        }
+        KnownCallFilterResult {
+            calls: filtered,
+            suppression_details,
+        }
     }
 
-    pub(crate) fn router_context(&self) -> String {
+    pub(crate) fn replay_feedback(
+        &self,
+        suppression_details: &[SuppressionDetail],
+    ) -> ReplayFeedback {
         let evidence = serde_json::json!({
             "completed": self.completed,
             "pending": self.pending,
             "repeated_call": self.repeated_call,
         });
-        format!(
-            "Use only this compact transport evidence. Completed tool responses are retained evidence; pending calls have unknown outcomes because no matching tool result was returned. Do not automatically reissue the same name and arguments as a completed or pending call unless the current caller tool contract explicitly marks it read-only and this is a new readback. This ledger does not decide whether an agent task is complete.\nEVIDENCE_LEDGER: {evidence}"
-        )
+        let suppressed =
+            serde_json::to_string(suppression_details).unwrap_or_else(|_| "[]".to_owned());
+        ReplayFeedback {
+            text: format!(
+                "The original request, attached documents, and tool outputs remain task evidence according to their content and provenance. This transport summary is only for preventing unsafe re-execution; it is not a replacement for that evidence and does not decide task completion. A returned result whose success was not certified is not a missing result. The rejected candidate(s) below were not dispatched to the caller. Use an earlier applicable result when it is available; do not repeat an already satisfied prerequisite solely to obtain the same information. Do not change arguments, spelling, paths, or tools merely to evade replay protection. Continue only with a genuinely necessary operation permitted by the existing tool contract, or give an evidence-based answer when tool_choice allows it. If needed evidence is unavailable, state the limitation without inventing it or claiming success.\nEVIDENCE_LEDGER: {evidence}\nSUPPRESSED_CANDIDATES: {suppressed}"
+            ),
+        }
     }
 
     pub(crate) fn is_valid_persisted(&self) -> bool {
@@ -671,9 +774,157 @@ mod tests {
             kind: "function".to_owned(),
             function: json!({"name": "read", "arguments": " { \"path\" : \"a\" } "}),
         };
-        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate], |_| false);
-        assert!(calls.is_empty());
-        assert!(suppressed);
+        let filtered = ledger.filter_known_calls(vec![candidate], |_| false);
+        assert!(filtered.calls.is_empty());
+        assert!(filtered.suppressed());
+    }
+
+    #[test]
+    fn suppression_details_preserve_replay_predicate_and_result_classification() {
+        let successful = build(&[
+            call("skill-call", "skill_view", r#"{"name":"m365-document"}"#),
+            result("skill-call", "saved reading answer"),
+        ]);
+        let candidate = DetectedToolCall {
+            id: "candidate".to_owned(),
+            kind: "function".to_owned(),
+            function: json!({
+                "name": "skill_view",
+                "arguments": r#"{"name":"m365-document"}"#,
+            }),
+        };
+        let filtered = successful.filter_known_calls(vec![candidate.clone()], |_| false);
+        assert!(filtered.calls.is_empty());
+        assert_eq!(filtered.suppression_details.len(), 1);
+        assert_eq!(
+            filtered.suppression_details[0].registered_tool_name,
+            "skill_view"
+        );
+        assert_eq!(filtered.suppression_details[0].candidate_ordinal, 1);
+        assert_eq!(
+            filtered.suppression_details[0].arguments_digest,
+            arguments_digest(r#"{"name":"m365-document"}"#)
+        );
+        assert_eq!(
+            filtered.suppression_details[0].blocking_reason,
+            SuppressionReason::CompletedNotAuthorizedReadback
+        );
+        assert_eq!(
+            filtered.suppression_details[0]
+                .matched_prior_call_id
+                .as_deref(),
+            Some("skill-call")
+        );
+        assert!(filtered.suppression_details[0].result_received);
+        assert_eq!(
+            filtered.suppression_details[0].result_classification,
+            ToolResultStatus::Unknown
+        );
+        assert!(filtered.suppression_details[0].candidate_not_dispatched);
+
+        let read_only = build(&[
+            call("read-call", "read_file", r#"{"path":"report.txt"}"#),
+            result(
+                "read-call",
+                r#"{"content":"report","file_size":6,"is_binary":false,"is_image":false,"total_lines":1,"truncated":false}"#,
+            ),
+        ]);
+        let accepted = read_only
+            .filter_known_calls(vec![candidate_for("read_file")], |name| name == "read_file");
+        assert_eq!(accepted.calls.len(), 1);
+        assert!(accepted.suppression_details.is_empty());
+
+        let unknown = build(&[
+            call("unknown-call", "read_file", r#"{"path":"report.txt"}"#),
+            result("unknown-call", "untyped result"),
+        ]);
+        let filtered = unknown
+            .filter_known_calls(vec![candidate_for("read_file")], |name| name == "read_file");
+        assert!(filtered.calls.is_empty());
+        assert_eq!(
+            filtered.suppression_details[0].blocking_reason,
+            SuppressionReason::CompletedResultNotVerified
+        );
+        assert!(filtered.suppression_details[0].result_received);
+        assert_eq!(
+            filtered.suppression_details[0].result_classification,
+            ToolResultStatus::Unknown
+        );
+
+        let failed = build(&[
+            call("failed-call", "read_file", r#"{"path":"report.txt"}"#),
+            result(
+                "failed-call",
+                r#"{"content":"partial","file_size":7,"is_binary":false,"is_image":false,"total_lines":1,"truncated":false,"error":"denied"}"#,
+            ),
+        ]);
+        let filtered =
+            failed.filter_known_calls(vec![candidate_for("read_file")], |name| name == "read_file");
+        assert_eq!(
+            filtered.suppression_details[0].blocking_reason,
+            SuppressionReason::CompletedResultNotVerified
+        );
+        assert_eq!(
+            filtered.suppression_details[0].result_classification,
+            ToolResultStatus::Failed
+        );
+    }
+
+    #[test]
+    fn replay_feedback_keeps_task_evidence_and_exact_rejected_candidate() {
+        let ledger = build(&[
+            call(
+                "skill-routing",
+                "skill_view",
+                r#"{"name":"m365-document-attachment-routing"}"#,
+            ),
+            result("skill-routing", "saved reading answer"),
+            call(
+                "skill-governance",
+                "skill_view",
+                r#"{"name":"hermes-single-agent-governance"}"#,
+            ),
+            result(
+                "skill-governance",
+                "verification result: gateway-only authority",
+            ),
+        ]);
+        let candidate = candidate_for_args(
+            "skill_view",
+            r#"{"name":"m365-document-attachment-routing"}"#,
+        );
+        let filtered = ledger.filter_known_calls(vec![candidate], |_| false);
+        let feedback = ledger.replay_feedback(&filtered.suppression_details);
+        assert!(feedback.as_str().contains(
+            "The original request, attached documents, and tool outputs remain task evidence"
+        ));
+        assert!(feedback.as_str().contains("skill_view"));
+        assert!(feedback.as_str().contains("skill-routing"));
+        assert!(feedback.as_str().contains("skill-governance"));
+        assert!(feedback.as_str().contains("candidate_not_dispatched"));
+        assert!(feedback.as_str().contains("arguments_digest"));
+        assert!(
+            !feedback
+                .as_str()
+                .contains("Use only this compact transport evidence")
+        );
+    }
+
+    fn candidate_for(name: &str) -> DetectedToolCall {
+        let arguments = if name == "skill_view" {
+            r#"{"name":"m365-document"}"#
+        } else {
+            r#"{"path":"report.txt"}"#
+        };
+        candidate_for_args(name, arguments)
+    }
+
+    fn candidate_for_args(name: &str, arguments: &str) -> DetectedToolCall {
+        DetectedToolCall {
+            id: "candidate".to_owned(),
+            kind: "function".to_owned(),
+            function: json!({"name": name, "arguments": arguments}),
+        }
     }
 
     #[test]
@@ -995,9 +1246,9 @@ mod tests {
             kind: "function".to_owned(),
             function: json!({"name": "deploy", "arguments": "{}"}),
         };
-        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate], |_| false);
-        assert!(calls.is_empty());
-        assert!(suppressed);
+        let filtered = ledger.filter_known_calls(vec![candidate], |_| false);
+        assert!(filtered.calls.is_empty());
+        assert!(filtered.suppressed());
     }
 
     #[test]
@@ -1017,9 +1268,9 @@ mod tests {
                 "arguments": "{\"task_id\":\"t_c3de88aa\"}"
             }),
         };
-        let (calls, suppressed) = ledger.filter_known_calls(vec![candidate], |_| false);
-        assert_eq!(calls.len(), 1);
-        assert!(!suppressed);
+        let filtered = ledger.filter_known_calls(vec![candidate], |_| false);
+        assert_eq!(filtered.calls.len(), 1);
+        assert!(!filtered.suppressed());
     }
 
     #[test]
@@ -1043,23 +1294,53 @@ mod tests {
                 "arguments": "{\"path\":\"report.txt\"}"
             }),
         };
-        let (calls, suppressed) =
+        let filtered =
             completed.filter_known_calls(vec![candidate.clone()], |name| name == "read_file");
-        assert_eq!(calls.len(), 1);
-        assert!(!suppressed);
+        assert_eq!(filtered.calls.len(), 1);
+        assert!(!filtered.suppressed());
 
         let pending = build(&[call("c1", "read_file", r#"{"path":"report.txt"}"#)]);
-        let (calls, suppressed) =
+        let filtered =
             pending.filter_known_calls(vec![candidate.clone()], |name| name == "read_file");
-        assert!(calls.is_empty());
-        assert!(suppressed);
+        assert!(filtered.calls.is_empty());
+        assert!(filtered.suppressed());
+        assert_eq!(
+            filtered.suppression_details[0].blocking_reason,
+            SuppressionReason::PendingSameCall
+        );
+        assert_eq!(
+            filtered.suppression_details[0]
+                .matched_prior_call_id
+                .as_deref(),
+            Some("c1")
+        );
+        assert!(!filtered.suppression_details[0].result_received);
+        assert_eq!(
+            filtered.suppression_details[0].result_classification,
+            ToolResultStatus::Unknown
+        );
 
-        let (calls, suppressed) = completed
-            .filter_known_calls(vec![candidate.clone(), candidate], |name| {
-                name == "read_file"
-            });
-        assert_eq!(calls.len(), 1);
-        assert!(suppressed);
+        let filtered = completed.filter_known_calls(vec![candidate.clone(), candidate], |name| {
+            name == "read_file"
+        });
+        assert_eq!(filtered.calls.len(), 1);
+        assert!(filtered.suppressed());
+        assert_eq!(filtered.suppression_details.len(), 1);
+        assert_eq!(
+            filtered.suppression_details[0].blocking_reason,
+            SuppressionReason::SameBatchDuplicate
+        );
+        assert_eq!(
+            filtered.suppression_details[0]
+                .matched_prior_call_id
+                .as_deref(),
+            Some("c1")
+        );
+        assert!(filtered.suppression_details[0].result_received);
+        assert_eq!(
+            filtered.suppression_details[0].result_classification,
+            ToolResultStatus::Success
+        );
     }
 
     #[test]
@@ -1089,10 +1370,9 @@ mod tests {
                 "arguments": "{\"path\":\"report.txt\"}"
             }),
         };
-        let (calls, suppressed) =
-            ledger.filter_known_calls(vec![candidate], |name| name == "read_file");
-        assert!(calls.is_empty());
-        assert!(suppressed);
+        let filtered = ledger.filter_known_calls(vec![candidate], |name| name == "read_file");
+        assert!(filtered.calls.is_empty());
+        assert!(filtered.suppressed());
     }
 
     #[test]

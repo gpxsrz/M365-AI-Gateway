@@ -353,8 +353,8 @@ class RecallProvenanceTests(unittest.TestCase):
         ):
             result = plugin.on_transform_api_error_classification(
                 provider="custom",
-                status_code=400,
-                error_type="BadRequestError",
+                status_code=409,
+                error_type="ConflictError",
                 error_code="unsafe_tool_replay",
                 error=types.SimpleNamespace(request=Request()),
                 error_body={
@@ -462,8 +462,8 @@ class RecallProvenanceTests(unittest.TestCase):
                 self.assertIsNone(
                     plugin.on_transform_api_error_classification(
                         provider=provider,
-                        status_code=400,
-                        error_type="BadRequestError",
+                        status_code=409,
+                        error_type="ConflictError",
                         error_code="unsafe_tool_replay",
                         error=types.SimpleNamespace(request=types.SimpleNamespace(url=url)),
                         error_body=body,
@@ -660,14 +660,39 @@ class RecallProvenanceTests(unittest.TestCase):
                     }
                 },
             ),
+            (
+                "invalid_tool_call",
+                {
+                    "error": {
+                        "type": "upstream_error",
+                        "code": "invalid_tool_call",
+                        "terminal": True,
+                        "retryable": False,
+                        "failure_stage": "replay_continuation",
+                        "candidate_not_dispatched": True,
+                    }
+                },
+            ),
         )
         for error_code, error_body in cases:
             with self.subTest(error_code=error_code):
                 result = plugin.on_transform_api_error_classification(
                     provider="m365",
                     model="gpt-5.6-reasoning",
-                    status_code=400,
-                    error_type="BadRequestError",
+                    status_code=(
+                        409
+                        if error_code == "unsafe_tool_replay"
+                        else 502
+                        if error_code == "invalid_tool_call"
+                        else 400
+                    ),
+                    error_type=(
+                        "ConflictError"
+                        if error_code == "unsafe_tool_replay"
+                        else "BadGatewayError"
+                        if error_code == "invalid_tool_call"
+                        else "BadRequestError"
+                    ),
                     error_code=error_code,
                     error_message="bounded synthetic classifier message",
                     error_body=error_body,
@@ -708,8 +733,22 @@ class RecallProvenanceTests(unittest.TestCase):
                     "retryable_after_reduction": True,
                 }
             },
+            {
+                "error": {
+                    "type": "upstream_error",
+                    "code": "invalid_tool_call",
+                    "terminal": True,
+                    "retryable": False,
+                    "failure_stage": "replay_continuation",
+                    "candidate_not_dispatched": True,
+                }
+            },
         )
-        for status_code, error_type in ((429, "RateLimitError"), (503, "APIStatusError")):
+        for status_code, error_type in (
+            (429, "RateLimitError"),
+            (503, "APIStatusError"),
+            (409.0, "ConflictError"),
+        ):
             for body in bodies:
                 with self.subTest(status_code=status_code, code=body["error"]["code"]):
                     self.assertIsNone(
@@ -722,6 +761,25 @@ class RecallProvenanceTests(unittest.TestCase):
                             error_body=body,
                         )
                     )
+        for status_code, error_type, body in (
+            (400, "BadRequestError", bodies[0]),
+            (400, "BadRequestError", bodies[2]),
+            (409, "ConflictError", bodies[1]),
+            (409, "ConflictError", bodies[2]),
+            (502, "BadGatewayError", bodies[0]),
+            (502, "BadGatewayError", bodies[1]),
+        ):
+            with self.subTest(status_code=status_code, code=body["error"]["code"]):
+                self.assertIsNone(
+                    plugin.on_transform_api_error_classification(
+                        provider="m365",
+                        status_code=status_code,
+                        error_type=error_type,
+                        error_code=body["error"]["code"],
+                        error=error,
+                        error_body=body,
+                    )
+                )
         self.assertIsNone(
             plugin.on_transform_api_error_classification(
                 provider="m365",
@@ -732,6 +790,69 @@ class RecallProvenanceTests(unittest.TestCase):
                 error_body=bodies[1],
             )
         )
+
+    def test_invalid_tool_call_requires_explicit_terminal_envelope(self):
+        error = types.SimpleNamespace(
+            request=types.SimpleNamespace(
+                url="https://m365.example/hermes/v1/chat/completions"
+            )
+        )
+        valid = {
+            "type": "upstream_error",
+            "code": "invalid_tool_call",
+            "terminal": True,
+            "retryable": False,
+            "failure_stage": "initial_projection",
+            "candidate_not_dispatched": True,
+        }
+        for status_code, error_type in ((502, "BadGatewayError"), (None, "APIError")):
+            for body in (valid, {"error": dict(valid)}):
+                with self.subTest(status_code=status_code, nested="error" in body):
+                    result = plugin.on_transform_api_error_classification(
+                        provider="m365",
+                        status_code=status_code,
+                        error_type=error_type,
+                        error_code="invalid_tool_call",
+                        error=error,
+                        error_body=body,
+                    )
+                    self.assertIsNotNone(result)
+                    self.assertEqual(
+                        result["error_context"],
+                        {
+                            "provider_error_code": "invalid_tool_call",
+                            "failure_stage": "initial_projection",
+                        },
+                    )
+
+        malformed = (
+            {key: value for key, value in valid.items() if key != "terminal"},
+            {**valid, "terminal": False},
+            {**valid, "retryable": True},
+            {**valid, "retryable": "false"},
+            {**valid, "candidate_not_dispatched": False},
+            {**valid, "failure_stage": "legacy_stage"},
+            {"error": {**valid, "failure_stage": "legacy_stage"}},
+            {"error": valid, "type": "other_error"},
+            {"error": valid, "code": "other_error"},
+            {"error": valid, "terminal": False},
+            {"error": valid, "retryable": True},
+            {"error": valid, "failure_stage": "syntax_correction"},
+            {"error": valid, "candidate_not_dispatched": False},
+            {"error": "not-an-envelope"},
+        )
+        for body in malformed:
+            with self.subTest(body=body):
+                self.assertIsNone(
+                    plugin.on_transform_api_error_classification(
+                        provider="m365",
+                        status_code=502,
+                        error_type="BadGatewayError",
+                        error_code="invalid_tool_call",
+                        error=error,
+                        error_body=body,
+                    )
+                )
 
     def test_real_hermes_manager_delivers_terminal_text_overflow_classification(self):
         agent_root = os.environ.get("HERMES_AGENT_ROOT")
@@ -769,7 +890,7 @@ class RecallProvenanceTests(unittest.TestCase):
                     manager._load_plugin(
                         PluginManifest(
                             name="m365-recall-provenance",
-                            version="1.3.1",
+                            version="1.4.0",
                             description="isolated classifier qualification",
                             source="user",
                             path=plugin_root,
@@ -787,6 +908,17 @@ class RecallProvenanceTests(unittest.TestCase):
                                 "type": "tool_protocol_error",
                                 "code": error_code,
                                 "retryable": False,
+                            }
+                        }
+                    if error_code == "invalid_tool_call":
+                        return {
+                            "error": {
+                                "type": "upstream_error",
+                                "code": error_code,
+                                "terminal": True,
+                                "retryable": False,
+                                "failure_stage": "replay_continuation",
+                                "candidate_not_dispatched": True,
                             }
                         }
                     return {
@@ -819,9 +951,12 @@ class RecallProvenanceTests(unittest.TestCase):
                                 content=content,
                                 request=request,
                             )
-                        return httpx.Response(
-                            400, json=body, request=request
-                        )
+                        status = {
+                            "unsafe_tool_replay": 409,
+                            "text_input_too_large": 400,
+                            "invalid_tool_call": 502,
+                        }[error_code]
+                        return httpx.Response(status, json=body, request=request)
 
                     return OpenAI(
                         api_key="synthetic",
@@ -833,7 +968,11 @@ class RecallProvenanceTests(unittest.TestCase):
                     )
 
                 try:
-                    for error_code in ("unsafe_tool_replay", "text_input_too_large"):
+                    for error_code in (
+                        "unsafe_tool_replay",
+                        "text_input_too_large",
+                        "invalid_tool_call",
+                    ):
                         for stream in (False, True):
                             attempts = [0]
                             client = sdk_client(error_code, attempts, stream)
@@ -870,7 +1009,11 @@ class RecallProvenanceTests(unittest.TestCase):
                             self.assertEqual(attempts[0], 1)
                             client.close()
 
-                    for error_code in ("unsafe_tool_replay", "text_input_too_large"):
+                    for error_code in (
+                        "unsafe_tool_replay",
+                        "text_input_too_large",
+                        "invalid_tool_call",
+                    ):
                         for stream in (False, True):
                             attempts = [0]
                             client = sdk_client(error_code, attempts, stream)
@@ -1114,7 +1257,7 @@ class RecallProvenanceTests(unittest.TestCase):
             manager._load_plugin(
                 PluginManifest(
                     name="m365-recall-provenance",
-                    version="1.3.1",
+                        version="1.4.0",
                     description="isolated registry qualification",
                     source="user",
                     path=plugin_root,

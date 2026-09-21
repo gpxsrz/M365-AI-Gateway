@@ -253,19 +253,78 @@ def _exact_text_input_too_large_context(error_body: Any) -> dict[str, Any] | Non
     return context
 
 
+def _exact_terminal_invalid_tool_call_context(error_body: Any) -> dict[str, Any] | None:
+    """Validate the Gateway's explicit terminal invalid-tool projection envelope."""
+    if not isinstance(error_body, dict):
+        return None
+    nested = error_body.get("error")
+    if "error" in error_body and not isinstance(nested, dict):
+        return None
+    candidates = [nested] if isinstance(nested, dict) else []
+    candidates.append(error_body)
+    candidate = next(
+        (value for value in candidates if value.get("code") == "invalid_tool_call"),
+        None,
+    )
+    if candidate is None:
+        return None
+    if (
+        candidate.get("type") != "upstream_error"
+        or type(candidate.get("terminal")) is not bool
+        or candidate.get("terminal") is not True
+        or type(candidate.get("retryable")) is not bool
+        or candidate.get("retryable") is not False
+        or type(candidate.get("candidate_not_dispatched")) is not bool
+        or candidate.get("candidate_not_dispatched") is not True
+    ):
+        return None
+    failure_stage = candidate.get("failure_stage")
+    if not isinstance(failure_stage, str) or failure_stage not in {
+        "initial_projection",
+        "syntax_correction",
+        "replay_continuation",
+    }:
+        return None
+
+    mirrored = (
+        "type",
+        "code",
+        "terminal",
+        "retryable",
+        "failure_stage",
+        "candidate_not_dispatched",
+    )
+    for value in candidates:
+        for field in mirrored:
+            if field in value and value[field] != candidate[field]:
+                return None
+    return {
+        "provider_error_code": "invalid_tool_call",
+        "failure_stage": failure_stage,
+    }
+
+
 def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | None:
-    """Claim only authenticated M365 terminal replay or text-overflow errors."""
+    """Claim only authenticated M365 terminal Gateway producer envelopes."""
     if not _m365_provider_matches(kwargs.get("provider")):
         return None
     status_code = kwargs.get("status_code")
-    if status_code not in (None, 400):
+    if status_code is not None and (
+        type(status_code) is not int or status_code not in (400, 409, 502)
+    ):
         return None
     # OpenAI's HTTP-200 SSE error event is surfaced as a status-less APIError;
     # a status-less timeout/transport exception must not inherit this verdict.
     if status_code is None and kwargs.get("error_type") != "APIError":
         return None
     error_code = kwargs.get("error_code")
-    if error_code not in (None, "", "unsafe_tool_replay", "text_input_too_large"):
+    if error_code not in (
+        None,
+        "",
+        "unsafe_tool_replay",
+        "text_input_too_large",
+        "invalid_tool_call",
+    ):
         return None
     error = kwargs.get("error")
     route = _api_request_route_identity(_api_error_request_url(error))
@@ -275,15 +334,16 @@ def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | Non
     if route is None or expected is None or route != expected:
         return None
     error_body = kwargs.get("error_body")
+    error_context = None
     if error_code in (None, "", "unsafe_tool_replay") and _is_exact_unsafe_tool_replay(
         error_body
-    ):
+    ) and (status_code is None or status_code == 409):
         error_context = {"provider_error_code": "unsafe_tool_replay"}
-    elif error_code in (None, "", "text_input_too_large"):
+    elif error_code in (None, "", "text_input_too_large") and status_code in (None, 400):
         error_context = _exact_text_input_too_large_context(error_body)
-        if error_context is None:
-            return None
-    else:
+    elif error_code in (None, "", "invalid_tool_call") and status_code in (None, 502):
+        error_context = _exact_terminal_invalid_tool_call_context(error_body)
+    if error_context is None:
         return None
     return {
         "reason": "format_error",

@@ -1014,7 +1014,12 @@ async fn complete_chat(
                     Err(QualificationError::Format(_)) => {
                         let projection =
                             project_tool_calls(&result.text, &tools, &tool_choice, tool_limit);
-                        return invalid_tool_call_response(&trace, &projection, permit);
+                        return invalid_tool_call_response(
+                            &trace,
+                            &projection,
+                            permit,
+                            InvalidToolCallStage::SyntaxCorrection,
+                        );
                     }
                     Err(QualificationError::Chat(error)) => {
                         return chat_error_with_overflow(
@@ -1074,16 +1079,27 @@ async fn complete_chat(
                 );
             }
             if transport.projection.rejected {
-                return invalid_tool_call_response(&trace, &transport.projection, permit);
+                return invalid_tool_call_response(
+                    &trace,
+                    &transport.projection,
+                    permit,
+                    if syntax_corrected {
+                        InvalidToolCallStage::SyntaxCorrection
+                    } else {
+                        InvalidToolCallStage::InitialProjection
+                    },
+                );
             }
             if transport.projection.overflowed {
-                trace.caller_tool_rejection(transport.projection.rejection.as_ref());
-                permit.finish(StatusCode::BAD_GATEWAY, None);
-                return openai_error(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_error",
-                    "invalid_tool_call",
-                    "model returned more tool calls than the safe request limit",
+                return invalid_tool_call_response(
+                    &trace,
+                    &transport.projection,
+                    permit,
+                    if syntax_corrected {
+                        InvalidToolCallStage::SyntaxCorrection
+                    } else {
+                        InvalidToolCallStage::InitialProjection
+                    },
                 );
             }
             if syntax_corrected && transport.suppressed {
@@ -1092,10 +1108,11 @@ async fn complete_chat(
             }
             if transport.completed_call_suppressed {
                 trace.tool_call_suppressed();
-                let answer_request = match completed_tool_answer_request(
+                let replay_feedback = agent_ledger.replay_feedback(&transport.suppression_details);
+                let answer_request = match completed_tool_answer_request_with_feedback(
                     &fallback_request,
                     &result,
-                    &agent_ledger,
+                    &replay_feedback,
                     gateway.settings.current().text_input_limit_utf16,
                 ) {
                     Ok(request) => request,
@@ -1230,16 +1247,19 @@ async fn complete_chat(
                     upstream_attempt_count.load(Ordering::Acquire),
                 );
                 if transport.projection.rejected {
-                    return invalid_tool_call_response(&trace, &transport.projection, permit);
+                    return invalid_tool_call_response(
+                        &trace,
+                        &transport.projection,
+                        permit,
+                        InvalidToolCallStage::ReplayContinuation,
+                    );
                 }
                 if transport.projection.overflowed {
-                    trace.caller_tool_rejection(transport.projection.rejection.as_ref());
-                    permit.finish(StatusCode::BAD_GATEWAY, None);
-                    return openai_error(
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_error",
-                        "invalid_tool_call",
-                        "model returned more tool calls than the safe request limit",
+                    return invalid_tool_call_response(
+                        &trace,
+                        &transport.projection,
+                        permit,
+                        InvalidToolCallStage::ReplayContinuation,
                     );
                 }
                 if transport.suppressed && transport.projection.calls.is_empty() {
@@ -1566,6 +1586,7 @@ async fn stream_chat(
                                 &sender,
                                 projection.rejection.as_ref(),
                                 permit,
+                                InvalidToolCallStage::SyntaxCorrection,
                             );
                             return;
                         }
@@ -1641,19 +1662,26 @@ async fn stream_chat(
                         &sender,
                         transport.projection.rejection.as_ref(),
                         permit,
+                        if syntax_corrected {
+                            InvalidToolCallStage::SyntaxCorrection
+                        } else {
+                            InvalidToolCallStage::InitialProjection
+                        },
                     );
                     return;
                 }
                 if transport.projection.overflowed {
-                    trace.caller_tool_rejection(transport.projection.rejection.as_ref());
-                    permit.finish(StatusCode::BAD_GATEWAY, None);
-                    send_sse_error(
+                    send_invalid_tool_call_error(
                         &trace,
                         &sender,
-                        "invalid_tool_call",
-                        "model returned more tool calls than the safe request limit",
+                        transport.projection.rejection.as_ref(),
+                        permit,
+                        if syntax_corrected {
+                            InvalidToolCallStage::SyntaxCorrection
+                        } else {
+                            InvalidToolCallStage::InitialProjection
+                        },
                     );
-                    let _ = send_sse_done(&trace, &sender);
                     return;
                 }
                 if syntax_corrected && transport.suppressed {
@@ -1667,10 +1695,12 @@ async fn stream_chat(
                     // The bounded repair changes only the upstream context. Keep the
                     // caller's tool contract so a distinct legal continuation remains
                     // structured instead of becoming ordinary final-answer text.
-                    let answer_request = match completed_tool_answer_request(
+                    let replay_feedback =
+                        agent_ledger.replay_feedback(&transport.suppression_details);
+                    let answer_request = match completed_tool_answer_request_with_feedback(
                         &fallback_request,
                         &result,
-                        &agent_ledger,
+                        &replay_feedback,
                         gateway.settings.current().text_input_limit_utf16,
                     ) {
                         Ok(request) => request,
@@ -1845,19 +1875,18 @@ async fn stream_chat(
                             &sender,
                             transport.projection.rejection.as_ref(),
                             permit,
+                            InvalidToolCallStage::ReplayContinuation,
                         );
                         return;
                     }
                     if transport.projection.overflowed {
-                        trace.caller_tool_rejection(transport.projection.rejection.as_ref());
-                        permit.finish(StatusCode::BAD_GATEWAY, None);
-                        send_sse_error(
+                        send_invalid_tool_call_error(
                             &trace,
                             &sender,
-                            "invalid_tool_call",
-                            "model returned more tool calls than the safe request limit",
+                            transport.projection.rejection.as_ref(),
+                            permit,
+                            InvalidToolCallStage::ReplayContinuation,
                         );
-                        let _ = send_sse_done(&trace, &sender);
                         return;
                     }
                     if transport.suppressed && transport.projection.calls.is_empty() {
@@ -2597,6 +2626,7 @@ struct TransportProjection {
     projection: ToolProjection,
     completed_call_suppressed: bool,
     suppressed: bool,
+    suppression_details: Vec<crate::agent_ledger::SuppressionDetail>,
 }
 
 fn apply_transport_projection(
@@ -2612,9 +2642,10 @@ fn apply_transport_projection(
             projection,
             completed_call_suppressed: false,
             suppressed: false,
+            suppression_details: Vec::new(),
         };
     }
-    let (calls, suppressed) = ledger.filter_known_calls(projection.calls, |name| {
+    let filtered = ledger.filter_known_calls(projection.calls, |name| {
         tools.iter().any(|tool| {
             tool.kind == "function"
                 && tool
@@ -2625,13 +2656,15 @@ fn apply_transport_projection(
                 && tool_is_clearly_read_only(&tool.function, hermes_route, read_only_secret)
         })
     });
-    projection.calls = calls;
+    let suppressed = filtered.suppressed();
+    projection.calls = filtered.calls;
     let completed_call_suppressed =
         suppressed && projection.calls.is_empty() && projection.content.trim().is_empty();
     TransportProjection {
         projection,
         completed_call_suppressed,
         suppressed,
+        suppression_details: filtered.suppression_details,
     }
 }
 
@@ -2782,7 +2815,7 @@ fn full_context_attachment_identity(
 fn project_continuation_full_context(
     answer: &mut ChatRequest,
     text_input_limit: usize,
-    router_context: &str,
+    replay_feedback: &crate::agent_ledger::ReplayFeedback,
 ) -> Result<(), ContinuationProjectionError> {
     let message_text_units = || {
         utf16_units(&crate::chathub::outbound_message_text(
@@ -2835,7 +2868,7 @@ fn project_continuation_full_context(
             recalled_source.as_ref(),
             &name,
             &file_sha,
-            Some(router_context),
+            Some(replay_feedback.as_str()),
             &budget,
             &context_scope,
         )
@@ -2864,7 +2897,7 @@ fn project_continuation_full_context(
         &flattened,
         recalled_source.as_ref(),
         &budget,
-        Some(router_context),
+        Some(replay_feedback.as_str()),
         "continuation_outbound_projection",
     )
     .map_err(|_| ContinuationProjectionError::CannotFitInline {
@@ -2880,19 +2913,26 @@ fn project_continuation_full_context(
     Ok(())
 }
 
+#[cfg(test)]
 fn completed_tool_answer_request(
     request: &ChatRequest,
     result: &ChatResult,
     ledger: &crate::agent_ledger::AgentLedger,
     text_input_limit: usize,
 ) -> Result<ChatRequest, ContinuationProjectionError> {
+    let replay_feedback = ledger.replay_feedback(&[]);
+    completed_tool_answer_request_with_feedback(request, result, &replay_feedback, text_input_limit)
+}
+
+fn completed_tool_answer_request_with_feedback(
+    request: &ChatRequest,
+    result: &ChatResult,
+    replay_feedback: &crate::agent_ledger::ReplayFeedback,
+    text_input_limit: usize,
+) -> Result<ChatRequest, ContinuationProjectionError> {
     let mut answer = request.clone();
     answer.upstream_start = None;
-    answer.text = format!(
-        "{}\n\n{}\n\nTRANSPORT CONTINUATION RULE: A caller tool with the same name and arguments is already represented in the conversation above. Do not reissue it. Continue the user's request using the retained tool evidence; if it is insufficient, state that plainly.",
-        request.text,
-        ledger.router_context(),
-    );
+    answer.text = format!("{}\n\n{}", request.text, replay_feedback.as_str());
     if !result.conversation_id.is_empty() {
         answer.conversation_id = result.conversation_id.clone();
     }
@@ -2912,7 +2952,7 @@ fn completed_tool_answer_request(
         .iter()
         .any(|attachment| attachment.generated_oversize_text);
     if has_generated_full_context || message_text_units > text_input_limit {
-        project_continuation_full_context(&mut answer, text_input_limit, &ledger.router_context())?;
+        project_continuation_full_context(&mut answer, text_input_limit, replay_feedback)?;
         message_text_units = utf16_units(&crate::chathub::outbound_message_text(
             &answer.text,
             &answer.tools,
@@ -2952,7 +2992,7 @@ fn unsafe_tool_replay_value() -> Value {
         "error": {
             "type": "tool_protocol_error",
             "code": "unsafe_tool_replay",
-            "message": "A tool call with an unknown or unsafe outcome was repeated; no new tool call or final checkpoint was accepted.",
+            "message": "A caller-tool candidate was rejected by replay protection; no new tool call or final checkpoint was accepted.",
             "retryable": false,
             "recommended_action": "reconcile_the_existing_call_or_start_a_new_user_turn"
         }
@@ -2966,6 +3006,37 @@ fn unsafe_tool_replay_response(permit: crate::traffic::Permit) -> Response {
 
 const INVALID_TOOL_CALL_MESSAGE: &str =
     "model returned a malformed caller tool candidate that was not safely executable";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InvalidToolCallStage {
+    InitialProjection,
+    SyntaxCorrection,
+    ReplayContinuation,
+}
+
+impl InvalidToolCallStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialProjection => "initial_projection",
+            Self::SyntaxCorrection => "syntax_correction",
+            Self::ReplayContinuation => "replay_continuation",
+        }
+    }
+}
+
+fn invalid_tool_call_value(stage: InvalidToolCallStage) -> Value {
+    json!({
+        "error": {
+            "type": "upstream_error",
+            "code": "invalid_tool_call",
+            "message": INVALID_TOOL_CALL_MESSAGE,
+            "terminal": true,
+            "retryable": false,
+            "failure_stage": stage.as_str(),
+            "candidate_not_dispatched": true,
+        }
+    })
+}
 
 fn observe_tool_projection(
     trace: &crate::debug::Trace,
@@ -2983,15 +3054,15 @@ fn invalid_tool_call_response(
     trace: &crate::debug::Trace,
     projection: &ToolProjection,
     permit: crate::traffic::Permit,
+    stage: InvalidToolCallStage,
 ) -> Response {
     trace.caller_tool_rejection(projection.rejection.as_ref());
     permit.finish(StatusCode::BAD_GATEWAY, None);
-    openai_error(
+    (
         StatusCode::BAD_GATEWAY,
-        "upstream_error",
-        "invalid_tool_call",
-        INVALID_TOOL_CALL_MESSAGE,
+        Json(invalid_tool_call_value(stage)),
     )
+        .into_response()
 }
 
 fn send_invalid_tool_call_error(
@@ -2999,15 +3070,12 @@ fn send_invalid_tool_call_error(
     sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
     rejection: Option<&crate::tool_calls::ToolRejection>,
     permit: crate::traffic::Permit,
+    stage: InvalidToolCallStage,
 ) {
     trace.caller_tool_rejection(rejection);
     permit.finish(StatusCode::BAD_GATEWAY, None);
-    send_sse_error(
-        trace,
-        sender,
-        "invalid_tool_call",
-        INVALID_TOOL_CALL_MESSAGE,
-    );
+    let sent = send_sse(sender, invalid_tool_call_value(stage));
+    trace.caller_delivery(stream_error_delivery(sender, sent));
     let _ = send_sse_done(trace, sender);
 }
 
@@ -5429,8 +5497,7 @@ fn full_context_inline_text_for_selection(
         let mut value = serde_json::from_str::<Value>(&inline_text)
             .map_err(|_| SpillFailure::ProjectionFailed)?;
         value["transport_continuation"] = json!({
-            "instruction": "A caller tool with the same name and arguments is already represented in the conversation above. Do not reissue it. Continue the user's request using the retained tool evidence; if it is insufficient, state that plainly.",
-            "router_context": rule,
+            "feedback": rule,
         });
         serde_json::to_string(&value).map_err(|_| SpillFailure::ProjectionFailed)
     } else {
@@ -7753,6 +7820,28 @@ mod tests {
             usize::from(expect_error),
             "case={case} stream={stream}"
         );
+        if expect_error {
+            let error = frames
+                .iter()
+                .find(|frame| frame["error"].is_object())
+                .expect("terminal syntax-correction error");
+            assert_eq!(error["error"]["type"], "upstream_error", "case={case}");
+            assert_eq!(error["error"]["terminal"], true, "case={case}");
+            assert_eq!(error["error"]["retryable"], false, "case={case}");
+            assert_eq!(
+                error["error"]["failure_stage"],
+                if expected_requests == 2 {
+                    "syntax_correction"
+                } else {
+                    "initial_projection"
+                },
+                "case={case}"
+            );
+            assert_eq!(
+                error["error"]["candidate_not_dispatched"], true,
+                "case={case}"
+            );
+        }
         for frame in &frames {
             for pointer in [
                 "/choices/0/delta/tool_calls",
@@ -11100,7 +11189,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_tool_answer_request_is_fit_checked_after_router_context() {
+    fn completed_tool_answer_request_is_fit_checked_after_replay_feedback() {
         let limit = 128_000;
         let request = ChatRequest {
             text: "x".repeat(limit - 100),
@@ -11139,10 +11228,12 @@ mod tests {
             continuation_messages: Some(Arc::new(messages)),
             ..ChatRequest::default()
         };
-        let answer = completed_tool_answer_request(
+        let replay_feedback = crate::agent_ledger::AgentLedger::default().replay_feedback(&[]);
+        let expected_feedback = replay_feedback.as_str().to_owned();
+        let answer = completed_tool_answer_request_with_feedback(
             &request,
             &ChatResult::default(),
-            &crate::agent_ledger::AgentLedger::default(),
+            &replay_feedback,
             request.outbound_text_limit_utf16,
         )
         .expect("fresh continuation spill must fit through the full-context projection");
@@ -11151,10 +11242,14 @@ mod tests {
             inline["transport_projection"]["kind"],
             "full_context_document"
         );
-        assert_eq!(
-            inline["transport_continuation"]["instruction"],
-            "A caller tool with the same name and arguments is already represented in the conversation above. Do not reissue it. Continue the user's request using the retained tool evidence; if it is insufficient, state that plainly."
-        );
+        let feedback = inline["transport_continuation"]["feedback"]
+            .as_str()
+            .expect("full-context continuation must carry structured feedback");
+        assert_eq!(feedback, expected_feedback);
+        assert!(feedback.contains(
+            "The original request, attached documents, and tool outputs remain task evidence"
+        ));
+        assert!(!feedback.contains("Use only this compact transport evidence"));
         let usage = answer
             .continuation_usage
             .expect("fresh spill must carry its complete usage estimate");
@@ -13209,7 +13304,7 @@ mod tests {
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
         let telemetry_path = gateway.debug.path_for_test().unwrap();
         let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 5_000;
+        settings.text_input_limit_utf16 = 7_000;
         gateway.settings.save(settings).unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
@@ -13261,7 +13356,7 @@ mod tests {
         assert_eq!(live[0]["spillReason"], "full_context_document");
         assert_eq!(live[0]["transportProjection"], "full_context_document");
         assert_eq!(live[0]["fallbackFailure"], "not_applicable");
-        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 5_000);
+        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 7_000);
         assert!(
             live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap()
                 >= live[0]["preliminaryMessageTextAfterUtf16"]
@@ -13272,7 +13367,7 @@ mod tests {
             live[0]["preliminaryMessageTextAfterUtf16"]
                 .as_u64()
                 .unwrap()
-                <= 5_000
+                <= 7_000
         );
         let requests = chat.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -13282,7 +13377,7 @@ mod tests {
                 &requests[1].tools,
                 &requests[1].tool_choice,
                 requests[1].tool_call_limit,
-            )) <= 5_000
+            )) <= 7_000
         );
         assert_eq!(
             requests[1]
@@ -13325,7 +13420,7 @@ mod tests {
         ));
         let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
         let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 5_000;
+        settings.text_input_limit_utf16 = 7_000;
         gateway.settings.save(settings).unwrap();
         let app = Gateway::router(Arc::clone(&gateway));
         let response = app
@@ -13367,7 +13462,7 @@ mod tests {
             live[0]["preliminaryMessageTextAfterUtf16"]
                 .as_u64()
                 .unwrap()
-                <= 5_000
+                <= 7_000
         );
         assert!(
             live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap()
@@ -13383,7 +13478,7 @@ mod tests {
                 &requests[1].tools,
                 &requests[1].tool_choice,
                 requests[1].tool_call_limit,
-            )) <= 5_000
+            )) <= 7_000
         );
         assert_eq!(
             requests[1]
@@ -16187,6 +16282,13 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].tools.len(), 2);
         assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
+        assert!(requests[1].text.contains("SUPPRESSED_CANDIDATES"));
+        assert!(requests[1].text.contains("completed-inspect"));
+        assert!(
+            !requests[1]
+                .text
+                .contains("Use only this compact transport evidence")
+        );
         assert_eq!(
             observed_prompt_tokens,
             (utf16_units(&requests[1].text) as u64).div_ceil(4),
@@ -16241,7 +16343,7 @@ mod tests {
         messages.push(json!({
             "role":"tool",
             "tool_call_id":call_id,
-            "content":"{\"content\":\"current file\",\"status\":\"completed\"}"
+            "content":"{\"content\":\"current file\",\"file_size\":12,\"is_binary\":false,\"is_image\":false,\"total_lines\":1,\"truncated\":false}"
         }));
         let second = app
             .oneshot(
@@ -16381,12 +16483,29 @@ mod tests {
             assert!(body.contains("invalid_tool_call"), "body={body}");
             assert!(!body.contains("finish_reason"), "body={body}");
             assert!(body.ends_with("data: [DONE]\n\n"));
+            assert_eq!(body.matches("data: [DONE]\n\n").count(), 1);
+            let error_line = body
+                .lines()
+                .find(|line| line.contains("\"code\":\"invalid_tool_call\""))
+                .expect("SSE terminal invalid-tool frame");
+            let value: Value =
+                serde_json::from_str(error_line.strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(value["error"]["type"], "upstream_error");
+            assert_eq!(value["error"]["terminal"], true);
+            assert_eq!(value["error"]["retryable"], false);
+            assert_eq!(value["error"]["failure_stage"], "replay_continuation");
+            assert_eq!(value["error"]["candidate_not_dispatched"], true);
         } else {
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             let value: Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
                     .unwrap();
             assert_eq!(value["error"]["code"], "invalid_tool_call");
+            assert_eq!(value["error"]["type"], "upstream_error");
+            assert_eq!(value["error"]["terminal"], true);
+            assert_eq!(value["error"]["retryable"], false);
+            assert_eq!(value["error"]["failure_stage"], "replay_continuation");
+            assert_eq!(value["error"]["candidate_not_dispatched"], true);
         }
         assert_eq!(chat.requests.lock().unwrap().len(), 2);
         let record = gateway.debug.records_for_test().pop().unwrap();
@@ -17788,13 +17907,28 @@ mod tests {
             if stream {
                 assert_eq!(status, StatusCode::OK);
                 assert!(body.contains("\"code\":\"invalid_tool_call\""));
+                assert_eq!(body.matches("data: [DONE]\n\n").count(), 1);
                 assert!(!body.contains("\"finish_reason\":\"stop\""));
                 assert!(!body.contains("\"finish_reason\":\"tool_calls\""));
                 assert!(body.ends_with("data: [DONE]\n\n"));
+                let error_line = body
+                    .lines()
+                    .find(|line| line.contains("\"code\":\"invalid_tool_call\""))
+                    .unwrap();
+                let value: Value =
+                    serde_json::from_str(error_line.strip_prefix("data: ").unwrap()).unwrap();
+                assert_eq!(value["error"]["failure_stage"], "initial_projection");
+                assert_eq!(value["error"]["terminal"], true);
+                assert_eq!(value["error"]["retryable"], false);
+                assert_eq!(value["error"]["candidate_not_dispatched"], true);
             } else {
                 assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body}");
                 let value: Value = serde_json::from_str(&body).unwrap();
                 assert_eq!(value["error"]["code"], "invalid_tool_call");
+                assert_eq!(value["error"]["failure_stage"], "initial_projection");
+                assert_eq!(value["error"]["terminal"], true);
+                assert_eq!(value["error"]["retryable"], false);
+                assert_eq!(value["error"]["candidate_not_dispatched"], true);
             }
         }
     }
@@ -17937,6 +18071,18 @@ mod tests {
         let mut custom = json!({"type":"custom","name":"exec"});
         validate_tool_choice(&mut custom).unwrap();
         assert!(validate_tool_choice(&mut json!({})).is_err());
+    }
+
+    #[test]
+    fn invalid_tool_call_envelope_is_explicit_terminal_and_bounded() {
+        let value = invalid_tool_call_value(InvalidToolCallStage::ReplayContinuation);
+        assert_eq!(value["error"]["type"], "upstream_error");
+        assert_eq!(value["error"]["code"], "invalid_tool_call");
+        assert_eq!(value["error"]["terminal"], true);
+        assert_eq!(value["error"]["retryable"], false);
+        assert_eq!(value["error"]["failure_stage"], "replay_continuation");
+        assert_eq!(value["error"]["candidate_not_dispatched"], true);
+        assert!(!value.to_string().contains("PRIVATE-SENTINEL"));
     }
 
     #[tokio::test]
