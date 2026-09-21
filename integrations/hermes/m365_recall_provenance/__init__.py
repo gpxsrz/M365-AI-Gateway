@@ -257,6 +257,13 @@ def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | Non
     """Claim only authenticated M365 terminal replay or text-overflow errors."""
     if not _m365_provider_matches(kwargs.get("provider")):
         return None
+    status_code = kwargs.get("status_code")
+    if status_code not in (None, 400):
+        return None
+    # OpenAI's HTTP-200 SSE error event is surfaced as a status-less APIError;
+    # a status-less timeout/transport exception must not inherit this verdict.
+    if status_code is None and kwargs.get("error_type") != "APIError":
+        return None
     error_code = kwargs.get("error_code")
     if error_code not in (None, "", "unsafe_tool_replay", "text_input_too_large"):
         return None

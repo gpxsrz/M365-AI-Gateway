@@ -15,6 +15,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  recall-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test recall plugin
+        run: python3 -m unittest discover -s integrations/hermes/m365_recall_provenance -p 'test*.py'
+
+  recall-hermes-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Checkout pinned Hermes integration fixture
+        uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 641f7c810449d9af5c21b0a5ee33b29b192b4117
+          path: .ci/hermes-agent
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+      - name: Install pinned Hermes runtime
+        working-directory: .ci/hermes-agent
+        run: uv sync --frozen --no-dev --python 3.11
+      - name: Test real Hermes SDK and loop path
+        env:
+          HERMES_AGENT_ROOT: ${{ github.workspace }}/.ci/hermes-agent
+          M365_REPLAY_PLUGIN_ROOT: ${{ github.workspace }}/integrations/hermes/m365_recall_provenance
+          HERMES_HOME: ${{ runner.temp }}/m365-hermes-home
+        run: >-
+          .ci/hermes-agent/.venv/bin/python -m unittest discover
+          -s integrations/hermes/m365_recall_provenance -p 'test*.py'
+
   rust:
     runs-on: ubuntu-latest
     steps:

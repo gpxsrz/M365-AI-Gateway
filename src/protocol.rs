@@ -2824,12 +2824,11 @@ fn project_continuation_full_context(
                 limit: text_input_limit,
             });
         };
-        let (normalized, _) = normalized_messages(messages, true, true).map_err(|_| {
-            ContinuationProjectionError::CannotFitInline {
+        let (normalized, _) = normalized_messages(messages, recalled_source.is_none(), true)
+            .map_err(|_| ContinuationProjectionError::CannotFitInline {
                 message_text_units: message_text_units(),
                 limit: text_input_limit,
-            }
-        })?;
+            })?;
         let (text, _) = full_context_inline_projection(
             &normalized,
             messages,
@@ -5206,8 +5205,8 @@ fn spill_full_context_document_with_budget_and_recall_with_rule(
     if has_generated_context_attachment(&flattened.attachments) {
         return Err(SpillFailure::ProjectionFailed);
     }
-    let (normalized, _) =
-        normalized_messages(messages, true, true).map_err(|_| SpillFailure::ProjectionFailed)?;
+    let (normalized, _) = normalized_messages(messages, recalled_source.is_none(), true)
+        .map_err(|_| SpillFailure::ProjectionFailed)?;
     if normalized.is_empty() {
         return Err(SpillFailure::ProjectionFailed);
     }
@@ -5717,6 +5716,9 @@ fn normalized_messages(
             "tool_calls": message.tool_calls,
             "tool_result_is_error": message.tool_result_is_error,
         });
+        if !message.name.is_empty() {
+            normalized_message["name"] = Value::String(message.name.clone());
+        }
         if role == "tool" || (role == "assistant" && !message.tool_calls.is_empty()) {
             normalized_message["execution_surface"] = Value::String("caller_tool".to_owned());
         }
@@ -6311,7 +6313,7 @@ mod tests {
             .expect("Issue 104 test conversation must carry the local Graph base")
             .to_owned();
         Box::pin(async move {
-            for attachment in attachments {
+            for attachment in &mut *attachments {
                 crate::attachment::prepare_document_at_for_test(
                     account,
                     conversation_id,
@@ -6329,6 +6331,8 @@ mod tests {
         fail_first: bool,
         create_calls: AtomicUsize,
         put_calls: AtomicUsize,
+        create_names: Mutex<Vec<String>>,
+        put_bodies: Mutex<Vec<Vec<u8>>>,
         upload_url: String,
     }
 
@@ -6337,6 +6341,12 @@ mod tests {
         request: axum::extract::Request,
     ) -> Response {
         if request.method() == axum::http::Method::POST {
+            let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            let name = body["item"]["name"].as_str().unwrap().to_owned();
+            state.create_names.lock().unwrap().push(name);
             let call = state.create_calls.fetch_add(1, Ordering::SeqCst);
             if state.fail_first && call == 0 {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -6344,6 +6354,10 @@ mod tests {
             return (StatusCode::OK, Json(json!({"uploadUrl": state.upload_url}))).into_response();
         }
         if request.method() == axum::http::Method::PUT {
+            let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            state.put_bodies.lock().unwrap().push(body.to_vec());
             let call = state.put_calls.fetch_add(1, Ordering::SeqCst);
             if state.fail_first && call == 0 {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -6390,6 +6404,8 @@ mod tests {
             fail_first,
             create_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
+            create_names: Mutex::new(Vec::new()),
+            put_bodies: Mutex::new(Vec::new()),
             upload_url: format!("http://{address}/upload"),
         });
         let app = Router::new()
@@ -9531,6 +9547,74 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_recall_range_survives_single_user_whitespace_projection() {
+        let clean_prefix = "  Current ask  ";
+        let source = format!(
+            "<memory-context>\n{}\n</memory-context>",
+            "R".repeat(128_100)
+        );
+        let content = format!("{clean_prefix}\n\n{source}  ");
+        let source_start = clean_prefix.len() + 2;
+        let source_end = source_start + source.len();
+        let body = ChatCompletionRequest {
+            messages: vec![OpenAiMessage::text("user", &content)],
+            recall_provenance: Some(signed_recall_provenance(
+                0,
+                clean_prefix,
+                &content,
+                source_start,
+                source_end,
+            )),
+            ..ChatCompletionRequest::default()
+        };
+        let recalled = authenticated_recalled_source(
+            "/hermes/v1/chat/completions",
+            &body,
+            "test-recall-provenance-secret",
+        )
+        .expect("signed source range must authenticate");
+        let flattened = flatten_messages(&body.messages).expect("message must flatten");
+        let tools = Vec::new();
+        let tool_choice = Value::Null;
+        let budget = TransportBudget {
+            limit: 128_000,
+            tone: "",
+            conversation_id: "",
+            session_id: "",
+            tools: &tools,
+            tool_choice: &tool_choice,
+            tool_call_limit: 1,
+            native_attachment_metadata: &[],
+            native_attachment_indices: &[],
+        };
+        let (spilled, reason) = spill_full_context_document_with_budget_and_recall(
+            &body.messages,
+            &flattened,
+            Some(&recalled),
+            &budget,
+            "recall-whitespace-test",
+        )
+        .expect("authenticated recall source must project without offset drift");
+        assert_eq!(reason, SpillReason::FullContextDocument);
+        let inline: Value = serde_json::from_str(&spilled.text).unwrap();
+        assert_eq!(
+            inline["transport_projection"]["inline_content_references"][0]["source_utf8_start"],
+            source_start
+        );
+        assert_eq!(
+            inline["transport_projection"]["inline_content_references"][0]["source_utf8_end"],
+            source_end
+        );
+        assert_eq!(
+            inline["messages"][0]["content"],
+            format!(
+                "{clean_prefix}\n\n{}  ",
+                full_context_reference_stub(&spilled.attachments[0].name, 0,)
+            )
+        );
+    }
+
+    #[test]
     fn synthetic_empty_recovery_does_not_invalidate_authenticated_recall_provenance() {
         let ask = "Current ask";
         let source = "<memory-context>recalled source</memory-context>";
@@ -11112,7 +11196,7 @@ mod tests {
         .expect("initial full-context spill must fit");
         assert_eq!(reason, SpillReason::FullContextDocument);
         let request = ChatRequest {
-            text: initial.text,
+            text: format!("{}\n{}", initial.text, "x".repeat(limit)),
             attachments: initial.attachments,
             tools,
             tool_choice,
@@ -11231,7 +11315,6 @@ mod tests {
                 reference_url: "https://prepared-attachment.invalid/old".to_owned(),
                 uploaded_conversation_id: "conversation-old".to_owned(),
                 uploaded_session_id: "session-old".to_owned(),
-                generated_oversize_text: true,
                 ..Attachment::default()
             }],
             ..ChatRequest::default()
@@ -14540,11 +14623,12 @@ mod tests {
         assert_eq!(messages.len(), 85);
         let latest = messages.last_mut().unwrap();
         let latest_text = latest["content"].as_str().unwrap().to_owned();
-        latest["content"] = json!([
-            {"type":"text","text":latest_text},
-            {"type":"file","file_data":"data:text/plain;base64,YQ==","filename":"ordinary-a.txt"},
-            {"type":"file","file_data":"data:text/plain;base64,Yg==","filename":"ordinary-b.txt"}
-        ]);
+        latest["content"] = json!(format!("{latest_text} 中文🙂 {{\"quoted\":\"\\\\value\"}}"));
+        latest["content"] = json!(format!(
+            "{} {}",
+            latest["content"].as_str().unwrap(),
+            repeat_to_utf16("中文🙂", 12_000)
+        ));
         body["tools"].as_array_mut().unwrap().last_mut().unwrap()["function"]["name"] =
             Value::String("third_round_tool_01".to_owned());
         body["conversation_id"] = Value::String("issue-104-placeholder".to_owned());
@@ -14565,14 +14649,43 @@ mod tests {
             .chat = Arc::new(hub);
 
         for stream in [false, true] {
-            body["stream"] = Value::Bool(stream);
-            body["conversation_id"] = Value::String(format!("issue-104-base:{upload_base}"));
+            let session_key = format!("issue-101-native-session-{stream}");
+            let expected_checkpoint_count = usize::from(stream) + 1;
+            let mut native_context = staged_native_context(
+                &gateway,
+                &session_key,
+                "issue-101-native-turn",
+                "ordinary-a.txt",
+                "text/plain",
+                b"synthetic native attachment A",
+            )
+            .await;
+            let second_native = staged_native_context(
+                &gateway,
+                &session_key,
+                "issue-101-native-turn",
+                "ordinary-b.txt",
+                "text/plain",
+                b"synthetic native attachment B",
+            )
+            .await;
+            native_context.attachments.extend(second_native.attachments);
+            native_context.signature = gateway
+                .hermes_attachments
+                .context_signature(&native_context);
+            let mut request_body = body.clone();
+            request_body["stream"] = Value::Bool(stream);
+            request_body["conversation_id"] =
+                Value::String(format!("issue-104-base:{upload_base}"));
+            request_body["session_key"] = Value::String(session_key);
+            request_body["m365_native_attachment_context"] =
+                serde_json::to_value(native_context).unwrap();
             let response = Gateway::router(Arc::clone(&gateway))
                 .oneshot(
                     Request::post("/hermes/v1/chat/completions")
                         .header("x-api-key", &raw_key)
                         .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
                         .unwrap(),
                 )
                 .await
@@ -14587,6 +14700,17 @@ mod tests {
                 "stream={stream} body={}",
                 String::from_utf8_lossy(&response_body)
             );
+            let checkpoint_views = gateway.checkpoints.list().unwrap();
+            assert_eq!(
+                checkpoint_views.len(),
+                expected_checkpoint_count,
+                "stream={stream} caller tool response checkpoint count"
+            );
+            assert!(checkpoint_views.iter().all(|view| {
+                !view.id.is_empty()
+                    && view.conversation_id == format!("issue-104-base:{upload_base}")
+                    && !view.session_id.is_empty()
+            }));
             let first_body = String::from_utf8(response_body.to_vec()).unwrap();
             let assistant = if stream {
                 let frames = sse_values(&first_body);
@@ -14615,14 +14739,14 @@ mod tests {
             assert_eq!(arguments["path"], "workspace/continuation.json");
             assert_eq!(arguments["mode"], "read_only");
 
-            let mut continuation_messages = body["messages"].as_array().unwrap().clone();
+            let mut continuation_messages = request_body["messages"].as_array().unwrap().clone();
             continuation_messages.push(assistant);
             continuation_messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": "{\"status\":\"completed\",\"output\":\"continuation result\",\"exit_code\":0}"
             }));
-            let mut continuation_body = body.clone();
+            let mut continuation_body = request_body;
             continuation_body["messages"] = Value::Array(continuation_messages);
             let continuation_response = Gateway::router(Arc::clone(&gateway))
                 .oneshot(
@@ -14643,6 +14767,17 @@ mod tests {
             )
             .unwrap();
             assert_eq!(continuation_status, StatusCode::OK, "stream={stream}");
+            let checkpoint_views = gateway.checkpoints.list().unwrap();
+            assert_eq!(
+                checkpoint_views.len(),
+                expected_checkpoint_count,
+                "stream={stream} continuation checkpoint count"
+            );
+            assert!(checkpoint_views.iter().all(|view| {
+                !view.id.is_empty()
+                    && view.conversation_id == format!("issue-104-base:{upload_base}")
+                    && !view.session_id.is_empty()
+            }));
             if stream {
                 let frames = sse_values(&continuation_body);
                 let terminal = sole_sse_terminal(&frames, "stop");
@@ -14667,12 +14802,48 @@ mod tests {
             }
         }
 
-        assert!(upload_state.create_calls.load(Ordering::Acquire) >= 12);
-        assert!(upload_state.put_calls.load(Ordering::Acquire) >= 12);
+        let create_calls = upload_state.create_calls.load(Ordering::Acquire);
+        let put_calls = upload_state.put_calls.load(Ordering::Acquire);
+        assert_eq!(create_calls, 10, "prepared document create calls");
+        assert_eq!(put_calls, 10, "prepared document upload calls");
+        let create_names = upload_state.create_names.lock().unwrap().clone();
+        let put_bodies = upload_state.put_bodies.lock().unwrap().clone();
+        assert_eq!(create_names.len(), create_calls);
+        assert_eq!(put_bodies.len(), put_calls);
+        let native_a = b"synthetic native attachment A";
+        let native_b = b"synthetic native attachment B";
+        let mut generated_uploads = 0;
+        let mut native_a_uploads = 0;
+        let mut native_b_uploads = 0;
+        for (name, bytes) in create_names.iter().zip(&put_bodies) {
+            if let Some(file_sha) = name
+                .strip_prefix("m365-oversize-")
+                .and_then(|name| name.strip_suffix(".txt"))
+            {
+                generated_uploads += 1;
+                assert!(is_sha256(file_sha));
+                assert_eq!(sha256_hex(bytes), file_sha);
+                let document: Value = serde_json::from_slice(bytes).unwrap();
+                assert_eq!(document["schema"], "m365-full-context/v1");
+                assert_eq!(document["source_message_count"], 85);
+                assert_eq!(document["message_count"], 85);
+            } else if bytes.as_slice() == native_a {
+                assert!(name.starts_with("ordinary-a-") && name.ends_with(".txt"));
+                native_a_uploads += 1;
+            } else if bytes.as_slice() == native_b {
+                assert!(name.starts_with("ordinary-b-") && name.ends_with(".txt"));
+                native_b_uploads += 1;
+            } else {
+                panic!("unexpected prepared attachment bytes");
+            }
+        }
+        assert_eq!(generated_uploads, 2);
+        assert_eq!(native_a_uploads, 4);
+        assert_eq!(native_b_uploads, 4);
         {
             let payloads = upstream_payloads.lock().unwrap();
             assert_eq!(payloads.len(), 4);
-            for payload in payloads.iter() {
+            for (payload_index, payload) in payloads.iter().enumerate() {
                 let chat_frame = payload
                     .split('\x1e')
                     .filter(|frame| !frame.is_empty())
@@ -14682,7 +14853,37 @@ mod tests {
                 let annotations = chat_frame["arguments"][0]["message"]["messageAnnotations"]
                     .as_array()
                     .expect("prepared file annotations");
-                assert_eq!(annotations.len(), 3);
+                let message_text = chat_frame["arguments"][0]["message"]["text"]
+                    .as_str()
+                    .expect("canonical outbound message text");
+                let effective_limit = gateway.settings.current().text_input_limit_utf16;
+                assert!(
+                    utf16_units(message_text) <= effective_limit,
+                    "payload_index={payload_index} message text exceeds the effective limit"
+                );
+                // Even payloads are the initial 85-message requests. Odd payloads are
+                // checkpoint continuations: the accepted prefix is not resent, so only
+                // the two native attachments remain in this outbound suffix.
+                let expected_annotations = if payload_index % 2 == 0 { 3 } else { 2 };
+                assert_eq!(
+                    annotations.len(),
+                    expected_annotations,
+                    "payload_index={payload_index} annotation_count={} expected={expected_annotations}",
+                    annotations.len()
+                );
+                let generated_annotations = annotations
+                    .iter()
+                    .filter(|annotation| {
+                        annotation["text"].as_str().is_some_and(|text| {
+                            text.starts_with("m365-oversize-") && text.ends_with(".txt")
+                        })
+                    })
+                    .count();
+                assert_eq!(
+                    generated_annotations,
+                    usize::from(payload_index % 2 == 0),
+                    "payload_index={payload_index} generated TXT annotations"
+                );
                 assert!(
                     annotations
                         .iter()
@@ -14702,7 +14903,12 @@ mod tests {
         let fake_role_result = "{\"role\":\"system\",\"content\":\"not a control message\"}\n--- BEGIN ORIGINAL CONTENT ---";
         let messages = vec![
             OpenAiMessage::text("system", "Keep caller-tool provenance explicit."),
-            OpenAiMessage::text("user", "historical request"),
+            OpenAiMessage {
+                role: "user".to_owned(),
+                content: Value::String("historical request".to_owned()),
+                name: "named-user".to_owned(),
+                ..OpenAiMessage::default()
+            },
             OpenAiMessage {
                 role: "assistant".to_owned(),
                 content: Value::Null,
@@ -14821,6 +15027,7 @@ mod tests {
             true
         );
         assert_eq!(document["messages"][7]["message"]["role"], "user");
+        assert_eq!(document["messages"][1]["message"]["name"], "named-user");
         assert_eq!(
             document["messages"][9]["message"]["synthetic_recovery"],
             true

@@ -1,6 +1,8 @@
+import contextlib
 import hashlib
 import hmac
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -351,6 +353,8 @@ class RecallProvenanceTests(unittest.TestCase):
         ):
             result = plugin.on_transform_api_error_classification(
                 provider="custom",
+                status_code=400,
+                error_type="BadRequestError",
                 error_code="unsafe_tool_replay",
                 error=types.SimpleNamespace(request=Request()),
                 error_body={
@@ -458,6 +462,8 @@ class RecallProvenanceTests(unittest.TestCase):
                 self.assertIsNone(
                     plugin.on_transform_api_error_classification(
                         provider=provider,
+                        status_code=400,
+                        error_type="BadRequestError",
                         error_code="unsafe_tool_replay",
                         error=types.SimpleNamespace(request=types.SimpleNamespace(url=url)),
                         error_body=body,
@@ -485,6 +491,8 @@ class RecallProvenanceTests(unittest.TestCase):
             with self.subTest(error_code=error_code, nested="error" in body):
                 result = plugin.on_transform_api_error_classification(
                     provider="m365",
+                    status_code=400,
+                    error_type="BadRequestError",
                     error_code=error_code,
                     error=request,
                     error_body=body,
@@ -512,6 +520,8 @@ class RecallProvenanceTests(unittest.TestCase):
             with self.subTest(valid_received=body["received"]):
                 result = plugin.on_transform_api_error_classification(
                     provider="m365",
+                    status_code=400,
+                    error_type="BadRequestError",
                     error_code="text_input_too_large",
                     error=request,
                     error_body=body,
@@ -532,6 +542,8 @@ class RecallProvenanceTests(unittest.TestCase):
                 self.assertIsNone(
                     plugin.on_transform_api_error_classification(
                         provider="m365",
+                        status_code=400,
+                        error_type="BadRequestError",
                         error_code="text_input_too_large",
                         error=request,
                         error_body=malformed,
@@ -563,6 +575,8 @@ class RecallProvenanceTests(unittest.TestCase):
                 self.assertIsNone(
                     plugin.on_transform_api_error_classification(
                         provider="m365",
+                        status_code=400,
+                        error_type="BadRequestError",
                         error_code="text_input_too_large",
                         error=request,
                         error_body=body,
@@ -605,13 +619,119 @@ class RecallProvenanceTests(unittest.TestCase):
                 self.assertIsNone(
                     plugin.on_transform_api_error_classification(
                         provider=provider,
+                        status_code=400,
+                        error_type="BadRequestError",
                         error_code=error_code,
                         error=types.SimpleNamespace(
                             request=types.SimpleNamespace(url=url)
                         ),
                         error_body=body,
-                    )
                 )
+            )
+
+    def test_error_classification_matches_actual_hermes_kwargs_without_api_mode(self):
+        error = types.SimpleNamespace(
+            request=types.SimpleNamespace(
+                url="https://m365.example/hermes/v1/chat/completions"
+            )
+        )
+        cases = (
+            (
+                "unsafe_tool_replay",
+                {
+                    "error": {
+                        "type": "tool_protocol_error",
+                        "code": "unsafe_tool_replay",
+                        "retryable": False,
+                    }
+                },
+            ),
+            (
+                "text_input_too_large",
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "text_input_too_large",
+                        "limit_type": "outbound_message_text_utf16",
+                        "limit": 128000,
+                        "received": 128001,
+                        "retryable": False,
+                        "retryable_after_reduction": True,
+                    }
+                },
+            ),
+        )
+        for error_code, error_body in cases:
+            with self.subTest(error_code=error_code):
+                result = plugin.on_transform_api_error_classification(
+                    provider="m365",
+                    model="gpt-5.6-reasoning",
+                    status_code=400,
+                    error_type="BadRequestError",
+                    error_code=error_code,
+                    error_message="bounded synthetic classifier message",
+                    error_body=error_body,
+                    error=error,
+                    approx_tokens=1,
+                    context_length=200000,
+                    num_messages=1,
+                )
+                self.assertIsNotNone(result)
+                self.assertEqual(result["reason"], "format_error")
+                self.assertFalse(result["retryable"])
+                self.assertFalse(result["should_compress"])
+                self.assertFalse(result["should_rotate_credential"])
+                self.assertFalse(result["should_fallback"])
+
+    def test_error_classification_rejects_non_target_status_and_timeout(self):
+        error = types.SimpleNamespace(
+            request=types.SimpleNamespace(
+                url="https://m365.example/hermes/v1/chat/completions"
+            )
+        )
+        bodies = (
+            {
+                "error": {
+                    "type": "tool_protocol_error",
+                    "code": "unsafe_tool_replay",
+                    "retryable": False,
+                }
+            },
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "text_input_too_large",
+                    "limit_type": "outbound_message_text_utf16",
+                    "limit": 128000,
+                    "received": 128001,
+                    "retryable": False,
+                    "retryable_after_reduction": True,
+                }
+            },
+        )
+        for status_code, error_type in ((429, "RateLimitError"), (503, "APIStatusError")):
+            for body in bodies:
+                with self.subTest(status_code=status_code, code=body["error"]["code"]):
+                    self.assertIsNone(
+                        plugin.on_transform_api_error_classification(
+                            provider="m365",
+                            status_code=status_code,
+                            error_type=error_type,
+                            error_code=body["error"]["code"],
+                            error=error,
+                            error_body=body,
+                        )
+                    )
+        self.assertIsNone(
+            plugin.on_transform_api_error_classification(
+                provider="m365",
+                status_code=None,
+                error_type="ReadTimeout",
+                error_code="text_input_too_large",
+                error=error,
+                error_body=bodies[1],
+            )
+        )
 
     def test_real_hermes_manager_delivers_terminal_text_overflow_classification(self):
         agent_root = os.environ.get("HERMES_AGENT_ROOT")
@@ -623,53 +743,182 @@ class RecallProvenanceTests(unittest.TestCase):
             )
 
         sys.path.insert(0, agent_root)
+        from hermes_cli import plugins as hermes_plugins
         from hermes_cli.plugins import PluginManager, _plugin_home_scope
         from hermes_cli.plugins_manifest import PluginManifest
+        import httpx
+        from agent.error_classifier import classify_api_error
+        from openai import OpenAI
+        from run_agent import AIAgent
 
-        with tempfile.TemporaryDirectory(prefix="m365-classifier-plugin-") as scope:
-            manager = PluginManager(scope_key=scope)
-            manager._load_plugin(
-                PluginManifest(
-                    name="m365-recall-provenance",
-                    version="1.3.0",
-                    description="isolated classifier qualification",
-                    source="user",
-                    path=plugin_root,
-                    key="m365-recall-provenance",
-                )
-            )
-            with _plugin_home_scope(Path(scope)):
-                results = manager.invoke_hook(
-                    "transform_api_error_classification",
-                    provider="m365",
-                    model="gpt-5.6-reasoning",
-                    status_code=400,
-                    error_type="BadRequestError",
-                    error_code="text_input_too_large",
-                    error_message="input is too long",
-                    error_body={"error": {
-                        "type": "invalid_request_error",
-                        "code": "text_input_too_large",
-                        "limit_type": "outbound_message_text_utf16",
-                        "limit": 128000,
-                        "received": 128001,
-                        "retryable": False,
-                        "retryable_after_reduction": True,
-                    }},
-                    error=types.SimpleNamespace(
-                        request=types.SimpleNamespace(
-                            url="https://m365.example/hermes/v1/chat/completions"
+        previous_manager = hermes_plugins._plugin_manager
+        previous_managers = dict(hermes_plugins._plugin_managers_by_home)
+        with tempfile.TemporaryDirectory(prefix="m365-classifier-hermes-home-") as scope:
+            scope_path = Path(scope)
+            with patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": scope,
+                    "M365_HERMES_PROVIDER": "m365",
+                    "M365_HERMES_GATEWAY_BASE_URL": "https://m365.example/hermes/v1",
+                },
+                clear=False,
+            ):
+                manager = PluginManager(scope_key=scope)
+                with _plugin_home_scope(scope_path):
+                    manager._load_plugin(
+                        PluginManifest(
+                            name="m365-recall-provenance",
+                            version="1.3.1",
+                            description="isolated classifier qualification",
+                            source="user",
+                            path=plugin_root,
+                            key="m365-recall-provenance",
                         )
-                    ),
-                    approx_tokens=1,
-                    context_length=200000,
-                    num_messages=1,
-                )
-            self.assertEqual(len(results), 1)
-            self.assertFalse(results[0]["retryable"])
-            self.assertFalse(results[0]["should_compress"])
-            self.assertFalse(results[0]["should_rotate_credential"])
-            self.assertFalse(results[0]["should_fallback"])
+                    )
+                manager._discovered = True
+                hermes_plugins._plugin_manager = manager
+                self.assertTrue(manager.has_hook("transform_api_error_classification"))
+
+                def error_body(error_code):
+                    if error_code == "unsafe_tool_replay":
+                        return {
+                            "error": {
+                                "type": "tool_protocol_error",
+                                "code": error_code,
+                                "retryable": False,
+                            }
+                        }
+                    return {
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": error_code,
+                            "limit_type": "outbound_message_text_utf16",
+                            "limit": 128000,
+                            "received": 128001,
+                            "retryable": False,
+                            "retryable_after_reduction": True,
+                        }
+                    }
+
+                def sdk_client(error_code, attempts, stream):
+                    def handler(request):
+                        attempts[0] += 1
+                        self.assertEqual(
+                            request.url.path, "/hermes/v1/chat/completions"
+                        )
+                        body = error_body(error_code)
+                        if stream:
+                            content = (
+                                f"data: {json.dumps(body, separators=(',', ':'))}\n\n"
+                                "data: [DONE]\n\n"
+                            ).encode()
+                            return httpx.Response(
+                                200,
+                                headers={"content-type": "text/event-stream"},
+                                content=content,
+                                request=request,
+                            )
+                        return httpx.Response(
+                            400, json=body, request=request
+                        )
+
+                    return OpenAI(
+                        api_key="synthetic",
+                        base_url="https://m365.example/hermes/v1/",
+                        http_client=httpx.Client(
+                            transport=httpx.MockTransport(handler)
+                        ),
+                        max_retries=0,
+                    )
+
+                try:
+                    for error_code in ("unsafe_tool_replay", "text_input_too_large"):
+                        for stream in (False, True):
+                            attempts = [0]
+                            client = sdk_client(error_code, attempts, stream)
+                            error = None
+                            try:
+                                response = client.chat.completions.create(
+                                    model="gpt-5.6-reasoning",
+                                    messages=[
+                                        {
+                                            "role": "user",
+                                            "content": "bounded synthetic request",
+                                        }
+                                    ],
+                                    stream=stream,
+                                )
+                                if stream:
+                                    list(response)
+                            except Exception as exc:
+                                error = exc
+                            self.assertIsNotNone(error)
+                            classified = classify_api_error(
+                                error,
+                                provider="m365",
+                                model="gpt-5.6-reasoning",
+                                approx_tokens=1,
+                                context_length=200000,
+                                num_messages=1,
+                            )
+                            self.assertEqual(classified.reason.value, "format_error")
+                            self.assertFalse(classified.retryable)
+                            self.assertFalse(classified.should_compress)
+                            self.assertFalse(classified.should_rotate_credential)
+                            self.assertFalse(classified.should_fallback)
+                            self.assertEqual(attempts[0], 1)
+                            client.close()
+
+                    for error_code in ("unsafe_tool_replay", "text_input_too_large"):
+                        for stream in (False, True):
+                            attempts = [0]
+                            client = sdk_client(error_code, attempts, stream)
+                            agent = None
+                            try:
+                                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                                    io.StringIO()
+                                ):
+                                    agent = AIAgent(
+                                        base_url="https://m365.example/hermes/v1/",
+                                        api_key="synthetic",
+                                        provider="m365",
+                                        api_mode="chat_completions",
+                                        model="gpt-5.6-reasoning",
+                                        max_iterations=1,
+                                        quiet_mode=True,
+                                        session_id=f"p3-hook-{error_code}-{stream}",
+                                        platform="test",
+                                        skip_context_files=True,
+                                        skip_memory=True,
+                                        skip_background_review=True,
+                                        load_soul_identity=False,
+                                    )
+                                    agent._api_max_retries = 1
+                                    agent._disable_streaming = not stream
+                                    agent._create_request_openai_client = (
+                                        lambda **kwargs: client
+                                    )
+                                    result = agent.run_conversation(
+                                        "bounded synthetic request",
+                                        task_id=f"p3-hook-task-{error_code}-{stream}",
+                                    )
+                                self.assertEqual(attempts[0], 1)
+                                self.assertFalse(result.get("completed"))
+                                self.assertTrue(result.get("failed"))
+                                self.assertFalse(result.get("failure_retryable"))
+                            finally:
+                                if agent is not None:
+                                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                                        io.StringIO()
+                                    ):
+                                        agent.close()
+                                client.close()
+                finally:
+                    manager.unload()
+                    hermes_plugins._plugin_managers_by_home.clear()
+                    hermes_plugins._plugin_managers_by_home.update(previous_managers)
+                    hermes_plugins._plugin_manager = previous_manager
 
     def test_read_file_annotation_requires_registered_handler_and_exact_schema(self):
         def _handle_read_file(*args, **kwargs):
@@ -865,7 +1114,7 @@ class RecallProvenanceTests(unittest.TestCase):
             manager._load_plugin(
                 PluginManifest(
                     name="m365-recall-provenance",
-                    version="1.3.0",
+                    version="1.3.1",
                     description="isolated registry qualification",
                     source="user",
                     path=plugin_root,
