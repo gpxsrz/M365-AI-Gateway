@@ -49,6 +49,52 @@ jobs:
           .ci/hermes-agent/.venv/bin/python -m unittest discover
           -s integrations/hermes/m365_recall_provenance -p 'test*.py'
 
+  native-attachments-hermes-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Checkout pinned Hermes integration fixture
+        uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 641f7c810449d9af5c21b0a5ee33b29b192b4117
+          path: .ci/hermes-agent
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97'
+      - name: Install pinned Hermes runtime
+        working-directory: .ci/hermes-agent
+        run: uv sync --frozen --no-dev --python 3.11
+      - name: Build loopback Gateway fixture
+        run: cargo build --locked --release
+      - name: Run native plugin unit and registry tests
+        env:
+          HERMES_AGENT_ROOT: ${{ github.workspace }}/.ci/hermes-agent
+          M365_NATIVE_ATTACHMENTS_PLUGIN_ROOT: ${{ github.workspace }}/integrations/hermes/m365_native_attachments
+          HERMES_HOME: ${{ runner.temp }}/m365-native-hermes-unit
+          M365_HERMES_RECALL_PROVENANCE_SECRET: ci-unit-fixture-only
+          M365_HERMES_PROVIDER: m365-copilot
+          M365_HERMES_GATEWAY_BASE_URL: https://127.0.0.1:9/hermes/v1
+          M365_HERMES_ATTACHMENT_ALLOWED_ROOTS: ${{ runner.temp }}
+        run: >-
+          .ci/hermes-agent/.venv/bin/python -m unittest discover
+          -s integrations/hermes/m365_native_attachments -p 'test*.py' -v
+      - name: Run real default M365 PluginManager to SDK to Gateway regression
+        env:
+          HERMES_AGENT_ROOT: ${{ github.workspace }}/.ci/hermes-agent
+          HERMES_EXPECTED_COMMIT: 641f7c810449d9af5c21b0a5ee33b29b192b4117
+          M365_GATEWAY_BINARY: ${{ github.workspace }}/target/release/m365-native
+          M365_NATIVE_ATTACHMENTS_PLUGIN_ROOT: ${{ github.workspace }}/integrations/hermes/m365_native_attachments
+          M365_RECALL_PROVENANCE_PLUGIN_ROOT: ${{ github.workspace }}/integrations/hermes/m365_recall_provenance
+        run: >-
+          .ci/hermes-agent/.venv/bin/python -m unittest -v
+          integrations.hermes.m365_native_attachments.hermes_integration
+
   rust:
     runs-on: ubuntu-latest
     steps:

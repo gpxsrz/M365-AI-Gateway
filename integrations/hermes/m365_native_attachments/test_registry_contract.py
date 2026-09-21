@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -32,7 +33,18 @@ class HermesRegistryContractTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory(prefix="m365-registry-contract-") as home:
+            runtime_root = Path(home) / "m365-native-attachments"
+            runtime_root.mkdir()
+            for filename in ("__init__.py", "plugin.yaml"):
+                shutil.copy2(Path(plugin_root) / filename, runtime_root / filename)
             manager = PluginManager(scope_key=home)
+            # Hermes' post-2026-09-14 compatibility scanner evaluates external
+            # plugin directories.  The source tree also contains this test file,
+            # whose imports are not part of the runtime plugin.  Stage only the
+            # shipped runtime files so this registry test exercises the actual
+            # loader without changing the fixture's compatibility policy.
+            manifest.path = str(runtime_root)
+            manifest.source = "bundled"
             manager._load_plugin(manifest)
             with _plugin_home_scope(Path(home)):
                 definitions = registry.get_definitions(
