@@ -148,6 +148,19 @@ Full-context TXT 是 transport projection，不保證模型已讀完、正確使
 
 只有 `/hermes/v1/chat/completions` 的初次 rejected caller candidate 可以進入一次由模型負責的 syntax correction。範圍限於完整且唯一已知、符合 tool choice 的工具 fence，JSON string value 內孤立的非法 `\]`，diagnostic-only neutralization 後結構為合法 object，且 provider transcript 已完整結束並確認只有已知純文字事件。任何 native／未知事件或 artifact 都不符合。帶有 `response_format`、缺少或漂移的 conversation binding、MCP 設定或 correction input 超限的 request 不啟用；未知證據仍 fail closed。這個資格檢查描述已完成的第一次回應，不是禁用所有 native capability 的 provider policy。Correction 不啟用 search 或 external MCP，但 provider 既有的 native capability 仍在；第二次回應若出現 native／未知事件，就拒絕 caller acceptance。拒絕不能撤銷 provider 可能已經執行的操作。
 
+資格分類器使用同一份已收到的 raw transcript；下表是本輪固定 contract table，不是可動態擴張的 allowlist：
+
+| JSON 位置／欄位 | 型別／限制 | 證據來源 | 操作判斷 | 正例／反例 |
+| --- | --- | --- | --- | --- |
+| type 2/3 `invocationId` | 只有既有最小短格式可缺省（type 2 僅保留既有 item/result/value 形狀，type 3 僅保留 type）；rich envelope 必須是 bounded non-empty string，且精確等於 outbound chat invocation `"0"` | SignalR Hub Protocol + 現有 `chat_payload` | correlation，不是 native authority | matching／最小 legacy；rich frame 缺 ID、number、null、空字串、錯 ID 拒絕 |
+| type 1 update `invocationId` | 可缺省；若存在只驗 bounded string，不與 `"0"` 做等式 | M365 reverse update shape | 被動 metadata | `server-update`；錯型別拒絕 |
+| bot message metadata | `messageId`、`requestId`、`responseIdentifier`、`createdAt`、`timestamp`、`turnState` 為 bounded string；`turnCount` 為 unsigned integer；不互相比對 | 既有 M365 producer／鑑識摘要 | 不授權操作 | 各自合法型別／wrong type 或未知欄位拒絕 |
+| `references`、`sourceAttributions`、`adaptiveCards` | 必須是 array；本輪空 array 可接受；card 只遞迴接受已證明 version `1.5` 的 bounded `AdaptiveCard`／`TextBlock`／容器 | 既有 M365 metadata evidence | card 只作展示 | empty／passive TextBlock；未知 version、非空 references、unknown child、Action、media 拒絕 |
+| quota／`throttling` | 只接受已證明的 `{ "remaining": unsigned integer }` | 現有 collector／probe 的 ordinary quota shape | counter，不等於成功或 native effect | remaining counter；unknown key、wrong type、soft/rate-limit 拒絕 |
+| `messageType=Progress` | 只有 `contentOrigin=ChainOfThoughtSummary` 且 passive 才可作 metadata；不把 text 當答案 | 既有 source-identified summary shape | 被動展示 | known summary；SearchResults、Code、ToolCall、MemoryUpdate、TriggerPlugin 拒絕 |
+
+展示 card 的 `text` 永遠不替換原始 model text；原始候選仍由既有 strict parser 驗證，card 與候選保持不同 identity。
+
 同一帳號、模型、conversation 與 session 接收明確的 transport feedback；rejected candidate 只存在記憶體。Gateway 不選擇 decoded argument、不拼接字串、不重新上傳附件，也不改寫 caller canonical history。模型的新提案必須是同一工具的唯一 strict JSON object、沒有 prose，並通過原有 tool choice、數量與 ledger 檢查。只有接受的新提案能進 checkpoint 與 caller response。再次 malformed、authority 漂移或 unsafe duplicate 都直接 fail closed，不進第三次 generation 或 final-answer fallback。Stream 與 non-stream 使用相同 gate；stream caller 中斷會取消等待中的 correction。這會多一次模型 generation，usage estimate 包含新增 outbound text；不代表 context 成本為零，也不能證明模型意圖完全不變。
 
 Authenticated live diagnostic 保留第一次 rejection witness，另外提供 `toolCorrectionAttempted`、`toolCorrectionOutcome`、`toolCorrectionFailureClass` 與原 candidate hash。Correction 欄位不寫 durable JSONL；不保存 rejected candidate、feedback prompt 或 raw provider frame。沿用 live store 的容量上限，restart 後欄位消失。Parser acceptance 沒有放寬。

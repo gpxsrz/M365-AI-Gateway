@@ -29,6 +29,7 @@ use url::Url;
 use crate::{attachment, runtime_settings};
 
 const RECORD_SEPARATOR: char = '\x1e';
+const CHAT_INVOCATION_ID: &str = "0";
 const WS_BASE: &str = "wss://substrate.office.com/m365Copilot/Chathub";
 const DEFAULT_TONE: &str = "magic";
 const STREAMING_MODE: &str = "ConciseWithPadding";
@@ -447,6 +448,7 @@ pub struct ChatResult {
     pub text_source: String,
     pub conversation_id: String,
     pub session_id: String,
+    pub(crate) invocation_id: String,
     pub request_id: String,
     pub throttling: Option<Value>,
     pub raw_result: String,
@@ -455,79 +457,353 @@ pub struct ChatResult {
     pub artifacts: Vec<Artifact>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorrectionEligibilityReason {
+    CompletionMissing,
+    InvocationMismatch,
+    MetadataTypeInvalid,
+    UnknownEventOrField,
+    NativeEffect,
+    TranscriptBudget,
+}
+
+impl CorrectionEligibilityReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CompletionMissing => "completion_missing",
+            Self::InvocationMismatch => "invocation_mismatch",
+            Self::MetadataTypeInvalid => "metadata_type_invalid",
+            Self::UnknownEventOrField => "unknown_event_or_field",
+            Self::NativeEffect => "native_effect",
+            Self::TranscriptBudget => "transcript_budget",
+        }
+    }
+}
+
+const MAX_TRANSCRIPT_EVENTS: usize = 4096;
+const MAX_TRANSCRIPT_NODES: usize = 64 * 1024;
+const MAX_METADATA_STRING_CHARS: usize = 1024;
+const SUPPORTED_ADAPTIVE_CARD_VERSION: &str = "1.5";
+
+fn object_has_only_keys(value: &Value, keys: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.keys().all(|key| keys.contains(&key.as_str())))
+}
+
+fn bounded_string(value: Option<&Value>, allow_empty: bool) -> bool {
+    value.and_then(Value::as_str).is_some_and(|text| {
+        (allow_empty || !text.is_empty()) && text.chars().count() <= MAX_METADATA_STRING_CHARS
+    })
+}
+
+fn validate_headers(value: &Value) -> Result<(), CorrectionEligibilityReason> {
+    let Some(headers) = value.as_object() else {
+        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+    };
+    if headers.len() > 64 {
+        return Err(CorrectionEligibilityReason::TranscriptBudget);
+    }
+    for (key, value) in headers {
+        if key.chars().count() > MAX_METADATA_STRING_CHARS || !bounded_string(Some(value), true) {
+            return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_invocation_id(
+    event: &Value,
+    expected: &str,
+    enforce_match: bool,
+) -> Result<(), CorrectionEligibilityReason> {
+    let Some(value) = event.get("invocationId") else {
+        return Ok(());
+    };
+    let Some(value) = value.as_str() else {
+        return Err(CorrectionEligibilityReason::InvocationMismatch);
+    };
+    if value.is_empty()
+        || value.chars().count() > MAX_METADATA_STRING_CHARS
+        || (enforce_match && value != expected)
+    {
+        return Err(CorrectionEligibilityReason::InvocationMismatch);
+    }
+    Ok(())
+}
+
+fn validate_passive_card(
+    value: &Value,
+    nodes: &mut usize,
+    depth: usize,
+) -> Result<(), CorrectionEligibilityReason> {
+    *nodes += 1;
+    if depth > 32 || *nodes > MAX_TRANSCRIPT_NODES {
+        return Err(CorrectionEligibilityReason::TranscriptBudget);
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                validate_passive_card(value, nodes, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            let Some(kind) = object.get("type").and_then(Value::as_str) else {
+                return Err(CorrectionEligibilityReason::UnknownEventOrField);
+            };
+            match kind {
+                "AdaptiveCard" => {
+                    if !object_has_only_keys(value, &["type", "version", "body"])
+                        || object.get("version").and_then(Value::as_str)
+                            != Some(SUPPORTED_ADAPTIVE_CARD_VERSION)
+                    {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    }
+                    let Some(body) = object.get("body").and_then(Value::as_array) else {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    };
+                    for child in body {
+                        validate_passive_card(child, nodes, depth + 1)?;
+                    }
+                }
+                "TextBlock" => {
+                    if !object_has_only_keys(value, &["type", "text", "wrap"])
+                        || !bounded_string(object.get("text"), true)
+                        || object.get("wrap").is_some_and(|value| !value.is_boolean())
+                    {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    }
+                }
+                "Container" => {
+                    if !object_has_only_keys(value, &["type", "items"]) {
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                    }
+                    let Some(items) = object.get("items").and_then(Value::as_array) else {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    };
+                    for child in items {
+                        validate_passive_card(child, nodes, depth + 1)?;
+                    }
+                }
+                "ColumnSet" => {
+                    if !object_has_only_keys(value, &["type", "columns"]) {
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                    }
+                    let Some(columns) = object.get("columns").and_then(Value::as_array) else {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    };
+                    for child in columns {
+                        validate_passive_card(child, nodes, depth + 1)?;
+                    }
+                }
+                "Column" => {
+                    if !object_has_only_keys(value, &["type", "items"]) {
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                    }
+                    let Some(items) = object.get("items").and_then(Value::as_array) else {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    };
+                    for child in items {
+                        validate_passive_card(child, nodes, depth + 1)?;
+                    }
+                }
+                "Action.Execute" | "Action.Submit" | "Action.OpenUrl" | "Image" | "Media" => {
+                    return Err(CorrectionEligibilityReason::NativeEffect);
+                }
+                _ => return Err(CorrectionEligibilityReason::UnknownEventOrField),
+            }
+            Ok(())
+        }
+        _ => Err(CorrectionEligibilityReason::MetadataTypeInvalid),
+    }
+}
+
+fn validate_message(value: &Value, nodes: &mut usize) -> Result<bool, CorrectionEligibilityReason> {
+    *nodes += 1;
+    if *nodes > MAX_TRANSCRIPT_NODES {
+        return Err(CorrectionEligibilityReason::TranscriptBudget);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+    };
+    for (key, value) in object {
+        match key.as_str() {
+            "text" => {
+                if !value.is_string() {
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                }
+            }
+            "author" | "messageType" | "contentType" | "contentOrigin" => {
+                if !bounded_string(Some(value), true) {
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                }
+            }
+            "messageId" | "requestId" | "responseIdentifier" | "createdAt" | "timestamp"
+            | "turnState" => {
+                if !bounded_string(Some(value), false) {
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                }
+            }
+            "turnCount" => {
+                if !value.is_u64() {
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                }
+            }
+            "references" | "sourceAttributions" => {
+                if !value.as_array().is_some_and(Vec::is_empty) {
+                    return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                }
+            }
+            "adaptiveCards" => {
+                if !value.is_array() {
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                }
+                validate_passive_card(value, nodes, 0)?;
+            }
+            "action" | "actions" | "media" | "outputFiles" | "searchQueries" => {
+                return Err(CorrectionEligibilityReason::NativeEffect);
+            }
+            _ => return Err(CorrectionEligibilityReason::UnknownEventOrField),
+        }
+    }
+    if object.get("author").and_then(Value::as_str) != Some("bot")
+        || !object.get("text").is_some_and(Value::is_string)
+    {
+        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+    }
+    let message_type = object
+        .get("messageType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let content_type = object
+        .get("contentType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let content_origin = object
+        .get("contentOrigin")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if message_type == "Progress" {
+        if content_origin != "ChainOfThoughtSummary" || !content_type.is_empty() {
+            return Err(CorrectionEligibilityReason::NativeEffect);
+        }
+        return Ok(false);
+    }
+    if !matches!(message_type, "" | "Chat") {
+        return Err(CorrectionEligibilityReason::NativeEffect);
+    }
+    if !content_type.is_empty() {
+        return Err(CorrectionEligibilityReason::NativeEffect);
+    }
+    if !matches!(content_origin, "" | "Model" | "BotConnection" | "DeepLeo") {
+        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+    }
+    Ok(true)
+}
+
+fn validate_quota(value: &Value) -> Result<(), CorrectionEligibilityReason> {
+    let Some(object) = value.as_object() else {
+        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+    };
+    if !object_has_only_keys(value, &["remaining"]) || !object["remaining"].is_u64() {
+        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+    }
+    Ok(())
+}
+
 impl ChatResult {
-    /// Recognizes only the complete raw transcript collected through type 3.
+    /// Classifies the complete raw transcript collected through type 3.
     /// This does not attest to activity outside the existing transport boundary.
-    pub(crate) fn has_complete_text_only_transcript(&self) -> bool {
-        fn only_keys(value: &Value, keys: &[&str]) -> bool {
-            value
-                .as_object()
-                .is_some_and(|object| object.keys().all(|key| keys.contains(&key.as_str())))
-        }
-
-        fn optional_string(value: &Value, key: &str, allowed: &[&str]) -> bool {
-            value
-                .get(key)
-                .is_none_or(|value| value.as_str().is_some_and(|text| allowed.contains(&text)))
-        }
-
-        fn text_message(value: &Value) -> bool {
-            only_keys(
-                value,
-                &[
-                    "author",
-                    "text",
-                    "messageType",
-                    "contentType",
-                    "contentOrigin",
-                ],
-            ) && value.get("author").and_then(Value::as_str) == Some("bot")
-                && value.get("text").is_some_and(Value::is_string)
-                && optional_string(value, "messageType", &["", "Chat"])
-                && optional_string(value, "contentType", &[""])
-                && optional_string(value, "contentOrigin", &["", "Model", "BotConnection"])
-        }
-
+    pub(crate) fn correction_eligibility(&self) -> Result<(), CorrectionEligibilityReason> {
         if self.text.trim().is_empty()
             || self.events.is_empty()
-            || self.events.len() > 4096
+            || self.events.len() > MAX_TRANSCRIPT_EVENTS
             || !self.images.is_empty()
             || !self.artifacts.is_empty()
-            || self.throttling.is_some()
-            || !matches!(self.raw_result.as_str(), "" | "Success")
         {
-            return false;
+            return Err(if self.events.len() > MAX_TRANSCRIPT_EVENTS {
+                CorrectionEligibilityReason::TranscriptBudget
+            } else if !self.images.is_empty() || !self.artifacts.is_empty() {
+                CorrectionEligibilityReason::NativeEffect
+            } else {
+                CorrectionEligibilityReason::CompletionMissing
+            });
+        }
+        if !matches!(self.raw_result.as_str(), "" | "Success") {
+            return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+        }
+        if let Some(throttling) = self.throttling.as_ref() {
+            validate_quota(throttling)?;
         }
 
-        // Reuse the artifact collector's 64K structural budget across this check,
-        // including constructed results, without copying any payload.
         let mut nodes = self.events.len();
         let mut received_text = false;
         for (index, event) in self.events.iter().enumerate() {
             let kind = event.get("type").and_then(Value::as_u64);
             if index + 1 == self.events.len() {
-                return received_text && kind == Some(3) && only_keys(event, &["type"]);
+                if kind != Some(3) {
+                    return Err(CorrectionEligibilityReason::CompletionMissing);
+                }
+                let has_invocation_id = event.get("invocationId").is_some();
+                let valid_shape = if has_invocation_id {
+                    object_has_only_keys(event, &["type", "invocationId", "headers"])
+                } else {
+                    object_has_only_keys(event, &["type"])
+                };
+                if !valid_shape {
+                    return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                }
+                if has_invocation_id {
+                    validate_invocation_id(event, &self.invocation_id, true)?;
+                    if let Some(headers) = event.get("headers") {
+                        validate_headers(headers)?;
+                    }
+                }
+                return if received_text {
+                    Ok(())
+                } else {
+                    Err(CorrectionEligibilityReason::CompletionMissing)
+                };
             }
             match kind {
-                Some(6) if only_keys(event, &["type"]) => {}
+                Some(6) if object_has_only_keys(event, &["type"]) => {}
                 Some(1) => {
-                    if !only_keys(event, &["type", "target", "arguments"])
-                        || event.get("target").and_then(Value::as_str) != Some("update")
+                    if !object_has_only_keys(
+                        event,
+                        &["type", "target", "arguments", "invocationId", "headers"],
+                    ) || event.get("target").and_then(Value::as_str) != Some("update")
                     {
-                        return false;
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                    }
+                    // Type 1 is the reverse server invocation. Validate its own
+                    // identity shape, but never correlate it to the client chat ID.
+                    validate_invocation_id(event, &self.invocation_id, false)?;
+                    if let Some(headers) = event.get("headers") {
+                        validate_headers(headers)?;
                     }
                     let Some(arguments) = event.get("arguments").and_then(Value::as_array) else {
-                        return false;
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
                     };
                     for argument in arguments {
                         nodes += 1;
-                        if nodes > 64 * 1024
-                            || !only_keys(argument, &["writeAtCursor", "messages"])
+                        if nodes > MAX_TRANSCRIPT_NODES
+                            || !object_has_only_keys(
+                                argument,
+                                &["writeAtCursor", "messages", "throttling"],
+                            )
                             || argument
                                 .get("writeAtCursor")
                                 .is_some_and(|value| !value.is_string())
                         {
-                            return false;
+                            return Err(if nodes > MAX_TRANSCRIPT_NODES {
+                                CorrectionEligibilityReason::TranscriptBudget
+                            } else {
+                                CorrectionEligibilityReason::MetadataTypeInvalid
+                            });
+                        }
+                        if let Some(throttling) = argument.get("throttling") {
+                            validate_quota(throttling)?;
                         }
                         received_text |= argument
                             .get("writeAtCursor")
@@ -535,45 +811,66 @@ impl ChatResult {
                             .is_some_and(|text| !text.is_empty());
                         if let Some(messages) = argument.get("messages") {
                             let Some(messages) = messages.as_array() else {
-                                return false;
+                                return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
                             };
                             for message in messages {
-                                nodes += 1;
-                                if nodes > 64 * 1024 || !text_message(message) {
-                                    return false;
-                                }
-                                received_text |= message
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|text| !text.is_empty());
+                                received_text |= validate_message(message, &mut nodes)?
+                                    && message
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|text| !text.is_empty());
                             }
                         }
                     }
                 }
                 Some(2) => {
                     let Some(item) = event.get("item") else {
-                        return false;
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
                     };
                     let Some(result) = item.get("result") else {
-                        return false;
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
                     };
-                    if !only_keys(event, &["type", "item"])
-                        || !only_keys(item, &["result"])
-                        || !only_keys(result, &["message", "value"])
+                    let has_invocation_id = event.get("invocationId").is_some();
+                    let valid_shape = if has_invocation_id {
+                        object_has_only_keys(event, &["type", "item", "invocationId", "headers"])
+                            && object_has_only_keys(item, &["result", "throttling"])
+                    } else {
+                        object_has_only_keys(event, &["type", "item"])
+                            && object_has_only_keys(item, &["result"])
+                    };
+                    if !valid_shape
+                        || !object_has_only_keys(result, &["message", "value"])
                         || !result.get("message").is_some_and(Value::is_string)
-                        || !optional_string(result, "value", &["", "Success"])
                     {
-                        return false;
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                    }
+                    if has_invocation_id {
+                        validate_invocation_id(event, &self.invocation_id, true)?;
+                        if let Some(headers) = event.get("headers") {
+                            validate_headers(headers)?;
+                        }
+                        if let Some(throttling) = item.get("throttling") {
+                            validate_quota(throttling)?;
+                        }
+                    }
+                    if let Some(value) = result.get("value")
+                        && !value
+                            .as_str()
+                            .is_some_and(|value| matches!(value, "" | "Success"))
+                    {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
                     }
                     received_text |= result
                         .get("message")
                         .and_then(Value::as_str)
                         .is_some_and(|text| !text.is_empty());
                 }
-                _ => return false,
+                Some(3) => return Err(CorrectionEligibilityReason::CompletionMissing),
+                Some(4 | 5 | 7) => return Err(CorrectionEligibilityReason::NativeEffect),
+                _ => return Err(CorrectionEligibilityReason::UnknownEventOrField),
             }
         }
-        false
+        Err(CorrectionEligibilityReason::CompletionMissing)
     }
 }
 
@@ -978,6 +1275,7 @@ struct SignalRCollector {
     events: Vec<Value>,
     conversation_id: String,
     session_id: String,
+    invocation_id: String,
     request_id: String,
     ping_seen: bool,
 }
@@ -994,6 +1292,7 @@ impl SignalRCollector {
             events: Vec::new(),
             conversation_id,
             session_id,
+            invocation_id: CHAT_INVOCATION_ID.to_owned(),
             request_id,
             ping_seen: false,
         }
@@ -1044,6 +1343,7 @@ impl SignalRCollector {
         frame: &str,
         sink: &mut (dyn EventSink + Send),
     ) -> Result<Option<ChatResult>, ChatError> {
+        let mut completed = false;
         for part in frame.split(RECORD_SEPARATOR).map(str::trim) {
             if part.is_empty() {
                 continue;
@@ -1097,7 +1397,8 @@ impl SignalRCollector {
                         soft: true,
                     });
                 }
-                return Ok(Some(self.result()?));
+                completed = true;
+                continue;
             }
             if kind == 7 {
                 return Err(ChatError::Terminal {
@@ -1106,7 +1407,11 @@ impl SignalRCollector {
                 });
             }
         }
-        Ok(None)
+        if completed {
+            Ok(Some(self.result()?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn update(
@@ -1222,6 +1527,7 @@ impl SignalRCollector {
             text_source: source,
             conversation_id: self.conversation_id.clone(),
             session_id: self.session_id.clone(),
+            invocation_id: self.invocation_id.clone(),
             request_id: self.request_id.clone(),
             throttling: self.throttling.clone(),
             raw_result: self.raw_result.clone(),
@@ -1550,7 +1856,7 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
     }
     let chat = json!({
         "arguments": [argument],
-        "invocationId": "0",
+        "invocationId": CHAT_INVOCATION_ID,
         "target": "chat",
         "type": 4,
     });
@@ -2134,6 +2440,17 @@ mod tests {
         request: ChatRequest,
         frames: Vec<Value>,
     ) -> Result<ChatResult, ChatError> {
+        loopback_chat_parts(
+            request,
+            frames.into_iter().map(|frame| vec![frame]).collect(),
+        )
+        .await
+    }
+
+    async fn loopback_chat_parts(
+        request: ChatRequest,
+        frames: Vec<Vec<Value>>,
+    ) -> Result<ChatResult, ChatError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2141,12 +2458,24 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             assert!(socket.next().await.unwrap().unwrap().is_text());
             socket.send(Message::Text("{}\x1e".into())).await.unwrap();
-            assert!(socket.next().await.unwrap().unwrap().is_text());
+            let invocation = socket.next().await.unwrap().unwrap();
+            let invocation = invocation.into_text().unwrap();
+            let invocation = invocation
+                .split(RECORD_SEPARATOR)
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| serde_json::from_str::<Value>(part).unwrap())
+                .find(|value| value.get("target").and_then(Value::as_str) == Some("chat"))
+                .unwrap();
+            let invocation_id = invocation["invocationId"].as_str().unwrap();
             for frame in frames {
-                socket
-                    .send(Message::Text(format!("{frame}\x1e").into()))
-                    .await
-                    .unwrap();
+                let mut encoded = String::new();
+                for mut value in frame {
+                    replace_invocation_id_marker(&mut value, invocation_id);
+                    encoded.push_str(&value.to_string());
+                    encoded.push(RECORD_SEPARATOR);
+                }
+                socket.send(Message::Text(encoded.into())).await.unwrap();
             }
             socket.close(None).await.unwrap();
         });
@@ -2175,6 +2504,30 @@ mod tests {
         }
         let _ = server.await;
         result
+    }
+
+    fn replace_invocation_id_marker(value: &mut Value, invocation_id: &str) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    replace_invocation_id_marker(value, invocation_id);
+                }
+            }
+            Value::Object(values) => {
+                if values.get("invocationId").and_then(Value::as_str)
+                    == Some("$outgoing_invocation_id")
+                {
+                    values.insert(
+                        "invocationId".to_owned(),
+                        Value::String(invocation_id.to_owned()),
+                    );
+                }
+                for value in values.values_mut() {
+                    replace_invocation_id_marker(value, invocation_id);
+                }
+            }
+            _ => {}
+        }
     }
 
     async fn text_only_loopback(frames: Vec<Value>) -> Result<ChatResult, ChatError> {
@@ -2213,8 +2566,364 @@ mod tests {
             ],
         ] {
             let result = text_only_loopback(frames).await.unwrap();
-            assert!(result.has_complete_text_only_transcript());
+            assert!(result.correction_eligibility().is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_accepts_matching_live_invocation_identity() {
+        let result = text_only_loopback(vec![
+            json!({
+                "type": 2,
+                "invocationId": "$outgoing_invocation_id",
+                "item": {"result": {"message": "Synthetic candidate"}}
+            }),
+            json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+        ])
+        .await
+        .unwrap();
+        assert!(result.correction_eligibility().is_ok());
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_accepts_supported_m365_metadata() {
+        let result = text_only_loopback(vec![
+            json!({
+                "type": 1,
+                "invocationId": "reverse-update-id",
+                "headers": {"x-trace": "opaque"},
+                "target": "update",
+                "arguments": [{
+                    "throttling": {"remaining": 1},
+                    "messages": [{
+                        "author": "bot",
+                        "text": "Candidate",
+                        "messageType": "Chat",
+                        "contentType": "",
+                        "contentOrigin": "DeepLeo",
+                        "messageId": "message-id",
+                        "requestId": "request-id",
+                        "responseIdentifier": "response-id",
+                        "createdAt": "2026-09-21T08:08:25.4759053Z",
+                        "timestamp": "2026-09-21T08:08:25.4759053Z",
+                        "turnCount": 1,
+                        "turnState": "Completed",
+                        "references": [],
+                        "sourceAttributions": [],
+                        "adaptiveCards": [{
+                            "type": "AdaptiveCard",
+                            "version": "1.5",
+                            "body": [{
+                                "type": "TextBlock",
+                                "text": "display only",
+                                "wrap": true
+                            }]
+                        }]
+                    }]
+                }]
+            }),
+            json!({
+                "type": 2,
+                "invocationId": "$outgoing_invocation_id",
+                "headers": {"x-trace": "opaque"},
+                "item": {
+                    "throttling": {"remaining": 1},
+                    "result": {"message": "Candidate", "value": "Success"}
+                }
+            }),
+            json!({
+                "type": 3,
+                "invocationId": "$outgoing_invocation_id",
+                "headers": {"x-trace": "opaque"}
+            }),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(result.text, "Candidate");
+        assert!(result.correction_eligibility().is_ok());
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_accepts_each_supported_metadata_field() {
+        let fields = [
+            ("messageId", json!("message-id")),
+            ("requestId", json!("request-id")),
+            ("responseIdentifier", json!("response-id")),
+            ("createdAt", json!("2026-09-21T08:08:25.4759053Z")),
+            ("timestamp", json!("2026-09-21T08:08:25.4759053Z")),
+            ("turnCount", json!(1)),
+            ("turnState", json!("Completed")),
+            ("references", json!([])),
+            ("sourceAttributions", json!([])),
+            ("adaptiveCards", json!([])),
+        ];
+        for (field, value) in fields {
+            let mut message = json!({
+                "author": "bot",
+                "text": "Candidate",
+                "messageType": "",
+                "contentType": "",
+                "contentOrigin": "DeepLeo"
+            });
+            message[field] = value;
+            let result = text_only_loopback(vec![
+                json!({
+                    "type": 1,
+                    "target": "update",
+                    "arguments": [{"messages": [message]}]
+                }),
+                json!({
+                    "type": 2,
+                    "invocationId": "$outgoing_invocation_id",
+                    "item": {"result": {"message": "Candidate", "value": "Success"}}
+                }),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+            ])
+            .await
+            .unwrap();
+            assert_eq!(result.text, "Candidate", "field={field}");
+            assert!(result.correction_eligibility().is_ok(), "field={field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_rejects_invalid_identity_and_metadata() {
+        let cases = [
+            (
+                json!({"type": 2, "invocationId": "wrong", "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+                CorrectionEligibilityReason::InvocationMismatch,
+            ),
+            (
+                json!({"type": 2, "invocationId": 7, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+                CorrectionEligibilityReason::InvocationMismatch,
+            ),
+            (
+                json!({"type": 2, "invocationId": null, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+                CorrectionEligibilityReason::InvocationMismatch,
+            ),
+            (
+                json!({"type": 2, "invocationId": "", "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+                CorrectionEligibilityReason::InvocationMismatch,
+            ),
+            (
+                json!({"type": 2, "headers": {"x-trace": "opaque"}, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+                CorrectionEligibilityReason::UnknownEventOrField,
+            ),
+            (
+                json!({"type": 2, "item": {"throttling": {"remaining": 1}, "result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+                CorrectionEligibilityReason::UnknownEventOrField,
+            ),
+            (
+                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "headers": {"x-trace": "opaque"}}),
+                CorrectionEligibilityReason::UnknownEventOrField,
+            ),
+            (
+                json!({"type": 2, "invocationId": "$outgoing_invocation_id", "headers": {"x": 1}, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+                CorrectionEligibilityReason::MetadataTypeInvalid,
+            ),
+            (
+                json!({"type": 2, "invocationId": "$outgoing_invocation_id", "item": {"result": {"message": "Candidate"}, "throttling": {"unexpected": 1}}}),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+                CorrectionEligibilityReason::MetadataTypeInvalid,
+            ),
+            (
+                json!({"type": 2, "invocationId": "$outgoing_invocation_id", "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "invocationId": "wrong"}),
+                CorrectionEligibilityReason::InvocationMismatch,
+            ),
+            (
+                json!({"type": 2, "invocationId": "$outgoing_invocation_id", "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id", "unexpected": true}),
+                CorrectionEligibilityReason::UnknownEventOrField,
+            ),
+        ];
+        for (stream_item, completion, reason) in cases {
+            let result = text_only_loopback(vec![stream_item, completion])
+                .await
+                .unwrap();
+            assert_eq!(result.correction_eligibility(), Err(reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_keeps_reverse_update_identity_independent() {
+        for reverse_invocation_id in ["server-side-update", "0"] {
+            let result = text_only_loopback(vec![
+                json!({
+                    "type": 1,
+                    "invocationId": reverse_invocation_id,
+                    "target": "update",
+                    "arguments": [{
+                        "messages": [{
+                            "author": "bot",
+                            "text": "display-only",
+                            "messageType": "Progress",
+                            "contentType": "",
+                            "contentOrigin": "ChainOfThoughtSummary"
+                        }]
+                    }]
+                }),
+                json!({
+                    "type": 2,
+                    "invocationId": "$outgoing_invocation_id",
+                    "item": {"result": {"message": "Candidate"}}
+                }),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+            ])
+            .await
+            .unwrap();
+            assert!(result.correction_eligibility().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_rejects_active_or_unknown_cards() {
+        for card in [
+            json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{
+                    "type": "ActionSet",
+                    "actions": [{"type": "Action.Execute"}]
+                }]
+            }),
+            json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{"type": "UnknownDisplayElement"}]
+            }),
+            json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{
+                    "type": "Container",
+                    "items": [{"type": "Action.OpenUrl"}]
+                }]
+            }),
+            json!({
+                "type": "AdaptiveCard",
+                "version": "1.6",
+                "body": [{"type": "TextBlock", "text": "display only"}]
+            }),
+        ] {
+            let result = text_only_loopback(vec![
+                json!({
+                    "type": 1,
+                    "target": "update",
+                    "arguments": [{"messages": [{
+                        "author": "bot",
+                        "text": "Candidate",
+                        "messageType": "Chat",
+                        "contentType": "",
+                        "contentOrigin": "DeepLeo",
+                        "adaptiveCards": [card]
+                    }]}]
+                }),
+                json!({
+                    "type": 2,
+                    "invocationId": "$outgoing_invocation_id",
+                    "item": {"result": {"message": "Candidate", "value": "Success"}}
+                }),
+                json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+            ])
+            .await
+            .unwrap();
+            assert!(matches!(
+                result.correction_eligibility(),
+                Err(CorrectionEligibilityReason::NativeEffect
+                    | CorrectionEligibilityReason::UnknownEventOrField
+                    | CorrectionEligibilityReason::MetadataTypeInvalid)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_rejects_non_array_adaptive_cards() {
+        let result = text_only_loopback(vec![
+            json!({
+                "type": 1,
+                "target": "update",
+                "arguments": [{"messages": [{
+                    "author": "bot",
+                    "text": "Candidate",
+                    "messageType": "Chat",
+                    "contentType": "",
+                    "contentOrigin": "DeepLeo",
+                    "adaptiveCards": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": []
+                    }
+                }]}]
+            }),
+            json!({
+                "type": 2,
+                "invocationId": "$outgoing_invocation_id",
+                "item": {"result": {"message": "Candidate", "value": "Success"}}
+            }),
+            json!({"type": 3, "invocationId": "$outgoing_invocation_id"}),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            result.correction_eligibility(),
+            Err(CorrectionEligibilityReason::MetadataTypeInvalid)
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_text_only_transcript_rejects_content_after_same_frame_completion() {
+        let result = loopback_chat_parts(
+            ChatRequest {
+                text: "Synthetic transcript qualification".into(),
+                conversation_id: "synthetic-conversation".into(),
+                session_id: "synthetic-session".into(),
+                ..ChatRequest::default()
+            },
+            vec![vec![
+                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+                json!({"type": 99}),
+            ]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.correction_eligibility(),
+            Err(CorrectionEligibilityReason::CompletionMissing)
+        );
+    }
+
+    #[test]
+    fn complete_text_only_transcript_enforces_node_budget_inside_metadata() {
+        let messages = (0..=MAX_TRANSCRIPT_NODES)
+            .map(|_| json!({"author":"bot","text":"x"}))
+            .collect::<Vec<_>>();
+        let result = ChatResult {
+            text: "Candidate".to_owned(),
+            events: vec![
+                json!({
+                    "type": 1,
+                    "target": "update",
+                    "arguments": [{"messages": messages}]
+                }),
+                json!({"type":2,"item":{"result":{"message":"Candidate"}}}),
+                json!({"type":3}),
+            ],
+            ..ChatResult::default()
+        };
+        assert_eq!(
+            result.correction_eligibility(),
+            Err(CorrectionEligibilityReason::TranscriptBudget)
+        );
     }
 
     #[tokio::test]
@@ -2222,6 +2931,8 @@ mod tests {
         let mut excluded = vec![
             json!({}),
             json!({"type":99}),
+            json!({"type":4}),
+            json!({"type":5}),
             json!({"type":6,"action":"synthetic"}),
             json!({"type":1,"target":"unknown","arguments":[]}),
             json!({"type":1,"target":"update","arguments":[{"action":"synthetic"}]}),
@@ -2237,6 +2948,7 @@ mod tests {
             json!({"author":"bot","text":"synthetic","contentType":"ToolCall"}),
             json!({"author":"bot","text":"synthetic","messageType":"MemoryUpdate"}),
             json!({"author":"bot","text":"synthetic","messageType":"TriggerPlugin"}),
+            json!({"author":"bot","text":"synthetic","messageType":"MCP"}),
             json!({"author":"bot","text":"synthetic","messageType":"Unknown"}),
             json!({"author":"bot","text":"synthetic","action":"synthetic"}),
         ] {
@@ -2252,7 +2964,7 @@ mod tests {
                     vec![candidate, event.clone(), json!({"type":3})]
                 };
                 let result = text_only_loopback(frames).await.unwrap();
-                assert!(!result.has_complete_text_only_transcript());
+                assert!(result.correction_eligibility().is_err());
             }
         }
     }
@@ -2268,6 +2980,32 @@ mod tests {
             text_only_loopback(vec![candidate, json!({"type":3,"error":"synthetic error"})]).await,
             Err(ChatError::Terminal { .. })
         ));
+        assert!(matches!(
+            text_only_loopback(vec![
+                json!({"type":2,"item":{"result":{"message":"Synthetic candidate"}}}),
+                json!({"type":3,"error":"synthetic error","result":{"message":"ignored"}}),
+            ])
+            .await,
+            Err(ChatError::Terminal { .. })
+        ));
+        assert!(matches!(
+            text_only_loopback(vec![
+                json!({"type":2,"item":{"result":{"message":"Synthetic candidate"}}}),
+                json!({"type":7,"error":"closed"}),
+            ])
+            .await,
+            Err(ChatError::Terminal { .. })
+        ));
+        let unsupported = text_only_loopback(vec![
+            json!({"type":2,"item":{"result":{"message":"Synthetic candidate"}}}),
+            json!({"type":3,"result":{"message":"unsupported"}}),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            unsupported.correction_eligibility(),
+            Err(CorrectionEligibilityReason::UnknownEventOrField)
+        );
     }
 
     #[test]
@@ -2280,46 +3018,48 @@ mod tests {
             ],
             ..ChatResult::default()
         };
-        assert!(plain.has_complete_text_only_transcript());
+        assert!(plain.correction_eligibility().is_ok());
         let mut altered = plain.clone();
         altered.text = " \n\t".into();
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.events.clear();
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.events.pop();
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.events.insert(0, json!({"type":3}));
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.events = vec![json!({"type":3})];
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.events[1] = json!({"type":3,"error":null});
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.images.push("synthetic".into());
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.artifacts.push(Artifact::default());
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.throttling = Some(json!({"remaining":1}));
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_ok());
+        altered.throttling = Some(json!({"remaining":"1"}));
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.raw_result = "unknown".into();
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain.clone();
         altered.events.splice(0..0, vec![json!({"type":6}); 4096]);
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
         altered = plain;
         altered.events.insert(
             0,
             json!({"type":1,"target":"update","arguments":vec![json!({});64*1024]}),
         );
-        assert!(!altered.has_complete_text_only_transcript());
+        assert!(altered.correction_eligibility().is_err());
     }
 
     #[test]
@@ -2429,14 +3169,15 @@ mod tests {
             Ok(())
         };
         let frame = concat!(
-            r#"{"type":2,"item":{"throttling":{"remaining":1},"result":{"message":"OK"}}}"#,
+            r#"{"type":2,"invocationId":"0","item":{"throttling":{"remaining":1},"result":{"message":"OK"}}}"#,
             "\u{1e}",
-            r#"{"type":3}"#,
+            r#"{"type":3,"invocationId":"0"}"#,
             "\u{1e}"
         );
         let result = collector.ingest(frame, &mut sink).unwrap().unwrap();
         assert_eq!(result.text, "OK");
         assert!(result.throttling.is_some());
+        assert!(result.correction_eligibility().is_ok());
     }
 
     #[test]

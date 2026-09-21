@@ -3405,14 +3405,14 @@ async fn correct_tool_syntax(
     };
     let ineligible = if crate::chathub::contains_protected_artifact_reference(&original.text) {
         Some("protected_artifact_reference")
-    } else if !original.has_complete_text_only_transcript() {
-        Some("unqualified_text_only_transcript")
+    } else if let Err(reason) = original.correction_eligibility() {
+        Some(reason.as_str())
     } else if original.conversation_id.is_empty()
         || original.session_id.is_empty()
         || (!base.conversation_id.is_empty() && base.conversation_id != original.conversation_id)
         || (!base.session_id.is_empty() && base.session_id != original.session_id)
     {
-        Some("unqualified_binding")
+        Some("binding")
     } else if !base.mcp_server_url.is_empty() {
         Some("external_mcp_configured")
     } else {
@@ -3516,14 +3516,18 @@ async fn correct_tool_syntax(
         &base.tool_choice,
         base.tool_call_limit,
     );
+    // Keep the initial rejection witness stable. The corrected projection is
+    // checked below, but its failure class must not replace the original
+    // candidate's bounded diagnostic while the request is still unwinding.
+    trace.caller_tool_projection_stage(stream, "syntax_correction", 2);
     let failure = if corrected.conversation_id != original.conversation_id
         || corrected.session_id != original.session_id
     {
-        Some("binding_drift")
+        Some("binding")
     } else if crate::chathub::contains_protected_artifact_reference(&corrected.text) {
         Some("protected_artifact_reference")
-    } else if !corrected.has_complete_text_only_transcript() {
-        Some("non_text_or_unknown_result")
+    } else if corrected.correction_eligibility().is_err() {
+        Some("corrected_response_ineligible")
     } else if !crate::tool_calls::is_strict_correction(&corrected.text, name) {
         Some(
             projection
@@ -6874,6 +6878,7 @@ mod tests {
                 assert_eq!(chat_frames[0]["invocationId"], "0");
                 assert_eq!(frames[1]["target"], "Metrics");
                 assert_eq!(frames[1]["type"], 1);
+                let invocation_id = chat_frames[0]["invocationId"].clone();
                 received_by_server.lock().unwrap().push(payload);
                 let result_message = if connection_index % 2 == 0 {
                     let arguments = json!({
@@ -6888,8 +6893,8 @@ mod tests {
                     "The caller tool result was accepted and the task can continue.".to_owned()
                 };
                 for frame in [
-                    json!({"type":2,"item":{"result":{"message":result_message}}}),
-                    json!({"type":3}),
+                    json!({"type":2,"invocationId":invocation_id,"item":{"result":{"message":result_message}}}),
+                    json!({"type":3,"invocationId":invocation_id}),
                 ] {
                     socket
                         .send(Message::Text(format!("{frame}\x1e").into()))
@@ -7409,6 +7414,472 @@ mod tests {
         })
     }
 
+    fn syntax_prepare_attachments<'a>(
+        account: &'a Account,
+        conversation_id: &'a str,
+        session_id: &'a str,
+        attachments: &'a mut [Attachment],
+    ) -> crate::chathub::AttachmentPreparationFuture<'a> {
+        Box::pin(crate::attachment::prepare(
+            account,
+            conversation_id,
+            session_id,
+            attachments,
+        ))
+    }
+
+    fn syntax_caller_harness(
+        calls: &[Value],
+        dispatches: &AtomicUsize,
+        receipts: &Mutex<Vec<Value>>,
+    ) -> (Value, Value) {
+        assert_eq!(
+            calls.len(),
+            1,
+            "the correction must project one caller call"
+        );
+        let call = calls[0].clone();
+        assert_eq!(call["function"]["name"], "terminal");
+        let arguments: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"pattern": "\\]"}));
+        assert_eq!(dispatches.fetch_add(1, Ordering::AcqRel), 0);
+
+        let receipt = json!({
+            "tool": "terminal",
+            "operation": "fixed-synthetic-safe-pattern-check",
+            "status": "completed",
+            "output": "synthetic-safe"
+        });
+        receipts.lock().unwrap().push(receipt.clone());
+        (call, receipt)
+    }
+
+    #[derive(Clone)]
+    struct SyntaxLiveReply {
+        message: String,
+        extra_events: Vec<Value>,
+    }
+
+    fn syntax_live_reply(message: &str) -> SyntaxLiveReply {
+        SyntaxLiveReply {
+            message: message.to_owned(),
+            extra_events: Vec::new(),
+        }
+    }
+
+    struct SyntaxLiveBindingDriftTransport {
+        live: LiveChatHub,
+        calls: AtomicUsize,
+    }
+
+    impl SyntaxLiveBindingDriftTransport {
+        fn new(live: LiveChatHub) -> Self {
+            Self {
+                live,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ChatHubTransport for SyntaxLiveBindingDriftTransport {
+        fn chat<'a>(
+            &'a self,
+            account: Account,
+            request: ChatRequest,
+            events: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                let mut result = self.live.chat(account, request, events).await?;
+                if call == 1 {
+                    result.conversation_id = "syntax-binding-drift".to_owned();
+                }
+                Ok(result)
+            })
+        }
+    }
+
+    async fn syntax_live_upstream_server(
+        replies: Vec<SyntaxLiveReply>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let payloads = Arc::new(Mutex::new(Vec::new()));
+        let payloads_for_server = Arc::clone(&payloads);
+        let server = tokio::spawn(async move {
+            for (connection_index, reply) in replies.into_iter().enumerate() {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                assert_eq!(
+                    socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    "{\"protocol\":\"json\",\"version\":1}\x1e"
+                );
+                socket
+                    .send(Message::Text("{}\x1e".to_owned().into()))
+                    .await
+                    .unwrap();
+                let Message::Text(payload) = socket.next().await.unwrap().unwrap() else {
+                    panic!("LiveChatHub must send a text chat payload");
+                };
+                let payload = payload.to_string();
+                let frames = payload
+                    .split('\x1e')
+                    .filter(|frame| !frame.is_empty())
+                    .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+                    .collect::<Vec<_>>();
+                let chat = frames
+                    .iter()
+                    .find(|frame| frame["target"] == "chat")
+                    .expect("chat invocation");
+                assert_eq!(chat["type"], 4);
+                let invocation_id = chat["invocationId"]
+                    .as_str()
+                    .expect("outgoing invocation identity")
+                    .to_owned();
+                payloads_for_server.lock().unwrap().push(payload);
+
+                let result_message = reply.message.as_str();
+                let display_cards = json!([{
+                    "type": "AdaptiveCard",
+                    "version": "1.5",
+                    "body": [{
+                        "type": "TextBlock",
+                        "text": r#"{"pattern":"]"}"#,
+                        "wrap": true
+                    }]
+                }]);
+                let update = json!({
+                    "type": 1,
+                    "invocationId": "server-update",
+                    "headers": {"x-trace": "opaque"},
+                    "target": "update",
+                    "arguments": [{"messages": [{
+                        "author": "bot",
+                        "text": result_message,
+                        "messageType": "Chat",
+                        "contentType": "",
+                        "contentOrigin": "DeepLeo",
+                        "messageId": format!("message-{connection_index}"),
+                        "requestId": format!("request-{connection_index}"),
+                        "responseIdentifier": format!("response-{connection_index}"),
+                        "createdAt": "2026-09-21T08:08:25.4759053Z",
+                        "timestamp": "2026-09-21T08:08:25.4759053Z",
+                        "turnCount": 1,
+                        "turnState": "Completed",
+                        "references": [],
+                        "sourceAttributions": [],
+                        "adaptiveCards": display_cards
+                    }]}]
+                });
+                let stream_item = json!({
+                    "type": 2,
+                    "invocationId": invocation_id,
+                    "headers": {"x-trace": "opaque"},
+                    "item": {
+                        "throttling": {"remaining": 1},
+                        "result": {"message": result_message, "value": "Success"}
+                    }
+                });
+                let completion = json!({
+                    "type": 3,
+                    "invocationId": invocation_id,
+                    "headers": {"x-trace": "opaque"}
+                });
+                let mut frames = reply.extra_events;
+                frames.extend([update, stream_item, completion]);
+                for frame in frames {
+                    socket
+                        .send(Message::Text(format!("{frame}\x1e").into()))
+                        .await
+                        .unwrap();
+                }
+                socket.close(None).await.unwrap();
+            }
+        });
+        (format!("ws://{address}"), payloads, server)
+    }
+
+    #[tokio::test]
+    async fn syntax_correction_live_loopback_qualifies_json_and_sse_then_continues() {
+        for stream in [false, true] {
+            let (websocket_base, payloads, server) = syntax_live_upstream_server(vec![
+                syntax_live_reply("```terminal\n{\"pattern\":\"\\]\"}\n```"),
+                syntax_live_reply("```terminal\n{\"pattern\":\"\\\\]\"}\n```"),
+                syntax_live_reply("Synthetic caller terminal complete."),
+            ])
+            .await;
+            let root = tempfile::tempdir().unwrap();
+            let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+                Arc::new(EmptyTransport),
+                oauth(),
+                root.path().to_owned(),
+                None,
+            );
+            let live_chat = LiveChatHub::new_for_test(
+                gateway.settings.clone(),
+                syntax_prepare_attachments,
+                websocket_base,
+            );
+            Arc::get_mut(&mut gateway)
+                .expect("test gateway must be uniquely owned before routing")
+                .chat = Arc::new(live_chat);
+            let app = Gateway::router(Arc::clone(&gateway));
+            let mut request = syntax_correction_body(stream);
+            request["session_key"] = json!(format!("syntax-live-{stream}"));
+            if stream {
+                request["stream_options"] = json!({"include_usage":true});
+            }
+
+            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            let calls = if stream {
+                sse_values(&body)
+                    .iter()
+                    .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .expect("SSE caller tool call")
+            } else {
+                serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+                    .expect("JSON caller tool call")
+            };
+            let dispatches = AtomicUsize::new(0);
+            let receipts = Mutex::new(Vec::new());
+            let (call, tool_result) = syntax_caller_harness(&calls, &dispatches, &receipts);
+            let call_id = call["id"].clone();
+            request["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"assistant","content":null,"tool_calls":[call]}));
+            request["messages"].as_array_mut().unwrap().push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": serde_json::to_string(&tool_result).unwrap()
+            }));
+            request["tool_choice"] = json!("auto");
+            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            assert!(body.contains("Synthetic caller terminal complete."));
+            assert_eq!(dispatches.load(Ordering::Acquire), 1);
+            assert_eq!(
+                receipts.into_inner().unwrap(),
+                vec![json!({
+                    "tool": "terminal",
+                    "operation": "fixed-synthetic-safe-pattern-check",
+                    "status": "completed",
+                    "output": "synthetic-safe"
+                })]
+            );
+
+            let payloads = payloads.lock().unwrap().clone();
+            assert_eq!(
+                payloads.len(),
+                3,
+                "two generations plus caller continuation"
+            );
+            for payload in payloads {
+                let chat = payload
+                    .split('\x1e')
+                    .filter(|frame| !frame.is_empty())
+                    .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+                    .find(|frame| frame["target"] == "chat")
+                    .unwrap();
+                assert_eq!(chat["invocationId"], "0");
+            }
+            server.await.unwrap();
+
+            let record = gateway
+                .debug
+                .records_for_test()
+                .into_iter()
+                .find(|record| record["toolCorrectionAttempted"] == true)
+                .expect("live correction diagnostic");
+            assert_eq!(record["toolCorrectionOutcome"], "succeeded");
+            assert_eq!(record["toolProjectionStage"], "syntax_correction");
+            assert_eq!(record["toolCallRejectionClass"], "illegal_escape");
+        }
+    }
+
+    #[tokio::test]
+    async fn syntax_correction_live_rejects_second_candidate_without_dispatch() {
+        let cases = [
+            (
+                "malformed",
+                r#"```terminal
+{"pattern":"\]"}
+```"#,
+                Vec::new(),
+            ),
+            (
+                "different_tool",
+                r#"```inspect
+{"pattern":"safe"}
+```"#,
+                Vec::new(),
+            ),
+            (
+                "overflow",
+                r#"```terminal
+{"pattern":"safe"}
+```
+```terminal
+{"pattern":"second"}
+```"#,
+                Vec::new(),
+            ),
+            (
+                "prose",
+                r#"Explanation
+```terminal
+{"pattern":"safe"}
+```"#,
+                Vec::new(),
+            ),
+            (
+                "native_effect",
+                r#"```terminal
+{"pattern":"safe"}
+```"#,
+                vec![json!({
+                    "type": 1,
+                    "target": "update",
+                    "arguments": [{"messages": [{
+                        "author": "bot",
+                        "text": "native effect",
+                        "messageType": "GeneratedCode",
+                        "contentType": "",
+                        "contentOrigin": "CodeInterpreter"
+                    }]}]
+                })],
+            ),
+            (
+                "unknown_event",
+                r#"```terminal
+{"pattern":"safe"}
+```"#,
+                vec![json!({"type": 99})],
+            ),
+            (
+                "known_replay",
+                r#"```terminal
+{"pattern":"]"}
+```"#,
+                Vec::new(),
+            ),
+            (
+                "binding_drift",
+                r#"```terminal
+{"pattern":"safe"}
+```"#,
+                Vec::new(),
+            ),
+        ];
+
+        for stream in [false, true] {
+            for (case, corrected, extra_events) in &cases {
+                let (websocket_base, payloads, server) = syntax_live_upstream_server(vec![
+                    syntax_live_reply("```terminal\n{\"pattern\":\"\\]\"}\n```"),
+                    SyntaxLiveReply {
+                        message: (*corrected).to_owned(),
+                        extra_events: extra_events.clone(),
+                    },
+                ])
+                .await;
+                let root = tempfile::tempdir().unwrap();
+                let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+                    Arc::new(EmptyTransport),
+                    oauth(),
+                    root.path().to_owned(),
+                    None,
+                );
+                let live_chat = LiveChatHub::new_for_test(
+                    gateway.settings.clone(),
+                    syntax_prepare_attachments,
+                    websocket_base,
+                );
+                let chat: Arc<dyn ChatHubTransport> = if *case == "binding_drift" {
+                    // LiveChatHub owns the request binding in production and no
+                    // provider response field is trusted to replace it. Keep
+                    // the real WebSocket/collector path, then corrupt only the
+                    // existing result seam to exercise the downstream guard.
+                    Arc::new(SyntaxLiveBindingDriftTransport::new(live_chat))
+                } else {
+                    Arc::new(live_chat)
+                };
+                Arc::get_mut(&mut gateway)
+                    .expect("test gateway must be uniquely owned before routing")
+                    .chat = chat;
+                let app = Gateway::router(Arc::clone(&gateway));
+                let mut request = syntax_correction_body(stream);
+                request["session_key"] = json!(format!("syntax-live-denied-{stream}-{case}"));
+                if *case == "known_replay" {
+                    request["messages"].as_array_mut().unwrap().extend([
+                        json!({
+                            "role":"assistant",
+                            "content":null,
+                            "tool_calls":[{"id":"already-completed","type":"function","function":{"name":"terminal","arguments":"{\"pattern\":\"]\"}"}}]
+                        }),
+                        json!({
+                            "role":"tool",
+                            "tool_call_id":"already-completed",
+                            "content":"{\"status\":\"completed\",\"output\":\"done\"}"
+                        }),
+                    ]);
+                }
+
+                let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+                assert_eq!(
+                    status,
+                    if *case == "known_replay" && !stream {
+                        StatusCode::CONFLICT
+                    } else if stream {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
+                    "case={case} stream={stream} body={body}"
+                );
+                assert!(
+                    !body.contains("tool_calls"),
+                    "no caller dispatch: case={case}"
+                );
+                assert!(!body.contains("CORRECTION_PRIVATE_SENTINEL"));
+                assert!(gateway.checkpoints.list().unwrap().is_empty());
+
+                let payloads = payloads.lock().unwrap().clone();
+                assert_eq!(payloads.len(), 2, "no third generation: case={case}");
+                for payload in payloads {
+                    let chat = payload
+                        .split('\x1e')
+                        .filter(|frame| !frame.is_empty())
+                        .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+                        .find(|frame| frame["target"] == "chat")
+                        .unwrap();
+                    assert_eq!(chat["invocationId"], "0", "case={case}");
+                }
+                server.await.unwrap();
+
+                let record = gateway.debug.records_for_test().pop().unwrap();
+                assert_eq!(record["toolCorrectionAttempted"], true, "case={case}");
+                assert_eq!(record["toolCorrectionOutcome"], "failed", "case={case}");
+                assert_eq!(
+                    record["toolProjectionStage"], "syntax_correction",
+                    "case={case}"
+                );
+                assert_eq!(
+                    record["toolCallRejectionClass"], "illegal_escape",
+                    "case={case}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn syntax_correction_projects_only_the_model_owned_second_call() {
         for stream in [false, true] {
@@ -7570,7 +8041,7 @@ mod tests {
                 );
                 let live = gateway.debug.records_for_test().pop().unwrap();
                 assert_eq!(live["toolCallRejectionClass"], "illegal_escape");
-                assert_eq!(live["toolProjectionStage"], "initial_response");
+                assert_eq!(live["toolProjectionStage"], "syntax_correction");
                 assert_eq!(live["toolCorrectionOutcome"], "succeeded");
                 assert_eq!(
                     live["toolCorrectionOriginalSha256"],
@@ -7874,6 +8345,14 @@ mod tests {
         );
         if expected_requests == 2 {
             assert_eq!(record["toolCorrectionOutcome"], "failed", "case={case}");
+            assert_eq!(
+                record["toolCallRejectionClass"], "illegal_escape",
+                "the initial rejection witness must survive correction failure: case={case}"
+            );
+            assert_eq!(
+                record["toolProjectionStage"], "syntax_correction",
+                "case={case}"
+            );
         }
     }
 

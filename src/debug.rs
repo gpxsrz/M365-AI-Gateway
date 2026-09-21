@@ -918,7 +918,7 @@ fn valid_tool_candidate_sha256(value: &str) -> bool {
 fn valid_tool_projection_stage(value: &str) -> bool {
     matches!(
         value,
-        "not_evaluated" | "initial_response" | "final_answer_fallback"
+        "not_evaluated" | "initial_response" | "syntax_correction" | "final_answer_fallback"
     )
 }
 
@@ -1253,6 +1253,19 @@ impl Trace {
     ) {
         self.update(|record| {
             apply_tool_diagnostic(record, diagnostic);
+            record.tool_projection_stage = stage.to_owned();
+            record.tool_stream = stream;
+            record.tool_retry_attempt_ordinal = retry_attempt_ordinal.clamp(1, 64);
+        });
+    }
+
+    pub(crate) fn caller_tool_projection_stage(
+        &self,
+        stream: bool,
+        stage: &str,
+        retry_attempt_ordinal: usize,
+    ) {
+        self.update(|record| {
             record.tool_projection_stage = stage.to_owned();
             record.tool_stream = stream;
             record.tool_retry_attempt_ordinal = retry_attempt_ordinal.clamp(1, 64);
@@ -1976,7 +1989,7 @@ mod tests {
 
         let candidate = "synthetic-private-mail-body cookie=SYNTHETIC-SECRET";
         let candidate_sha256 = format!("{:x}", Sha256::digest(candidate.as_bytes()));
-        for failure in [None, Some("binding_drift")] {
+        for failure in [None, Some("binding")] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("debug-telemetry.jsonl");
             let store = Store::open(path.clone(), "test").unwrap();
@@ -2087,25 +2100,22 @@ mod tests {
         let path = root.path().join("debug-telemetry.jsonl");
         let store = Store::open(path.clone(), "test").unwrap();
         let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.tool_correction_ineligible("non_text_or_unknown_result");
+        trace.tool_correction_ineligible("completion_missing");
         trace.tool_correction_finished(Some("cancelled"));
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
         assert_eq!(live["toolCorrectionAttempted"], false);
         assert_eq!(live["toolCorrectionOutcome"], "not_attempted");
-        assert_eq!(
-            live["toolCorrectionFailureClass"],
-            "non_text_or_unknown_result"
-        );
+        assert_eq!(live["toolCorrectionFailureClass"], "completion_missing");
         assert_eq!(live["toolCorrectionOriginalSha256"], "");
         let raw = std::fs::read_to_string(path).unwrap();
         assert!(!raw.contains("toolCorrection"));
-        assert!(!raw.contains("non_text_or_unknown_result"));
+        assert!(!raw.contains("completion_missing"));
 
         let trace = store.start_request("POST", "/hermes/v1/chat/completions");
         trace.tool_correction_started(&"a".repeat(64));
         trace.tool_correction_finished(None);
-        trace.tool_correction_ineligible("non_text_or_unknown_result");
+        trace.tool_correction_ineligible("completion_missing");
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
         assert_eq!(live["toolCorrectionAttempted"], true);
