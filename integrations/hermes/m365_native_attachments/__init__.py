@@ -16,6 +16,7 @@ import mimetypes
 import os
 import re
 import stat as stat_module
+import sys
 import threading
 import unicodedata
 from collections import OrderedDict
@@ -291,6 +292,31 @@ def _request_without_context(request: Any) -> Any:
     extra.pop(_CONTEXT_FIELD, None)
     updated["extra_body"] = extra
     return updated
+
+
+def _reapply_recall_projection(request: Any, **kwargs: Any) -> Any:
+    """Preserve the dependency's request projection across Hermes middleware.
+
+    Hermes invokes every ``llm_request`` callback with the original payload.
+    This adapter depends on m365-recall-provenance, so reapply that already
+    loaded projection before adding native-attachment fields instead of
+    allowing this callback's copy to discard it.
+    """
+
+    recall_module = sys.modules.get("hermes_plugins.m365_recall_provenance")
+    if recall_module is None:
+        if __package__ == "hermes_plugins":
+            raise _AttachmentFailure("native_attachment_context_malformed")
+        return request
+    callback = getattr(recall_module, "on_llm_request", None)
+    if not callable(callback):
+        raise _AttachmentFailure("native_attachment_context_malformed")
+    result = callback(request=request, **kwargs)
+    if result is None:
+        return request
+    if not isinstance(result, dict) or not isinstance(result.get("request"), dict):
+        raise _AttachmentFailure("native_attachment_context_malformed")
+    return result["request"]
 
 
 def _has_unresolved_native_context(request: Any) -> bool:
@@ -619,7 +645,7 @@ def on_llm_request(
     session_id: Any = "",
     turn_id: Any = "",
     base_url: Any = "",
-    **_: Any,
+    **kwargs: Any,
 ) -> dict[str, Any] | None:
     if not _is_m365(provider, api_mode, base_url):
         key = _turn_key(session_id, turn_id)
@@ -646,6 +672,15 @@ def on_llm_request(
             request, session_id, turn_id, "native_attachment_binding_invalid"
         )
     try:
+        request = _reapply_recall_projection(
+            request,
+            provider=provider,
+            api_mode=api_mode,
+            session_id=session_id,
+            turn_id=turn_id,
+            base_url=base_url,
+            **kwargs,
+        )
         with _lock:
             if key in _ended:
                 return _safe_failure_request(

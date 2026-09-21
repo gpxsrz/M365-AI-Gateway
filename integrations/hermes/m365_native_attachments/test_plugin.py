@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -1319,6 +1320,148 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                     "sha256="
                 )
             )
+
+    def test_runner_style_full_plugin_chain_keeps_read_file_and_native_context(self):
+        def _handle_read_file(*args, **kwargs):
+            return "{}"
+
+        _handle_read_file.__module__ = "tools.file_tools"
+
+        class Entry:
+            toolset = "file"
+
+        Entry.handler = staticmethod(_handle_read_file)
+
+        class Registry:
+            def get_entry(self, name):
+                return Entry() if name == "read_file" else None
+
+            def get_definitions(self, names, quiet=True):
+                del names, quiet
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read a text file with line numbers.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                            },
+                        },
+                    }
+                ]
+
+        registry_module = type(sys)("tools.registry")
+        registry_module.registry = Registry()
+        file_tools_module = type(sys)("tools.file_tools")
+        file_tools_module._handle_read_file = _handle_read_file
+        tools_module = type(sys)("tools")
+        tools_module.__path__ = []
+        tools_module.file_tools = file_tools_module
+
+        with plugin._lock:
+            plugin._sessions[("session", "turn")] = {
+                "refs": [
+                    {
+                        "stage_ref": "A" * 43,
+                        "size": 3,
+                        "sha256": hashlib.sha256(b"abc").hexdigest(),
+                        "original_filename": "report.txt",
+                        "extension": "txt",
+                        "mime_type": "text/plain",
+                        "attachment_id": "attachment-1",
+                        "source_message_id": "message-1",
+                    }
+                ],
+                "route": "https://m365.example/hermes/v1",
+                "session_key": "session",
+            }
+            plugin._outcomes[("session", "turn")] = {"ok": True}
+        recall.on_pre_llm_call(
+            session_id="session", turn_id="turn", user_message="read"
+        )
+        request = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "read\n\n<memory-context>\nrecalled\n</memory-context>",
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a text file with line numbers.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
+            "extra_body": {"session_key": "session", "caller_marker": "preserve"},
+        }
+        middleware_context = {
+            "provider": "m365",
+            "api_mode": "chat_completions",
+            "session_id": "session",
+            "turn_id": "turn",
+            "base_url": "https://m365.example/hermes/v1",
+            "api_request_id": "turn:api:1",
+            "api_call_count": 1,
+        }
+        callbacks = [recall.on_llm_request, plugin.on_llm_request]
+        with patch.dict(
+            sys.modules,
+            {
+                "hermes_plugins.m365_recall_provenance": recall,
+                "tools": tools_module,
+                "tools.registry": registry_module,
+                "tools.file_tools": file_tools_module,
+            },
+        ), patch.object(plugin, "_turn_route", return_value=True):
+            final = json.loads(json.dumps(request))
+            for callback in callbacks:
+                result = callback(
+                    request=json.loads(json.dumps(request)), **middleware_context
+                )
+                if result is not None:
+                    final = json.loads(json.dumps(result["request"]))
+
+        extra = final["extra_body"]
+        self.assertIn("annotations", final["tools"][0]["function"])
+        annotations = final["tools"][0]["function"]["annotations"]
+        self.assertTrue(annotations["readOnlyHint"])
+        self.assertFalse(annotations["destructiveHint"])
+        self.assertIn("m365ReadOnlyContract", annotations)
+        self.assertIn("m365_recall_provenance", extra)
+        self.assertIn(plugin._CONTEXT_FIELD, extra)
+        self.assertEqual(extra["caller_marker"], "preserve")
+
+    def test_missing_recall_dependency_fails_closed_in_runtime_package(self):
+        with patch.object(plugin, "__package__", "hermes_plugins"), patch.dict(
+            sys.modules,
+            {"hermes_plugins.m365_recall_provenance": None},
+        ), patch.object(plugin, "_turn_route", return_value=True):
+            result = plugin.on_llm_request(
+                {
+                    "messages": [{"role": "user", "content": "read"}],
+                    "extra_body": {"session_key": "session"},
+                },
+                provider="m365",
+                api_mode="chat_completions",
+                session_id="session",
+                turn_id="turn",
+                base_url="https://m365.example/hermes/v1",
+            )
+
+        self.assertIsNotNone(result)
+        context = result["request"]["extra_body"][plugin._CONTEXT_FIELD]
+        self.assertEqual(context["error"], "native_attachment_context_malformed")
 
     def test_registers_required_middleware_dependency_and_no_post_api_cleanup(self):
         context = FakeContext()
