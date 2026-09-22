@@ -7544,6 +7544,7 @@ mod tests {
         calls: &[Value],
         dispatches: &AtomicUsize,
         receipts: &Mutex<Vec<Value>>,
+        expected_pattern: &str,
     ) -> (Value, Value) {
         assert_eq!(
             calls.len(),
@@ -7554,7 +7555,7 @@ mod tests {
         assert_eq!(call["function"]["name"], "terminal");
         let arguments: Value =
             serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(arguments, json!({"pattern": "\\]"}));
+        assert_eq!(arguments, json!({"pattern": expected_pattern}));
         assert_eq!(dispatches.fetch_add(1, Ordering::AcqRel), 0);
 
         let receipt = json!({
@@ -7718,103 +7719,116 @@ mod tests {
     #[tokio::test]
     async fn syntax_correction_live_loopback_qualifies_json_and_sse_then_continues() {
         for stream in [false, true] {
-            let (websocket_base, payloads, server) = syntax_live_upstream_server(vec![
-                syntax_live_reply("```terminal\n{\"pattern\":\"\\]\"}\n```"),
-                syntax_live_reply("```terminal\n{\"pattern\":\"\\\\]\"}\n```"),
-                syntax_live_reply("Synthetic caller terminal complete."),
-            ])
-            .await;
-            let root = tempfile::tempdir().unwrap();
-            let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
-                Arc::new(EmptyTransport),
-                oauth(),
-                root.path().to_owned(),
-                None,
-            );
-            let live_chat = LiveChatHub::new_for_test(
-                gateway.settings.clone(),
-                syntax_prepare_attachments,
-                websocket_base,
-            );
-            Arc::get_mut(&mut gateway)
-                .expect("test gateway must be uniquely owned before routing")
-                .chat = Arc::new(live_chat);
-            let app = Gateway::router(Arc::clone(&gateway));
-            let mut request = syntax_correction_body(stream);
-            request["session_key"] = json!(format!("syntax-live-{stream}"));
-            if stream {
-                request["stream_options"] = json!({"include_usage":true});
-            }
+            for (arguments, expected_pattern, rejection_class) in [
+                (r#"{"pattern":"\]"}"#, "\\]", "illegal_escape"),
+                (r#"{"pattern":"\q"}"#, "\\q", "illegal_escape"),
+                (r#"{"pattern":"\\]",}"#, "\\]", "malformed_json_structure"),
+                (r#"{"pattern":"\\]"#, "\\]", "unclosed_string"),
+                (r#"{"pattern":"\]",}"#, "\\]", "illegal_escape"),
+            ] {
+                let initial = format!("```terminal\n{arguments}\n```");
+                let corrected =
+                    format!("```terminal\n{}\n```", json!({"pattern":expected_pattern}));
+                let (websocket_base, payloads, server) = syntax_live_upstream_server(vec![
+                    syntax_live_reply(&initial),
+                    syntax_live_reply(&corrected),
+                    syntax_live_reply("Synthetic caller terminal complete."),
+                ])
+                .await;
+                let root = tempfile::tempdir().unwrap();
+                let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+                    Arc::new(EmptyTransport),
+                    oauth(),
+                    root.path().to_owned(),
+                    None,
+                );
+                let live_chat = LiveChatHub::new_for_test(
+                    gateway.settings.clone(),
+                    syntax_prepare_attachments,
+                    websocket_base,
+                );
+                Arc::get_mut(&mut gateway)
+                    .expect("test gateway must be uniquely owned before routing")
+                    .chat = Arc::new(live_chat);
+                let app = Gateway::router(Arc::clone(&gateway));
+                let mut request = syntax_correction_body(stream);
+                request.as_object_mut().unwrap().remove("tool_choice");
+                request["session_key"] = json!(format!("syntax-live-{stream}"));
+                if stream {
+                    request["stream_options"] = json!({"include_usage":true});
+                }
 
-            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
-            assert_eq!(status, StatusCode::OK, "body={body}");
-            let calls = if stream {
-                sse_values(&body)
-                    .iter()
-                    .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .expect("SSE caller tool call")
-            } else {
-                serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"]
+                let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+                assert_eq!(status, StatusCode::OK, "body={body}");
+                let calls = if stream {
+                    sse_values(&body)
+                        .iter()
+                        .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls"))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .expect("SSE caller tool call")
+                } else {
+                    serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"]
                     .as_array()
                     .cloned()
                     .expect("JSON caller tool call")
-            };
-            let dispatches = AtomicUsize::new(0);
-            let receipts = Mutex::new(Vec::new());
-            let (call, tool_result) = syntax_caller_harness(&calls, &dispatches, &receipts);
-            let call_id = call["id"].clone();
-            request["messages"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"role":"assistant","content":null,"tool_calls":[call]}));
-            request["messages"].as_array_mut().unwrap().push(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": serde_json::to_string(&tool_result).unwrap()
-            }));
-            request["tool_choice"] = json!("auto");
-            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
-            assert_eq!(status, StatusCode::OK, "body={body}");
-            assert!(body.contains("Synthetic caller terminal complete."));
-            assert_eq!(dispatches.load(Ordering::Acquire), 1);
-            assert_eq!(
-                receipts.into_inner().unwrap(),
-                vec![json!({
-                    "tool": "terminal",
-                    "operation": "fixed-synthetic-safe-pattern-check",
-                    "status": "completed",
-                    "output": "synthetic-safe"
-                })]
-            );
+                };
+                let dispatches = AtomicUsize::new(0);
+                let receipts = Mutex::new(Vec::new());
+                let (call, tool_result) =
+                    syntax_caller_harness(&calls, &dispatches, &receipts, expected_pattern);
+                let call_id = call["id"].clone();
+                request["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"assistant","content":null,"tool_calls":[call]}));
+                request["messages"].as_array_mut().unwrap().push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": serde_json::to_string(&tool_result).unwrap()
+                }));
+                request["tool_choice"] = json!("auto");
+                let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+                assert_eq!(status, StatusCode::OK, "body={body}");
+                assert!(body.contains("Synthetic caller terminal complete."));
+                assert_eq!(dispatches.load(Ordering::Acquire), 1);
+                assert_eq!(
+                    receipts.into_inner().unwrap(),
+                    vec![json!({
+                        "tool": "terminal",
+                        "operation": "fixed-synthetic-safe-pattern-check",
+                        "status": "completed",
+                        "output": "synthetic-safe"
+                    })]
+                );
 
-            let payloads = payloads.lock().unwrap().clone();
-            assert_eq!(
-                payloads.len(),
-                3,
-                "two generations plus caller continuation"
-            );
-            for payload in payloads {
-                let chat = payload
-                    .split('\x1e')
-                    .filter(|frame| !frame.is_empty())
-                    .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
-                    .find(|frame| frame["target"] == "chat")
-                    .unwrap();
-                assert_eq!(chat["invocationId"], "0");
+                let payloads = payloads.lock().unwrap().clone();
+                assert_eq!(
+                    payloads.len(),
+                    3,
+                    "two generations plus caller continuation"
+                );
+                for payload in payloads {
+                    let chat = payload
+                        .split('\x1e')
+                        .filter(|frame| !frame.is_empty())
+                        .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+                        .find(|frame| frame["target"] == "chat")
+                        .unwrap();
+                    assert_eq!(chat["invocationId"], "0");
+                }
+                server.await.unwrap();
+
+                let record = gateway
+                    .debug
+                    .records_for_test()
+                    .into_iter()
+                    .find(|record| record["toolCorrectionAttempted"] == true)
+                    .expect("live correction diagnostic");
+                assert_eq!(record["toolCorrectionOutcome"], "succeeded");
+                assert_eq!(record["toolProjectionStage"], "syntax_correction");
+                assert_eq!(record["toolCallRejectionClass"], rejection_class);
             }
-            server.await.unwrap();
-
-            let record = gateway
-                .debug
-                .records_for_test()
-                .into_iter()
-                .find(|record| record["toolCorrectionAttempted"] == true)
-                .expect("live correction diagnostic");
-            assert_eq!(record["toolCorrectionOutcome"], "succeeded");
-            assert_eq!(record["toolProjectionStage"], "syntax_correction");
-            assert_eq!(record["toolCallRejectionClass"], "illegal_escape");
         }
     }
 
@@ -8060,6 +8074,64 @@ mod tests {
             let record = gateway.debug.records_for_test().pop().unwrap();
             assert_eq!(record["toolCorrectionAttempted"], true);
             assert_eq!(record["toolCorrectionOutcome"], "succeeded");
+        }
+    }
+
+    // Decision-boundary fixture, not a reconstruction of the private incident.
+    // The tool and argument text are synthetic; only the proven predicate is shared.
+    #[tokio::test]
+    async fn syntax_correction_incident_predicate_without_explicit_tool_choice() {
+        let initial = "```terminal\n{\"pattern\":\"\\q\"}\n```";
+        let corrected = "```terminal\n{\"pattern\":\"\\\\q\"}\n```";
+        for stream in [false, true] {
+            let chat = Arc::new(SyntaxCorrectionTransport::new(&[initial, corrected]));
+            let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+            let mut request = syntax_correction_body(stream);
+            request.as_object_mut().unwrap().remove("tool_choice");
+            assert!(request.get("response_format").is_none());
+            let (status, body) =
+                syntax_public_response(&Gateway::router(Arc::clone(&gateway)), &raw_key, &request)
+                    .await;
+            let requests = chat.requests.lock().unwrap();
+            let initial_projection = crate::tool_calls::project(
+                initial,
+                &requests[0].tools,
+                &requests[0].tool_choice,
+                requests[0].tool_call_limit,
+            );
+            assert!(initial_projection.calls.is_empty());
+            let rejection = initial_projection.rejection.unwrap();
+            assert_eq!(rejection.class.as_str(), "illegal_escape");
+            assert_eq!(rejection.fence_count, 2);
+            assert_eq!(rejection.matching_known_tool_fence_count, 1);
+            let record = gateway.debug.records_for_test().pop().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "unique known malformed candidate must receive one correction; attempted={}",
+                record["toolCorrectionAttempted"]
+            );
+            assert_eq!(record["toolCorrectionAttempted"], true);
+            assert_eq!(record["toolCorrectionOutcome"], "succeeded");
+            assert_eq!(status, StatusCode::OK);
+            let frames = if stream { sse_values(&body) } else { vec![] };
+            let response: Value = if stream {
+                frames
+                    .iter()
+                    .find(|frame| frame["choices"][0]["delta"]["tool_calls"].is_array())
+                    .unwrap()["choices"][0]["delta"]
+                    .clone()
+            } else {
+                serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"].clone()
+            };
+            let calls = response["tool_calls"].as_array().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["function"]["name"], "terminal");
+            assert_eq!(
+                serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap())
+                    .unwrap(),
+                json!({"pattern":"\\q"})
+            );
         }
     }
 
@@ -8528,7 +8600,15 @@ mod tests {
             "prose_before",
             "prose_after",
             "multiple_fences",
-            "second_structural_error",
+            "malformed_array",
+            "malformed_scalar",
+            "second_value",
+            "malformed_then_second_value",
+            "malformed_then_prose",
+            "mismatched_delimiter",
+            "duplicate_arguments",
+            "unknown_tool",
+            "missing_fence",
             "ambiguous_declaration",
             "tool_choice_none",
             "native_event",
@@ -8549,10 +8629,28 @@ mod tests {
                     "multiple_fences" => {
                         first.push_str("\n```terminal\n{\"pattern\":\"valid\"}\n```")
                     }
-                    "second_structural_error" => {
+                    "malformed_array" => first = "```terminal\n[\n```".to_owned(),
+                    "malformed_scalar" => first = "```terminal\n\"unfinished\n```".to_owned(),
+                    "second_value" => first = "```terminal\n{} {}\n```".to_owned(),
+                    "malformed_then_second_value" => {
+                        first = "```terminal\n{\"pattern\":\"\\q\"} {}\n```".to_owned()
+                    }
+                    "malformed_then_prose" => {
+                        first = "```terminal\n{\"pattern\":\"\\q\"} prose\n```".to_owned()
+                    }
+                    "mismatched_delimiter" => {
+                        first = "```terminal\n{\"pattern\":[}\n```".to_owned()
+                    }
+                    "duplicate_arguments" => {
                         first =
-                            "```terminal\n{\"pattern\":\"CORRECTION_PRIVATE_SENTINEL\\]\",}\n```"
-                                .to_owned();
+                            "```terminal\n{\"pattern\":\"one\",\"pattern\":\"two\"}\n```".to_owned()
+                    }
+                    "unknown_tool" => {
+                        first = "```unknown\n{\"pattern\":\"\\q\"}\n```".to_owned();
+                        body.as_object_mut().unwrap().remove("tool_choice");
+                    }
+                    "missing_fence" => {
+                        first.truncate(first.len() - 4);
                     }
                     "ambiguous_declaration" => {
                         let duplicate = body["tools"][0].clone();
@@ -8589,9 +8687,46 @@ mod tests {
                         _ => {}
                     }
                 }
-                assert_syntax_correction_denied(chat, body, 1, case != "tool_choice_none", case)
-                    .await;
+                assert_syntax_correction_denied(
+                    chat,
+                    body,
+                    1,
+                    !matches!(case, "tool_choice_none" | "unknown_tool"),
+                    case,
+                )
+                .await;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn syntax_correction_preserves_disallowed_named_choice_failure() {
+        for stream in [false, true] {
+            let chat = Arc::new(SyntaxCorrectionTransport::new(&[
+                "```terminal\n{\"pattern\":\"\\q\"}\n```",
+            ]));
+            let (gateway, key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+            let mut request = syntax_correction_body(stream);
+            let mut other = request["tools"][0].clone();
+            other["function"]["name"] = json!("inspect");
+            request["tools"].as_array_mut().unwrap().push(other);
+            request["tool_choice"]["function"]["name"] = json!("inspect");
+            let (status, body) =
+                syntax_public_response(&Gateway::router(gateway.clone()), &key, &request).await;
+            assert_eq!(
+                status,
+                if stream {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+            assert!(body.contains("tool_choice_unsatisfied"));
+            assert!(!body.contains("tool_calls"));
+            assert_eq!(chat.requests.lock().unwrap().len(), 1);
+            assert!(gateway.checkpoints.list().unwrap().is_empty());
+            let record = gateway.debug.records_for_test().pop().unwrap();
+            assert_eq!(record["toolCorrectionAttempted"], false);
         }
     }
 

@@ -146,7 +146,7 @@ Full-context TXT 是 transport projection，不保證模型已讀完、正確使
 - `response_format` / `json_schema` 是 caller contract。Transport projection 後會再驗一次；Gateway 不會用 HTTP 200 回不符合 schema 的 prose。
 - ChatHub 成功但 qualification / artifact materialization 後仍沒有可見內容，non-stream 回 `502 upstream_empty_response`；stream 回 error event 後 `[DONE]`，不送假的空成功。
 
-只有 `/hermes/v1/chat/completions` 的初次 rejected caller candidate 可以進入一次由模型負責的 syntax correction。範圍限於完整且唯一已知、符合 tool choice 的工具 fence，JSON string value 內孤立的非法 `\]`，diagnostic-only neutralization 後結構為合法 object，且 provider transcript 已完整結束並確認只有已知純文字事件。任何 native／未知事件或 artifact 都不符合。帶有 `response_format`、缺少或漂移的 conversation binding、MCP 設定或 correction input 超限的 request 不啟用；未知證據仍 fail closed。這個資格檢查描述已完成的第一次回應，不是禁用所有 native capability 的 provider policy。Correction 不啟用 search 或 external MCP，但 provider 既有的 native capability 仍在；第二次回應若出現 native／未知事件，就拒絕 caller acceptance。拒絕不能撤銷 provider 可能已經執行的操作。
+只有 `/hermes/v1/chat/completions` 的初次 rejected caller candidate 可以進入一次由模型負責的 syntax correction。範圍限於完整、無歧義且唯一已知、符合 tool choice 的工具 fence，初次 rejection 分類為 `illegal_escape`、`malformed_json_structure` 或 `unclosed_string`。Arguments 必須以 object 開始；未閉合的 object／string 可交由模型重新表述，但括號配對錯誤、已閉合 object 後的第二個值或 prose 不符合。此邊界檢查不修補 argument bytes，也不證明語意等價。Provider transcript 仍須完整結束且只有已知純文字事件；任何 native／未知事件或 artifact 都不符合。帶有 `response_format`、缺少或漂移的 conversation binding、MCP 設定或 correction input 超限的 request 不啟用；未知證據仍 fail closed。這個資格檢查描述已完成的第一次回應，不是禁用所有 native capability 的 provider policy。Correction 不啟用 search 或 external MCP，但 provider 既有的 native capability 仍在；第二次回應若出現 native／未知事件，就拒絕 caller acceptance。拒絕不能撤銷 provider 可能已經執行的操作。
 
 資格分類器使用同一份已收到的 raw transcript；下表是本輪固定 contract table，不是可動態擴張的 allowlist：
 

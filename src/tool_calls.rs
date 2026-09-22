@@ -78,31 +78,68 @@ pub struct ToolDiagnostic {
 
 pub type ToolRejection = ToolDiagnostic;
 
-// This selects an observed syntax-only window; it never repairs argument bytes.
+// Select one known caller tool for model-owned correction; never repair its bytes.
 pub(crate) fn syntax_correction_tool<'a>(
     text: &'a str,
     tools: &[Tool],
     choice: &Value,
     limit: usize,
 ) -> Option<&'a str> {
-    let (name, _) = single_tool_fence(text)?;
+    let (name, arguments) = single_tool_fence(text)?;
     tool(tools, name).filter(|_| choice_allows(choice, name))?;
+    if !single_argument_object_boundary(arguments) {
+        return None;
+    }
     let projection = project(text, tools, choice, limit);
     let diagnostic = projection.rejection.as_ref()?;
-    let witness = diagnostic.escape_witness.as_ref()?;
-    (diagnostic.class == ToolRejectionClass::IllegalEscape
-        && projection.calls.is_empty()
+    (matches!(
+        diagnostic.class,
+        ToolRejectionClass::IllegalEscape
+            | ToolRejectionClass::MalformedJsonStructure
+            | ToolRejectionClass::UnclosedString
+    ) && projection.calls.is_empty()
         && !projection.overflowed
         && diagnostic.fence_count == 2
-        && diagnostic.matching_known_tool_fence_count == 1
-        && witness.kind == "invalid_simple_escape"
-        && witness.escape_marker_ascii == Some(b']')
-        && witness.lexical_inside_string
-        && witness.string_preceding_class == "colon"
-        && witness.preceding_backslash_count == 1
-        && !witness.backslash_count_capped
-        && witness.single_escape_neutralized_object == "valid_object")
+        && diagnostic.matching_known_tool_fence_count == 1)
         .then_some(name)
+}
+
+// Ownership boundary only, not JSON validation. An unfinished object/string may
+// be re-expressed by the model; a second value or trailing prose must not be.
+fn single_argument_object_boundary(arguments: &str) -> bool {
+    let raw = arguments.trim();
+    if !raw.starts_with('{') {
+        return false;
+    }
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in raw.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'{' | b'[' => stack.push(byte),
+                b'}' | b']' => {
+                    if stack.pop() != Some(if byte == b'}' { b'{' } else { b'[' }) {
+                        return false;
+                    }
+                    if stack.is_empty() {
+                        return raw[index + 1..].trim().is_empty();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn is_strict_correction(text: &str, expected_tool: &str) -> bool {
@@ -882,6 +919,116 @@ mod tests {
             kind: "function".to_owned(),
             function: json!({"name":"read_file","parameters":{"type":"object"}}),
         }]
+    }
+
+    #[test]
+    fn syntax_correction_selects_only_one_known_object_candidate() {
+        // Public decision-boundary fixtures, not recovered incident candidates.
+        let malformed = "```read_file\n{\"path\":\"\\q\"}\n```";
+        for (case, text, expected_class) in [
+            ("illegal_escape", malformed, Some("illegal_escape")),
+            (
+                "malformed_structure",
+                "```read_file\n{\"path\":\"a\",}\n```",
+                Some("malformed_json_structure"),
+            ),
+            (
+                "unclosed_string",
+                "```read_file\n{\"path\":\"a\n```",
+                Some("unclosed_string"),
+            ),
+            (
+                "unfinished_nested_object",
+                "```read_file\n{\"paths\":[{\"path\":\"a\"\n```",
+                Some("malformed_json_structure"),
+            ),
+            (
+                "braces_and_escaped_quote_in_string",
+                "```read_file\n{\"path\":\"{[}] \\\" \\q\"}\n```",
+                Some("illegal_escape"),
+            ),
+            ("root_array", "```read_file\n[]\n```", None),
+            ("malformed_array", "```read_file\n[\n```", None),
+            (
+                "root_unclosed_string",
+                "```read_file\n\"unfinished\n```",
+                None,
+            ),
+            ("malformed_scalar", "```read_file\n1e\n```", None),
+            ("root_null", "```read_file\nnull\n```", None),
+            (
+                "second_object",
+                "```read_file\n{\"path\":\"\\q\"} {\"path\":\"other\"}\n```",
+                None,
+            ),
+            (
+                "trailing_prose_inside_fence",
+                "```read_file\n{\"path\":\"\\q\"} explanation\n```",
+                None,
+            ),
+            (
+                "mismatched_delimiters",
+                "```read_file\n{\"paths\":[}\n```",
+                None,
+            ),
+            ("unknown_tool", "```unknown\n{\"path\":\"\\q\"}\n```", None),
+            ("duplicate_declaration", malformed, None),
+            ("disallowed_named_choice", malformed, None),
+            ("choice_none", malformed, None),
+            (
+                "multiple_fences",
+                "```read_file\n{\"path\":\"\\q\"}\n```\n```read_file\n{\"path\":\"other\"}\n```",
+                None,
+            ),
+            ("broken_fence", "```read_file\n{\"path\":\"\\q\"}", None),
+            (
+                "prose_before",
+                "explanation\n```read_file\n{\"path\":\"\\q\"}\n```",
+                None,
+            ),
+            (
+                "prose_after",
+                "```read_file\n{\"path\":\"\\q\"}\n```\nexplanation",
+                None,
+            ),
+            (
+                "duplicate_argument_keys",
+                "```read_file\n{\"path\":\"one\",\"path\":\"two\"}\n```",
+                None,
+            ),
+            (
+                "already_valid",
+                "```read_file\n{\"path\":\"README.md\"}\n```",
+                None,
+            ),
+        ] {
+            let mut available = tools();
+            if case == "duplicate_declaration" {
+                available.push(available[0].clone());
+            }
+            let choice = match case {
+                "disallowed_named_choice" => json!({"type":"function","function":{"name":"other"}}),
+                "choice_none" => json!("none"),
+                _ => json!("auto"),
+            };
+            assert_eq!(
+                syntax_correction_tool(text, &available, &choice, 1),
+                expected_class.map(|_| "read_file"),
+                "case={case}"
+            );
+            if let Some(expected_class) = expected_class {
+                let projection = project(text, &available, &choice, 1);
+                assert!(
+                    projection.rejected && projection.calls.is_empty(),
+                    "case={case}"
+                );
+                assert_eq!(
+                    projection.rejection.unwrap().class.as_str(),
+                    expected_class,
+                    "case={case}"
+                );
+            }
+        }
     }
 
     #[test]
