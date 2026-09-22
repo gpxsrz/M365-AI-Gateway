@@ -94,6 +94,12 @@ jobs:
         run: >-
           .ci/hermes-agent/.venv/bin/python -m unittest -v
           integrations.hermes.m365_native_attachments.hermes_integration
+      - name: Require real Hermes SDK checkpoint continuation and read-modify-read
+        env:
+          HERMES_AGENT_ROOT: ${{ github.workspace }}/.ci/hermes-agent
+        run: >-
+          cargo test --locked --lib protocol::tests::hermes_checkpoint_sdk_identity_real_chain
+          -- --ignored --exact --nocapture
 
   rust:
     runs-on: ubuntu-latest

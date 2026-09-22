@@ -16,12 +16,14 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{agent_ledger::AgentLedger, error::GatewayError, private_file};
 
-const SCHEMA: &str = "wp6-transport-checkpoints/rust-v2";
+const SCHEMA: &str = "wp6-transport-checkpoints/rust-v3";
+const PREVIOUS_SCHEMA: &str = "wp6-transport-checkpoints/rust-v2";
 const LEGACY_SCHEMA: &str = "wp6-transport-checkpoints/rust-v1";
 const TTL: Duration = Duration::hours(24);
 const MAX_RECORDS: usize = 256;
 const MAX_MESSAGES: usize = 4_096;
 const MESSAGE_DOMAIN: &[u8] = b"m365/wp6/transport-checkpoint/message/v1\0";
+const MESSAGE_IDENTITY_DOMAIN: &[u8] = b"m365/wp6/transport-checkpoint/argument-identity/v1\0";
 const CHAIN_DOMAIN: &[u8] = b"m365/wp6/transport-checkpoint/chain/v1\0";
 const OWNER_DOMAIN: &[u8] = b"m365/wp6/transport-checkpoint/owner/v1\0";
 const KEY_DOMAIN: &[u8] = b"m365/wp6/transport-checkpoint/key/v1\0";
@@ -93,6 +95,8 @@ pub enum CheckpointError {
     RecoveryRequired,
     #[error("transport checkpoint conversation identity changed")]
     ConversationDrift,
+    #[error("transport checkpoint requires strict, unambiguous JSON tool arguments")]
+    InvalidArguments,
     #[error("transport checkpoint persistence failed: {0}")]
     Persistence(String),
 }
@@ -133,6 +137,10 @@ struct Record {
     accepted_count: usize,
     message_digests: Vec<String>,
     hash_chain: Vec<String>,
+    // Absent entries are legacy hash-only evidence, not permission to infer
+    // argument semantics. Keep original message_digests/hash_chain immutable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    message_identities: Vec<Option<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     response_cursors: Vec<ResponseCursor>,
     #[serde(default)]
@@ -146,6 +154,8 @@ struct Record {
     in_flight: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     in_flight_message_digests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    in_flight_message_identities: Vec<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     in_flight_upstream_started: Option<bool>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -247,6 +257,7 @@ pub struct CheckpointTurn {
     rollback_record: Option<Record>,
     base_digests: Vec<String>,
     base_chain: Vec<String>,
+    base_identities: Vec<Option<String>>,
     closed: bool,
     upstream_started: bool,
     recovery_lease: bool,
@@ -319,7 +330,7 @@ impl CheckpointStore {
             return Err(CheckpointError::HistoryLimit);
         }
         let digests = message_digests(messages)?;
-        let chain = hash_chain(&digests);
+        let identities = message_identities(messages)?;
         let owner_digest = digest(OWNER_DOMAIN, owner.as_bytes());
         let key_digest = if key.is_empty() {
             String::new()
@@ -333,7 +344,7 @@ impl CheckpointStore {
                 messages,
                 force_new,
                 digests,
-                chain,
+                identities,
                 owner_digest,
                 key_digest,
             );
@@ -362,7 +373,12 @@ impl CheckpointStore {
                 record.namespace == namespace
                     && record.owner_digest == owner_digest
                     && record.key_digest == key_digest
-                    && prefix(&record.message_digests, &digests)
+                    && identity_prefix(
+                        &record.message_digests,
+                        &record.message_identities,
+                        &digests,
+                        &identities,
+                    )
             })
             .map(|record| record.id.clone())
             .collect::<Vec<_>>();
@@ -384,8 +400,12 @@ impl CheckpointStore {
             let record = state.records.get_mut(&id).unwrap();
             let rollback_record = record.clone();
             let accepted = record.accepted_count;
+            let mut retained_digests = record.message_digests.clone();
+            retained_digests.extend(digests.iter().skip(accepted).cloned());
+            let retained_chain = hash_chain(&retained_digests);
             record.in_flight = true;
             record.in_flight_message_digests = digests.clone();
+            record.in_flight_message_identities = identities.clone();
             record.in_flight_upstream_started = Some(false);
             record.revision += 1;
             record.updated_at = now;
@@ -394,8 +414,9 @@ impl CheckpointStore {
                 record_id: id.clone(),
                 revision: record.revision,
                 rollback_record: Some(rollback_record),
-                base_digests: digests,
-                base_chain: chain,
+                base_digests: retained_digests,
+                base_chain: retained_chain,
+                base_identities: identities,
                 closed: false,
                 upstream_started: false,
                 recovery_lease: false,
@@ -443,6 +464,7 @@ impl CheckpointStore {
                     && record.key_digest == key_digest)
             });
         }
+        let chain = hash_chain(&digests);
         let id = random_hex(16);
         let record = Record {
             id: id.clone(),
@@ -454,6 +476,7 @@ impl CheckpointStore {
             accepted_count: 0,
             message_digests: Vec::new(),
             hash_chain: Vec::new(),
+            message_identities: Vec::new(),
             response_cursors: Vec::new(),
             tool_ledger: AgentLedger::default(),
             created_at: now,
@@ -461,6 +484,7 @@ impl CheckpointStore {
             revision: 1,
             in_flight: true,
             in_flight_message_digests: digests.clone(),
+            in_flight_message_identities: identities.clone(),
             in_flight_upstream_started: Some(false),
             terminal_unknown: false,
             ledger_mac: String::new(),
@@ -477,6 +501,7 @@ impl CheckpointStore {
             rollback_record: None,
             base_digests: digests,
             base_chain: chain,
+            base_identities: identities,
             closed: false,
             upstream_started: false,
             recovery_lease: false,
@@ -495,7 +520,7 @@ impl CheckpointStore {
         messages: &[CheckpointMessage],
         force_new: bool,
         digests: Vec<String>,
-        chain: Vec<String>,
+        identities: Vec<Option<String>>,
         owner_digest: String,
         key_digest: String,
     ) -> Result<CheckpointTurn, CheckpointError> {
@@ -520,7 +545,12 @@ impl CheckpointStore {
                         && record.owner_digest == owner_digest
                         && record.key_digest == key_digest
                         && record.in_flight
-                        && prefix(&record.message_digests, &digests)
+                        && identity_prefix(
+                            &record.message_digests,
+                            &record.in_flight_message_identities,
+                            &digests,
+                            &identities,
+                        )
                 })
                 .map(|record| record.id.clone())
                 .collect::<Vec<_>>();
@@ -555,7 +585,14 @@ impl CheckpointStore {
         if !record.in_flight {
             return Err(CheckpointError::RecoveryRequired);
         }
-        if record.in_flight_message_digests != digests {
+        if record.in_flight_message_digests.len() != digests.len()
+            || !identity_prefix(
+                &record.in_flight_message_digests,
+                &record.in_flight_message_identities,
+                &digests,
+                &identities,
+            )
+        {
             return Err(CheckpointError::ConversationDrift);
         }
         if record.in_flight_upstream_started != Some(true) {
@@ -568,6 +605,15 @@ impl CheckpointStore {
         let record = state.records.get_mut(&id).expect("record was checked");
         let rollback_record = record.clone();
         let accepted = record.accepted_count;
+        let mut retained_digests = record.message_digests.clone();
+        retained_digests.extend(
+            record
+                .in_flight_message_digests
+                .iter()
+                .skip(accepted)
+                .cloned(),
+        );
+        let retained_chain = hash_chain(&retained_digests);
         record.revision += 1;
         record.updated_at = OffsetDateTime::now_utc();
         let turn = CheckpointTurn {
@@ -575,8 +621,9 @@ impl CheckpointStore {
             record_id: id.clone(),
             revision: record.revision,
             rollback_record: Some(rollback_record),
-            base_digests: digests,
-            base_chain: chain,
+            base_digests: retained_digests,
+            base_chain: retained_chain,
+            base_identities: identities,
             closed: false,
             upstream_started: false,
             recovery_lease: true,
@@ -785,6 +832,7 @@ impl CheckpointStore {
         }
         record.in_flight = false;
         record.in_flight_message_digests.clear();
+        record.in_flight_message_identities.clear();
         record.in_flight_upstream_started = Some(false);
         record.terminal_unknown = true;
         record.revision += 1;
@@ -1026,6 +1074,7 @@ impl CheckpointTurn {
         ledger: Option<AgentLedger>,
     ) -> Result<(), CheckpointError> {
         let produced_digests = message_digests(produced)?;
+        let produced_identities = message_identities(produced)?;
         if self.base_digests.len() + produced_digests.len() > MAX_MESSAGES {
             self.abort()?;
             return Err(CheckpointError::HistoryLimit);
@@ -1069,6 +1118,8 @@ impl CheckpointTurn {
         record.session_id = binding.session_id;
         record.message_digests = self.base_digests.clone();
         record.message_digests.extend(produced_digests);
+        record.message_identities = self.base_identities.clone();
+        record.message_identities.extend(produced_identities);
         record.hash_chain = self.base_chain.clone();
         for digest in record.message_digests.iter().skip(record.hash_chain.len()) {
             let previous = record
@@ -1100,6 +1151,7 @@ impl CheckpointTurn {
         }
         record.in_flight = false;
         record.in_flight_message_digests.clear();
+        record.in_flight_message_identities.clear();
         record.in_flight_upstream_started = Some(false);
         record.revision += 1;
         record.updated_at = OffsetDateTime::now_utc();
@@ -1259,7 +1311,8 @@ fn load_records(
         return Ok((HashMap::new(), false));
     };
     let legacy_schema = file.schema == LEGACY_SCHEMA;
-    if file.schema != SCHEMA && !legacy_schema {
+    let previous_schema = file.schema == PREVIOUS_SCHEMA;
+    if file.schema != SCHEMA && !legacy_schema && !previous_schema {
         return Err(CheckpointError::Persistence(format!(
             "unsupported schema {:?}",
             file.schema
@@ -1268,6 +1321,16 @@ fn load_records(
     let mut records = HashMap::new();
     let mut migrated = legacy_schema;
     for mut record in file.records {
+        // v1 has no authenticated comparison evidence. v2 authenticates only
+        // its original shape. Never accept injected new identities as migration.
+        if (legacy_schema || previous_schema)
+            && (!record.message_identities.is_empty()
+                || !record.in_flight_message_identities.is_empty())
+        {
+            return Err(CheckpointError::Persistence(
+                "unexpected identity fields in legacy checkpoint".to_owned(),
+            ));
+        }
         if !valid_record(&record, legacy_schema) {
             return Err(CheckpointError::Persistence(
                 "invalid checkpoint record".to_owned(),
@@ -1310,6 +1373,7 @@ fn load_records(
             }
             record.in_flight = false;
             record.in_flight_message_digests.clear();
+            record.in_flight_message_identities.clear();
             migrated = true;
         }
         if record.in_flight_upstream_started.is_none() {
@@ -1363,6 +1427,7 @@ fn begin_append(
         return Err(CheckpointError::HistoryLimit);
     }
     let delta_digests = message_digests(messages)?;
+    let delta_identities = message_identities(messages)?;
     let snapshot = state.records.clone();
     let record = state
         .records
@@ -1381,8 +1446,12 @@ fn begin_append(
     let mut digests = record.message_digests.clone();
     digests.extend(delta_digests);
     let chain = hash_chain(&digests);
+    let mut identities = record.message_identities.clone();
+    identities.resize(record.accepted_count, None);
+    identities.extend(delta_identities);
     record.in_flight = true;
     record.in_flight_message_digests = digests.clone();
+    record.in_flight_message_identities = identities.clone();
     record.in_flight_upstream_started = Some(false);
     record.revision += 1;
     record.updated_at = OffsetDateTime::now_utc();
@@ -1393,6 +1462,7 @@ fn begin_append(
         rollback_record: Some(rollback_record),
         base_digests: digests,
         base_chain: chain,
+        base_identities: identities,
         closed: false,
         upstream_started: false,
         recovery_lease: false,
@@ -1429,6 +1499,12 @@ fn valid_record(record: &Record, allow_legacy_statusless: bool) -> bool {
         && record.revision > 0
         && record.accepted_count == record.message_digests.len()
         && record.message_digests.len() == record.hash_chain.len()
+        && valid_identities(&record.message_identities, record.message_digests.len())
+        && valid_identities(
+            &record.in_flight_message_identities,
+            record.in_flight_message_digests.len(),
+        )
+        && (record.in_flight || record.in_flight_message_identities.is_empty())
         && record
             .response_cursors
             .iter()
@@ -1456,6 +1532,56 @@ fn valid_record_id(value: &str) -> bool {
 
 fn is_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_identities(identities: &[Option<String>], count: usize) -> bool {
+    identities.is_empty()
+        || (identities.len() == count
+            && identities
+                .iter()
+                .all(|value| value.as_deref().is_none_or(is_digest)))
+}
+
+fn identity_prefix(
+    saved: &[String],
+    saved_identities: &[Option<String>],
+    incoming: &[String],
+    incoming_identities: &[Option<String>],
+) -> bool {
+    saved.len() <= incoming.len()
+        && saved.iter().enumerate().all(|(index, raw)| {
+            match saved_identities.get(index).and_then(Option::as_ref) {
+                Some(identity) => {
+                    incoming_identities.get(index).and_then(Option::as_ref) == Some(identity)
+                }
+                None => raw == &incoming[index],
+            }
+        })
+}
+
+fn message_identities(
+    messages: &[CheckpointMessage],
+) -> Result<Vec<Option<String>>, CheckpointError> {
+    messages
+        .iter()
+        .filter(|message| !message.empty_recovery_synthetic)
+        .map(|message| {
+            let mut canonical = canonical_checkpoint_message(message);
+            for call in &mut canonical.tool_calls {
+                let arguments = call
+                    .get("function")
+                    .and_then(|function| function.get("arguments"))
+                    .and_then(Value::as_str)
+                    .ok_or(CheckpointError::InvalidArguments)?;
+                let identity = crate::tool_calls::canonical_arguments(arguments)
+                    .map_err(|_| CheckpointError::InvalidArguments)?;
+                call["function"]["arguments"] = Value::String(identity);
+            }
+            serde_json::to_vec(&canonical)
+                .map(|bytes| Some(digest(MESSAGE_IDENTITY_DOMAIN, &bytes)))
+                .map_err(|error| CheckpointError::Persistence(error.to_string()))
+        })
+        .collect()
 }
 
 fn valid_identity(value: &str, max: usize) -> bool {
@@ -1547,10 +1673,6 @@ fn digest(domain: &[u8], value: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
-fn prefix(prefix: &[String], full: &[String]) -> bool {
-    prefix.len() <= full.len() && prefix.iter().zip(full).all(|(left, right)| left == right)
-}
-
 fn random_hex(size: usize) -> String {
     let mut bytes = vec![0_u8; size];
     rand::rng().fill(bytes.as_mut_slice());
@@ -1589,6 +1711,277 @@ mod tests {
         let mut message = message(role, text);
         message.empty_recovery_synthetic = true;
         message
+    }
+
+    #[test]
+    fn legacy_hash_only_history_requires_raw_proof_before_semantic_upgrade() {
+        for schema in [PREVIOUS_SCHEMA, LEGACY_SCHEMA] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("legacy-checkpoints.json");
+            let store = CheckpointStore::open(&path).unwrap();
+            let user = message("user", "Synthetic legacy checkpoint.");
+            let mut original = message("assistant", "");
+            original.tool_calls = vec![serde_json::json!({
+                "id":"legacy-call", "type":"function",
+                "function":{"name":"todo_list","arguments":"{\"text\":\"中文😀\"}"}
+            })];
+            let binding = Binding {
+                conversation_id: "legacy-conversation".into(),
+                session_id: "legacy-session".into(),
+            };
+            store
+                .begin_full("hermes", "owner", "key", std::slice::from_ref(&user), false)
+                .unwrap()
+                .accept(binding.clone(), &[original.clone()])
+                .unwrap();
+            let mut legacy = store
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let saved_raw = legacy.message_digests.clone();
+            let saved_chain = legacy.hash_chain.clone();
+            legacy.message_identities.clear();
+            legacy.in_flight_message_identities.clear();
+            legacy.ledger_mac = if schema == PREVIOUS_SCHEMA {
+                record_ledger_mac(&store.integrity_key, &legacy).unwrap()
+            } else {
+                String::new()
+            };
+            let encoded = serde_json::to_vec(&CheckpointFile {
+                schema: schema.to_owned(),
+                records: vec![legacy],
+            })
+            .unwrap();
+            assert!(!String::from_utf8_lossy(&encoded).contains("messageIdentities"));
+            std::fs::write(&path, encoded).unwrap();
+            drop(store);
+            let reopened = CheckpointStore::open(&path).unwrap();
+            let before_denial = std::fs::read(&path).unwrap();
+            let mut escaped = original.clone();
+            escaped.tool_calls[0]["function"]["arguments"] =
+                serde_json::json!(r#"{"text":"\u4e2d\u6587\ud83d\ude00"}"#);
+            let mut result = message("tool", r#"{"ok":true}"#);
+            result.tool_call_id = "legacy-call".into();
+            assert!(matches!(
+                reopened.begin_full(
+                    "hermes",
+                    "owner",
+                    "key",
+                    &[user.clone(), escaped.clone(), result.clone()],
+                    false
+                ),
+                Err(CheckpointError::ConversationDrift)
+            ));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before_denial,
+                "hash-only denial must never rewrite old evidence"
+            );
+            let done = message("assistant", "Legacy continuation verified.");
+            let mut verified = reopened
+                .begin_full(
+                    "hermes",
+                    "owner",
+                    "key",
+                    &[user.clone(), original, result.clone()],
+                    false,
+                )
+                .unwrap();
+            verified.mark_upstream_started().unwrap();
+            drop(verified);
+            assert!(matches!(
+                reopened.begin_full(
+                    "hermes",
+                    "owner",
+                    "key",
+                    &[user.clone(), escaped.clone(), result.clone()],
+                    false
+                ),
+                Err(CheckpointError::RecoveryRequired)
+            ));
+            reopened
+                .begin_full_recovery(
+                    "hermes",
+                    "owner",
+                    "key",
+                    &[user.clone(), escaped.clone(), result.clone()],
+                    false,
+                )
+                .unwrap()
+                .accept(binding, std::slice::from_ref(&done))
+                .unwrap();
+            let upgraded = reopened
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            assert_eq!(&upgraded.message_digests[..saved_raw.len()], saved_raw);
+            assert_eq!(&upgraded.hash_chain[..saved_chain.len()], saved_chain);
+            drop(reopened);
+            let restarted = CheckpointStore::open(&path).unwrap();
+            let resumed = restarted
+                .begin_full(
+                    "hermes",
+                    "owner",
+                    "key",
+                    &[
+                        user,
+                        escaped,
+                        result,
+                        done,
+                        message("user", "Next synthetic request."),
+                    ],
+                    false,
+                )
+                .unwrap();
+            assert_eq!(resumed.outbound.len(), 1);
+        }
+    }
+
+    #[test]
+    fn v2_ledger_restart_preserves_legacy_digests_and_replay_protection() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("v2-checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let user = message("user", "Synthetic legacy ledger.");
+        let mut calls = message("assistant", "");
+        for id in ["completed", "pending"] {
+            calls.tool_calls.push(json!({
+                "id":id, "type":"function",
+                "function":{"name":id,"arguments":r#"{"scale":1230.0}"#}
+            }));
+        }
+        let mut result = message("tool", "ok");
+        result.tool_call_id = "completed".into();
+        // v2 hashed the Value serialization {"scale":1230.0}, not the new
+        // strict representation {"scale":123e1}. Keep its exact wire shape.
+        let old_digest = "679ac7600d70ae4ec9cc71ae3f181e400f58415cc6a070afbf48eb88ec508293";
+        let evidence = |id: &str, complete: bool| {
+            json!({
+                "id":id, "name":id, "arguments_digest":old_digest,
+                "result_length":if complete { 2 } else { 0 },
+                "result_digest":if complete { hex(&Sha256::digest(b"ok")) } else { String::new() },
+                "failed":false, "has_result":complete,
+                "result_status":if complete { "success" } else { "unknown" }
+            })
+        };
+        let ledger: AgentLedger = serde_json::from_value(json!({
+            "completed":[evidence("completed", true)],
+            "pending":[evidence("pending", false)],
+            "tool_rounds":1, "repeated_call":false, "repeated_failure":false
+        }))
+        .unwrap();
+        let binding = Binding {
+            conversation_id: "c".into(),
+            session_id: "s".into(),
+        };
+        store
+            .begin_full("hermes", "owner", "key", std::slice::from_ref(&user), false)
+            .unwrap()
+            .accept_with_ledger(binding.clone(), &[calls.clone(), result.clone()], ledger)
+            .unwrap();
+        let mut record = store
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        record.message_identities.clear();
+        record.ledger_mac = record_ledger_mac(&store.integrity_key, &record).unwrap();
+        let bytes = serde_json::to_vec(&CheckpointFile {
+            schema: PREVIOUS_SCHEMA.into(),
+            records: vec![record],
+        })
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("arguments_version"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("messageIdentities"));
+        std::fs::write(&path, bytes).unwrap();
+        drop(store);
+
+        let reopened = CheckpointStore::open(&path).unwrap();
+        let turn = reopened
+            .begin_full("hermes", "owner", "key", &[user, calls, result], false)
+            .unwrap();
+        let before = serde_json::to_value(&turn.prior_ledger).unwrap();
+        for (name, reason) in [
+            (
+                "completed",
+                crate::agent_ledger::SuppressionReason::CompletedNotAuthorizedReadback,
+            ),
+            (
+                "pending",
+                crate::agent_ledger::SuppressionReason::PendingSameCall,
+            ),
+        ] {
+            let filtered = turn.prior_ledger.filter_known_calls(
+                vec![crate::tool_calls::DetectedToolCall {
+                    id: format!("new-{name}"),
+                    kind: "function".into(),
+                    function: json!({"name":name,"arguments":r#"{ "scale": 1.2300e3 }"#}),
+                }],
+                |_| false,
+            );
+            assert!(filtered.calls.is_empty());
+            assert_eq!(filtered.suppression_details[0].blocking_reason, reason);
+        }
+        let prior = turn.prior_ledger.clone();
+        turn.accept_with_ledger(binding, &[], prior).unwrap();
+        drop(reopened);
+        let restarted = CheckpointStore::open(&path).unwrap();
+        let state = restarted.state.lock().unwrap();
+        let after =
+            serde_json::to_value(&state.records.values().next().unwrap().tool_ledger).unwrap();
+        assert_eq!(
+            before, after,
+            "continuation must preserve historical ledger evidence"
+        );
+        assert_eq!(after["completed"][0]["arguments_digest"], old_digest);
+        assert_eq!(after["pending"][0]["arguments_digest"], old_digest);
+    }
+
+    #[test]
+    fn comparison_identity_is_authenticated_not_a_mutable_bypass() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        store
+            .begin_full(
+                "hermes",
+                "owner",
+                "key",
+                &[message("user", "original")],
+                false,
+            )
+            .unwrap()
+            .accept(
+                Binding {
+                    conversation_id: "c".into(),
+                    session_id: "s".into(),
+                },
+                &[message("assistant", "done")],
+            )
+            .unwrap();
+        drop(store);
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["records"][0]["messageIdentities"][0] = serde_json::json!("0".repeat(64));
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(matches!(
+            CheckpointStore::open(&path),
+            Err(CheckpointError::Persistence(_))
+        ));
     }
 
     #[test]
@@ -2872,6 +3265,8 @@ mod tests {
         file["schema"] = Value::String(LEGACY_SCHEMA.to_owned());
         for field in [
             "inFlightMessageDigests",
+            "messageIdentities",
+            "inFlightMessageIdentities",
             "inFlightUpstreamStarted",
             "terminalUnknown",
             "ledgerMac",
@@ -2930,6 +3325,14 @@ mod tests {
         let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         file["schema"] = Value::String(LEGACY_SCHEMA.to_owned());
         file["records"][0]["ledgerMac"] = Value::String(String::new());
+        file["records"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("messageIdentities");
+        file["records"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("inFlightMessageIdentities");
         let evidence = file["records"][0]["toolLedger"]["completed"][0]
             .as_object_mut()
             .unwrap();
@@ -3020,6 +3423,11 @@ mod tests {
         file["schema"] = Value::String(LEGACY_SCHEMA.to_owned());
         for record in file["records"].as_array_mut().unwrap() {
             record["ledgerMac"] = Value::String(String::new());
+            record.as_object_mut().unwrap().remove("messageIdentities");
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("inFlightMessageIdentities");
             for evidence in record["toolLedger"]["completed"].as_array_mut().unwrap() {
                 let evidence = evidence.as_object_mut().unwrap();
                 evidence.remove("result_status");

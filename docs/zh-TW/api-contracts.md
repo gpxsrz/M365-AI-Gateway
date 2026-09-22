@@ -196,7 +196,9 @@ Checkpoint 的目標是安全續接 transport，不是保存 Agent lifecycle。
 - 同一 checkpoint 同時只允許一個 recovery attempt；
 - destructive checkpoint operation 遇到 unresolved in-flight work 會 fail closed。
 
-Current durable schema 是 `wp6-transport-checkpoints/rust-v2`，包含完整性 binding。Legacy `rust-v1` 只做保守 migration；無法證明的 legacy result 會降級成 unknown，不會被補成成功。
+Current durable schema 是 `wp6-transport-checkpoints/rust-v3`。既有 raw message digest/hash-chain 保留作鑑識；完整性 binding 同時保護新增的 arguments comparison identity。比較共用 strict JSON canonicalization，只忽略空白、object key order 與合法 escape 表示差異，不做 Unicode normalization 或有損數字轉換，也不合併 integer/float。Duplicate decoded keys、非法 JSON/surrogate 與 trailing garbage 都會拒絕。
+
+Legacy `rust-v1`／`rust-v2` 若只有 raw hash，仍須 raw 相符才能續接，不會倒推 semantic identity；只有經證明的後續 continuation 才能保存新 identity。`rust-v1` 無法證明的 legacy result 仍降級成 unknown，不會補成成功。這不改變 in-flight、recovery 或工具重播授權。
 
 ### Admin recovery
 

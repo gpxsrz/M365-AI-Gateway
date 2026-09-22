@@ -5,6 +5,9 @@ use sha2::{Digest, Sha256};
 
 use crate::chathub::Tool;
 
+mod arguments;
+pub(crate) use arguments::canonical_arguments;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DetectedToolCall {
     pub id: String,
@@ -106,8 +109,7 @@ pub(crate) fn is_strict_correction(text: &str, expected_tool: &str) -> bool {
     let Some((name, arguments)) = single_tool_fence(text) else {
         return false;
     };
-    name == expected_tool
-        && serde_json::from_str::<Value>(arguments.trim()).is_ok_and(|value| value.is_object())
+    name == expected_tool && canonical_arguments(arguments.trim()).is_ok()
 }
 
 fn single_tool_fence(text: &str) -> Option<(&str, &str)> {
@@ -557,13 +559,25 @@ struct JsonStringScan {
     illegal_escape_offset: Option<usize>,
 }
 
+fn argument_round_trip_is_lossless(raw: &str, value: &Value) -> bool {
+    let Ok(original) = canonical_arguments(raw) else {
+        return false;
+    };
+    serde_json::to_string(value)
+        .ok()
+        .and_then(|encoded| canonical_arguments(&encoded).ok())
+        .is_some_and(|encoded| encoded == original)
+}
+
 fn parse_object_arguments(raw: &str) -> ArgumentParseOutcome {
     let raw = raw.trim();
     match serde_json::from_str::<Value>(raw) {
-        Ok(value) if value.is_object() => ArgumentParseOutcome::Success {
-            value,
-            class: ToolRejectionClass::StrictJsonValid,
-        },
+        Ok(value) if argument_round_trip_is_lossless(raw, &value) => {
+            ArgumentParseOutcome::Success {
+                value,
+                class: ToolRejectionClass::StrictJsonValid,
+            }
+        }
         Ok(_) => ArgumentParseOutcome::Failure {
             class: ToolRejectionClass::Other,
             offset: None,
@@ -572,10 +586,12 @@ fn parse_object_arguments(raw: &str) -> ArgumentParseOutcome {
             let scan = scan_json_string(raw);
             if scan.changed {
                 match serde_json::from_str::<Value>(&scan.repaired) {
-                    Ok(value) if value.is_object() => ArgumentParseOutcome::Success {
-                        value,
-                        class: ToolRejectionClass::LiteralControlCharInsideJsonString,
-                    },
+                    Ok(value) if argument_round_trip_is_lossless(&scan.repaired, &value) => {
+                        ArgumentParseOutcome::Success {
+                            value,
+                            class: ToolRejectionClass::LiteralControlCharInsideJsonString,
+                        }
+                    }
                     Ok(_) => ArgumentParseOutcome::Failure {
                         class: ToolRejectionClass::Other,
                         offset: Some(parse_error_offset(raw, &error)),

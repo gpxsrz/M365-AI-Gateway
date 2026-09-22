@@ -283,6 +283,7 @@ async fn execute_chat_request_inner(
                 error,
                 crate::checkpoint::CheckpointError::UnknownCursor
                     | crate::checkpoint::CheckpointError::KeyRequired
+                    | crate::checkpoint::CheckpointError::InvalidArguments
             ) {
                 StatusCode::BAD_REQUEST
             } else {
@@ -7402,6 +7403,117 @@ mod tests {
         }
     }
 
+    // Requires the separately installed, pinned upstream fixture. CI invokes
+    // this exact test with --ignored; absence is an error, never a skip/PASS.
+    #[tokio::test]
+    #[ignore = "mandatory pinned-Hermes CI gate executes this exact test"]
+    async fn hermes_checkpoint_sdk_identity_real_chain() {
+        let agent_root = std::path::PathBuf::from(
+            std::env::var("HERMES_AGENT_ROOT")
+                .expect("HERMES_AGENT_ROOT is required for the real SDK gate"),
+        );
+        let python = agent_root.join(".venv/bin/python");
+        assert!(
+            python.is_file(),
+            "pinned Hermes Python environment is required"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture_中文😀.txt");
+        let read = format!(
+            "```read_file\n{}\n```",
+            json!({"path":path,"offset":1,"limit":8})
+        );
+        let write = format!(
+            "```write_file\n{}\n```",
+            json!({"path":path,"content":"modified 中文😀\n"})
+        );
+        let (websocket_base, payloads, upstream) = syntax_live_upstream_server(vec![
+            syntax_live_reply(&read),
+            syntax_live_reply(&write),
+            syntax_live_reply(&read),
+            syntax_live_reply("IDENTITY_SDK_COMPLETE"),
+        ])
+        .await;
+        let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+            Arc::new(EmptyTransport),
+            oauth(),
+            root.path().to_owned(),
+            None,
+        );
+        let live = LiveChatHub::new_for_test(
+            gateway.settings.clone(),
+            syntax_prepare_attachments,
+            websocket_base,
+        );
+        Arc::get_mut(&mut gateway).unwrap().chat = Arc::new(live);
+        let mut read_function = json!({"name":"read_file","description":"Read a local file without changing it.",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}});
+        signed_read_only_contract(&mut read_function);
+        let tools = json!([
+            {"type":"function","function":read_function},
+            {"type":"function","function":{"name":"write_file","description":"Write a local file.",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}
+        ]);
+        std::fs::write(
+            root.path().join("sdk-tools.json"),
+            serde_json::to_vec(&tools).unwrap(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Gateway::router(Arc::clone(&gateway));
+        let http = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let output = tokio::process::Command::new(python)
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("integrations/hermes/checkpoint_argument_identity.py"),
+            )
+            .env("HERMES_AGENT_ROOT", &agent_root)
+            .env("M365_IDENTITY_FIXTURE_ROOT", root.path())
+            .env("M365_IDENTITY_FIXTURE_KEY", raw_key)
+            .env(
+                "M365_IDENTITY_FIXTURE_URL",
+                format!("http://{address}/hermes/v1"),
+            )
+            .output()
+            .await
+            .unwrap();
+        http.abort();
+        if !output.status.success() {
+            upstream.abort();
+        }
+        assert!(
+            output.status.success(),
+            "real Hermes/SDK gate failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        upstream.await.unwrap();
+        assert_eq!(
+            payloads.lock().unwrap().len(),
+            4,
+            "seven rejected histories must not reach upstream"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("\"result\": \"PASS\""));
+        let durable: Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("transport-checkpoints.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable["records"].as_array().unwrap().len(), 1);
+        assert_ne!(durable["records"][0]["inFlight"], Value::Bool(true));
+        assert_eq!(durable["records"][0]["acceptedCount"], 8);
+        assert_eq!(
+            CheckpointStore::open(root.path().join("transport-checkpoints.json"))
+                .unwrap()
+                .list()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     fn syntax_correction_body(stream: bool) -> Value {
         json!({
             "model":"gpt-5.6-reasoning",
@@ -12510,10 +12622,29 @@ mod tests {
                 }
                 "assistant_tool" => {
                     let call_id = format!("third-round-call-{call_index:02}");
-                    let arguments = repeat_to_utf16(
-                        &format!("argument-{call_index} {seed} {{}} "),
-                        argument_units[call_index].as_u64().unwrap() as usize,
-                    );
+                    let target = argument_units[call_index].as_u64().unwrap() as usize;
+                    // Preserve the fixture's exact size and escape-heavy seed,
+                    // while constructing legal arguments for checkpoint admission.
+                    let mut remaining = target - utf16_units(r#"{"path":""}"#);
+                    let mut path = String::new();
+                    for character in format!("argument-{call_index} {seed} {{}} ")
+                        .chars()
+                        .cycle()
+                    {
+                        let cost = utf16_units(&serde_json::to_string(&character).unwrap()) - 2;
+                        if cost > remaining {
+                            break;
+                        }
+                        path.push(character);
+                        remaining -= cost;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    path.push_str(&"a".repeat(remaining));
+                    let arguments = serde_json::to_string(&json!({"path":path})).unwrap();
+                    assert_eq!(utf16_units(&arguments), target);
+                    assert!(crate::tool_calls::canonical_arguments(&arguments).is_ok());
                     messages.push(json!({
                         "role":"assistant",
                         "content":null,
@@ -12835,8 +12966,8 @@ mod tests {
             &Value::String("auto".to_owned()),
             1,
         ));
-        assert_eq!(source_units, 166_465);
-        assert_eq!(initial_message_text_units, 245_400);
+        assert_eq!(source_units, 169_945);
+        assert_eq!(initial_message_text_units, 248_880);
         let measurement_request = ChatRequest {
             text: flattened.text.clone(),
             tone: "Gpt_5_6_Reasoning".to_owned(),
@@ -12849,7 +12980,7 @@ mod tests {
             crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(
                 &measurement_request,
             );
-        assert_eq!(initial_payload_units, 369_501);
+        assert_eq!(initial_payload_units, 381_333);
 
         let (oauth, token_server) = oauth_with_graph_token_server().await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -12904,10 +13035,10 @@ mod tests {
         assert_eq!(live[0]["status"], 200);
         assert_eq!(live[0]["spillDecision"], "performed");
         assert_eq!(live[0]["spillReason"], "full_context_document");
-        assert_eq!(live[0]["messageTextBeforeUtf16"], 245_400);
+        assert_eq!(live[0]["messageTextBeforeUtf16"], 248_880);
         assert_eq!(live[0]["preliminaryMessageTextAfterUtf16"], 80_955);
         assert_eq!(live[0]["messageTextAfterUtf16"], 80_955);
-        assert_eq!(live[0]["wireBeforeUtf16"], 369_501);
+        assert_eq!(live[0]["wireBeforeUtf16"], 381_333);
         assert_eq!(live[0]["preliminaryWireAfterUtf16"], 182_444);
         assert_eq!(live[0]["wireAfterUtf16"], 181_470);
         let encoded = request.attachments[0]
@@ -13032,14 +13163,14 @@ mod tests {
             crate::chathub::outbound_payload_utf16_units_with_prepared_reservation(
                 &measurement_request,
             );
-        assert_eq!(source_units, if error_state { 193_517 } else { 193_518 });
+        assert_eq!(source_units, if error_state { 196_997 } else { 196_998 });
         assert_eq!(
             initial_message_text_units,
-            if error_state { 272_452 } else { 272_453 }
+            if error_state { 275_932 } else { 275_933 }
         );
         assert_eq!(
             initial_payload_units,
-            if error_state { 398_743 } else { 398_744 }
+            if error_state { 410_575 } else { 410_576 }
         );
         assert!(initial_message_text_units > 128_000);
         assert!(initial_payload_units > initial_message_text_units);

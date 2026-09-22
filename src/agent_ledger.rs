@@ -20,6 +20,8 @@ pub(crate) struct ToolEvidence {
     id: String,
     name: String,
     arguments_digest: String,
+    #[serde(default, skip_serializing_if = "is_legacy_arguments")]
+    arguments_version: u8,
     result_length: usize,
     result_digest: String,
     failed: bool,
@@ -35,6 +37,8 @@ struct PersistedToolEvidence {
     id: String,
     name: String,
     arguments_digest: String,
+    #[serde(default)]
+    arguments_version: u8,
     result_length: usize,
     result_digest: String,
     failed: bool,
@@ -54,6 +58,7 @@ impl<'de> Deserialize<'de> for ToolEvidence {
             id: persisted.id,
             name: persisted.name,
             arguments_digest: persisted.arguments_digest,
+            arguments_version: persisted.arguments_version,
             result_length: persisted.result_length,
             result_digest: persisted.result_digest,
             failed: persisted.failed,
@@ -65,6 +70,17 @@ impl<'de> Deserialize<'de> for ToolEvidence {
 }
 
 impl ToolEvidence {
+    fn matches_arguments(&self, name: &str, current: &str, legacy: &str) -> bool {
+        self.name == name
+            && is_digest(&self.arguments_digest)
+            && self.arguments_digest
+                == if self.arguments_version == 0 {
+                    legacy
+                } else {
+                    current
+                }
+    }
+
     fn result_status(&self) -> ToolResultStatus {
         if !self.has_result || (self.failed && self.result_status == ToolResultStatus::Success) {
             ToolResultStatus::Unknown
@@ -78,6 +94,9 @@ impl ToolEvidence {
     }
 
     fn is_valid_persisted_with_legacy_statusless(&self, allow_legacy_statusless: bool) -> bool {
+        if self.arguments_version > 1 {
+            return false;
+        }
         if !self.status_was_present && !allow_legacy_statusless {
             return false;
         }
@@ -113,6 +132,7 @@ impl ToolEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SuppressionReason {
+    InvalidArguments,
     SameBatchDuplicate,
     PendingSameCall,
     CompletedNotAuthorizedReadback,
@@ -209,31 +229,44 @@ impl AgentLedger {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let argument_digest = arguments_digest(arguments);
+            if !is_digest(&argument_digest) {
+                suppression_details.push(SuppressionDetail {
+                    registered_tool_name: name.to_owned(),
+                    candidate_ordinal: candidate_ordinal + 1,
+                    arguments_digest: String::new(),
+                    matched_prior_call_id: None,
+                    result_received: false,
+                    result_classification: ToolResultStatus::Unknown,
+                    blocking_reason: SuppressionReason::InvalidArguments,
+                    candidate_not_dispatched: true,
+                });
+                continue;
+            }
+            // Historical digests remain unchanged. This compatibility comparison
+            // can retain an old replay prohibition; new evidence uses only v1.
+            let legacy_digest = legacy_arguments_digest(arguments);
+            let matches = |evidence: &&ToolEvidence| {
+                evidence.matches_arguments(name, &argument_digest, &legacy_digest)
+            };
             let identity = format!("{name}\0{argument_digest}");
             let duplicate_in_batch = !batch.insert(identity);
             // A pending effect is never safe to replay. A completed read-only
             // effect may be a new observation, but only its caller contract
             // can authorize that distinction.
-            let duplicate_pending = self.pending.iter().any(|evidence| {
-                is_digest(&evidence.arguments_digest)
-                    && evidence.name == name
-                    && evidence.arguments_digest == argument_digest
-            });
-            let duplicate_completed = self.completed.iter().any(|evidence| {
-                is_digest(&evidence.arguments_digest)
-                    && evidence.name == name
-                    && evidence.arguments_digest == argument_digest
-            });
+            let duplicate_pending = self
+                .pending
+                .iter()
+                .any(|evidence| evidence.matches_arguments(name, &argument_digest, &legacy_digest));
+            let duplicate_completed = self
+                .completed
+                .iter()
+                .any(|evidence| evidence.matches_arguments(name, &argument_digest, &legacy_digest));
             let completed_contract_allows = duplicate_completed && allow_completed_reissue(name);
             let completed_result_verified = duplicate_completed
                 && self
                     .completed
                     .iter()
-                    .filter(|evidence| {
-                        is_digest(&evidence.arguments_digest)
-                            && evidence.name == name
-                            && evidence.arguments_digest == argument_digest
-                    })
+                    .filter(matches)
                     .all(|evidence| evidence.result_status() == ToolResultStatus::Success);
             let completed_reissue_allowed = completed_contract_allows && completed_result_verified;
             let duplicate = duplicate_in_batch
@@ -255,30 +288,16 @@ impl AgentLedger {
                 SuppressionReason::CompletedResultNotVerified
             };
             let matched = if duplicate_pending {
-                self.pending.iter().find(|evidence| {
-                    is_digest(&evidence.arguments_digest)
-                        && evidence.name == name
-                        && evidence.arguments_digest == argument_digest
-                })
+                self.pending.iter().find(matches)
             } else {
                 self.completed
                     .iter()
-                    .filter(|evidence| {
-                        is_digest(&evidence.arguments_digest)
-                            && evidence.name == name
-                            && evidence.arguments_digest == argument_digest
-                    })
+                    .filter(matches)
                     .find(|evidence| {
                         blocking_reason == SuppressionReason::CompletedResultNotVerified
                             && evidence.result_status() != ToolResultStatus::Success
                     })
-                    .or_else(|| {
-                        self.completed.iter().find(|evidence| {
-                            is_digest(&evidence.arguments_digest)
-                                && evidence.name == name
-                                && evidence.arguments_digest == argument_digest
-                        })
-                    })
+                    .or_else(|| self.completed.iter().find(matches))
             };
             suppression_details.push(SuppressionDetail {
                 registered_tool_name: name.to_owned(),
@@ -480,6 +499,7 @@ pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -
                             id: id.to_owned(),
                             name: name.to_owned(),
                             arguments_digest: arguments_digest(arguments),
+                            arguments_version: 1,
                             ..ToolEvidence::default()
                         },
                     );
@@ -707,6 +727,17 @@ fn is_successful_read_file_result(object: &serde_json::Map<String, Value>) -> bo
 }
 
 fn arguments_digest(arguments: &str) -> String {
+    crate::tool_calls::canonical_arguments(arguments)
+        .map(|canonical| digest(canonical.as_bytes()))
+        .unwrap_or_default()
+}
+
+fn is_legacy_arguments(version: &u8) -> bool {
+    *version == 0
+}
+
+// Read compatibility only. Never create a new evidence identity with this parser.
+fn legacy_arguments_digest(arguments: &str) -> String {
     let canonical = serde_json::from_str::<Value>(arguments.trim())
         .ok()
         .and_then(|value| serde_json::to_string(&value).ok())

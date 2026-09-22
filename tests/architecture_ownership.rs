@@ -15,6 +15,7 @@ fn checkpoint_error_surface(error: &CheckpointError) -> &'static str {
         CheckpointError::Stale => "stale",
         CheckpointError::RecoveryRequired => "recovery_required",
         CheckpointError::ConversationDrift => "conversation_drift",
+        CheckpointError::InvalidArguments => "invalid_arguments",
         CheckpointError::Persistence(_) => "persistence",
     }
 }

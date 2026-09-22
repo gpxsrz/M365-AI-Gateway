@@ -196,7 +196,9 @@ Core invariants:
 - only one recovery attempt may own a checkpoint at a time;
 - destructive checkpoint operations fail closed while unresolved in-flight work exists.
 
-The current durable schema is `wp6-transport-checkpoints/rust-v2` and includes integrity binding. Legacy `rust-v1` records migrate conservatively; an unprovable legacy result is downgraded to unknown instead of being invented as success.
+The current durable schema is `wp6-transport-checkpoints/rust-v3`. Existing raw message digests and hash chains remain forensic evidence; integrity binding also protects the added arguments comparison identity. Comparison uses shared strict JSON canonicalization, ignoring whitespace, object key order, and equivalent legal escapes without Unicode normalization, lossy numeric conversion, or merging integers with floats. Duplicate decoded keys, invalid JSON or surrogates, and trailing garbage are rejected.
+
+Legacy `rust-v1` and `rust-v2` records with only raw hashes still require a raw match to continue; semantic identity is never inferred from a hash. New identity may be saved only through a subsequently proven continuation. Unprovable `rust-v1` results remain unknown rather than being invented as success. In-flight, recovery, and tool replay authorization remain unchanged.
 
 ### Admin recovery
 
