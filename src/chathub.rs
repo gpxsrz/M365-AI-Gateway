@@ -619,6 +619,7 @@ struct ImageOrigin {
     candidate_node_type_class: NativeEffectImageCandidateNodeTypeClass,
     container_class: Option<NativeEffectImageContainerClass>,
     message_type_class: Option<NativeEffectMessageTypeClass>,
+    known_message_type: Option<&'static str>,
     content_origin_class: Option<NativeEffectImageContentOriginClass>,
 }
 
@@ -631,6 +632,7 @@ struct ImageCollection {
 struct ImageTraversalContext {
     container_class: Option<NativeEffectImageContainerClass>,
     message_type_class: Option<NativeEffectMessageTypeClass>,
+    known_message_type: Option<&'static str>,
     content_origin_class: Option<NativeEffectImageContentOriginClass>,
 }
 
@@ -641,6 +643,7 @@ impl ImageTraversalContext {
                 NativeEffectMessageTypeClass::Unknown,
                 native_effect_message_type_class,
             ));
+            self.known_message_type = value.as_str().and_then(known_message_type);
         }
         if let Some(value) = object.get("contentOrigin") {
             self.content_origin_class = Some(value.as_str().map_or(
@@ -674,6 +677,7 @@ pub(crate) struct NativeEffectImageDiagnostic {
     candidate_node_type_class: NativeEffectImageCandidateNodeTypeClass,
     container_class: Option<NativeEffectImageContainerClass>,
     message_type_class: Option<NativeEffectMessageTypeClass>,
+    known_message_type: Option<&'static str>,
     content_origin_class: Option<NativeEffectImageContentOriginClass>,
     counterfactual_eligible: bool,
     counterfactual_reason: Option<CorrectionEligibilityReason>,
@@ -683,7 +687,7 @@ pub(crate) struct NativeEffectImageDiagnostic {
 
 impl NativeEffectImageDiagnostic {
     pub(crate) fn valid(&self) -> bool {
-        if self.schema != "m365-native-effect-image-diagnostic/v2"
+        if self.schema != "m365-native-effect-image-diagnostic/v3"
             || self.projection_stage != CorrectionIneligibilityStage::InitialResponse
             || !(1..=32).contains(&self.image_count)
         {
@@ -712,7 +716,16 @@ impl NativeEffectImageDiagnostic {
                 && self.counterfactual_branch.is_none()
                 && self.counterfactual_predicate_field.is_none()
         };
-        valid_source && valid_counterfactual
+        let valid_known_message_type = match (self.message_type_class, self.known_message_type) {
+            (None, None)
+            | (
+                Some(NativeEffectMessageTypeClass::Empty | NativeEffectMessageTypeClass::Unknown),
+                None,
+            ) => true,
+            (Some(class), Some(value)) => native_effect_message_type_class(value) == class,
+            _ => false,
+        };
+        valid_source && valid_counterfactual && valid_known_message_type
     }
 }
 
@@ -1011,6 +1024,13 @@ fn native_effect_message_type_class(value: &str) -> NativeEffectMessageTypeClass
         value if ALLOWED_MESSAGE_TYPES.contains(&value) => NativeEffectMessageTypeClass::OtherKnown,
         _ => NativeEffectMessageTypeClass::Unknown,
     }
+}
+
+fn known_message_type(value: &str) -> Option<&'static str> {
+    ALLOWED_MESSAGE_TYPES
+        .iter()
+        .copied()
+        .find(|known| *known == value)
 }
 
 fn native_effect_image_content_origin_class(value: &str) -> NativeEffectImageContentOriginClass {
@@ -1440,7 +1460,7 @@ impl ChatResult {
             }
         };
         let diagnostic = NativeEffectImageDiagnostic {
-            schema: "m365-native-effect-image-diagnostic/v2".to_owned(),
+            schema: "m365-native-effect-image-diagnostic/v3".to_owned(),
             projection_stage: CorrectionIneligibilityStage::InitialResponse,
             source_class: origin.source_class,
             image_count: self.images.len(),
@@ -1450,6 +1470,7 @@ impl ChatResult {
             candidate_node_type_class: origin.candidate_node_type_class,
             container_class: origin.container_class,
             message_type_class: origin.message_type_class,
+            known_message_type: origin.known_message_type,
             content_origin_class: origin.content_origin_class,
             counterfactual_eligible,
             counterfactual_reason,
@@ -3083,6 +3104,7 @@ fn collect_image_urls(
                                 native_effect_image_candidate_node_type_class(object),
                             container_class: context.container_class,
                             message_type_class: context.message_type_class,
+                            known_message_type: context.known_message_type,
                             content_origin_class: context.content_origin_class,
                         });
                     }
@@ -3902,6 +3924,53 @@ mod tests {
             )
             .unwrap();
             assert_eq!(diagnostic["candidateNodeTypeClass"], expected);
+            assert_eq!(diagnostic["knownMessageType"], "SemanticSerp");
+            let encoded = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!encoded.contains(PRIVATE_URL));
+            assert!(!encoded.contains(PRIVATE_TEXT));
+        }
+
+        for (message_type, expected) in [
+            ("GenerateGraphicArt", Some("GenerateGraphicArt")),
+            ("RenderCardRequest", Some("RenderCardRequest")),
+            (PRIVATE_TEXT, None),
+        ] {
+            let result = text_only_loopback(vec![
+                json!({
+                    "type": 1,
+                    "target": "update",
+                    "arguments": [{"messages": [{
+                        "author": "bot",
+                        "text": "display-only metadata",
+                        "messageType": message_type,
+                        "contentType": "",
+                        "contentOrigin": "DeepLeo",
+                        "adaptiveCards": [{
+                            "type": "AdaptiveCard",
+                            "version": "1.5",
+                            "body": [{"type": "Container", "items": [{
+                                "type": "Image",
+                                "url": PRIVATE_URL
+                            }]}]
+                        }]
+                    }]}]
+                }),
+                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+            ])
+            .await
+            .unwrap();
+            let diagnostic = serde_json::to_value(
+                result
+                    .native_effect_image_diagnostic()
+                    .expect("image rejection must retain a content-free diagnostic"),
+            )
+            .unwrap();
+            assert_eq!(
+                diagnostic["knownMessageType"].as_str(),
+                expected,
+                "messageType={message_type}"
+            );
             let encoded = serde_json::to_string(&diagnostic).unwrap();
             assert!(!encoded.contains(PRIVATE_URL));
             assert!(!encoded.contains(PRIVATE_TEXT));
@@ -3951,6 +4020,7 @@ mod tests {
         assert_eq!(passive["candidateNodeTypeClass"], "absent");
         assert_eq!(passive["containerClass"], "source_attributions");
         assert_eq!(passive["messageTypeClass"], "chat");
+        assert_eq!(passive["knownMessageType"], "Chat");
         assert_eq!(passive["contentOriginClass"], "deep_leo");
         assert_eq!(passive["counterfactualEligible"], false);
         assert_eq!(passive["counterfactualReason"], "unknown_event_or_field");
@@ -3981,6 +4051,7 @@ mod tests {
         assert_eq!(native["candidateNodeTypeClass"], "invalid");
         assert!(native["containerClass"].is_null());
         assert!(native["messageTypeClass"].is_null());
+        assert!(native["knownMessageType"].is_null());
         assert!(native["contentOriginClass"].is_null());
         assert_eq!(native["counterfactualEligible"], false);
         assert_eq!(native["counterfactualReason"], "native_effect");
@@ -4038,22 +4109,23 @@ mod tests {
                 .expect("raw-result image rejection must retain provenance"),
         )
         .unwrap();
-        assert_eq!(raw_result.as_object().unwrap().len(), 15);
+        assert_eq!(raw_result.as_object().unwrap().len(), 16);
         assert_eq!(raw_result["sourceClass"], "raw_result");
         assert!(raw_result["eventIndex"].is_null());
         assert!(raw_result["collectorEventSha256"].is_null());
         assert_eq!(raw_result["candidateFieldClass"], "image_url");
         assert_eq!(raw_result["candidateNodeTypeClass"], "absent");
+        assert!(raw_result["knownMessageType"].is_null());
         assert_eq!(raw_result["counterfactualEligible"], false);
         assert_eq!(raw_result["counterfactualReason"], "metadata_type_invalid");
         assert!(raw_result["counterfactualBranch"].is_null());
         assert!(raw_result["counterfactualPredicateField"].is_null());
 
         for diagnostic in [&passive, &native, &otherwise_eligible] {
-            assert_eq!(diagnostic.as_object().unwrap().len(), 15);
+            assert_eq!(diagnostic.as_object().unwrap().len(), 16);
             assert_eq!(
                 diagnostic["schema"],
-                "m365-native-effect-image-diagnostic/v2"
+                "m365-native-effect-image-diagnostic/v3"
             );
             assert_eq!(diagnostic["projectionStage"], "initial_response");
             assert_eq!(diagnostic["imageCount"], 1);

@@ -2316,12 +2316,13 @@ mod tests {
         assert_eq!(live["toolCorrectionNativeEffectWitness"], witness_value);
         assert_eq!(
             live["toolCorrectionNativeEffectImageDiagnostic"]["schema"],
-            "m365-native-effect-image-diagnostic/v2"
+            "m365-native-effect-image-diagnostic/v3"
         );
         assert_eq!(
             live["toolCorrectionNativeEffectImageDiagnostic"]["candidateNodeTypeClass"],
             "invalid"
         );
+        assert!(live["toolCorrectionNativeEffectImageDiagnostic"]["knownMessageType"].is_null());
         assert_eq!(
             live["toolCorrectionNativeEffectImageDiagnostic"]["counterfactualBranch"],
             "active_event_type"
