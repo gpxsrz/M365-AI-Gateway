@@ -8013,13 +8013,14 @@ mod tests {
                     assert_eq!(
                         record["toolCorrectionNativeEffectImageDiagnostic"],
                         json!({
-                            "schema": "m365-native-effect-image-diagnostic/v1",
+                            "schema": "m365-native-effect-image-diagnostic/v2",
                             "projectionStage": "initial_response",
                             "sourceClass": "event",
                             "imageCount": 1,
                             "eventIndex": 0,
                             "collectorEventSha256": collector_event_sha256,
                             "candidateFieldClass": "thumbnail_url",
+                            "candidateNodeTypeClass": "absent",
                             "containerClass": "source_attributions",
                             "messageTypeClass": "chat",
                             "contentOriginClass": "deep_leo",

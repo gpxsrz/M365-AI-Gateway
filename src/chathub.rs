@@ -577,6 +577,16 @@ enum NativeEffectImageCandidateFieldClass {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+enum NativeEffectImageCandidateNodeTypeClass {
+    Absent,
+    Invalid,
+    Image,
+    Media,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum NativeEffectImageContainerClass {
     Messages,
     SourceAttributions,
@@ -606,6 +616,7 @@ struct ImageOrigin {
     source_class: NativeEffectImageSourceClass,
     event_index: Option<usize>,
     candidate_field_class: NativeEffectImageCandidateFieldClass,
+    candidate_node_type_class: NativeEffectImageCandidateNodeTypeClass,
     container_class: Option<NativeEffectImageContainerClass>,
     message_type_class: Option<NativeEffectMessageTypeClass>,
     content_origin_class: Option<NativeEffectImageContentOriginClass>,
@@ -660,6 +671,7 @@ pub(crate) struct NativeEffectImageDiagnostic {
     event_index: Option<usize>,
     collector_event_sha256: Option<String>,
     candidate_field_class: NativeEffectImageCandidateFieldClass,
+    candidate_node_type_class: NativeEffectImageCandidateNodeTypeClass,
     container_class: Option<NativeEffectImageContainerClass>,
     message_type_class: Option<NativeEffectMessageTypeClass>,
     content_origin_class: Option<NativeEffectImageContentOriginClass>,
@@ -671,7 +683,7 @@ pub(crate) struct NativeEffectImageDiagnostic {
 
 impl NativeEffectImageDiagnostic {
     pub(crate) fn valid(&self) -> bool {
-        if self.schema != "m365-native-effect-image-diagnostic/v1"
+        if self.schema != "m365-native-effect-image-diagnostic/v2"
             || self.projection_stage != CorrectionIneligibilityStage::InitialResponse
             || !(1..=32).contains(&self.image_count)
         {
@@ -1026,6 +1038,22 @@ fn native_effect_image_candidate_field_class(
         "data" => NativeEffectImageCandidateFieldClass::Data,
         _ => return None,
     })
+}
+
+fn native_effect_image_candidate_node_type_class(
+    object: &serde_json::Map<String, Value>,
+) -> NativeEffectImageCandidateNodeTypeClass {
+    let Some(value) = object.get("type") else {
+        return NativeEffectImageCandidateNodeTypeClass::Absent;
+    };
+    let Some(value) = value.as_str() else {
+        return NativeEffectImageCandidateNodeTypeClass::Invalid;
+    };
+    match value {
+        "Image" => NativeEffectImageCandidateNodeTypeClass::Image,
+        "Media" => NativeEffectImageCandidateNodeTypeClass::Media,
+        _ => NativeEffectImageCandidateNodeTypeClass::Other,
+    }
 }
 
 fn native_effect_image_container_class(field: &str) -> Option<NativeEffectImageContainerClass> {
@@ -1412,13 +1440,14 @@ impl ChatResult {
             }
         };
         let diagnostic = NativeEffectImageDiagnostic {
-            schema: "m365-native-effect-image-diagnostic/v1".to_owned(),
+            schema: "m365-native-effect-image-diagnostic/v2".to_owned(),
             projection_stage: CorrectionIneligibilityStage::InitialResponse,
             source_class: origin.source_class,
             image_count: self.images.len(),
             event_index: origin.event_index,
             collector_event_sha256,
             candidate_field_class: origin.candidate_field_class,
+            candidate_node_type_class: origin.candidate_node_type_class,
             container_class: origin.container_class,
             message_type_class: origin.message_type_class,
             content_origin_class: origin.content_origin_class,
@@ -3050,6 +3079,8 @@ fn collect_image_urls(
                             source_class,
                             event_index,
                             candidate_field_class,
+                            candidate_node_type_class:
+                                native_effect_image_candidate_node_type_class(object),
                             container_class: context.container_class,
                             message_type_class: context.message_type_class,
                             content_origin_class: context.content_origin_class,
@@ -3830,6 +3861,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_rejection_diagnostic_classifies_candidate_node_type_without_content() {
+        const PRIVATE_URL: &str = "https://private.invalid/image.png";
+        const PRIVATE_TEXT: &str = "PRIVATE_IMAGE_NODE_TYPE_SENTINEL";
+
+        for (node, expected) in [
+            (
+                json!({"type": "TextBlock", "text": PRIVATE_TEXT, "url": PRIVATE_URL}),
+                "other",
+            ),
+            (json!({"type": "Image", "url": PRIVATE_URL}), "image"),
+            (json!({"type": "Media", "url": PRIVATE_URL}), "media"),
+        ] {
+            let result = text_only_loopback(vec![
+                json!({
+                    "type": 1,
+                    "target": "update",
+                    "arguments": [{"messages": [{
+                        "author": "bot",
+                        "text": "display-only metadata",
+                        "messageType": "SemanticSerp",
+                        "contentType": "",
+                        "contentOrigin": "DeepLeo",
+                        "adaptiveCards": [{
+                            "type": "AdaptiveCard",
+                            "version": "1.5",
+                            "body": [{"type": "Container", "items": [node]}]
+                        }]
+                    }]}]
+                }),
+                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+            ])
+            .await
+            .unwrap();
+            let diagnostic = serde_json::to_value(
+                result
+                    .native_effect_image_diagnostic()
+                    .expect("image rejection must retain a content-free diagnostic"),
+            )
+            .unwrap();
+            assert_eq!(diagnostic["candidateNodeTypeClass"], expected);
+            let encoded = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!encoded.contains(PRIVATE_URL));
+            assert!(!encoded.contains(PRIVATE_TEXT));
+        }
+    }
+
+    #[tokio::test]
     async fn image_rejection_diagnostic_distinguishes_passive_thumbnail_from_native_event() {
         const PRIVATE_URL: &str = "https://private.invalid/image.png";
         const PRIVATE_TEXT: &str = "PRIVATE_IMAGE_DIAGNOSTIC_SENTINEL";
@@ -3869,6 +3948,7 @@ mod tests {
         assert_eq!(passive["sourceClass"], "event");
         assert_eq!(passive["eventIndex"], 0);
         assert_eq!(passive["candidateFieldClass"], "thumbnail_url");
+        assert_eq!(passive["candidateNodeTypeClass"], "absent");
         assert_eq!(passive["containerClass"], "source_attributions");
         assert_eq!(passive["messageTypeClass"], "chat");
         assert_eq!(passive["contentOriginClass"], "deep_leo");
@@ -3898,6 +3978,7 @@ mod tests {
         assert_eq!(native["sourceClass"], "event");
         assert_eq!(native["eventIndex"], 0);
         assert_eq!(native["candidateFieldClass"], "url");
+        assert_eq!(native["candidateNodeTypeClass"], "invalid");
         assert!(native["containerClass"].is_null());
         assert!(native["messageTypeClass"].is_null());
         assert!(native["contentOriginClass"].is_null());
@@ -3929,6 +4010,7 @@ mod tests {
         .unwrap();
         assert_eq!(otherwise_eligible["sourceClass"], "event");
         assert_eq!(otherwise_eligible["candidateFieldClass"], "url");
+        assert_eq!(otherwise_eligible["candidateNodeTypeClass"], "absent");
         assert_eq!(otherwise_eligible["counterfactualEligible"], true);
         assert!(otherwise_eligible["counterfactualReason"].is_null());
         assert!(otherwise_eligible["counterfactualBranch"].is_null());
@@ -3956,21 +4038,22 @@ mod tests {
                 .expect("raw-result image rejection must retain provenance"),
         )
         .unwrap();
-        assert_eq!(raw_result.as_object().unwrap().len(), 14);
+        assert_eq!(raw_result.as_object().unwrap().len(), 15);
         assert_eq!(raw_result["sourceClass"], "raw_result");
         assert!(raw_result["eventIndex"].is_null());
         assert!(raw_result["collectorEventSha256"].is_null());
         assert_eq!(raw_result["candidateFieldClass"], "image_url");
+        assert_eq!(raw_result["candidateNodeTypeClass"], "absent");
         assert_eq!(raw_result["counterfactualEligible"], false);
         assert_eq!(raw_result["counterfactualReason"], "metadata_type_invalid");
         assert!(raw_result["counterfactualBranch"].is_null());
         assert!(raw_result["counterfactualPredicateField"].is_null());
 
         for diagnostic in [&passive, &native, &otherwise_eligible] {
-            assert_eq!(diagnostic.as_object().unwrap().len(), 14);
+            assert_eq!(diagnostic.as_object().unwrap().len(), 15);
             assert_eq!(
                 diagnostic["schema"],
-                "m365-native-effect-image-diagnostic/v1"
+                "m365-native-effect-image-diagnostic/v2"
             );
             assert_eq!(diagnostic["projectionStage"], "initial_response");
             assert_eq!(diagnostic["imageCount"], 1);
