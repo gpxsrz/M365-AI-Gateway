@@ -332,6 +332,11 @@ struct Record {
     // Store compaction, instead of being reset or discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_correction_native_effect_witness: Option<crate::chathub::NativeEffectWitness>,
+    // The image-origin counterfactual is intentionally live-only. A rollback
+    // reader must neither ingest nor persist this bounded diagnostic.
+    #[serde(skip)]
+    tool_correction_native_effect_image_diagnostic:
+        Option<crate::chathub::NativeEffectImageDiagnostic>,
     // Transport details are a bounded live projection. They are deliberately
     // absent from the v1 JSONL record so an older rollback reader can still
     // read the authoritative durable surface.
@@ -648,6 +653,7 @@ impl Record {
             tool_correction_failure_class: String::new(),
             tool_correction_original_sha256: String::new(),
             tool_correction_native_effect_witness: None,
+            tool_correction_native_effect_image_diagnostic: None,
             transport_projection: "not_evaluated".to_owned(),
             wire_before_utf16: 0,
             inline_core_utf16: 0,
@@ -813,6 +819,15 @@ impl Record {
                         && matches!(self.upstream_attempt_class.as_str(), "initial" | "retried")
                         && self.upstream_result_class == "success"
                         && witness.valid()
+                })
+            && self
+                .tool_correction_native_effect_image_diagnostic
+                .as_ref()
+                .is_none_or(|diagnostic| {
+                    self.tool_correction_native_effect_witness.is_some()
+                        && self.tool_correction_failure_class == "native_effect"
+                        && !self.tool_correction_attempted
+                        && diagnostic.valid()
                 })
             && valid_transport_projection(&self.transport_projection)
             && self.wire_before_utf16 <= MAX_RECORDED_UTF16
@@ -1317,6 +1332,7 @@ impl Trace {
         &self,
         reason: &'static str,
         witness: Option<crate::chathub::NativeEffectWitness>,
+        image_diagnostic: Option<crate::chathub::NativeEffectImageDiagnostic>,
     ) {
         self.update(move |record| {
             if record.tool_correction_attempted || !record.tool_correction_failure_class.is_empty()
@@ -1326,6 +1342,7 @@ impl Trace {
             record.tool_correction_outcome = "not_attempted".to_owned();
             record.tool_correction_failure_class = reason.to_owned();
             record.tool_correction_native_effect_witness = witness;
+            record.tool_correction_native_effect_image_diagnostic = image_diagnostic;
         });
     }
 
@@ -1486,6 +1503,12 @@ pub(crate) async fn detail(
     if let Some(witness) = record.tool_correction_native_effect_witness.as_ref() {
         detail["toolCorrectionNativeEffectWitness"] = json!(witness);
     }
+    if let Some(diagnostic) = record
+        .tool_correction_native_effect_image_diagnostic
+        .as_ref()
+    {
+        detail["toolCorrectionNativeEffectImageDiagnostic"] = json!(diagnostic);
+    }
     Json(detail).into_response()
 }
 
@@ -1578,6 +1601,12 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["toolCorrectionOutcome"] = json!(record.tool_correction_outcome);
     value["toolCorrectionFailureClass"] = json!(record.tool_correction_failure_class);
     value["toolCorrectionOriginalSha256"] = json!(record.tool_correction_original_sha256);
+    if let Some(diagnostic) = record
+        .tool_correction_native_effect_image_diagnostic
+        .as_ref()
+    {
+        value["toolCorrectionNativeEffectImageDiagnostic"] = json!(diagnostic);
+    }
     value["toolEscapeWitness"] = json!(live_escape_witness(record));
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
     value["transportProjection"] = serde_json::Value::String(record.transport_projection.clone());
@@ -2188,7 +2217,7 @@ mod tests {
         let path = root.path().join("debug-telemetry.jsonl");
         let store = Store::open(path.clone(), "test").unwrap();
         let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.tool_correction_ineligible("completion_missing", None);
+        trace.tool_correction_ineligible("completion_missing", None, None);
         trace.tool_correction_finished(Some("cancelled"));
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
@@ -2203,7 +2232,7 @@ mod tests {
         let trace = store.start_request("POST", "/hermes/v1/chat/completions");
         trace.tool_correction_started(&"a".repeat(64));
         trace.tool_correction_finished(None);
-        trace.tool_correction_ineligible("completion_missing", None);
+        trace.tool_correction_ineligible("completion_missing", None, None);
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
         assert_eq!(live["toolCorrectionAttempted"], true);
@@ -2230,8 +2259,8 @@ mod tests {
         trace.admission(AdmissionResult::Admitted);
         trace.upstream_attempt(UpstreamAttempt::Initial);
         trace.upstream_result(UpstreamResult::Success);
-        trace.tool_correction_ineligible("native_effect", Some(witness));
-        trace.tool_correction_ineligible("completion_missing", None);
+        trace.tool_correction_ineligible("native_effect", Some(witness), None);
+        trace.tool_correction_ineligible("completion_missing", None, None);
         trace.tool_correction_finished(Some("corrected_response_ineligible"));
         drop(trace);
 
@@ -2244,6 +2273,76 @@ mod tests {
         assert!(raw.contains("toolCorrectionNativeEffectWitness"));
         assert!(!raw.contains("toolCorrectionFailureClass"));
         assert!(!raw.contains("native_effect"));
+    }
+
+    #[test]
+    fn native_effect_image_diagnostic_is_live_only_content_free_and_not_reloaded() {
+        const PRIVATE_URL: &str = "https://private.invalid/image.png";
+        const PRIVATE_TEXT: &str = "PRIVATE_IMAGE_DIAGNOSTIC_SENTINEL";
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug-telemetry.jsonl");
+        let store = Store::open(path.clone(), "test").unwrap();
+        let event = json!({"type": 4, "url": PRIVATE_URL, "private": PRIVATE_TEXT});
+        let result = crate::chathub::ChatResult {
+            text: "Synthetic malformed caller candidate".to_owned(),
+            events: vec![
+                event,
+                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+            ],
+            collector_event_sha256: vec!["b".repeat(64), "c".repeat(64), "d".repeat(64)],
+            images: vec![PRIVATE_URL.to_owned()],
+            ..crate::chathub::ChatResult::default()
+        };
+        let (_, witness) = result
+            .correction_eligibility_with_witness(&"a".repeat(64))
+            .expect_err("image result must remain ineligible");
+        let witness = *witness.expect("durable native-effect witness");
+        let witness_value = serde_json::to_value(&witness).unwrap();
+        let diagnostic = result
+            .native_effect_image_diagnostic()
+            .expect("live image diagnostic");
+
+        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
+        trace.admission(AdmissionResult::Admitted);
+        trace.upstream_attempt(UpstreamAttempt::Initial);
+        trace.upstream_result(UpstreamResult::Success);
+        trace.tool_correction_ineligible("native_effect", Some(witness), Some(diagnostic));
+        trace.tool_correction_ineligible("completion_missing", None, None);
+        drop(trace);
+
+        let live = store.records_for_test().pop().unwrap();
+        assert_eq!(live["toolCorrectionNativeEffectWitness"], witness_value);
+        assert_eq!(
+            live["toolCorrectionNativeEffectImageDiagnostic"]["schema"],
+            "m365-native-effect-image-diagnostic/v1"
+        );
+        assert_eq!(
+            live["toolCorrectionNativeEffectImageDiagnostic"]["counterfactualBranch"],
+            "active_event_type"
+        );
+        assert!(!live.to_string().contains(PRIVATE_URL));
+        assert!(!live.to_string().contains(PRIVATE_TEXT));
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("toolCorrectionNativeEffectImageDiagnostic"));
+        assert!(!raw.contains(PRIVATE_URL));
+        assert!(!raw.contains(PRIVATE_TEXT));
+        let mut injected: serde_json::Value =
+            serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        injected["toolCorrectionNativeEffectImageDiagnostic"] = json!({"schema": "injected"});
+        assert!(serde_json::from_value::<Record>(injected).is_err());
+        drop(store);
+
+        let reopened = Store::open(path, "test").unwrap();
+        let reloaded = reopened.records_for_test().pop().unwrap();
+        assert_eq!(reloaded["toolCorrectionNativeEffectWitness"], witness_value);
+        assert!(
+            reloaded
+                .get("toolCorrectionNativeEffectImageDiagnostic")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2641,7 +2740,7 @@ mod tests {
         trace.admission(AdmissionResult::Admitted);
         trace.upstream_attempt(UpstreamAttempt::Initial);
         trace.upstream_result(UpstreamResult::Success);
-        trace.tool_correction_ineligible("native_effect", Some(witness));
+        trace.tool_correction_ineligible("native_effect", Some(witness), None);
         drop(trace);
         let record_id = store.records_for_test().pop().unwrap()["id"]
             .as_str()
