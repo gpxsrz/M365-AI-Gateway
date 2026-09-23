@@ -16,6 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -453,6 +454,10 @@ pub struct ChatResult {
     pub throttling: Option<Value>,
     pub raw_result: String,
     pub events: Vec<Value>,
+    // The rollback-compatible reader captures this now; the producer release
+    // consumes it when it attaches a native-effect witness.
+    #[allow(dead_code)]
+    pub(crate) collector_event_sha256: Vec<String>,
     pub images: Vec<String>,
     pub artifacts: Vec<Artifact>,
 }
@@ -478,6 +483,254 @@ impl CorrectionEligibilityReason {
             Self::TranscriptBudget => "transcript_budget",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CorrectionIneligibilityClassification {
+    PolicyIneligibleStructure,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CorrectionIneligibilityStage {
+    InitialResponse,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeEffectBranch {
+    ResultArtifactOrImage,
+    ActiveCardNode,
+    ActiveMessageField,
+    ProgressNotPassive,
+    NonChatMessageType,
+    NonemptyContentType,
+    ActiveEventType,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeEffectEventTypeClass {
+    Update,
+    #[serde(rename = "native_4")]
+    Native4,
+    #[serde(rename = "native_5")]
+    Native5,
+    #[serde(rename = "native_7")]
+    Native7,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeEffectMessageTypeClass {
+    Empty,
+    Chat,
+    Progress,
+    GeneratedCode,
+    MemoryUpdate,
+    TriggerPlugin,
+    OtherKnown,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeEffectCardTypeClass {
+    ActionExecute,
+    ActionSubmit,
+    ActionOpenUrl,
+    Image,
+    Media,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeEffectPredicateField {
+    Images,
+    Artifacts,
+    Action,
+    Actions,
+    Media,
+    OutputFiles,
+    SearchQueries,
+    ContentOrigin,
+    ContentType,
+}
+
+/// Durable, content-free evidence for one native-effect eligibility rejection.
+/// The rollback-compatible reader declares and validates this final shape
+/// before a producer is enabled, so rollback preserves future records.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeEffectWitness {
+    schema: String,
+    classification: CorrectionIneligibilityClassification,
+    branch: NativeEffectBranch,
+    initial_candidate_sha256: String,
+    projection_stage: CorrectionIneligibilityStage,
+    transcript_event_count: usize,
+    // Zero-based position in ChatResult.events.
+    event_index: Option<usize>,
+    // Zero-based message encounter ordinal across this event's arguments.
+    message_index: Option<usize>,
+    // Zero-based card-node preorder ordinal within this message.
+    card_index: Option<usize>,
+    event_type_class: Option<NativeEffectEventTypeClass>,
+    message_type_class: Option<NativeEffectMessageTypeClass>,
+    card_type_class: Option<NativeEffectCardTypeClass>,
+    predicate_field: Option<NativeEffectPredicateField>,
+    collector_event_sha256: Option<String>,
+}
+
+impl NativeEffectWitness {
+    pub(crate) fn valid(&self) -> bool {
+        if self.schema != "m365-native-effect-witness/v1"
+            || self.classification
+                != CorrectionIneligibilityClassification::PolicyIneligibleStructure
+            || self.projection_stage != CorrectionIneligibilityStage::InitialResponse
+            || !valid_lower_sha256(&self.initial_candidate_sha256)
+            || !(1..=MAX_TRANSCRIPT_EVENTS).contains(&self.transcript_event_count)
+            || self
+                .event_index
+                .is_some_and(|index| index >= self.transcript_event_count)
+            || self
+                .message_index
+                .is_some_and(|index| index >= MAX_TRANSCRIPT_NODES)
+            || self
+                .card_index
+                .is_some_and(|index| index >= MAX_TRANSCRIPT_NODES)
+            || self
+                .collector_event_sha256
+                .as_deref()
+                .is_some_and(|hash| !valid_lower_sha256(hash))
+        {
+            return false;
+        }
+
+        let result_level = self.event_index.is_none()
+            && self.message_index.is_none()
+            && self.card_index.is_none()
+            && self.event_type_class.is_none()
+            && self.message_type_class.is_none()
+            && self.card_type_class.is_none()
+            && self.collector_event_sha256.is_none();
+        let update_event = self.event_index.is_some()
+            && self.event_type_class == Some(NativeEffectEventTypeClass::Update)
+            && self.collector_event_sha256.is_some();
+        let message = update_event && self.message_index.is_some();
+
+        match self.branch {
+            NativeEffectBranch::ResultArtifactOrImage => {
+                result_level
+                    && matches!(
+                        self.predicate_field,
+                        Some(
+                            NativeEffectPredicateField::Images
+                                | NativeEffectPredicateField::Artifacts
+                        )
+                    )
+            }
+            NativeEffectBranch::ActiveCardNode => {
+                message
+                    && self.card_index.is_some()
+                    && self.message_type_class.is_some()
+                    && matches!(
+                        self.card_type_class,
+                        Some(
+                            NativeEffectCardTypeClass::ActionExecute
+                                | NativeEffectCardTypeClass::ActionSubmit
+                                | NativeEffectCardTypeClass::ActionOpenUrl
+                                | NativeEffectCardTypeClass::Image
+                                | NativeEffectCardTypeClass::Media
+                        )
+                    )
+                    && self.predicate_field.is_none()
+            }
+            NativeEffectBranch::ActiveMessageField => {
+                message
+                    && self.card_index.is_none()
+                    && self.message_type_class.is_some()
+                    && self.card_type_class.is_none()
+                    && matches!(
+                        self.predicate_field,
+                        Some(
+                            NativeEffectPredicateField::Action
+                                | NativeEffectPredicateField::Actions
+                                | NativeEffectPredicateField::Media
+                                | NativeEffectPredicateField::OutputFiles
+                                | NativeEffectPredicateField::SearchQueries
+                        )
+                    )
+            }
+            NativeEffectBranch::ProgressNotPassive => {
+                message
+                    && self.card_index.is_none()
+                    && self.message_type_class == Some(NativeEffectMessageTypeClass::Progress)
+                    && self.card_type_class.is_none()
+                    && matches!(
+                        self.predicate_field,
+                        Some(
+                            NativeEffectPredicateField::ContentOrigin
+                                | NativeEffectPredicateField::ContentType
+                        )
+                    )
+            }
+            NativeEffectBranch::NonChatMessageType => {
+                message
+                    && self.card_index.is_none()
+                    && matches!(
+                        self.message_type_class,
+                        Some(
+                            NativeEffectMessageTypeClass::GeneratedCode
+                                | NativeEffectMessageTypeClass::MemoryUpdate
+                                | NativeEffectMessageTypeClass::TriggerPlugin
+                                | NativeEffectMessageTypeClass::OtherKnown
+                                | NativeEffectMessageTypeClass::Unknown
+                        )
+                    )
+                    && self.card_type_class.is_none()
+                    && self.predicate_field.is_none()
+            }
+            NativeEffectBranch::NonemptyContentType => {
+                message
+                    && self.card_index.is_none()
+                    && matches!(
+                        self.message_type_class,
+                        Some(
+                            NativeEffectMessageTypeClass::Empty
+                                | NativeEffectMessageTypeClass::Chat
+                        )
+                    )
+                    && self.card_type_class.is_none()
+                    && self.predicate_field.is_none()
+            }
+            NativeEffectBranch::ActiveEventType => {
+                self.event_index.is_some()
+                    && self.message_index.is_none()
+                    && self.card_index.is_none()
+                    && matches!(
+                        self.event_type_class,
+                        Some(
+                            NativeEffectEventTypeClass::Native4
+                                | NativeEffectEventTypeClass::Native5
+                                | NativeEffectEventTypeClass::Native7
+                        )
+                    )
+                    && self.message_type_class.is_none()
+                    && self.card_type_class.is_none()
+                    && self.predicate_field.is_none()
+                    && self.collector_event_sha256.is_some()
+            }
+        }
+    }
+}
+
+fn valid_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 const MAX_TRANSCRIPT_EVENTS: usize = 4096;
@@ -1265,6 +1518,13 @@ fn generated_attachment_ready_for_reuse(
         && attachment.uploaded_session_id == session_id
 }
 
+/// Hashes the complete event bytes after the collector's existing record split
+/// and Unicode-whitespace trim, but before JSON parsing. This is raw collector
+/// identity, not canonical JSON: spelling, escaping and object order matter.
+fn collector_event_sha256(event: &str) -> String {
+    format!("{:x}", Sha256::digest(event.trim().as_bytes()))
+}
+
 struct SignalRCollector {
     streamed_text: String,
     final_text: String,
@@ -1273,6 +1533,7 @@ struct SignalRCollector {
     soft_throttle_candidate: String,
     raw_result: String,
     events: Vec<Value>,
+    collector_event_sha256: Vec<String>,
     conversation_id: String,
     session_id: String,
     invocation_id: String,
@@ -1290,6 +1551,7 @@ impl SignalRCollector {
             soft_throttle_candidate: String::new(),
             raw_result: String::new(),
             events: Vec::new(),
+            collector_event_sha256: Vec::new(),
             conversation_id,
             session_id,
             invocation_id: CHAT_INVOCATION_ID.to_owned(),
@@ -1348,6 +1610,8 @@ impl SignalRCollector {
             if part.is_empty() {
                 continue;
             }
+            self.collector_event_sha256
+                .push(collector_event_sha256(part));
             let value: Value = serde_json::from_str(part)
                 .map_err(|_| ChatError::Protocol("JSON decode failed".to_owned()))?;
             self.events.push(value.clone());
@@ -1532,6 +1796,7 @@ impl SignalRCollector {
             throttling: self.throttling.clone(),
             raw_result: self.raw_result.clone(),
             events: self.events.clone(),
+            collector_event_sha256: self.collector_event_sha256.clone(),
             images,
             artifacts,
         })
@@ -3083,6 +3348,62 @@ mod tests {
 
         let prose = json!({"text": format!("codeResultFileUrl: {protected}")});
         assert!(generated_artifacts(&[prose], "").unwrap().is_empty());
+    }
+
+    #[test]
+    fn collector_event_sha256_is_exact_trimmed_utf8_identity() {
+        for (event, expected) in [
+            (
+                r#"{"a":null,"b":""}"#,
+                "bb9c31ec660b7d9da0eaac9751c16198fc4abecc2a85280c63e6a7cb76496cba",
+            ),
+            (
+                r#"{"b":"","a":null}"#,
+                "1ee48706bd96b97fc32c46ca2e606df561612bb3124f966ba380e03596680b95",
+            ),
+            (
+                r#"{"u":"é"}"#,
+                "606ffff9f63ae3058a32788b12169fffef7f4f86e8e34e22cf3056949620ab37",
+            ),
+            (
+                r#"{"u":"\u00e9"}"#,
+                "148a90d46ed37a567cad182991ff91f4859d23897040279f2dface9fff66d847",
+            ),
+            (
+                r#"{"n":9223372036854775807}"#,
+                "faf5d00c8f17856eac0c8cae6eae118ca936a9ae1af9de80da15dcc33e844a9d",
+            ),
+            (
+                r#"{"n":1e0}"#,
+                "1499d8ce7727c52f249d9b8cd88eae2162f228881be4d8e91720e482848b5153",
+            ),
+            (
+                r#"{"n":-0}"#,
+                "d54829e5b2d6e184fe2005d0b3ee73c1931163e1c1fd461a7449c9f7255ea2d2",
+            ),
+        ] {
+            assert_eq!(collector_event_sha256(event), expected, "{event}");
+        }
+        assert_eq!(
+            collector_event_sha256(" \n\t{\"a\":null,\"b\":\"\"}\r "),
+            "bb9c31ec660b7d9da0eaac9751c16198fc4abecc2a85280c63e6a7cb76496cba"
+        );
+    }
+
+    #[test]
+    fn collector_retains_one_raw_identity_per_complete_event() {
+        let update = r#"{"type":2,"item":{"result":{"message":"candidate"}}}"#;
+        let completion = r#"{"type":3}"#;
+        let frame = format!(" {update} \n{RECORD_SEPARATOR}\t{completion}{RECORD_SEPARATOR}");
+        let mut collector = SignalRCollector::new("c".into(), "s".into(), "r".into());
+        let result = collector.ingest(&frame, &mut |_| Ok(())).unwrap().unwrap();
+        assert_eq!(
+            result.collector_event_sha256,
+            [update, completion]
+                .map(collector_event_sha256)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

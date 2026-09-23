@@ -328,6 +328,11 @@ struct Record {
     tool_correction_failure_class: String,
     #[serde(skip)]
     tool_correction_original_sha256: String,
+    // This final typed shape is predeclared before its producer is enabled.
+    // None preserves the frozen v1 bytes; Some survives a future rollback,
+    // including Store compaction, instead of being reset or discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_correction_native_effect_witness: Option<crate::chathub::NativeEffectWitness>,
     // Transport details are a bounded live projection. They are deliberately
     // absent from the v1 JSONL record so an older rollback reader can still
     // read the authoritative durable surface.
@@ -643,6 +648,7 @@ impl Record {
             tool_correction_outcome: "not_attempted".to_owned(),
             tool_correction_failure_class: String::new(),
             tool_correction_original_sha256: String::new(),
+            tool_correction_native_effect_witness: None,
             transport_projection: "not_evaluated".to_owned(),
             wire_before_utf16: 0,
             inline_core_utf16: 0,
@@ -796,6 +802,19 @@ impl Record {
                 .is_none_or(|offset| offset <= MAX_RECORDED_BYTES)
             && valid_tool_projection_stage(&self.tool_projection_stage)
             && self.tool_retry_attempt_ordinal <= 64
+            && self
+                .tool_correction_native_effect_witness
+                .as_ref()
+                .is_none_or(|witness| {
+                    self.method == "POST"
+                        && self.path == "/hermes/v1/chat/completions"
+                        && self.protocol == "openai"
+                        && self.route == "hermes"
+                        && self.admission_result == "admitted"
+                        && matches!(self.upstream_attempt_class.as_str(), "initial" | "retried")
+                        && self.upstream_result_class == "success"
+                        && witness.valid()
+                })
             && valid_transport_projection(&self.transport_projection)
             && self.wire_before_utf16 <= MAX_RECORDED_UTF16
             && self.inline_core_utf16 <= MAX_RECORDED_UTF16
@@ -1396,7 +1415,7 @@ pub(crate) async fn detail(
             "找不到診斷摘要",
         );
     };
-    Json(json!({
+    let mut detail = json!({
         "id": record.id,
         "at": record.at,
         "protocol": record.protocol,
@@ -1457,8 +1476,11 @@ pub(crate) async fn detail(
         "eventCount": record.event_count,
         "snapshotAvailable": false,
         "snapshot": null,
-    }))
-    .into_response()
+    });
+    if let Some(witness) = record.tool_correction_native_effect_witness.as_ref() {
+        detail["toolCorrectionNativeEffectWitness"] = json!(witness);
+    }
+    Json(detail).into_response()
 }
 
 #[derive(Default, Deserialize)]
@@ -1750,6 +1772,64 @@ fn format_time(value: OffsetDateTime) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct NativeEffectWitnessFixture<'a> {
+        branch: &'a str,
+        event_index: Option<usize>,
+        message_index: Option<usize>,
+        card_index: Option<usize>,
+        event_type_class: Option<&'a str>,
+        message_type_class: Option<&'a str>,
+        card_type_class: Option<&'a str>,
+        predicate_field: Option<&'a str>,
+    }
+
+    fn future_native_effect_witness(fixture: NativeEffectWitnessFixture<'_>) -> serde_json::Value {
+        let NativeEffectWitnessFixture {
+            branch,
+            event_index,
+            message_index,
+            card_index,
+            event_type_class,
+            message_type_class,
+            card_type_class,
+            predicate_field,
+        } = fixture;
+        let transcript_event_count = event_index.map_or(1, |index| index.saturating_add(1));
+        serde_json::json!({
+            "schema": "m365-native-effect-witness/v1",
+            "classification": "policy_ineligible_structure",
+            "branch": branch,
+            "initialCandidateSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "projectionStage": "initial_response",
+            "transcriptEventCount": transcript_event_count,
+            "eventIndex": event_index,
+            "messageIndex": message_index,
+            "cardIndex": card_index,
+            "eventTypeClass": event_type_class,
+            "messageTypeClass": message_type_class,
+            "cardTypeClass": card_type_class,
+            "predicateField": predicate_field,
+            "collectorEventSha256": event_index.map(|_| "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        })
+    }
+
+    fn future_native_effect_record(witness: serde_json::Value) -> serde_json::Value {
+        let mut record =
+            serde_json::to_value(Record::new("POST", "/hermes/v1/chat/completions")).unwrap();
+        record["admissionResult"] = serde_json::json!("admitted");
+        record["upstreamAttemptClass"] = serde_json::json!("initial");
+        record["upstreamResultClass"] = serde_json::json!("success");
+        record["toolCorrectionNativeEffectWitness"] = witness;
+        record
+    }
+
+    fn assert_native_effect_witness_valid(name: &str, value: serde_json::Value) {
+        let witness: crate::chathub::NativeEffectWitness =
+            serde_json::from_value(value).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(witness.valid(), "invalid {name}");
+    }
+
     #[test]
     fn throttle_kind_is_derived_without_changing_the_durable_record_schema() {
         let mut soft = Record::new("POST", "/hermes/v1/chat/completions");
@@ -1948,6 +2028,7 @@ mod tests {
         assert!(value.get("toolProjectionStage").is_none());
         assert!(value.get("toolStream").is_none());
         assert!(value.get("toolRetryAttemptOrdinal").is_none());
+        assert!(value.get("toolCorrectionNativeEffectWitness").is_none());
 
         // This is the exact v1 record shape an older rollback reader sees.
         let reopened = Store::open(path.clone(), "test").unwrap();
@@ -2040,6 +2121,7 @@ mod tests {
                 "toolCorrectionOutcome",
                 "toolCorrectionFailureClass",
                 "toolCorrectionOriginalSha256",
+                "toolCorrectionNativeEffectWitness",
             ] {
                 assert!(durable.get(key).is_none());
             }
@@ -2242,6 +2324,391 @@ mod tests {
         assert_eq!(record.post_policy_reason, "not_evaluated");
         assert_eq!(record.caller_delivery, "not_evaluated");
         assert!(!record.tool_call_suppressed);
+    }
+
+    #[test]
+    fn rollback_reader_accepts_every_future_native_effect_branch() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, witness) in [
+            (
+                "result",
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "result_artifact_or_image",
+                    predicate_field: Some("images"),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "card",
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_card_node",
+                    event_index: Some(1),
+                    message_index: Some(0),
+                    card_index: Some(2),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("chat"),
+                    card_type_class: Some("action_execute"),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "message-field",
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_message_field",
+                    event_index: Some(1),
+                    message_index: Some(3),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("unknown"),
+                    predicate_field: Some("output_files"),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "progress",
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "progress_not_passive",
+                    event_index: Some(1),
+                    message_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("progress"),
+                    predicate_field: Some("content_origin"),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "non-chat",
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "non_chat_message_type",
+                    event_index: Some(1),
+                    message_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("generated_code"),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "content-type",
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "nonempty_content_type",
+                    event_index: Some(1),
+                    message_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("chat"),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "event",
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_event_type",
+                    event_index: Some(0),
+                    event_type_class: Some("native_4"),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let path = root.path().join(format!("{name}.jsonl"));
+            let record = future_native_effect_record(witness.clone());
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&record).unwrap()),
+            )
+            .unwrap();
+            let store = Store::open(path, "test").unwrap();
+            assert_eq!(
+                store.records_for_test().pop().unwrap()["toolCorrectionNativeEffectWitness"],
+                witness
+            );
+        }
+    }
+
+    #[test]
+    fn native_effect_witness_accepts_the_complete_closed_taxonomy() {
+        for field in ["images", "artifacts"] {
+            assert_native_effect_witness_valid(
+                field,
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "result_artifact_or_image",
+                    predicate_field: Some(field),
+                    ..Default::default()
+                }),
+            );
+        }
+        for card in [
+            "action_execute",
+            "action_submit",
+            "action_open_url",
+            "image",
+            "media",
+        ] {
+            assert_native_effect_witness_valid(
+                card,
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_card_node",
+                    event_index: Some(0),
+                    message_index: Some(0),
+                    card_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("chat"),
+                    card_type_class: Some(card),
+                    ..Default::default()
+                }),
+            );
+        }
+        for field in [
+            "action",
+            "actions",
+            "media",
+            "output_files",
+            "search_queries",
+        ] {
+            assert_native_effect_witness_valid(
+                field,
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_message_field",
+                    event_index: Some(0),
+                    message_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("unknown"),
+                    predicate_field: Some(field),
+                    ..Default::default()
+                }),
+            );
+        }
+        for field in ["content_origin", "content_type"] {
+            assert_native_effect_witness_valid(
+                field,
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "progress_not_passive",
+                    event_index: Some(0),
+                    message_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("progress"),
+                    predicate_field: Some(field),
+                    ..Default::default()
+                }),
+            );
+        }
+        for message in [
+            "generated_code",
+            "memory_update",
+            "trigger_plugin",
+            "other_known",
+            "unknown",
+        ] {
+            assert_native_effect_witness_valid(
+                message,
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "non_chat_message_type",
+                    event_index: Some(0),
+                    message_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some(message),
+                    ..Default::default()
+                }),
+            );
+        }
+        for message in ["empty", "chat"] {
+            assert_native_effect_witness_valid(
+                message,
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "nonempty_content_type",
+                    event_index: Some(0),
+                    message_index: Some(0),
+                    event_type_class: Some("update"),
+                    message_type_class: Some(message),
+                    ..Default::default()
+                }),
+            );
+        }
+        for event in ["native_4", "native_5", "native_7"] {
+            assert_native_effect_witness_valid(
+                event,
+                future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_event_type",
+                    event_index: Some(0),
+                    event_type_class: Some(event),
+                    ..Default::default()
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_reader_preserves_future_native_effect_witness_through_compaction() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug-telemetry.jsonl");
+        let baseline =
+            serde_json::to_value(Record::new("POST", "/hermes/v1/chat/completions")).unwrap();
+        assert!(baseline.get("toolCorrectionNativeEffectWitness").is_none());
+        assert!(
+            public_record(&Record::new("POST", "/hermes/v1/chat/completions"))
+                .get("toolCorrectionNativeEffectWitness")
+                .is_none()
+        );
+        let witness = future_native_effect_witness(NativeEffectWitnessFixture {
+            branch: "active_event_type",
+            event_index: Some(0),
+            event_type_class: Some("native_4"),
+            ..Default::default()
+        });
+        let future = future_native_effect_record(witness.clone());
+        let record_id = future["id"].as_str().unwrap().to_owned();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&future).unwrap()),
+        )
+        .unwrap();
+
+        let store = Store::open(path.clone(), "test").unwrap();
+        let reopened = store.records_for_test().pop().unwrap();
+        assert_eq!(reopened["toolCorrectionNativeEffectWitness"], witness);
+        for _ in 0..(MAX_RECORDS - 1) {
+            store.push(Record::new("GET", "/health"));
+        }
+        {
+            let inner = store.inner.lock().unwrap();
+            assert_eq!(inner.records.len(), MAX_RECORDS);
+            assert_eq!(inner.writes_since_compaction, 0);
+            assert_eq!(inner.writer_state, "ok");
+        }
+        drop(store);
+
+        let reopened = Store::open(path, "test").unwrap();
+        let retained = reopened
+            .records_for_test()
+            .into_iter()
+            .find(|record| record["id"] == record_id)
+            .unwrap();
+        assert_eq!(retained["toolCorrectionNativeEffectWitness"], witness);
+    }
+
+    #[test]
+    fn rollback_reader_rejects_invalid_native_effect_witness() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = future_native_effect_witness(NativeEffectWitnessFixture {
+            branch: "active_event_type",
+            event_index: Some(0),
+            event_type_class: Some("native_4"),
+            ..Default::default()
+        });
+        for (name, record) in [
+            ("unknown-field", {
+                let mut value = witness.clone();
+                value["raw"] = serde_json::json!("PRIVATE-SENTINEL");
+                future_native_effect_record(value)
+            }),
+            ("unknown-type-class", {
+                let mut value = witness.clone();
+                value["eventTypeClass"] = serde_json::json!("PRIVATE-SENTINEL");
+                future_native_effect_record(value)
+            }),
+            ("unknown-classification", {
+                let mut value = witness.clone();
+                value["classification"] = serde_json::json!("native_action_executed");
+                future_native_effect_record(value)
+            }),
+            ("wrong-stage", {
+                let mut value = witness.clone();
+                value["projectionStage"] = serde_json::json!("syntax_correction");
+                future_native_effect_record(value)
+            }),
+            ("invalid-relation", {
+                let mut value = witness.clone();
+                value["branch"] = serde_json::json!("result_artifact_or_image");
+                value["predicateField"] = serde_json::json!("images");
+                future_native_effect_record(value)
+            }),
+            ("missing-event-hash", {
+                let mut value = witness.clone();
+                value["collectorEventSha256"] = serde_json::Value::Null;
+                future_native_effect_record(value)
+            }),
+            ("redundant-event-predicate", {
+                let mut value = witness.clone();
+                value["predicateField"] = serde_json::json!("content_type");
+                future_native_effect_record(value)
+            }),
+            ("uppercase-candidate-hash", {
+                let mut value = witness.clone();
+                value["initialCandidateSha256"] = serde_json::json!("A".repeat(64));
+                future_native_effect_record(value)
+            }),
+            ("event-index-out-of-bounds", {
+                let mut value = witness.clone();
+                value["eventIndex"] = serde_json::json!(usize::MAX);
+                value["transcriptEventCount"] = serde_json::json!(usize::MAX);
+                future_native_effect_record(value)
+            }),
+            ("zero-transcript-event-count", {
+                let mut value = witness.clone();
+                value["transcriptEventCount"] = serde_json::json!(0);
+                future_native_effect_record(value)
+            }),
+            ("event-index-not-below-count", {
+                let mut value = witness.clone();
+                value["eventIndex"] = serde_json::json!(1);
+                value["transcriptEventCount"] = serde_json::json!(1);
+                future_native_effect_record(value)
+            }),
+            ("message-index-out-of-bounds", {
+                let value = future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_message_field",
+                    event_index: Some(0),
+                    message_index: Some(usize::MAX),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("chat"),
+                    predicate_field: Some("action"),
+                    ..Default::default()
+                });
+                future_native_effect_record(value)
+            }),
+            ("card-index-out-of-bounds", {
+                let value = future_native_effect_witness(NativeEffectWitnessFixture {
+                    branch: "active_card_node",
+                    event_index: Some(0),
+                    message_index: Some(0),
+                    card_index: Some(usize::MAX),
+                    event_type_class: Some("update"),
+                    message_type_class: Some("chat"),
+                    card_type_class: Some("image"),
+                    ..Default::default()
+                });
+                future_native_effect_record(value)
+            }),
+            ("uppercase-event-hash", {
+                let mut value = witness.clone();
+                value["collectorEventSha256"] = serde_json::json!("B".repeat(64));
+                future_native_effect_record(value)
+            }),
+            ("wrong-parent-route", {
+                let mut value = future_native_effect_record(witness.clone());
+                value["method"] = serde_json::json!("GET");
+                value["path"] = serde_json::json!("/api/health");
+                value["protocol"] = serde_json::json!("management");
+                value["route"] = serde_json::json!("management");
+                value
+            }),
+            ("upstream-not-attempted", {
+                let mut value = future_native_effect_record(witness.clone());
+                value["upstreamAttemptClass"] = serde_json::json!("none");
+                value["upstreamResultClass"] = serde_json::json!("not_attempted");
+                value
+            }),
+            ("request-not-admitted", {
+                let mut value = future_native_effect_record(witness.clone());
+                value["admissionResult"] = serde_json::json!("other_denied");
+                value
+            }),
+        ] {
+            let path = root.path().join(format!("{name}.jsonl"));
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&record).unwrap()),
+            )
+            .unwrap();
+            assert!(Store::open(path, "test").is_err(), "accepted {name}");
+        }
     }
 
     #[test]
