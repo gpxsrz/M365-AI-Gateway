@@ -3396,7 +3396,7 @@ async fn correct_tool_syntax(
     trace: &crate::debug::Trace,
     stream: bool,
 ) -> Result<Option<(ChatResult, usize)>, QualificationError> {
-    let Some(name) = crate::tool_calls::syntax_correction_tool(
+    let Some((name, initial)) = crate::tool_calls::syntax_correction_tool(
         &original.text,
         &base.tools,
         &base.tool_choice,
@@ -3404,23 +3404,29 @@ async fn correct_tool_syntax(
     ) else {
         return Ok(None);
     };
+    let diagnostic = initial
+        .rejection
+        .as_ref()
+        .expect("eligible syntax rejection");
     let ineligible = if crate::chathub::contains_protected_artifact_reference(&original.text) {
-        Some("protected_artifact_reference")
-    } else if let Err(reason) = original.correction_eligibility() {
-        Some(reason.as_str())
+        Some(("protected_artifact_reference", None))
+    } else if let Err((reason, witness)) =
+        original.correction_eligibility_with_witness(&diagnostic.candidate_sha256)
+    {
+        Some((reason.as_str(), witness.map(|witness| *witness)))
     } else if original.conversation_id.is_empty()
         || original.session_id.is_empty()
         || (!base.conversation_id.is_empty() && base.conversation_id != original.conversation_id)
         || (!base.session_id.is_empty() && base.session_id != original.session_id)
     {
-        Some("binding")
+        Some(("binding", None))
     } else if !base.mcp_server_url.is_empty() {
-        Some("external_mcp_configured")
+        Some(("external_mcp_configured", None))
     } else {
         None
     };
-    if let Some(reason) = ineligible {
-        trace.tool_correction_ineligible(reason);
+    if let Some((reason, witness)) = ineligible {
+        trace.tool_correction_ineligible(reason, witness);
         return Ok(None);
     }
     // Explicit transport feedback on the same model/binding. This is not a
@@ -3454,19 +3460,9 @@ async fn correct_tool_syntax(
         correction.tool_call_limit,
     ));
     if correction.outbound_text_limit_utf16 > 0 && units > correction.outbound_text_limit_utf16 {
-        trace.tool_correction_ineligible("correction_input_limit");
+        trace.tool_correction_ineligible("correction_input_limit", None);
         return Ok(None);
     }
-    let initial = project_tool_calls(
-        &original.text,
-        &base.tools,
-        &base.tool_choice,
-        base.tool_call_limit,
-    );
-    let diagnostic = initial
-        .rejection
-        .as_ref()
-        .expect("eligible syntax rejection");
     observe_tool_projection(
         trace,
         &initial,
@@ -7833,6 +7829,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn syntax_correction_live_initial_native_effect_records_content_free_witness_without_retry_or_dispatch()
+     {
+        const TOOL_PRIVATE_SENTINEL: &str = "NATIVE_EFFECT_TOOL_PRIVATE_SENTINEL";
+        const EVENT_PRIVATE_SENTINEL: &str = "NATIVE_EFFECT_EVENT_PRIVATE_SENTINEL";
+
+        let arguments = format!(r#"{{"pattern":"{TOOL_PRIVATE_SENTINEL}\]"}}"#);
+        let initial = format!("```terminal\n{arguments}\n```");
+        let initial_candidate_sha256 = sha256_hex(arguments.as_bytes());
+        for stream in [false, true] {
+            let native_event = json!({
+                "type": 1,
+                "target": "update",
+                "arguments": [{"messages": [{
+                    "author": "bot",
+                    "text": EVENT_PRIVATE_SENTINEL,
+                    "messageType": "GeneratedCode",
+                    "contentType": "",
+                    "contentOrigin": "CodeInterpreter"
+                }]}]
+            });
+            let collector_event_sha256 = sha256_hex(native_event.to_string().as_bytes());
+            let (websocket_base, payloads, server) =
+                syntax_live_upstream_server(vec![SyntaxLiveReply {
+                    message: initial.clone(),
+                    extra_events: vec![native_event],
+                }])
+                .await;
+            let root = tempfile::tempdir().unwrap();
+            let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+                Arc::new(EmptyTransport),
+                oauth(),
+                root.path().to_owned(),
+                None,
+            );
+            let live_chat = LiveChatHub::new_for_test(
+                gateway.settings.clone(),
+                syntax_prepare_attachments,
+                websocket_base,
+            );
+            Arc::get_mut(&mut gateway)
+                .expect("test gateway must be uniquely owned before routing")
+                .chat = Arc::new(live_chat);
+            let app = Gateway::router(Arc::clone(&gateway));
+            let mut request = syntax_correction_body(stream);
+            request.as_object_mut().unwrap().remove("tool_choice");
+            request["session_key"] = json!(format!("syntax-live-native-effect-{stream}"));
+
+            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+            let terminal = if stream {
+                assert_eq!(status, StatusCode::OK, "body={body}");
+                let frames = body
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| line.strip_prefix("data: ").expect("SSE data frame"))
+                    .collect::<Vec<_>>();
+                assert_eq!(frames.len(), 2, "one error and one DONE frame: {body}");
+                assert_eq!(frames[1], "[DONE]");
+                serde_json::from_str::<Value>(frames[0]).unwrap()
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body}");
+                serde_json::from_str::<Value>(&body).unwrap()
+            };
+            assert_eq!(
+                terminal,
+                invalid_tool_call_value(InvalidToolCallStage::InitialProjection)
+            );
+            assert!(!body.contains("tool_calls"));
+            assert!(!body.contains(TOOL_PRIVATE_SENTINEL));
+            assert!(!body.contains(EVENT_PRIVATE_SENTINEL));
+
+            let payloads = payloads.lock().unwrap().clone();
+            assert_eq!(payloads.len(), 1, "native effect must not generate a retry");
+            server.await.unwrap();
+
+            assert!(
+                gateway.checkpoints.list().unwrap().is_empty(),
+                "the rejected candidate must not be accepted"
+            );
+            assert_eq!(
+                gateway.checkpoints.recovery_views().unwrap().len(),
+                1,
+                "the upstream-started turn must remain recoverable"
+            );
+            let checkpoint_raw =
+                std::fs::read_to_string(root.path().join("transport-checkpoints.json")).unwrap();
+            assert!(!checkpoint_raw.contains(TOOL_PRIVATE_SENTINEL));
+            assert!(!checkpoint_raw.contains(EVENT_PRIVATE_SENTINEL));
+            let checkpoint: Value = serde_json::from_str(&checkpoint_raw).unwrap();
+            let checkpoint = &checkpoint["records"][0];
+            assert_eq!(checkpoint["acceptedCount"], 0);
+            assert_eq!(checkpoint["inFlight"], true);
+            assert_eq!(checkpoint["inFlightUpstreamStarted"], true);
+            assert!(
+                checkpoint["toolLedger"]["pending"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                checkpoint["toolLedger"]["completed"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let expected_witness = json!({
+                "schema": "m365-native-effect-witness/v1",
+                "classification": "policy_ineligible_structure",
+                "branch": "non_chat_message_type",
+                "initialCandidateSha256": initial_candidate_sha256,
+                "projectionStage": "initial_response",
+                "transcriptEventCount": 4,
+                "eventIndex": 0,
+                "messageIndex": 0,
+                "cardIndex": null,
+                "eventTypeClass": "update",
+                "messageTypeClass": "generated_code",
+                "cardTypeClass": null,
+                "predicateField": null,
+                "collectorEventSha256": collector_event_sha256,
+            });
+            let record = gateway.debug.records_for_test().pop().unwrap();
+            assert_eq!(record["toolCorrectionAttempted"], false);
+            assert_eq!(record["toolCorrectionOutcome"], "not_attempted");
+            assert_eq!(record["toolCorrectionFailureClass"], "native_effect");
+            assert_eq!(record["toolProjectionStage"], "initial_response");
+            assert_eq!(record["toolRetryAttemptOrdinal"], 1);
+            assert_eq!(record["toolCallRejectionClass"], "illegal_escape");
+            assert_eq!(record["toolCandidateSha256"], initial_candidate_sha256);
+            assert_eq!(
+                record["toolCorrectionNativeEffectWitness"],
+                expected_witness
+            );
+            assert!(!record.to_string().contains(TOOL_PRIVATE_SENTINEL));
+            assert!(!record.to_string().contains(EVENT_PRIVATE_SENTINEL));
+
+            let debug_raw =
+                std::fs::read_to_string(root.path().join("debug-telemetry.jsonl")).unwrap();
+            assert!(!debug_raw.contains(TOOL_PRIVATE_SENTINEL));
+            assert!(!debug_raw.contains(EVENT_PRIVATE_SENTINEL));
+            let durable: Value = serde_json::from_str(debug_raw.lines().next().unwrap()).unwrap();
+            assert_eq!(
+                durable["toolCorrectionNativeEffectWitness"],
+                expected_witness
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn syntax_correction_live_rejects_second_candidate_without_dispatch() {
         let cases = [
             (
@@ -8002,6 +8147,16 @@ mod tests {
                     record["toolCallRejectionClass"], "illegal_escape",
                     "case={case}"
                 );
+                assert!(
+                    record.get("toolCorrectionNativeEffectWitness").is_none(),
+                    "a corrected response must not produce or overwrite the initial witness: case={case}"
+                );
+                if *case == "native_effect" {
+                    assert_eq!(
+                        record["toolCorrectionFailureClass"],
+                        "corrected_response_ineligible"
+                    );
+                }
             }
         }
     }

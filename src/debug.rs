@@ -328,9 +328,8 @@ struct Record {
     tool_correction_failure_class: String,
     #[serde(skip)]
     tool_correction_original_sha256: String,
-    // This final typed shape is predeclared before its producer is enabled.
-    // None preserves the frozen v1 bytes; Some survives a future rollback,
-    // including Store compaction, instead of being reset or discarded.
+    // None preserves the frozen v1 bytes; Some survives rollback, including
+    // Store compaction, instead of being reset or discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_correction_native_effect_witness: Option<crate::chathub::NativeEffectWitness>,
     // Transport details are a bounded live projection. They are deliberately
@@ -1314,12 +1313,19 @@ impl Trace {
         });
     }
 
-    pub(crate) fn tool_correction_ineligible(&self, reason: &'static str) {
-        self.update(|record| {
-            if !record.tool_correction_attempted {
-                record.tool_correction_outcome = "not_attempted".to_owned();
-                record.tool_correction_failure_class = reason.to_owned();
+    pub(crate) fn tool_correction_ineligible(
+        &self,
+        reason: &'static str,
+        witness: Option<crate::chathub::NativeEffectWitness>,
+    ) {
+        self.update(move |record| {
+            if record.tool_correction_attempted || !record.tool_correction_failure_class.is_empty()
+            {
+                return;
             }
+            record.tool_correction_outcome = "not_attempted".to_owned();
+            record.tool_correction_failure_class = reason.to_owned();
+            record.tool_correction_native_effect_witness = witness;
         });
     }
 
@@ -2182,7 +2188,7 @@ mod tests {
         let path = root.path().join("debug-telemetry.jsonl");
         let store = Store::open(path.clone(), "test").unwrap();
         let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.tool_correction_ineligible("completion_missing");
+        trace.tool_correction_ineligible("completion_missing", None);
         trace.tool_correction_finished(Some("cancelled"));
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
@@ -2197,12 +2203,47 @@ mod tests {
         let trace = store.start_request("POST", "/hermes/v1/chat/completions");
         trace.tool_correction_started(&"a".repeat(64));
         trace.tool_correction_finished(None);
-        trace.tool_correction_ineligible("completion_missing");
+        trace.tool_correction_ineligible("completion_missing", None);
         drop(trace);
         let live = store.records_for_test().pop().unwrap();
         assert_eq!(live["toolCorrectionAttempted"], true);
         assert_eq!(live["toolCorrectionOutcome"], "succeeded");
         assert_eq!(live["toolCorrectionFailureClass"], "");
+    }
+
+    #[test]
+    fn native_effect_first_rejection_atomically_records_reason_and_witness() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug-telemetry.jsonl");
+        let store = Store::open(path.clone(), "test").unwrap();
+        let witness_value = future_native_effect_witness(NativeEffectWitnessFixture {
+            branch: "non_chat_message_type",
+            event_index: Some(0),
+            message_index: Some(0),
+            event_type_class: Some("update"),
+            message_type_class: Some("generated_code"),
+            ..Default::default()
+        });
+        let witness: crate::chathub::NativeEffectWitness =
+            serde_json::from_value(witness_value.clone()).unwrap();
+        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
+        trace.admission(AdmissionResult::Admitted);
+        trace.upstream_attempt(UpstreamAttempt::Initial);
+        trace.upstream_result(UpstreamResult::Success);
+        trace.tool_correction_ineligible("native_effect", Some(witness));
+        trace.tool_correction_ineligible("completion_missing", None);
+        trace.tool_correction_finished(Some("corrected_response_ineligible"));
+        drop(trace);
+
+        let live = store.records_for_test().pop().unwrap();
+        assert_eq!(live["toolCorrectionAttempted"], false);
+        assert_eq!(live["toolCorrectionOutcome"], "not_attempted");
+        assert_eq!(live["toolCorrectionFailureClass"], "native_effect");
+        assert_eq!(live["toolCorrectionNativeEffectWitness"], witness_value);
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(raw.contains("toolCorrectionNativeEffectWitness"));
+        assert!(!raw.contains("toolCorrectionFailureClass"));
+        assert!(!raw.contains("native_effect"));
     }
 
     #[test]
@@ -2581,6 +2622,62 @@ mod tests {
             .find(|record| record["id"] == record_id)
             .unwrap();
         assert_eq!(retained["toolCorrectionNativeEffectWitness"], witness);
+    }
+
+    #[test]
+    fn producer_native_effect_witness_survives_restart_and_compaction() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("debug-telemetry.jsonl");
+        let witness_value = future_native_effect_witness(NativeEffectWitnessFixture {
+            branch: "active_event_type",
+            event_index: Some(0),
+            event_type_class: Some("native_5"),
+            ..Default::default()
+        });
+        let witness: crate::chathub::NativeEffectWitness =
+            serde_json::from_value(witness_value.clone()).unwrap();
+        let store = Store::open(path.clone(), "test").unwrap();
+        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
+        trace.admission(AdmissionResult::Admitted);
+        trace.upstream_attempt(UpstreamAttempt::Initial);
+        trace.upstream_result(UpstreamResult::Success);
+        trace.tool_correction_ineligible("native_effect", Some(witness));
+        drop(trace);
+        let record_id = store.records_for_test().pop().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(store);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("toolCorrectionNativeEffectWitness"));
+        assert!(!raw.contains("toolCorrectionFailureClass"));
+        assert!(!raw.contains("native_effect"));
+        let store = Store::open(path.clone(), "test").unwrap();
+        let reopened = store
+            .records_for_test()
+            .into_iter()
+            .find(|record| record["id"] == record_id)
+            .unwrap();
+        assert_eq!(reopened["toolCorrectionNativeEffectWitness"], witness_value);
+        for _ in 0..(MAX_RECORDS - 1) {
+            store.push(Record::new("GET", "/health"));
+        }
+        {
+            let inner = store.inner.lock().unwrap();
+            assert_eq!(inner.records.len(), MAX_RECORDS);
+            assert_eq!(inner.writes_since_compaction, 0);
+            assert_eq!(inner.writer_state, "ok");
+        }
+        drop(store);
+
+        let reopened = Store::open(path, "test").unwrap();
+        let retained = reopened
+            .records_for_test()
+            .into_iter()
+            .find(|record| record["id"] == record_id)
+            .unwrap();
+        assert_eq!(retained["toolCorrectionNativeEffectWitness"], witness_value);
     }
 
     #[test]

@@ -454,9 +454,6 @@ pub struct ChatResult {
     pub throttling: Option<Value>,
     pub raw_result: String,
     pub events: Vec<Value>,
-    // The rollback-compatible reader captures this now; the producer release
-    // consumes it when it attaches a native-effect witness.
-    #[allow(dead_code)]
     pub(crate) collector_event_sha256: Vec<String>,
     pub images: Vec<String>,
     pub artifacts: Vec<Artifact>,
@@ -559,8 +556,8 @@ enum NativeEffectPredicateField {
 }
 
 /// Durable, content-free evidence for one native-effect eligibility rejection.
-/// The rollback-compatible reader declares and validates this final shape
-/// before a producer is enabled, so rollback preserves future records.
+/// Its rollback-compatible reader validates the final shape so an older
+/// release preserves records written by the initial-response producer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NativeEffectWitness {
@@ -726,6 +723,135 @@ impl NativeEffectWitness {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NativeEffectLocation {
+    branch: NativeEffectBranch,
+    event_index: Option<usize>,
+    message_index: Option<usize>,
+    card_index: Option<usize>,
+    event_type_class: Option<NativeEffectEventTypeClass>,
+    message_type_class: Option<NativeEffectMessageTypeClass>,
+    card_type_class: Option<NativeEffectCardTypeClass>,
+    predicate_field: Option<NativeEffectPredicateField>,
+}
+
+impl NativeEffectLocation {
+    fn new(branch: NativeEffectBranch) -> Self {
+        Self {
+            branch,
+            event_index: None,
+            message_index: None,
+            card_index: None,
+            event_type_class: None,
+            message_type_class: None,
+            card_type_class: None,
+            predicate_field: None,
+        }
+    }
+
+    fn at_message(
+        mut self,
+        event_index: usize,
+        message_index: usize,
+        message_type_class: NativeEffectMessageTypeClass,
+    ) -> Self {
+        self.event_index = Some(event_index);
+        self.message_index = Some(message_index);
+        self.event_type_class = Some(NativeEffectEventTypeClass::Update);
+        self.message_type_class = Some(message_type_class);
+        self
+    }
+
+    fn witness(
+        self,
+        result: &ChatResult,
+        initial_candidate_sha256: &str,
+    ) -> Option<NativeEffectWitness> {
+        if !valid_lower_sha256(initial_candidate_sha256)
+            || !(1..=MAX_TRANSCRIPT_EVENTS).contains(&result.events.len())
+        {
+            return None;
+        }
+        let collector_event_sha256 = match self.event_index {
+            Some(index) => result
+                .collector_event_sha256
+                .get(index)
+                .filter(|hash| valid_lower_sha256(hash))
+                .cloned(),
+            None => None,
+        };
+        if self.event_index.is_some() && collector_event_sha256.is_none() {
+            return None;
+        }
+        let witness = NativeEffectWitness {
+            schema: "m365-native-effect-witness/v1".to_owned(),
+            classification: CorrectionIneligibilityClassification::PolicyIneligibleStructure,
+            branch: self.branch,
+            initial_candidate_sha256: initial_candidate_sha256.to_owned(),
+            projection_stage: CorrectionIneligibilityStage::InitialResponse,
+            transcript_event_count: result.events.len(),
+            event_index: self.event_index,
+            message_index: self.message_index,
+            card_index: self.card_index,
+            event_type_class: self.event_type_class,
+            message_type_class: self.message_type_class,
+            card_type_class: self.card_type_class,
+            predicate_field: self.predicate_field,
+            collector_event_sha256,
+        };
+        witness.valid().then_some(witness)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CorrectionIneligibility {
+    reason: CorrectionEligibilityReason,
+    native_effect: Option<NativeEffectLocation>,
+}
+
+impl CorrectionIneligibility {
+    fn native_effect(location: NativeEffectLocation) -> Self {
+        Self {
+            reason: CorrectionEligibilityReason::NativeEffect,
+            native_effect: Some(location),
+        }
+    }
+
+    fn at_message(
+        mut self,
+        event_index: usize,
+        message_index: usize,
+        message_type_class: NativeEffectMessageTypeClass,
+    ) -> Self {
+        self.native_effect = self
+            .native_effect
+            .map(|location| location.at_message(event_index, message_index, message_type_class));
+        self
+    }
+}
+
+impl From<CorrectionEligibilityReason> for CorrectionIneligibility {
+    fn from(reason: CorrectionEligibilityReason) -> Self {
+        Self {
+            reason,
+            native_effect: None,
+        }
+    }
+}
+
+fn native_effect_message_type_class(value: &str) -> NativeEffectMessageTypeClass {
+    match value {
+        "" => NativeEffectMessageTypeClass::Empty,
+        "Chat" => NativeEffectMessageTypeClass::Chat,
+        "Progress" => NativeEffectMessageTypeClass::Progress,
+        "GeneratedCode" => NativeEffectMessageTypeClass::GeneratedCode,
+        "MemoryUpdate" => NativeEffectMessageTypeClass::MemoryUpdate,
+        "TriggerPlugin" => NativeEffectMessageTypeClass::TriggerPlugin,
+        value if ALLOWED_MESSAGE_TYPES.contains(&value) => NativeEffectMessageTypeClass::OtherKnown,
+        _ => NativeEffectMessageTypeClass::Unknown,
+    }
+}
+
 fn valid_lower_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -789,21 +915,24 @@ fn validate_passive_card(
     value: &Value,
     nodes: &mut usize,
     depth: usize,
-) -> Result<(), CorrectionEligibilityReason> {
+    card_index: &mut usize,
+) -> Result<(), CorrectionIneligibility> {
     *nodes += 1;
     if depth > 32 || *nodes > MAX_TRANSCRIPT_NODES {
-        return Err(CorrectionEligibilityReason::TranscriptBudget);
+        return Err(CorrectionEligibilityReason::TranscriptBudget.into());
     }
     match value {
         Value::Array(values) => {
             for value in values {
-                validate_passive_card(value, nodes, depth + 1)?;
+                validate_passive_card(value, nodes, depth + 1, card_index)?;
             }
             Ok(())
         }
         Value::Object(object) => {
+            let current_card_index = *card_index;
+            *card_index += 1;
             let Some(kind) = object.get("type").and_then(Value::as_str) else {
-                return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
             };
             match kind {
                 "AdaptiveCard" => {
@@ -811,13 +940,13 @@ fn validate_passive_card(
                         || object.get("version").and_then(Value::as_str)
                             != Some(SUPPORTED_ADAPTIVE_CARD_VERSION)
                     {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     }
                     let Some(body) = object.get("body").and_then(Value::as_array) else {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in body {
-                        validate_passive_card(child, nodes, depth + 1)?;
+                        validate_passive_card(child, nodes, depth + 1, card_index)?;
                     }
                 }
                 "TextBlock" => {
@@ -825,110 +954,150 @@ fn validate_passive_card(
                         || !bounded_string(object.get("text"), true)
                         || object.get("wrap").is_some_and(|value| !value.is_boolean())
                     {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     }
                 }
                 "Container" => {
                     if !object_has_only_keys(value, &["type", "items"]) {
-                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
                     }
                     let Some(items) = object.get("items").and_then(Value::as_array) else {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in items {
-                        validate_passive_card(child, nodes, depth + 1)?;
+                        validate_passive_card(child, nodes, depth + 1, card_index)?;
                     }
                 }
                 "ColumnSet" => {
                     if !object_has_only_keys(value, &["type", "columns"]) {
-                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
                     }
                     let Some(columns) = object.get("columns").and_then(Value::as_array) else {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in columns {
-                        validate_passive_card(child, nodes, depth + 1)?;
+                        validate_passive_card(child, nodes, depth + 1, card_index)?;
                     }
                 }
                 "Column" => {
                     if !object_has_only_keys(value, &["type", "items"]) {
-                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
                     }
                     let Some(items) = object.get("items").and_then(Value::as_array) else {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in items {
-                        validate_passive_card(child, nodes, depth + 1)?;
+                        validate_passive_card(child, nodes, depth + 1, card_index)?;
                     }
                 }
                 "Action.Execute" | "Action.Submit" | "Action.OpenUrl" | "Image" | "Media" => {
-                    return Err(CorrectionEligibilityReason::NativeEffect);
+                    let mut location =
+                        NativeEffectLocation::new(NativeEffectBranch::ActiveCardNode);
+                    location.card_index = Some(current_card_index);
+                    location.card_type_class = Some(match kind {
+                        "Action.Execute" => NativeEffectCardTypeClass::ActionExecute,
+                        "Action.Submit" => NativeEffectCardTypeClass::ActionSubmit,
+                        "Action.OpenUrl" => NativeEffectCardTypeClass::ActionOpenUrl,
+                        "Image" => NativeEffectCardTypeClass::Image,
+                        "Media" => NativeEffectCardTypeClass::Media,
+                        _ => unreachable!("closed active card taxonomy"),
+                    });
+                    return Err(CorrectionIneligibility::native_effect(location));
                 }
-                _ => return Err(CorrectionEligibilityReason::UnknownEventOrField),
+                _ => return Err(CorrectionEligibilityReason::UnknownEventOrField.into()),
             }
             Ok(())
         }
-        _ => Err(CorrectionEligibilityReason::MetadataTypeInvalid),
+        _ => Err(CorrectionEligibilityReason::MetadataTypeInvalid.into()),
     }
 }
 
-fn validate_message(value: &Value, nodes: &mut usize) -> Result<bool, CorrectionEligibilityReason> {
+fn validate_message(
+    value: &Value,
+    nodes: &mut usize,
+    event_index: usize,
+    message_index: usize,
+) -> Result<bool, CorrectionIneligibility> {
     *nodes += 1;
     if *nodes > MAX_TRANSCRIPT_NODES {
-        return Err(CorrectionEligibilityReason::TranscriptBudget);
+        return Err(CorrectionEligibilityReason::TranscriptBudget.into());
     }
     let Some(object) = value.as_object() else {
-        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
     };
+    let message_type = object
+        .get("messageType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message_type_class =
+        object
+            .get("messageType")
+            .map_or(NativeEffectMessageTypeClass::Empty, |value| {
+                value.as_str().map_or(
+                    NativeEffectMessageTypeClass::Unknown,
+                    native_effect_message_type_class,
+                )
+            });
     for (key, value) in object {
         match key.as_str() {
             "text" => {
                 if !value.is_string() {
-                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                 }
             }
             "author" | "messageType" | "contentType" | "contentOrigin" => {
                 if !bounded_string(Some(value), true) {
-                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                 }
             }
             "messageId" | "requestId" | "responseIdentifier" | "createdAt" | "timestamp"
             | "turnState" => {
                 if !bounded_string(Some(value), false) {
-                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                 }
             }
             "turnCount" => {
                 if !value.is_u64() {
-                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                 }
             }
             "references" | "sourceAttributions" => {
                 if !value.as_array().is_some_and(Vec::is_empty) {
-                    return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                    return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
                 }
             }
             "adaptiveCards" => {
                 if !value.is_array() {
-                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                 }
-                validate_passive_card(value, nodes, 0)?;
+                let mut card_index = 0;
+                validate_passive_card(value, nodes, 0, &mut card_index).map_err(|failure| {
+                    failure.at_message(event_index, message_index, message_type_class)
+                })?;
             }
             "action" | "actions" | "media" | "outputFiles" | "searchQueries" => {
-                return Err(CorrectionEligibilityReason::NativeEffect);
+                let mut location = NativeEffectLocation::new(
+                    NativeEffectBranch::ActiveMessageField,
+                )
+                .at_message(event_index, message_index, message_type_class);
+                location.predicate_field = Some(match key.as_str() {
+                    "action" => NativeEffectPredicateField::Action,
+                    "actions" => NativeEffectPredicateField::Actions,
+                    "media" => NativeEffectPredicateField::Media,
+                    "outputFiles" => NativeEffectPredicateField::OutputFiles,
+                    "searchQueries" => NativeEffectPredicateField::SearchQueries,
+                    _ => unreachable!("closed active message-field taxonomy"),
+                });
+                return Err(CorrectionIneligibility::native_effect(location));
             }
-            _ => return Err(CorrectionEligibilityReason::UnknownEventOrField),
+            _ => return Err(CorrectionEligibilityReason::UnknownEventOrField.into()),
         }
     }
     if object.get("author").and_then(Value::as_str) != Some("bot")
         || !object.get("text").is_some_and(Value::is_string)
     {
-        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+        return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
     }
-    let message_type = object
-        .get("messageType")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     let content_type = object
         .get("contentType")
         .and_then(Value::as_str)
@@ -939,18 +1108,29 @@ fn validate_message(value: &Value, nodes: &mut usize) -> Result<bool, Correction
         .unwrap_or_default();
     if message_type == "Progress" {
         if content_origin != "ChainOfThoughtSummary" || !content_type.is_empty() {
-            return Err(CorrectionEligibilityReason::NativeEffect);
+            let mut location = NativeEffectLocation::new(NativeEffectBranch::ProgressNotPassive)
+                .at_message(event_index, message_index, message_type_class);
+            location.predicate_field = Some(if content_origin != "ChainOfThoughtSummary" {
+                NativeEffectPredicateField::ContentOrigin
+            } else {
+                NativeEffectPredicateField::ContentType
+            });
+            return Err(CorrectionIneligibility::native_effect(location));
         }
         return Ok(false);
     }
     if !matches!(message_type, "" | "Chat") {
-        return Err(CorrectionEligibilityReason::NativeEffect);
+        let location = NativeEffectLocation::new(NativeEffectBranch::NonChatMessageType)
+            .at_message(event_index, message_index, message_type_class);
+        return Err(CorrectionIneligibility::native_effect(location));
     }
     if !content_type.is_empty() {
-        return Err(CorrectionEligibilityReason::NativeEffect);
+        let location = NativeEffectLocation::new(NativeEffectBranch::NonemptyContentType)
+            .at_message(event_index, message_index, message_type_class);
+        return Err(CorrectionIneligibility::native_effect(location));
     }
     if !matches!(content_origin, "" | "Model" | "BotConnection" | "DeepLeo") {
-        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+        return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
     }
     Ok(true)
 }
@@ -969,22 +1149,53 @@ impl ChatResult {
     /// Classifies the complete raw transcript collected through type 3.
     /// This does not attest to activity outside the existing transport boundary.
     pub(crate) fn correction_eligibility(&self) -> Result<(), CorrectionEligibilityReason> {
+        self.classify_correction_eligibility()
+            .map_err(|failure| failure.reason)
+    }
+
+    pub(crate) fn correction_eligibility_with_witness(
+        &self,
+        initial_candidate_sha256: &str,
+    ) -> Result<
+        (),
+        (
+            CorrectionEligibilityReason,
+            Option<Box<NativeEffectWitness>>,
+        ),
+    > {
+        self.classify_correction_eligibility().map_err(|failure| {
+            let witness = failure
+                .native_effect
+                .and_then(|location| location.witness(self, initial_candidate_sha256))
+                .map(Box::new);
+            (failure.reason, witness)
+        })
+    }
+
+    fn classify_correction_eligibility(&self) -> Result<(), CorrectionIneligibility> {
         if self.text.trim().is_empty()
             || self.events.is_empty()
             || self.events.len() > MAX_TRANSCRIPT_EVENTS
             || !self.images.is_empty()
             || !self.artifacts.is_empty()
         {
-            return Err(if self.events.len() > MAX_TRANSCRIPT_EVENTS {
-                CorrectionEligibilityReason::TranscriptBudget
-            } else if !self.images.is_empty() || !self.artifacts.is_empty() {
-                CorrectionEligibilityReason::NativeEffect
-            } else {
-                CorrectionEligibilityReason::CompletionMissing
-            });
+            if self.events.len() > MAX_TRANSCRIPT_EVENTS {
+                return Err(CorrectionEligibilityReason::TranscriptBudget.into());
+            }
+            if !self.images.is_empty() || !self.artifacts.is_empty() {
+                let mut location =
+                    NativeEffectLocation::new(NativeEffectBranch::ResultArtifactOrImage);
+                location.predicate_field = Some(if !self.images.is_empty() {
+                    NativeEffectPredicateField::Images
+                } else {
+                    NativeEffectPredicateField::Artifacts
+                });
+                return Err(CorrectionIneligibility::native_effect(location));
+            }
+            return Err(CorrectionEligibilityReason::CompletionMissing.into());
         }
         if !matches!(self.raw_result.as_str(), "" | "Success") {
-            return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+            return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
         }
         if let Some(throttling) = self.throttling.as_ref() {
             validate_quota(throttling)?;
@@ -996,7 +1207,7 @@ impl ChatResult {
             let kind = event.get("type").and_then(Value::as_u64);
             if index + 1 == self.events.len() {
                 if kind != Some(3) {
-                    return Err(CorrectionEligibilityReason::CompletionMissing);
+                    return Err(CorrectionEligibilityReason::CompletionMissing.into());
                 }
                 let has_invocation_id = event.get("invocationId").is_some();
                 let valid_shape = if has_invocation_id {
@@ -1005,7 +1216,7 @@ impl ChatResult {
                     object_has_only_keys(event, &["type"])
                 };
                 if !valid_shape {
-                    return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                    return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
                 }
                 if has_invocation_id {
                     validate_invocation_id(event, &self.invocation_id, true)?;
@@ -1016,7 +1227,7 @@ impl ChatResult {
                 return if received_text {
                     Ok(())
                 } else {
-                    Err(CorrectionEligibilityReason::CompletionMissing)
+                    Err(CorrectionEligibilityReason::CompletionMissing.into())
                 };
             }
             match kind {
@@ -1027,7 +1238,7 @@ impl ChatResult {
                         &["type", "target", "arguments", "invocationId", "headers"],
                     ) || event.get("target").and_then(Value::as_str) != Some("update")
                     {
-                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
                     }
                     // Type 1 is the reverse server invocation. Validate its own
                     // identity shape, but never correlate it to the client chat ID.
@@ -1036,8 +1247,9 @@ impl ChatResult {
                         validate_headers(headers)?;
                     }
                     let Some(arguments) = event.get("arguments").and_then(Value::as_array) else {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
+                    let mut message_index = 0;
                     for argument in arguments {
                         nodes += 1;
                         if nodes > MAX_TRANSCRIPT_NODES
@@ -1053,7 +1265,8 @@ impl ChatResult {
                                 CorrectionEligibilityReason::TranscriptBudget
                             } else {
                                 CorrectionEligibilityReason::MetadataTypeInvalid
-                            });
+                            }
+                            .into());
                         }
                         if let Some(throttling) = argument.get("throttling") {
                             validate_quota(throttling)?;
@@ -1064,24 +1277,30 @@ impl ChatResult {
                             .is_some_and(|text| !text.is_empty());
                         if let Some(messages) = argument.get("messages") {
                             let Some(messages) = messages.as_array() else {
-                                return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                                return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                             };
                             for message in messages {
-                                received_text |= validate_message(message, &mut nodes)?
-                                    && message
-                                        .get("text")
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|text| !text.is_empty());
+                                let current_message_index = message_index;
+                                message_index += 1;
+                                received_text |= validate_message(
+                                    message,
+                                    &mut nodes,
+                                    index,
+                                    current_message_index,
+                                )? && message
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty());
                             }
                         }
                     }
                 }
                 Some(2) => {
                     let Some(item) = event.get("item") else {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     let Some(result) = item.get("result") else {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     let has_invocation_id = event.get("invocationId").is_some();
                     let valid_shape = if has_invocation_id {
@@ -1095,7 +1314,7 @@ impl ChatResult {
                         || !object_has_only_keys(result, &["message", "value"])
                         || !result.get("message").is_some_and(Value::is_string)
                     {
-                        return Err(CorrectionEligibilityReason::UnknownEventOrField);
+                        return Err(CorrectionEligibilityReason::UnknownEventOrField.into());
                     }
                     if has_invocation_id {
                         validate_invocation_id(event, &self.invocation_id, true)?;
@@ -1111,19 +1330,30 @@ impl ChatResult {
                             .as_str()
                             .is_some_and(|value| matches!(value, "" | "Success"))
                     {
-                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid);
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     }
                     received_text |= result
                         .get("message")
                         .and_then(Value::as_str)
                         .is_some_and(|text| !text.is_empty());
                 }
-                Some(3) => return Err(CorrectionEligibilityReason::CompletionMissing),
-                Some(4 | 5 | 7) => return Err(CorrectionEligibilityReason::NativeEffect),
-                _ => return Err(CorrectionEligibilityReason::UnknownEventOrField),
+                Some(3) => return Err(CorrectionEligibilityReason::CompletionMissing.into()),
+                Some(kind @ (4 | 5 | 7)) => {
+                    let mut location =
+                        NativeEffectLocation::new(NativeEffectBranch::ActiveEventType);
+                    location.event_index = Some(index);
+                    location.event_type_class = Some(match kind {
+                        4 => NativeEffectEventTypeClass::Native4,
+                        5 => NativeEffectEventTypeClass::Native5,
+                        7 => NativeEffectEventTypeClass::Native7,
+                        _ => unreachable!("closed active event taxonomy"),
+                    });
+                    return Err(CorrectionIneligibility::native_effect(location));
+                }
+                _ => return Err(CorrectionEligibilityReason::UnknownEventOrField.into()),
             }
         }
-        Err(CorrectionEligibilityReason::CompletionMissing)
+        Err(CorrectionEligibilityReason::CompletionMissing.into())
     }
 }
 
@@ -3232,6 +3462,314 @@ mod tests {
                 assert!(result.correction_eligibility().is_err());
             }
         }
+    }
+
+    fn native_effect_witness_result(events: Vec<Value>) -> ChatResult {
+        let collector_event_sha256 = (1..=events.len())
+            .map(|ordinal| format!("{ordinal:064x}"))
+            .collect();
+        ChatResult {
+            text: "Synthetic malformed caller candidate".to_owned(),
+            conversation_id: "synthetic-conversation".to_owned(),
+            session_id: "synthetic-session".to_owned(),
+            events,
+            collector_event_sha256,
+            ..ChatResult::default()
+        }
+    }
+
+    fn native_effect_message_events(message: Value) -> Vec<Value> {
+        vec![
+            json!({
+                "type": 1,
+                "target": "update",
+                "arguments": [{"messages": [message]}]
+            }),
+            json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+            json!({"type": 3}),
+        ]
+    }
+
+    fn native_effect_witness_json(result: &ChatResult) -> Value {
+        let (reason, witness) = result
+            .correction_eligibility_with_witness(&"a".repeat(64))
+            .expect_err("synthetic native effect must stay ineligible");
+        assert_eq!(reason, CorrectionEligibilityReason::NativeEffect);
+        assert_eq!(
+            result.correction_eligibility(),
+            Err(CorrectionEligibilityReason::NativeEffect)
+        );
+        let witness = witness.expect("native effect must retain a bounded witness");
+        assert!(witness.valid());
+        let value = serde_json::to_value(witness).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 14);
+        let encoded = serde_json::to_string(&value).unwrap();
+        for private in [
+            "PRIVATE_NATIVE_VALUE",
+            "https://private.invalid/artifact",
+            "x-private-header",
+        ] {
+            assert!(!encoded.contains(private));
+        }
+        value
+    }
+
+    #[test]
+    fn native_effect_witness_covers_closed_classifier_taxonomy_without_raw_values() {
+        let mut result = native_effect_witness_result(vec![
+            json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+            json!({"type": 3}),
+        ]);
+        result
+            .images
+            .push("https://private.invalid/artifact".to_owned());
+        result.artifacts.push(Artifact::default());
+        let witness = native_effect_witness_json(&result);
+        assert_eq!(witness["branch"], "result_artifact_or_image");
+        assert_eq!(witness["predicateField"], "images");
+        assert!(witness["eventIndex"].is_null());
+        assert!(witness["collectorEventSha256"].is_null());
+        result.images.clear();
+        let witness = native_effect_witness_json(&result);
+        assert_eq!(witness["predicateField"], "artifacts");
+
+        let card = json!({
+            "author": "bot",
+            "text": "PRIVATE_NATIVE_VALUE",
+            "messageType": "Chat",
+            "contentType": "",
+            "contentOrigin": "Model",
+            "adaptiveCards": [{
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{
+                    "type": "Container",
+                    "items": [{"type": "Action.Execute", "url": "https://private.invalid/artifact"}]
+                }]
+            }]
+        });
+        let witness = native_effect_witness_json(&native_effect_witness_result(
+            native_effect_message_events(card),
+        ));
+        assert_eq!(witness["branch"], "active_card_node");
+        assert_eq!(witness["cardIndex"], 2);
+        assert_eq!(witness["cardTypeClass"], "action_execute");
+        assert_eq!(witness["collectorEventSha256"], format!("{:064x}", 1));
+
+        let field = json!({
+            "author": "bot",
+            "text": "PRIVATE_NATIVE_VALUE",
+            "messageType": "Chat",
+            "contentType": "",
+            "contentOrigin": "Model",
+            "outputFiles": [{"url": "https://private.invalid/artifact"}]
+        });
+        let witness = native_effect_witness_json(&native_effect_witness_result(
+            native_effect_message_events(field),
+        ));
+        assert_eq!(witness["branch"], "active_message_field");
+        assert_eq!(witness["predicateField"], "output_files");
+        assert_eq!(witness["messageTypeClass"], "chat");
+
+        let progress = json!({
+            "author": "bot",
+            "text": "PRIVATE_NATIVE_VALUE",
+            "messageType": "Progress",
+            "contentType": "PRIVATE_NATIVE_VALUE",
+            "contentOrigin": "PRIVATE_NATIVE_VALUE"
+        });
+        let witness = native_effect_witness_json(&native_effect_witness_result(
+            native_effect_message_events(progress),
+        ));
+        assert_eq!(witness["branch"], "progress_not_passive");
+        assert_eq!(witness["predicateField"], "content_origin");
+        assert_eq!(witness["messageTypeClass"], "progress");
+
+        let unknown_message = json!({
+            "author": "bot",
+            "text": "PRIVATE_NATIVE_VALUE",
+            "messageType": "PRIVATE_NATIVE_VALUE",
+            "contentType": "",
+            "contentOrigin": "Model"
+        });
+        let witness = native_effect_witness_json(&native_effect_witness_result(
+            native_effect_message_events(unknown_message),
+        ));
+        assert_eq!(witness["branch"], "non_chat_message_type");
+        assert_eq!(witness["messageTypeClass"], "unknown");
+        assert!(witness["predicateField"].is_null());
+
+        let content_type = json!({
+            "author": "bot",
+            "text": "PRIVATE_NATIVE_VALUE",
+            "messageType": "Chat",
+            "contentType": "PRIVATE_NATIVE_VALUE",
+            "contentOrigin": "Model"
+        });
+        let witness = native_effect_witness_json(&native_effect_witness_result(
+            native_effect_message_events(content_type),
+        ));
+        assert_eq!(witness["branch"], "nonempty_content_type");
+        assert_eq!(witness["messageTypeClass"], "chat");
+
+        let witness = native_effect_witness_json(&native_effect_witness_result(vec![
+            json!({"type": 4, "private": "PRIVATE_NATIVE_VALUE"}),
+            json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+            json!({"type": 3}),
+        ]));
+        assert_eq!(witness["branch"], "active_event_type");
+        assert_eq!(witness["eventIndex"], 0);
+        assert_eq!(witness["eventTypeClass"], "native_4");
+        assert_eq!(witness["projectionStage"], "initial_response");
+        assert_eq!(witness["classification"], "policy_ineligible_structure");
+        assert_eq!(witness["transcriptEventCount"], 3);
+
+        for (kind, class) in [
+            ("Action.Execute", "action_execute"),
+            ("Action.Submit", "action_submit"),
+            ("Action.OpenUrl", "action_open_url"),
+            ("Image", "image"),
+            ("Media", "media"),
+        ] {
+            let message = json!({
+                "author": "bot",
+                "text": "PRIVATE_NATIVE_VALUE",
+                "messageType": "Chat",
+                "contentType": "",
+                "contentOrigin": "Model",
+                "adaptiveCards": [{"type": kind, "private": "PRIVATE_NATIVE_VALUE"}]
+            });
+            let witness = native_effect_witness_json(&native_effect_witness_result(
+                native_effect_message_events(message),
+            ));
+            assert_eq!(witness["cardTypeClass"], class, "kind={kind}");
+            assert_eq!(witness["cardIndex"], 0, "kind={kind}");
+        }
+
+        for (field, class) in [
+            ("action", "action"),
+            ("actions", "actions"),
+            ("media", "media"),
+            ("outputFiles", "output_files"),
+            ("searchQueries", "search_queries"),
+        ] {
+            let mut message = json!({
+                "author": "bot",
+                "text": "PRIVATE_NATIVE_VALUE",
+                "messageType": "GeneratedCode",
+                "contentType": "",
+                "contentOrigin": "Model"
+            });
+            message[field] = json!("PRIVATE_NATIVE_VALUE");
+            let witness = native_effect_witness_json(&native_effect_witness_result(
+                native_effect_message_events(message),
+            ));
+            assert_eq!(witness["branch"], "active_message_field", "field={field}");
+            assert_eq!(witness["predicateField"], class, "field={field}");
+        }
+
+        for (content_origin, content_type, field) in [
+            (
+                "PRIVATE_NATIVE_VALUE",
+                "PRIVATE_NATIVE_VALUE",
+                "content_origin",
+            ),
+            (
+                "ChainOfThoughtSummary",
+                "PRIVATE_NATIVE_VALUE",
+                "content_type",
+            ),
+        ] {
+            let message = json!({
+                "author": "bot",
+                "text": "PRIVATE_NATIVE_VALUE",
+                "messageType": "Progress",
+                "contentType": content_type,
+                "contentOrigin": content_origin
+            });
+            let witness = native_effect_witness_json(&native_effect_witness_result(
+                native_effect_message_events(message),
+            ));
+            assert_eq!(witness["predicateField"], field);
+        }
+
+        for (message_type, class) in [
+            ("GeneratedCode", "generated_code"),
+            ("MemoryUpdate", "memory_update"),
+            ("TriggerPlugin", "trigger_plugin"),
+            ("Suggestion", "other_known"),
+            ("PRIVATE_NATIVE_VALUE", "unknown"),
+        ] {
+            let message = json!({
+                "author": "bot",
+                "text": "PRIVATE_NATIVE_VALUE",
+                "messageType": message_type,
+                "contentType": "",
+                "contentOrigin": "Model"
+            });
+            let witness = native_effect_witness_json(&native_effect_witness_result(
+                native_effect_message_events(message),
+            ));
+            assert_eq!(witness["messageTypeClass"], class, "type={message_type}");
+        }
+
+        for message_type in [None, Some("Chat")] {
+            let mut message = json!({
+                "author": "bot",
+                "text": "PRIVATE_NATIVE_VALUE",
+                "contentType": "PRIVATE_NATIVE_VALUE",
+                "contentOrigin": "Model"
+            });
+            if let Some(message_type) = message_type {
+                message["messageType"] = json!(message_type);
+            }
+            let witness = native_effect_witness_json(&native_effect_witness_result(
+                native_effect_message_events(message),
+            ));
+            assert_eq!(
+                witness["messageTypeClass"],
+                message_type.map_or("empty", |_| "chat")
+            );
+        }
+
+        for (kind, class) in [(4, "native_4"), (5, "native_5"), (7, "native_7")] {
+            let witness = native_effect_witness_json(&native_effect_witness_result(vec![
+                json!({"type": kind, "private": "PRIVATE_NATIVE_VALUE"}),
+                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+            ]));
+            assert_eq!(witness["eventTypeClass"], class, "type={kind}");
+        }
+
+        let ordinal_result = native_effect_witness_result(vec![
+            json!({"type": 6}),
+            json!({
+                "type": 1,
+                "target": "update",
+                "arguments": [
+                    {"messages": [{
+                        "author": "bot",
+                        "text": "display-only",
+                        "messageType": "Progress",
+                        "contentType": "",
+                        "contentOrigin": "ChainOfThoughtSummary"
+                    }]},
+                    {"messages": [{
+                        "author": "bot",
+                        "text": "PRIVATE_NATIVE_VALUE",
+                        "messageType": "MemoryUpdate",
+                        "contentType": "",
+                        "contentOrigin": "Model"
+                    }]}
+                ]
+            }),
+            json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+            json!({"type": 3}),
+        ]);
+        let witness = native_effect_witness_json(&ordinal_result);
+        assert_eq!(witness["eventIndex"], 1);
+        assert_eq!(witness["messageIndex"], 1);
+        assert_eq!(witness["collectorEventSha256"], format!("{:064x}", 2));
     }
 
     #[tokio::test]

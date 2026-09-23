@@ -84,7 +84,7 @@ pub(crate) fn syntax_correction_tool<'a>(
     tools: &[Tool],
     choice: &Value,
     limit: usize,
-) -> Option<&'a str> {
+) -> Option<(&'a str, ToolProjection)> {
     let (name, arguments) = single_tool_fence(text)?;
     tool(tools, name).filter(|_| choice_allows(choice, name))?;
     if !single_argument_object_boundary(arguments) {
@@ -101,7 +101,7 @@ pub(crate) fn syntax_correction_tool<'a>(
         && !projection.overflowed
         && diagnostic.fence_count == 2
         && diagnostic.matching_known_tool_fence_count == 1)
-        .then_some(name)
+        .then_some((name, projection))
 }
 
 // Ownership boundary only, not JSON validation. An unfinished object/string may
@@ -1012,7 +1012,9 @@ mod tests {
                 _ => json!("auto"),
             };
             assert_eq!(
-                syntax_correction_tool(text, &available, &choice, 1),
+                syntax_correction_tool(text, &available, &choice, 1)
+                    .as_ref()
+                    .map(|(name, _)| *name),
                 expected_class.map(|_| "read_file"),
                 "case={case}"
             );
