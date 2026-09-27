@@ -1127,6 +1127,8 @@ fn valid_lower_sha256(value: &str) -> bool {
 const MAX_TRANSCRIPT_EVENTS: usize = 4096;
 const MAX_TRANSCRIPT_NODES: usize = 64 * 1024;
 const MAX_METADATA_STRING_CHARS: usize = 1024;
+const MAX_CONTENT_TEXT_BYTES: usize = 64 * 1024;
+const MAX_TRANSCRIPT_CONTENT_BYTES: usize = 1024 * 1024;
 const SUPPORTED_ADAPTIVE_CARD_VERSION: &str = "1.5";
 
 fn object_has_only_keys(value: &Value, keys: &[&str]) -> bool {
@@ -1139,6 +1141,22 @@ fn bounded_string(value: Option<&Value>, allow_empty: bool) -> bool {
     value.and_then(Value::as_str).is_some_and(|text| {
         (allow_empty || !text.is_empty()) && text.chars().count() <= MAX_METADATA_STRING_CHARS
     })
+}
+
+fn bounded_content_text(
+    value: Option<&Value>,
+    total_bytes: &mut usize,
+) -> Result<(), CorrectionEligibilityReason> {
+    let text = value
+        .and_then(Value::as_str)
+        .ok_or(CorrectionEligibilityReason::MetadataTypeInvalid)?;
+    *total_bytes = total_bytes
+        .checked_add(text.len())
+        .filter(|bytes| {
+            text.len() <= MAX_CONTENT_TEXT_BYTES && *bytes <= MAX_TRANSCRIPT_CONTENT_BYTES
+        })
+        .ok_or(CorrectionEligibilityReason::TranscriptBudget)?;
+    Ok(())
 }
 
 fn validate_headers(value: &Value) -> Result<(), CorrectionEligibilityReason> {
@@ -1186,6 +1204,7 @@ struct PassiveCardValidationContext {
 fn validate_passive_card(
     value: &Value,
     nodes: &mut usize,
+    content_bytes: &mut usize,
     depth: usize,
     card_index: &mut usize,
     context: PassiveCardValidationContext,
@@ -1201,6 +1220,7 @@ fn validate_passive_card(
                 validate_passive_card(
                     value,
                     nodes,
+                    content_bytes,
                     depth + 1,
                     card_index,
                     context,
@@ -1230,6 +1250,7 @@ fn validate_passive_card(
                         validate_passive_card(
                             child,
                             nodes,
+                            content_bytes,
                             depth + 1,
                             card_index,
                             PassiveCardValidationContext {
@@ -1243,11 +1264,11 @@ fn validate_passive_card(
                 }
                 "TextBlock" => {
                     if !object_has_only_keys(value, &["type", "text", "wrap"])
-                        || !bounded_string(object.get("text"), true)
                         || object.get("wrap").is_some_and(|value| !value.is_boolean())
                     {
                         return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     }
+                    bounded_content_text(object.get("text"), content_bytes)?;
                 }
                 "Container" => {
                     if !object_has_only_keys(value, &["type", "items"]) {
@@ -1260,6 +1281,7 @@ fn validate_passive_card(
                         validate_passive_card(
                             child,
                             nodes,
+                            content_bytes,
                             depth + 1,
                             card_index,
                             PassiveCardValidationContext {
@@ -1281,6 +1303,7 @@ fn validate_passive_card(
                         validate_passive_card(
                             child,
                             nodes,
+                            content_bytes,
                             depth + 1,
                             card_index,
                             PassiveCardValidationContext {
@@ -1302,6 +1325,7 @@ fn validate_passive_card(
                         validate_passive_card(
                             child,
                             nodes,
+                            content_bytes,
                             depth + 1,
                             card_index,
                             PassiveCardValidationContext {
@@ -1395,6 +1419,7 @@ fn validate_passive_card(
 fn validate_message(
     value: &Value,
     nodes: &mut usize,
+    content_bytes: &mut usize,
     event_index: usize,
     message_index: usize,
 ) -> Result<bool, CorrectionIneligibility> {
@@ -1429,9 +1454,7 @@ fn validate_message(
     for (key, value) in object {
         match key.as_str() {
             "text" => {
-                if !value.is_string() {
-                    return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
-                }
+                bounded_content_text(Some(value), content_bytes)?;
             }
             "author" | "messageType" | "contentType" | "contentOrigin" => {
                 if !bounded_string(Some(value), true) {
@@ -1462,6 +1485,7 @@ fn validate_message(
                 validate_passive_card(
                     value,
                     nodes,
+                    content_bytes,
                     0,
                     &mut card_index,
                     PassiveCardValidationContext {
@@ -1675,6 +1699,7 @@ impl ChatResult {
         }
 
         let mut nodes = self.events.len();
+        let mut content_bytes = 0;
         let mut received_text = false;
         for (index, event) in self.events.iter().enumerate() {
             let kind = event.get("type").and_then(Value::as_u64);
@@ -1730,9 +1755,6 @@ impl ChatResult {
                                 argument,
                                 &["writeAtCursor", "messages", "throttling"],
                             )
-                            || argument
-                                .get("writeAtCursor")
-                                .is_some_and(|value| !value.is_string())
                         {
                             return Err(if nodes > MAX_TRANSCRIPT_NODES {
                                 CorrectionEligibilityReason::TranscriptBudget
@@ -1743,6 +1765,12 @@ impl ChatResult {
                         }
                         if let Some(throttling) = argument.get("throttling") {
                             validate_quota(throttling)?;
+                        }
+                        if argument.get("writeAtCursor").is_some() {
+                            bounded_content_text(
+                                argument.get("writeAtCursor"),
+                                &mut content_bytes,
+                            )?;
                         }
                         received_text |= argument
                             .get("writeAtCursor")
@@ -1758,6 +1786,7 @@ impl ChatResult {
                                 received_text |= validate_message(
                                     message,
                                     &mut nodes,
+                                    &mut content_bytes,
                                     index,
                                     current_message_index,
                                 )? && message
@@ -1798,6 +1827,7 @@ impl ChatResult {
                             validate_quota(throttling)?;
                         }
                     }
+                    bounded_content_text(result.get("message"), &mut content_bytes)?;
                     if let Some(value) = result.get("value")
                         && !value
                             .as_str()
@@ -3673,6 +3703,163 @@ mod tests {
         .unwrap();
         assert_eq!(result.text, "Candidate");
         assert!(result.correction_eligibility().is_ok());
+    }
+
+    #[tokio::test]
+    async fn passive_text_block_uses_content_budget_not_metadata_identifier_budget() {
+        for (length, long_card) in [
+            (1023, true),
+            (1024, true),
+            (1025, false),
+            (1025, true),
+            (4284, true),
+        ] {
+            let candidate = "```terminal\n{\"pattern\":\"\\]\"}\n```";
+            let displayed = format!("{candidate}{}", " ".repeat(length - candidate.len()));
+            assert_eq!(displayed.len(), length);
+            let card_text = if long_card {
+                displayed.as_str()
+            } else {
+                "display only"
+            };
+            let result = text_only_loopback(vec![
+                json!({"type":1,"target":"update","invocationId":"reverse-update-id",
+                    "arguments":[{"messages":[{"author":"bot","text":displayed,
+                        "messageType":"Chat","contentType":"","contentOrigin":"DeepLeo",
+                        "adaptiveCards":[{"type":"AdaptiveCard","version":"1.5",
+                            "body":[{"type":"TextBlock","text":card_text,"wrap":true}]}]}]}]}),
+                json!({"type":2,"invocationId":"$outgoing_invocation_id",
+                    "item":{"result":{"message":displayed,"value":"Success"}}}),
+                json!({"type":3,"invocationId":"$outgoing_invocation_id"}),
+            ])
+            .await
+            .unwrap();
+            assert_eq!(
+                result.correction_eligibility(),
+                Ok(()),
+                "length={length} long_card={long_card}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passive_display_budget_and_active_siblings_remain_closed() {
+        let candidate = "Synthetic candidate";
+        let base_message = json!({"author":"bot","text":candidate,"messageType":"Chat",
+            "contentType":"","contentOrigin":"DeepLeo",
+            "adaptiveCards":[{"type":"AdaptiveCard","version":"1.5",
+                "body":[{"type":"TextBlock","text":"x".repeat(1025),"wrap":true}]}]});
+        let frames = |message: Value| {
+            vec![
+                json!({"type":1,"target":"update","arguments":[{"messages":[message]}]}),
+                json!({"type":2,"invocationId":"$outgoing_invocation_id",
+                "item":{"result":{"message":candidate,"value":"Success"}}}),
+                json!({"type":3,"invocationId":"$outgoing_invocation_id"}),
+            ]
+        };
+        let mut max_text = base_message.clone();
+        max_text["adaptiveCards"][0]["body"][0]["text"] = json!("x".repeat(MAX_CONTENT_TEXT_BYTES));
+        assert_eq!(
+            text_only_loopback(frames(max_text))
+                .await
+                .unwrap()
+                .correction_eligibility(),
+            Ok(())
+        );
+        let mut over_text = base_message.clone();
+        over_text["adaptiveCards"][0]["body"][0]["text"] =
+            json!("x".repeat(MAX_CONTENT_TEXT_BYTES + 1));
+        assert_eq!(
+            text_only_loopback(frames(over_text))
+                .await
+                .unwrap()
+                .correction_eligibility(),
+            Err(CorrectionEligibilityReason::TranscriptBudget)
+        );
+        let mut over_total = base_message.clone();
+        over_total["adaptiveCards"][0]["body"] = json!(
+            (0..16)
+                .map(|_| json!({
+                    "type":"TextBlock","text":"x".repeat(MAX_CONTENT_TEXT_BYTES)
+                }))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            text_only_loopback(frames(over_total))
+                .await
+                .unwrap()
+                .correction_eligibility(),
+            Err(CorrectionEligibilityReason::TranscriptBudget)
+        );
+        let mut identifier = base_message.clone();
+        identifier["messageId"] = json!("x".repeat(MAX_METADATA_STRING_CHARS + 1));
+        assert_eq!(
+            text_only_loopback(frames(identifier))
+                .await
+                .unwrap()
+                .correction_eligibility(),
+            Err(CorrectionEligibilityReason::MetadataTypeInvalid)
+        );
+        for wrong in [json!({"opaque":"unknown"}), json!(["unknown"])] {
+            let mut card = base_message.clone();
+            card["adaptiveCards"][0]["body"][0]["text"] = wrong.clone();
+            assert_eq!(
+                text_only_loopback(frames(card))
+                    .await
+                    .unwrap()
+                    .correction_eligibility(),
+                Err(CorrectionEligibilityReason::MetadataTypeInvalid)
+            );
+            let mut message = base_message.clone();
+            message["text"] = wrong.clone();
+            assert_eq!(
+                text_only_loopback(frames(message))
+                    .await
+                    .unwrap()
+                    .correction_eligibility(),
+                Err(CorrectionEligibilityReason::MetadataTypeInvalid)
+            );
+            let mut result_frames = frames(base_message.clone());
+            result_frames[1]["item"]["result"]["message"] = wrong;
+            assert!(
+                text_only_loopback(result_frames)
+                    .await
+                    .unwrap()
+                    .correction_eligibility()
+                    .is_err()
+            );
+        }
+        for active in [
+            json!({"type":"Action.Execute"}),
+            json!({"type":"Media"}),
+            json!({"type":"Container","items":[{"type":"Action.Submit"}]}),
+        ] {
+            let mut message = base_message.clone();
+            message["adaptiveCards"][0]["body"]
+                .as_array_mut()
+                .unwrap()
+                .push(active);
+            assert_eq!(
+                text_only_loopback(frames(message))
+                    .await
+                    .unwrap()
+                    .correction_eligibility(),
+                Err(CorrectionEligibilityReason::NativeEffect)
+            );
+        }
+        for (first, last) in [(true, false), (false, true)] {
+            let mut transcript = frames(base_message.clone());
+            let insert_at = if first { 0 } else { 1 };
+            transcript.insert(insert_at, json!({"type":4,"item":{"effect":"synthetic"}}));
+            assert_eq!(
+                text_only_loopback(transcript)
+                    .await
+                    .unwrap()
+                    .correction_eligibility(),
+                Err(CorrectionEligibilityReason::NativeEffect),
+                "first={first} last={last}"
+            );
+        }
     }
 
     #[tokio::test]

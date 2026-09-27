@@ -7582,12 +7582,49 @@ mod tests {
     struct SyntaxLiveReply {
         message: String,
         extra_events: Vec<Value>,
+        frames: Option<Vec<Value>>,
     }
 
     fn syntax_live_reply(message: &str) -> SyntaxLiveReply {
         SyntaxLiveReply {
             message: message.to_owned(),
             extra_events: Vec::new(),
+            frames: None,
+        }
+    }
+
+    fn syntax_live_full_frames(
+        candidate: &str,
+        display_len: usize,
+        long_card: bool,
+    ) -> SyntaxLiveReply {
+        let displayed = format!(
+            "{candidate}{}",
+            " ".repeat(display_len.saturating_sub(candidate.len()))
+        );
+        assert_eq!(displayed.len(), display_len.max(candidate.len()));
+        let card_text = if long_card {
+            displayed.as_str()
+        } else {
+            "display only"
+        };
+        SyntaxLiveReply {
+            message: String::new(),
+            extra_events: Vec::new(),
+            frames: Some(vec![
+                json!({"type":1,"target":"update","invocationId":"reverse-update-id",
+                    "headers":{"x-trace":"opaque"},
+                    "arguments":[{"messages":[{"author":"bot","text":displayed.clone(),
+                        "messageType":"Chat","contentType":"","contentOrigin":"DeepLeo",
+                        "adaptiveCards":[{"type":"AdaptiveCard","version":"1.5",
+                            "body":[{"type":"TextBlock","text":card_text,"wrap":true}]}]}]}]}),
+                json!({"type":2,"invocationId":"$outgoing_invocation_id",
+                    "headers":{"x-trace":"opaque"},
+                    "item":{"throttling":{"remaining":1},
+                        "result":{"message":displayed,"value":"Success"}}}),
+                json!({"type":3,"invocationId":"$outgoing_invocation_id",
+                    "headers":{"x-trace":"opaque"}}),
+            ]),
         }
     }
 
@@ -7712,8 +7749,20 @@ mod tests {
                     "invocationId": invocation_id,
                     "headers": {"x-trace": "opaque"}
                 });
-                let mut frames = reply.extra_events;
-                frames.extend([update, stream_item, completion]);
+                let mut frames = if let Some(frames) = reply.frames {
+                    frames
+                } else {
+                    let mut frames = reply.extra_events;
+                    frames.extend([update, stream_item, completion]);
+                    frames
+                };
+                for frame in &mut frames {
+                    if frame.get("invocationId").and_then(Value::as_str)
+                        == Some("$outgoing_invocation_id")
+                    {
+                        frame["invocationId"] = json!(invocation_id);
+                    }
+                }
                 for frame in frames {
                     socket
                         .send(Message::Text(format!("{frame}\x1e").into()))
@@ -7843,6 +7892,327 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn syntax_correction_live_full_passive_frames_cross_metadata_boundary() {
+        let initial = "```terminal\n{\"pattern\":\"\\]\"}\n```";
+        let corrected = "```terminal\n{\"pattern\":\"\\\\]\"}\n```";
+        for stream in [false, true] {
+            for (padding, long_card) in [
+                (0, false),
+                (1023, true),
+                (1024, true),
+                (1025, false),
+                (1025, true),
+                (4284, true),
+            ] {
+                let (websocket_base, payloads, server) = syntax_live_upstream_server(vec![
+                    syntax_live_full_frames(initial, padding, long_card),
+                    syntax_live_full_frames(corrected, padding, long_card),
+                    syntax_live_reply("Synthetic caller terminal complete."),
+                ])
+                .await;
+                let root = tempfile::tempdir().unwrap();
+                let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+                    Arc::new(EmptyTransport),
+                    oauth(),
+                    root.path().to_owned(),
+                    None,
+                );
+                let live_chat = LiveChatHub::new_for_test(
+                    gateway.settings.clone(),
+                    syntax_prepare_attachments,
+                    websocket_base,
+                );
+                Arc::get_mut(&mut gateway).unwrap().chat = Arc::new(live_chat);
+                let app = Gateway::router(Arc::clone(&gateway));
+                let mut request = syntax_correction_body(stream);
+                request["session_key"] =
+                    json!(format!("syntax-full-frames-{stream}-{padding}-{long_card}"));
+                let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+                if status != StatusCode::OK || body.contains("\"error\"") {
+                    server.abort();
+                    panic!(
+                        "full-frame correction failed: stream={stream} padding={padding} long_card={long_card} status={status} body={body}"
+                    );
+                }
+                let calls = if stream {
+                    sse_values(&body)
+                        .iter()
+                        .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls"))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .expect("SSE caller tool call")
+                } else {
+                    serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"]
+                        .as_array().cloned().expect("JSON caller tool call")
+                };
+                let dispatches = AtomicUsize::new(0);
+                let receipts = Mutex::new(Vec::new());
+                let (call, tool_result) =
+                    syntax_caller_harness(&calls, &dispatches, &receipts, "\\]");
+                let call_id = call["id"].clone();
+                request["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"assistant","content":null,"tool_calls":[call]}));
+                request["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"tool","tool_call_id":call_id,
+                    "content":serde_json::to_string(&tool_result).unwrap()}));
+                request["tool_choice"] = json!("auto");
+                let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(body.contains("Synthetic caller terminal complete."));
+                assert_eq!(dispatches.load(Ordering::Acquire), 1);
+                assert_eq!(payloads.lock().unwrap().len(), 3);
+                server.await.unwrap();
+                let record = gateway
+                    .debug
+                    .records_for_test()
+                    .into_iter()
+                    .find(|record| record["toolCorrectionAttempted"] == true)
+                    .expect("one correction diagnostic");
+                assert_eq!(record["toolCorrectionOutcome"], "succeeded");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn syntax_correction_preserves_prior_clarify_result_through_live_continuation() {
+        let clarify = "```clarify\n{\"question\":\"keep the existing KB?\"}\n```";
+        let initial = "```terminal\n{\"pattern\":\"\\]\"}\n```";
+        let corrected = "```terminal\n{\"pattern\":\"\\\\]\"}\n```";
+        for stream in [false, true] {
+            let (websocket_base, payloads, server) = syntax_live_upstream_server(vec![
+                syntax_live_reply(clarify),
+                syntax_live_full_frames(initial, 4284, true),
+                syntax_live_full_frames(corrected, 4284, true),
+                syntax_live_reply("Synthetic Outlook packet work complete."),
+            ])
+            .await;
+            let root = tempfile::tempdir().unwrap();
+            let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+                Arc::new(EmptyTransport),
+                oauth(),
+                root.path().to_owned(),
+                None,
+            );
+            let live_chat = LiveChatHub::new_for_test(
+                gateway.settings.clone(),
+                syntax_prepare_attachments,
+                websocket_base,
+            );
+            Arc::get_mut(&mut gateway).unwrap().chat = Arc::new(live_chat);
+            let app = Gateway::router(Arc::clone(&gateway));
+            let mut request = syntax_correction_body(stream);
+            request["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{
+                "name":"clarify","parameters":{"type":"object","properties":{"question":{"type":"string"}}}
+            }}));
+            request["tool_choice"] = json!("auto");
+            request["session_key"] = json!(format!("syntax-clarify-before-terminal-{stream}"));
+
+            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            let clarify_calls = if stream {
+                sse_values(&body)
+                    .iter()
+                    .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .expect("SSE clarify call")
+            } else {
+                serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+                    .expect("JSON clarify call")
+            };
+            assert_eq!(clarify_calls.len(), 1);
+            assert_eq!(clarify_calls[0]["function"]["name"], "clarify");
+            let clarify_call = clarify_calls[0].clone();
+            let clarify_id = clarify_call["id"].clone();
+            let checkpoint_path = root.path().join("transport-checkpoints.json");
+            let checkpoint: Value =
+                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["pending"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            request["messages"].as_array_mut().unwrap().push(json!({
+                "role":"assistant","content":null,"tool_calls":[clarify_call]
+            }));
+            request["messages"].as_array_mut().unwrap().push(json!({
+                "role":"tool","tool_call_id":clarify_id,
+                "content":"keep_existing_kb_synthetic"
+            }));
+
+            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            let terminal_calls = if stream {
+                sse_values(&body)
+                    .iter()
+                    .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .expect("SSE terminal call")
+            } else {
+                serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+                    .expect("JSON terminal call")
+            };
+            let dispatches = AtomicUsize::new(0);
+            let receipts = Mutex::new(Vec::new());
+            let (terminal_call, terminal_result) =
+                syntax_caller_harness(&terminal_calls, &dispatches, &receipts, "\\]");
+            let terminal_id = terminal_call["id"].clone();
+            let checkpoint: Value =
+                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["completed"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["completed"][0]["id"],
+                clarify_id
+            );
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["pending"][0]["id"],
+                terminal_id
+            );
+            request["messages"].as_array_mut().unwrap().push(json!({
+                "role":"assistant","content":null,"tool_calls":[terminal_call]
+            }));
+            request["messages"].as_array_mut().unwrap().push(json!({
+                "role":"tool","tool_call_id":terminal_id,
+                "content":serde_json::to_string(&terminal_result).unwrap()
+            }));
+            let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("Synthetic Outlook packet work complete."));
+            assert_eq!(dispatches.load(Ordering::Acquire), 1);
+            let payloads = payloads.lock().unwrap().clone();
+            assert_eq!(
+                payloads.len(),
+                4,
+                "clarify, original, correction, continuation"
+            );
+            assert!(payloads[1].contains("keep_existing_kb_synthetic"));
+            server.await.unwrap();
+            let checkpoint: Value =
+                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+            assert_eq!(checkpoint["records"][0]["acceptedCount"], 6);
+            assert_eq!(
+                checkpoint["records"][0]["messageDigests"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                6
+            );
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["pending"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["completed"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["completed"][0]["id"],
+                clarify_id
+            );
+            assert_eq!(
+                checkpoint["records"][0]["toolLedger"]["completed"][1]["id"],
+                terminal_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn syntax_correction_live_long_passive_display_does_not_hide_active_effect() {
+        let initial = "```terminal\n{\"pattern\":\"\\]\"}\n```";
+        let corrected = "```terminal\n{\"pattern\":\"\\\\]\"}\n```";
+        for stream in [false, true] {
+            for corrected_stage in [false, true] {
+                for active in ["before", "after", "nested"] {
+                    let mut replies = vec![syntax_live_full_frames(initial, 1025, true)];
+                    if corrected_stage {
+                        replies.push(syntax_live_full_frames(corrected, 1025, true));
+                    }
+                    let frames = replies.last_mut().unwrap().frames.as_mut().unwrap();
+                    if active == "nested" {
+                        frames[0]["arguments"][0]["messages"][0]["adaptiveCards"][0]["body"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"type":"Container",
+                                "items":[{"type":"Action.Execute"}]}));
+                    } else {
+                        frames.insert(if active == "before" { 0 } else { 1 }, json!({"type":4}));
+                    }
+                    let (websocket_base, payloads, server) =
+                        syntax_live_upstream_server(replies).await;
+                    let root = tempfile::tempdir().unwrap();
+                    let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+                        Arc::new(EmptyTransport),
+                        oauth(),
+                        root.path().to_owned(),
+                        None,
+                    );
+                    let live_chat = LiveChatHub::new_for_test(
+                        gateway.settings.clone(),
+                        syntax_prepare_attachments,
+                        websocket_base,
+                    );
+                    Arc::get_mut(&mut gateway).unwrap().chat = Arc::new(live_chat);
+                    let app = Gateway::router(Arc::clone(&gateway));
+                    let mut request = syntax_correction_body(stream);
+                    request["session_key"] = json!(format!(
+                        "syntax-long-active-{stream}-{corrected_stage}-{active}"
+                    ));
+                    let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
+                    assert_eq!(
+                        status,
+                        if stream {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_GATEWAY
+                        }
+                    );
+                    assert!(body.contains("error"));
+                    assert!(!body.contains("tool_calls"));
+                    assert_eq!(
+                        payloads.lock().unwrap().len(),
+                        if corrected_stage { 2 } else { 1 }
+                    );
+                    assert!(gateway.checkpoints.list().unwrap().is_empty());
+                    server.await.unwrap();
+                    let record = gateway.debug.records_for_test().pop().unwrap();
+                    assert_eq!(record["toolCorrectionAttempted"], corrected_stage);
+                    assert_eq!(
+                        record["toolCorrectionFailureClass"],
+                        if corrected_stage {
+                            "corrected_response_ineligible"
+                        } else {
+                            "native_effect"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn syntax_correction_live_ignores_developer_logs_deep_leo_presentation_image() {
         const PRESENTATION_IMAGE_URL: &str = "https://private.invalid/image.png";
         let initial = "```terminal\n{\"pattern\":\"\\]\"}\n```";
@@ -7875,6 +8245,7 @@ mod tests {
                 SyntaxLiveReply {
                     message: initial.to_owned(),
                     extra_events: vec![developer_logs],
+                    frames: None,
                 },
                 syntax_live_reply(corrected),
                 syntax_live_reply("Synthetic caller terminal complete."),
@@ -8393,6 +8764,7 @@ mod tests {
                     syntax_live_upstream_server(vec![SyntaxLiveReply {
                         message: initial.clone(),
                         extra_events: vec![native_event],
+                        frames: None,
                     }])
                     .await;
                 let root = tempfile::tempdir().unwrap();
@@ -8654,6 +9026,7 @@ mod tests {
                     SyntaxLiveReply {
                         message: (*corrected).to_owned(),
                         extra_events: extra_events.clone(),
+                        frames: None,
                     },
                 ])
                 .await;

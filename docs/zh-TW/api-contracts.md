@@ -162,6 +162,7 @@ Full-context TXT 是 transport projection，不保證模型已讀完、正確使
 | `messageType=Progress` | 只有 `contentOrigin=ChainOfThoughtSummary` 且 passive 才可作 metadata；不把 text 當答案 | 既有 source-identified summary shape | 被動展示 | known summary；SearchResults、Code、ToolCall、MemoryUpdate、TriggerPlugin 拒絕 |
 
 展示 card 的 `text` 永遠不替換原始 model text；原始候選仍由既有 strict parser 驗證，card 與候選保持不同 identity。
+已驗證的 `TextBlock.text` 與同類回應文字使用內容預算：單一文字最多 64 KiB UTF-8 bytes，完整 transcript 的內容文字合計最多 1 MiB UTF-8 bytes。短 metadata 識別字串仍最多 1024 Unicode 字元；內容超限會拒絕修正資格，不會放寬事件、卡片或副作用判定。這個界限是資格驗證的本機資源保護，不是 outbound 128K UTF-16 限制。歷史 20:36 回應的精確 metadata 欄位仍未取得，合成回歸不代表精確事故重播。
 
 同一帳號、模型、conversation 與 session 接收明確的 transport feedback；rejected candidate 只存在記憶體。Gateway 不選擇 decoded argument、不拼接字串、不重新上傳附件，也不改寫 caller canonical history。模型的新提案必須是同一工具的唯一 strict JSON object、沒有 prose，並通過原有 tool choice、數量與 ledger 檢查。對 fence-only 分支，原始、修正與最後交給 caller 的 arguments 必須有相同 canonical identity；只忽略 JSON 空白、object key order 與合法 escape 表示差異，不合併 integer/float，也不把比較結果重新序列化成 caller arguments。既有 JSON syntax 分支仍不保證僅憑 SAME tool 可證明意圖等價。只有接受的新提案能進 checkpoint 與 caller response。再次 malformed、authority 漂移或 unsafe duplicate 都直接 fail closed，不進第三次 generation 或 final-answer fallback。Stream 與 non-stream 使用相同 gate；stream caller 中斷會取消等待中的 correction。這會多一次模型 generation，usage estimate 包含新增 outbound text；不代表 context 成本為零，也不能證明模型意圖完全不變。
 
