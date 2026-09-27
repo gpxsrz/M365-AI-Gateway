@@ -84,24 +84,38 @@ pub(crate) fn syntax_correction_tool<'a>(
     tools: &[Tool],
     choice: &Value,
     limit: usize,
-) -> Option<(&'a str, ToolProjection)> {
-    let (name, arguments) = single_tool_fence(text)?;
+) -> Option<(&'a str, ToolProjection, Option<String>)> {
+    let projection = project(text, tools, choice, limit);
+    let diagnostic = projection.rejection.as_ref()?;
+    let (name, arguments) = match diagnostic.class {
+        ToolRejectionClass::MalformedFence => terminal_malformed_closer_tool_fence(text, tools)?,
+        ToolRejectionClass::IllegalEscape
+        | ToolRejectionClass::MalformedJsonStructure
+        | ToolRejectionClass::UnclosedString => single_tool_fence(text)?,
+        _ => return None,
+    };
     tool(tools, name).filter(|_| choice_allows(choice, name))?;
     if !single_argument_object_boundary(arguments) {
         return None;
     }
-    let projection = project(text, tools, choice, limit);
-    let diagnostic = projection.rejection.as_ref()?;
+    let fence_arguments = if diagnostic.class == ToolRejectionClass::MalformedFence {
+        Some(canonical_arguments(arguments.trim()).ok()?)
+    } else {
+        None
+    };
+    // The fence branch uses the parsed terminal shape above; diagnostic counts
+    // can miss a tool name preceded by whitespace after the backticks.
     (matches!(
         diagnostic.class,
         ToolRejectionClass::IllegalEscape
             | ToolRejectionClass::MalformedJsonStructure
             | ToolRejectionClass::UnclosedString
+            | ToolRejectionClass::MalformedFence
     ) && projection.calls.is_empty()
         && !projection.overflowed
-        && diagnostic.fence_count == 2
-        && diagnostic.matching_known_tool_fence_count == 1)
-        .then_some((name, projection))
+        && (diagnostic.class == ToolRejectionClass::MalformedFence
+            || (diagnostic.fence_count == 2 && diagnostic.matching_known_tool_fence_count == 1)))
+        .then_some((name, projection, fence_arguments))
 }
 
 // Ownership boundary only, not JSON validation. An unfinished object/string may
@@ -142,11 +156,11 @@ fn single_argument_object_boundary(arguments: &str) -> bool {
     true
 }
 
-pub(crate) fn is_strict_correction(text: &str, expected_tool: &str) -> bool {
-    let Some((name, arguments)) = single_tool_fence(text) else {
-        return false;
-    };
-    name == expected_tool && canonical_arguments(arguments.trim()).is_ok()
+pub(crate) fn strict_correction_arguments(text: &str, expected_tool: &str) -> Option<String> {
+    let (name, arguments) = single_tool_fence(text)?;
+    (name == expected_tool)
+        .then(|| canonical_arguments(arguments.trim()).ok())
+        .flatten()
 }
 
 fn single_tool_fence(text: &str) -> Option<(&str, &str)> {
@@ -157,6 +171,45 @@ fn single_tool_fence(text: &str) -> Option<(&str, &str)> {
     }
     let (arguments, closing) = rest.rsplit_once('\n')?;
     if closing.trim() != "```" || arguments.lines().any(|line| line.trim().starts_with("```")) {
+        return None;
+    }
+    Some((name, arguments))
+}
+
+// Correction may own one narrowly bounded Markdown closer typo without
+// executing or locally repairing it: an otherwise isolated known-tool fence
+// whose final line is another terminal fence marker carrying only one
+// ASCII info-string token (for example, ```json). The existing opening tag
+// and closing line both permit surrounding whitespace; the closing token
+// cannot name any registered tool.
+// Any extra material,
+// nested fence, second known tool, or non-object argument remains ineligible.
+fn terminal_malformed_closer_tool_fence<'a>(
+    text: &'a str,
+    tools: &[Tool],
+) -> Option<(&'a str, &'a str)> {
+    let (opening, rest) = text.trim().split_once('\n')?;
+    let name = opening.trim().strip_prefix("```")?.trim();
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let (arguments, closing) = rest.rsplit_once('\n')?;
+    let closing = closing.trim();
+    if closing == "```" || !closing.starts_with("```") {
+        return None;
+    }
+    let tag = closing[3..].trim();
+    if tag.is_empty()
+        || tools
+            .iter()
+            .any(|tool| tool.function.get("name").and_then(Value::as_str) == Some(tag))
+        || !tag
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '+'))
+        || arguments
+            .lines()
+            .any(|line| line.trim_start().starts_with("```"))
+    {
         return None;
     }
     Some((name, arguments))
@@ -928,6 +981,11 @@ mod tests {
         for (case, text, expected_class) in [
             ("illegal_escape", malformed, Some("illegal_escape")),
             (
+                "terminal_malformed_closing_fence",
+                "```read_file\n{\"path\":\"README.md\"}\n```json",
+                Some("malformed_fence"),
+            ),
+            (
                 "malformed_structure",
                 "```read_file\n{\"path\":\"a\",}\n```",
                 Some("malformed_json_structure"),
@@ -982,6 +1040,76 @@ mod tests {
             ),
             ("broken_fence", "```read_file\n{\"path\":\"\\q\"}", None),
             (
+                "malformed_closer_is_second_known_tool",
+                "```read_file\n{\"path\":\"README.md\"}\n```read_file",
+                None,
+            ),
+            (
+                "malformed_closer_spaced_known_tool",
+                "```read_file\n{\"path\":\"README.md\"}\n``` read_file",
+                None,
+            ),
+            (
+                "malformed_closer_tabbed_known_tool",
+                "```read_file\n{\"path\":\"README.md\"}\n```\tread_file",
+                None,
+            ),
+            (
+                "malformed_closer_duplicate_keys",
+                "```read_file\n{\"path\":\"one\",\"path\":\"two\"}\n```json",
+                None,
+            ),
+            (
+                "malformed_closer_truncated_arguments",
+                "```read_file\n{\"path\":\"unfinished\n```json",
+                None,
+            ),
+            (
+                "malformed_closer_nested_fence",
+                "```read_file\n{\"path\":\"README.md\"}\n```json\n```other",
+                None,
+            ),
+            (
+                "malformed_closer_has_trailing_material",
+                "```read_file\n{\"path\":\"README.md\"}\n```json extra",
+                None,
+            ),
+            (
+                "malformed_closer_followed_by_prose",
+                "```read_file\n{\"path\":\"README.md\"}\n```json\nexplanation",
+                None,
+            ),
+            (
+                "malformed_closer_second_object",
+                "```read_file\n{\"path\":\"README.md\"} {\"path\":\"other\"}\n```json",
+                None,
+            ),
+            (
+                "malformed_closer_root_array",
+                "```read_file\n[]\n```json",
+                None,
+            ),
+            (
+                "malformed_closer_unknown_tool",
+                "```unknown\n{\"path\":\"README.md\"}\n```json",
+                None,
+            ),
+            (
+                "malformed_closer_duplicate_declaration",
+                "```read_file\n{\"path\":\"README.md\"}\n```json",
+                None,
+            ),
+            (
+                "malformed_closer_choice_none",
+                "```read_file\n{\"path\":\"README.md\"}\n```json",
+                None,
+            ),
+            (
+                "malformed_closer_disallowed_choice",
+                "```read_file\n{\"path\":\"README.md\"}\n```json",
+                None,
+            ),
+            (
                 "prose_before",
                 "explanation\n```read_file\n{\"path\":\"\\q\"}\n```",
                 None,
@@ -1003,18 +1131,23 @@ mod tests {
             ),
         ] {
             let mut available = tools();
-            if case == "duplicate_declaration" {
+            if matches!(
+                case,
+                "duplicate_declaration" | "malformed_closer_duplicate_declaration"
+            ) {
                 available.push(available[0].clone());
             }
             let choice = match case {
-                "disallowed_named_choice" => json!({"type":"function","function":{"name":"other"}}),
-                "choice_none" => json!("none"),
+                "disallowed_named_choice" | "malformed_closer_disallowed_choice" => {
+                    json!({"type":"function","function":{"name":"other"}})
+                }
+                "choice_none" | "malformed_closer_choice_none" => json!("none"),
                 _ => json!("auto"),
             };
             assert_eq!(
                 syntax_correction_tool(text, &available, &choice, 1)
                     .as_ref()
-                    .map(|(name, _)| *name),
+                    .map(|(name, _, _)| *name),
                 expected_class.map(|_| "read_file"),
                 "case={case}"
             );
