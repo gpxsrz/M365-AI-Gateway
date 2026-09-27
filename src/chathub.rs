@@ -634,10 +634,17 @@ struct ImageTraversalContext {
     message_type_class: Option<NativeEffectMessageTypeClass>,
     known_message_type: Option<&'static str>,
     content_origin_class: Option<NativeEffectImageContentOriginClass>,
+    inside_adaptive_card: bool,
+    in_presentation_image_slot: bool,
 }
 
 impl ImageTraversalContext {
     fn at_object(mut self, object: &serde_json::Map<String, Value>) -> Self {
+        if self.container_class == Some(NativeEffectImageContainerClass::AdaptiveCards)
+            && object.get("type").and_then(Value::as_str) == Some("AdaptiveCard")
+        {
+            self.inside_adaptive_card = true;
+        }
         if let Some(value) = object.get("messageType") {
             self.message_type_class = Some(value.as_str().map_or(
                 NativeEffectMessageTypeClass::Unknown,
@@ -655,10 +662,29 @@ impl ImageTraversalContext {
     }
 
     fn at_field(mut self, field: &str) -> Self {
+        self.in_presentation_image_slot = matches!(
+            native_effect_image_container_class(field),
+            Some(
+                NativeEffectImageContainerClass::CardBody
+                    | NativeEffectImageContainerClass::CardItems
+            )
+        );
         if let Some(container_class) = native_effect_image_container_class(field) {
             self.container_class = Some(container_class);
         }
         self
+    }
+
+    fn is_developer_logs_deep_leo_presentation_image(
+        self,
+        object: &serde_json::Map<String, Value>,
+    ) -> bool {
+        self.known_message_type == Some("DeveloperLogs")
+            && self.content_origin_class == Some(NativeEffectImageContentOriginClass::DeepLeo)
+            && native_effect_image_candidate_node_type_class(object)
+                == NativeEffectImageCandidateNodeTypeClass::Image
+            && self.inside_adaptive_card
+            && self.in_presentation_image_slot
     }
 }
 
@@ -1150,11 +1176,20 @@ fn validate_invocation_id(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct PassiveCardValidationContext {
+    allow_developer_logs_presentation_image: bool,
+    inside_adaptive_card: bool,
+    image_slot: bool,
+}
+
 fn validate_passive_card(
     value: &Value,
     nodes: &mut usize,
     depth: usize,
     card_index: &mut usize,
+    context: PassiveCardValidationContext,
+    saw_developer_logs_presentation_image: &mut bool,
 ) -> Result<(), CorrectionIneligibility> {
     *nodes += 1;
     if depth > 32 || *nodes > MAX_TRANSCRIPT_NODES {
@@ -1163,7 +1198,14 @@ fn validate_passive_card(
     match value {
         Value::Array(values) => {
             for value in values {
-                validate_passive_card(value, nodes, depth + 1, card_index)?;
+                validate_passive_card(
+                    value,
+                    nodes,
+                    depth + 1,
+                    card_index,
+                    context,
+                    saw_developer_logs_presentation_image,
+                )?;
             }
             Ok(())
         }
@@ -1185,7 +1227,18 @@ fn validate_passive_card(
                         return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in body {
-                        validate_passive_card(child, nodes, depth + 1, card_index)?;
+                        validate_passive_card(
+                            child,
+                            nodes,
+                            depth + 1,
+                            card_index,
+                            PassiveCardValidationContext {
+                                inside_adaptive_card: true,
+                                image_slot: true,
+                                ..context
+                            },
+                            saw_developer_logs_presentation_image,
+                        )?;
                     }
                 }
                 "TextBlock" => {
@@ -1204,7 +1257,17 @@ fn validate_passive_card(
                         return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in items {
-                        validate_passive_card(child, nodes, depth + 1, card_index)?;
+                        validate_passive_card(
+                            child,
+                            nodes,
+                            depth + 1,
+                            card_index,
+                            PassiveCardValidationContext {
+                                image_slot: true,
+                                ..context
+                            },
+                            saw_developer_logs_presentation_image,
+                        )?;
                     }
                 }
                 "ColumnSet" => {
@@ -1215,7 +1278,17 @@ fn validate_passive_card(
                         return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in columns {
-                        validate_passive_card(child, nodes, depth + 1, card_index)?;
+                        validate_passive_card(
+                            child,
+                            nodes,
+                            depth + 1,
+                            card_index,
+                            PassiveCardValidationContext {
+                                image_slot: false,
+                                ..context
+                            },
+                            saw_developer_logs_presentation_image,
+                        )?;
                     }
                 }
                 "Column" => {
@@ -1226,8 +1299,76 @@ fn validate_passive_card(
                         return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                     };
                     for child in items {
-                        validate_passive_card(child, nodes, depth + 1, card_index)?;
+                        validate_passive_card(
+                            child,
+                            nodes,
+                            depth + 1,
+                            card_index,
+                            PassiveCardValidationContext {
+                                image_slot: true,
+                                ..context
+                            },
+                            saw_developer_logs_presentation_image,
+                        )?;
                     }
+                }
+                "Image"
+                    if context.allow_developer_logs_presentation_image
+                        && context.inside_adaptive_card
+                        && context.image_slot
+                        && object
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| !contains_protected_artifact_reference(url)) =>
+                {
+                    if !object_has_only_keys(
+                        value,
+                        &[
+                            "type",
+                            "url",
+                            "altText",
+                            "backgroundColor",
+                            "height",
+                            "horizontalAlignment",
+                            "id",
+                            "isVisible",
+                            "separator",
+                            "size",
+                            "spacing",
+                            "style",
+                            "width",
+                        ],
+                    ) || !bounded_string(object.get("url"), false)
+                        || !is_image_url(
+                            object
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        )
+                        || [
+                            "altText",
+                            "backgroundColor",
+                            "height",
+                            "horizontalAlignment",
+                            "id",
+                            "size",
+                            "spacing",
+                            "style",
+                            "width",
+                        ]
+                        .into_iter()
+                        .any(|key| {
+                            object
+                                .get(key)
+                                .is_some_and(|value| !bounded_string(Some(value), true))
+                        })
+                        || ["isVisible", "separator"]
+                            .into_iter()
+                            .any(|key| object.get(key).is_some_and(|value| !value.is_boolean()))
+                    {
+                        return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
+                    }
+                    *saw_developer_logs_presentation_image = true;
                 }
                 "Action.Execute" | "Action.Submit" | "Action.OpenUrl" | "Image" | "Media" => {
                     let mut location =
@@ -1277,6 +1418,14 @@ fn validate_message(
                     native_effect_message_type_class,
                 )
             });
+    let developer_logs_deep_leo_presentation = message_type == "DeveloperLogs"
+        && object.get("contentOrigin").and_then(Value::as_str) == Some("DeepLeo")
+        && object
+            .get("contentType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty();
+    let mut saw_developer_logs_presentation_image = false;
     for (key, value) in object {
         match key.as_str() {
             "text" => {
@@ -1310,7 +1459,20 @@ fn validate_message(
                     return Err(CorrectionEligibilityReason::MetadataTypeInvalid.into());
                 }
                 let mut card_index = 0;
-                validate_passive_card(value, nodes, 0, &mut card_index).map_err(|failure| {
+                validate_passive_card(
+                    value,
+                    nodes,
+                    0,
+                    &mut card_index,
+                    PassiveCardValidationContext {
+                        allow_developer_logs_presentation_image:
+                            developer_logs_deep_leo_presentation,
+                        inside_adaptive_card: false,
+                        image_slot: false,
+                    },
+                    &mut saw_developer_logs_presentation_image,
+                )
+                .map_err(|failure| {
                     failure.at_message(event_index, message_index, message_type_class)
                 })?;
             }
@@ -1356,6 +1518,9 @@ fn validate_message(
             });
             return Err(CorrectionIneligibility::native_effect(location));
         }
+        return Ok(false);
+    }
+    if developer_logs_deep_leo_presentation && saw_developer_logs_presentation_image {
         return Ok(false);
     }
     if !matches!(message_type, "" | "Chat") {
@@ -3094,19 +3259,23 @@ fn collect_image_urls(
                     && !contains_protected_artifact_reference(candidate)
                     && seen.insert(candidate.to_owned())
                 {
-                    images.push(candidate.to_owned());
-                    if first_origin.is_none() {
-                        *first_origin = Some(ImageOrigin {
-                            source_class,
-                            event_index,
-                            candidate_field_class,
-                            candidate_node_type_class:
-                                native_effect_image_candidate_node_type_class(object),
-                            container_class: context.container_class,
-                            message_type_class: context.message_type_class,
-                            known_message_type: context.known_message_type,
-                            content_origin_class: context.content_origin_class,
-                        });
+                    if context.is_developer_logs_deep_leo_presentation_image(object) {
+                        seen.remove(candidate);
+                    } else {
+                        images.push(candidate.to_owned());
+                        if first_origin.is_none() {
+                            *first_origin = Some(ImageOrigin {
+                                source_class,
+                                event_index,
+                                candidate_field_class,
+                                candidate_node_type_class:
+                                    native_effect_image_candidate_node_type_class(object),
+                                container_class: context.container_class,
+                                message_type_class: context.message_type_class,
+                                known_message_type: context.known_message_type,
+                                content_origin_class: context.content_origin_class,
+                            });
+                        }
                     }
                 } else {
                     collect_image_urls(
@@ -3974,6 +4143,109 @@ mod tests {
             let encoded = serde_json::to_string(&diagnostic).unwrap();
             assert!(!encoded.contains(PRIVATE_URL));
             assert!(!encoded.contains(PRIVATE_TEXT));
+        }
+    }
+
+    #[tokio::test]
+    async fn developer_logs_deep_leo_presentation_image_keeps_native_controls_fail_closed() {
+        const PRESENTATION_URL: &str = "https://private.invalid/image.png";
+
+        let message_with = |message_type: &str, node: Value| {
+            json!({
+                "type": 1,
+                "target": "update",
+                "arguments": [{"messages": [{
+                    "author": "bot",
+                    "text": "display-only metadata",
+                    "messageType": message_type,
+                    "contentType": "",
+                    "contentOrigin": "DeepLeo",
+                    "adaptiveCards": [{
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "Container", "items": [node]}]
+                    }]
+                }]}]
+            })
+        };
+        let result_with = |event: Value| async move {
+            text_only_loopback(vec![
+                event,
+                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
+                json!({"type": 3}),
+            ])
+            .await
+            .unwrap()
+        };
+
+        let presentation = result_with(message_with(
+            "DeveloperLogs",
+            json!({"type": "Image", "url": PRESENTATION_URL}),
+        ))
+        .await;
+        assert!(presentation.images.is_empty());
+        assert_eq!(presentation.correction_eligibility(), Ok(()));
+
+        let direct_adaptivecards_image = result_with(json!({
+            "type": 1,
+            "target": "update",
+            "arguments": [{"messages": [{
+                "author": "bot",
+                "text": "malformed presentation hierarchy",
+                "messageType": "DeveloperLogs",
+                "contentType": "",
+                "contentOrigin": "DeepLeo",
+                "adaptiveCards": [{"type": "Image", "url": PRESENTATION_URL}]
+            }]}]
+        }))
+        .await;
+        assert_eq!(
+            direct_adaptivecards_image.correction_eligibility(),
+            Err(CorrectionEligibilityReason::NativeEffect),
+            "an Image outside an AdaptiveCard body/items hierarchy must stay fail-closed"
+        );
+
+        let developer_logs_without_presentation_image = result_with(json!({
+            "type": 1,
+            "target": "update",
+            "arguments": [{"messages": [{
+                "author": "bot",
+                "text": "not the proven presentation-image case",
+                "messageType": "DeveloperLogs",
+                "contentType": "",
+                "contentOrigin": "DeepLeo"
+            }]}]
+        }))
+        .await;
+        assert_eq!(
+            developer_logs_without_presentation_image.correction_eligibility(),
+            Err(CorrectionEligibilityReason::NativeEffect),
+            "DeveloperLogs/DeepLeo alone must not bypass NonChatMessageType"
+        );
+
+        for (case, message_type, node) in [
+            (
+                "protected_artifact_image",
+                "DeveloperLogs",
+                json!({
+                    "type": "Image",
+                    "url": "https://asyncgw.teams.microsoft.com/image.png"
+                }),
+            ),
+            ("media", "DeveloperLogs", json!({"type": "Media"})),
+            ("action", "DeveloperLogs", json!({"type": "Action.Execute"})),
+            (
+                "ordinary_chat_image",
+                "Chat",
+                json!({"type": "Image", "url": PRESENTATION_URL}),
+            ),
+        ] {
+            let result = result_with(message_with(message_type, node)).await;
+            assert_eq!(
+                result.correction_eligibility(),
+                Err(CorrectionEligibilityReason::NativeEffect),
+                "case={case}"
+            );
         }
     }
 
