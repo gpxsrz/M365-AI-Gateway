@@ -196,6 +196,7 @@ Core invariants:
 
 - history prefix, role, tool ID, arguments, and transcript identity must match;
 - a reservation before upstream starts may be reclaimed safely;
+- when upstream has responded and Gateway replay protection rejects an `unsafe_tool_replay` candidate before caller-tool dispatch or final acceptance, only the current unaccepted turn is rolled back; the prior accepted checkpoint and tool ledger remain, and the response stays terminal 409;
 - once upstream starts and outcome is uncertain, recovery-required state must remain;
 - process restart alone does not prove replay safety;
 - only one recovery attempt may own a checkpoint at a time;

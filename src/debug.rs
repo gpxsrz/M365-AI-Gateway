@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Instant,
 };
 
@@ -255,6 +255,12 @@ struct Record {
     provenance_class: String,
     upstream_attempt_class: String,
     upstream_result_class: String,
+    #[serde(
+        skip_serializing,
+        default = "default_not_evaluated",
+        deserialize_with = "deserialize_not_evaluated"
+    )]
+    checkpoint_turn_outcome: String,
     // These fields are a live projection. Keeping them out of the v1 JSONL
     // record preserves readback by an older rollback binary.
     #[serde(
@@ -631,6 +637,7 @@ impl Record {
             provenance_class: ProvenanceClass::None.as_str().to_owned(),
             upstream_attempt_class: UpstreamAttempt::None.as_str().to_owned(),
             upstream_result_class: UpstreamResult::NotAttempted.as_str().to_owned(),
+            checkpoint_turn_outcome: "not_evaluated".to_owned(),
             post_policy_disposition: "not_evaluated".to_owned(),
             post_policy_reason: "not_evaluated".to_owned(),
             caller_delivery: CallerDelivery::NotEvaluated.as_str().to_owned(),
@@ -1016,6 +1023,13 @@ impl Drop for TraceInner {
             record.tool_correction_failure_class = "request_not_accepted".to_owned();
         }
         record.duration_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if record.checkpoint_turn_outcome != "not_evaluated" {
+            tracing::info!(
+                correlation_id = %record.correlation_id,
+                checkpoint_turn_outcome = %record.checkpoint_turn_outcome,
+                "checkpoint turn outcome"
+            );
+        }
         self.store.push(record);
     }
 }
@@ -1023,6 +1037,20 @@ impl Drop for TraceInner {
 #[derive(Clone)]
 pub(crate) struct Trace {
     inner: Arc<TraceInner>,
+}
+
+pub(crate) struct TraceObserver(Weak<TraceInner>);
+
+impl TraceObserver {
+    pub(crate) fn checkpoint_turn_outcome(&self, outcome: &'static str) {
+        if let Some(inner) = self.0.upgrade() {
+            inner
+                .record
+                .lock()
+                .expect("debug trace poisoned")
+                .checkpoint_turn_outcome = outcome.to_owned();
+        }
+    }
 }
 
 fn apply_tool_diagnostic(
@@ -1061,6 +1089,10 @@ fn apply_tool_diagnostic(
 }
 
 impl Trace {
+    pub(crate) fn observer(&self) -> TraceObserver {
+        TraceObserver(Arc::downgrade(&self.inner))
+    }
+
     fn update(&self, update: impl FnOnce(&mut Record)) {
         update(&mut self.inner.record.lock().expect("debug trace poisoned"));
     }
@@ -1251,6 +1283,10 @@ impl Trace {
 
     pub(crate) fn upstream_result(&self, class: UpstreamResult) {
         self.update(|record| record.upstream_result_class = class.as_str().to_owned());
+    }
+
+    pub(crate) fn checkpoint_turn_outcome(&self, outcome: &'static str) {
+        self.update(|record| record.checkpoint_turn_outcome = outcome.to_owned());
     }
 
     pub(crate) fn caller_delivery(&self, delivery: CallerDelivery) {
@@ -1462,6 +1498,7 @@ pub(crate) async fn detail(
         "provenanceClass": record.provenance_class,
         "upstreamAttemptClass": record.upstream_attempt_class,
         "upstreamResultClass": record.upstream_result_class,
+        "checkpointTurnOutcome": record.checkpoint_turn_outcome,
         "callerDelivery": record.caller_delivery,
         "toolCallSuppressed": record.tool_call_suppressed,
         "toolCallRejectionClass": record.tool_call_rejection_class,
@@ -1580,6 +1617,7 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["spillDecision"] = serde_json::Value::String(public_spill_decision(record).to_owned());
     value["spillReason"] = serde_json::Value::String(public_spill_reason(record).to_owned());
     value["callerDelivery"] = serde_json::Value::String(record.caller_delivery.clone());
+    value["checkpointTurnOutcome"] = json!(record.checkpoint_turn_outcome);
     value["toolCallSuppressed"] = serde_json::Value::Bool(record.tool_call_suppressed);
     value["toolCallRejectionClass"] =
         serde_json::Value::String(record.tool_call_rejection_class.clone());

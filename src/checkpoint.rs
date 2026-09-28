@@ -164,7 +164,7 @@ struct Record {
     ledger_mac: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 struct ResponseCursor {
     digest: String,
     revision: u64,
@@ -1207,6 +1207,78 @@ impl CheckpointTurn {
             state.recovery_leases.remove(&self.record_id);
             self.recovery_lease = false;
         }
+        self.closed = true;
+        Ok(())
+    }
+
+    // Only a Gateway policy path that has received the upstream response and
+    // withheld every caller effect may settle a started turn this way.
+    pub(crate) fn reject_without_effect(&mut self) -> Result<(), CheckpointError> {
+        if self.closed || !self.upstream_started || !self.recovery_lease {
+            return Err(CheckpointError::RecoveryRequired);
+        }
+        let _global_lease = FileLease::blocking(&global_lock_path(&self.store.path))?;
+        let (records, migrated) = load_records(&self.store.path, &self.store.integrity_key, false)?;
+        let mut state = self.store.state.lock().expect("checkpoint state poisoned");
+        state.records = records;
+        if migrated {
+            self.store.save(&state)?;
+        }
+        let record = state
+            .records
+            .get(&self.record_id)
+            .ok_or(CheckpointError::Stale)?;
+        let same_ledger = serde_json::to_value(&record.tool_ledger)
+            .map_err(|error| CheckpointError::Persistence(error.to_string()))?
+            == serde_json::to_value(
+                self.rollback_record
+                    .as_ref()
+                    .map_or_else(AgentLedger::default, |prior| prior.tool_ledger.clone()),
+            )
+            .map_err(|error| CheckpointError::Persistence(error.to_string()))?;
+        let accepted_state_unchanged = self.rollback_record.as_ref().map_or_else(
+            || {
+                record.accepted_count == 0
+                    && record.message_digests.is_empty()
+                    && record.message_identities.is_empty()
+                    && record.hash_chain.is_empty()
+                    && record.response_cursors.is_empty()
+                    && record.conversation_id.is_empty()
+                    && record.session_id.is_empty()
+            },
+            |prior| {
+                record.accepted_count == prior.accepted_count
+                    && record.message_digests == prior.message_digests
+                    && record.message_identities == prior.message_identities
+                    && record.hash_chain == prior.hash_chain
+                    && record.conversation_id == prior.conversation_id
+                    && record.session_id == prior.session_id
+                    && record.response_cursors == prior.response_cursors
+                    && record.terminal_unknown == prior.terminal_unknown
+            },
+        );
+        if !record.in_flight
+            || record.in_flight_upstream_started != Some(true)
+            || record.revision != self.revision
+            || record.in_flight_message_digests != self.base_digests
+            || record.in_flight_message_identities != self.base_identities
+            || !accepted_state_unchanged
+            || !same_ledger
+        {
+            return Err(CheckpointError::Stale);
+        }
+        let snapshot = state.records.clone();
+        if let Some(prior) = self.rollback_record.clone() {
+            state.records.insert(self.record_id.clone(), prior);
+        } else {
+            state.records.remove(&self.record_id);
+        }
+        if let Err(error) = self.store.save(&state) {
+            state.records = snapshot;
+            return Err(error);
+        }
+        state.recovery_leases.remove(&self.record_id);
+        self.recovery_lease = false;
         self.closed = true;
         Ok(())
     }
@@ -2730,6 +2802,98 @@ mod tests {
                 "session",
                 &[message("user", "one")],
                 false,
+            ),
+            Err(CheckpointError::RecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn rejected_without_effect_restores_only_the_current_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let user = message("user", "one");
+        let answer = message("assistant", "accepted");
+        store
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                std::slice::from_ref(&user),
+                false,
+            )
+            .unwrap()
+            .accept(Binding::default(), std::slice::from_ref(&answer))
+            .unwrap();
+        let before: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut turn = store
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[user.clone(), answer.clone(), message("user", "two")],
+                false,
+            )
+            .unwrap();
+        turn.mark_upstream_started().unwrap();
+        assert!(matches!(
+            turn.abort(),
+            Err(CheckpointError::RecoveryRequired)
+        ));
+        turn.reject_without_effect().unwrap();
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, before);
+        drop(turn);
+        drop(store);
+        CheckpointStore::open(&path)
+            .unwrap()
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[user, answer, message("user", "three")],
+                false,
+            )
+            .unwrap()
+            .abort()
+            .unwrap();
+    }
+
+    #[test]
+    fn rejected_without_effect_cannot_overwrite_a_newer_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let mut turn = store
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[message("user", "one")],
+                false,
+            )
+            .unwrap();
+        turn.mark_upstream_started().unwrap();
+        {
+            let mut state = store.state.lock().unwrap();
+            state.records.get_mut(&turn.record_id).unwrap().revision += 1;
+            store.save(&state).unwrap();
+        }
+        let drifted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(
+            turn.reject_without_effect(),
+            Err(CheckpointError::Stale)
+        ));
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, drifted);
+        drop(turn);
+        assert!(matches!(
+            store.begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[message("user", "one")],
+                false
             ),
             Err(CheckpointError::RecoveryRequired)
         ));

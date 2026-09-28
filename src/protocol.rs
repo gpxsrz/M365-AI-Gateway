@@ -848,8 +848,10 @@ fn admission_result(code: &str) -> AdmissionResult {
 
 fn checkpoint_start_hook(
     checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
+    trace: &crate::debug::Trace,
 ) -> crate::chathub::UpstreamStartHook {
     let checkpoint = Arc::clone(checkpoint);
+    let trace = trace.observer();
     crate::chathub::UpstreamStartHook::new(move || {
         let mut checkpoint = checkpoint
             .lock()
@@ -860,7 +862,9 @@ fn checkpoint_start_hook(
             ));
         };
         turn.mark_upstream_started()
-            .map_err(|error| ChatError::Protocol(format!("checkpoint start failed: {error}")))
+            .map_err(|error| ChatError::Protocol(format!("checkpoint start failed: {error}")))?;
+        trace.checkpoint_turn_outcome("unresolved");
+        Ok(())
     })
 }
 
@@ -909,12 +913,12 @@ async fn complete_chat(
     let checkpoint = Arc::new(Mutex::new(checkpoint));
     let _checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
     let mut request = request;
-    if checkpoint
+    let had_checkpoint = checkpoint
         .lock()
         .expect("checkpoint handle poisoned")
-        .is_some()
-    {
-        request.upstream_start = Some(checkpoint_start_hook(&checkpoint));
+        .is_some();
+    if had_checkpoint {
+        request.upstream_start = Some(checkpoint_start_hook(&checkpoint, &trace));
     }
     let mut input_units = usage_input_units;
     let mut usage_estimate_scope = usage_estimate_scope;
@@ -1105,7 +1109,12 @@ async fn complete_chat(
             }
             if syntax_corrected && transport.suppressed {
                 trace.tool_correction_finished(Some("unsafe_tool_replay"));
-                return unsafe_tool_replay_response(permit);
+                return unsafe_tool_replay_or_checkpoint_error_response(
+                    &checkpoint,
+                    &trace,
+                    &transport,
+                    permit,
+                );
             }
             if transport.completed_call_suppressed {
                 trace.tool_call_suppressed();
@@ -1264,7 +1273,12 @@ async fn complete_chat(
                     );
                 }
                 if transport.suppressed && transport.projection.calls.is_empty() {
-                    return unsafe_tool_replay_response(permit);
+                    return unsafe_tool_replay_or_checkpoint_error_response(
+                        &checkpoint,
+                        &trace,
+                        &transport,
+                        permit,
+                    );
                 }
                 if tool_choice_requires_call(&tool_choice) && transport.projection.calls.is_empty()
                 {
@@ -1318,6 +1332,9 @@ async fn complete_chat(
                     "checkpoint_error",
                     &error,
                 );
+            }
+            if had_checkpoint {
+                trace.checkpoint_turn_outcome("accepted");
             }
             trace.caller_delivery(CallerDelivery::Sent);
             if syntax_corrected {
@@ -1413,12 +1430,12 @@ async fn stream_chat(
     let checkpoint = Arc::new(Mutex::new(checkpoint));
     let checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
     let mut request = request;
-    if checkpoint
+    let had_checkpoint = checkpoint
         .lock()
         .expect("checkpoint handle poisoned")
-        .is_some()
-    {
-        request.upstream_start = Some(checkpoint_start_hook(&checkpoint));
+        .is_some();
+    if had_checkpoint {
+        request.upstream_start = Some(checkpoint_start_hook(&checkpoint, &trace));
     }
     let mut input_units = usage_input_units;
     let include_usage = stream_options.include_usage;
@@ -1687,7 +1704,13 @@ async fn stream_chat(
                 }
                 if syntax_corrected && transport.suppressed {
                     trace.tool_correction_finished(Some("unsafe_tool_replay"));
-                    send_unsafe_tool_replay_error(&trace, &sender, permit);
+                    send_unsafe_tool_replay_or_checkpoint_error(
+                        &checkpoint,
+                        &trace,
+                        &transport,
+                        &sender,
+                        permit,
+                    );
                     let _ = send_sse_done(&trace, &sender);
                     return;
                 }
@@ -1891,7 +1914,13 @@ async fn stream_chat(
                         return;
                     }
                     if transport.suppressed && transport.projection.calls.is_empty() {
-                        send_unsafe_tool_replay_error(&trace, &sender, permit);
+                        send_unsafe_tool_replay_or_checkpoint_error(
+                            &checkpoint,
+                            &trace,
+                            &transport,
+                            &sender,
+                            permit,
+                        );
                         let _ = send_sse_done(&trace, &sender);
                         return;
                     }
@@ -2054,6 +2083,9 @@ async fn stream_chat(
                     send_sse_error(&trace, &sender, "checkpoint_error", &error);
                     let _ = send_sse_done(&trace, &sender);
                     return;
+                }
+                if had_checkpoint {
+                    trace.checkpoint_turn_outcome("accepted");
                 }
                 final_frames_sent = final_frames
                     .into_iter()
@@ -3005,6 +3037,51 @@ fn unsafe_tool_replay_response(permit: crate::traffic::Permit) -> Response {
     (StatusCode::CONFLICT, Json(unsafe_tool_replay_value())).into_response()
 }
 
+fn settle_unsafe_tool_replay_checkpoint(
+    checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
+    trace: &crate::debug::Trace,
+    transport: &TransportProjection,
+) -> Result<(), crate::checkpoint::CheckpointError> {
+    use crate::agent_ledger::SuppressionReason;
+    if transport.suppression_details.is_empty()
+        || !transport.suppression_details.iter().all(|detail| {
+            detail.candidate_not_dispatched
+                && matches!(
+                    detail.blocking_reason,
+                    SuppressionReason::SameBatchDuplicate
+                        | SuppressionReason::PendingSameCall
+                        | SuppressionReason::CompletedNotAuthorizedReadback
+                        | SuppressionReason::CompletedResultNotVerified
+                )
+        })
+    {
+        return Ok(());
+    }
+    if let Some(mut turn) = take_checkpoint(checkpoint) {
+        turn.reject_without_effect()?;
+        trace.checkpoint_turn_outcome("rejected_without_effect");
+    }
+    Ok(())
+}
+
+fn unsafe_tool_replay_or_checkpoint_error_response(
+    checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
+    trace: &crate::debug::Trace,
+    transport: &TransportProjection,
+    permit: crate::traffic::Permit,
+) -> Response {
+    if let Err(error) = settle_unsafe_tool_replay_checkpoint(checkpoint, trace, transport) {
+        permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
+        return openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "checkpoint_error",
+            "checkpoint_error",
+            &error.to_string(),
+        );
+    }
+    unsafe_tool_replay_response(permit)
+}
+
 const INVALID_TOOL_CALL_MESSAGE: &str =
     "model returned a malformed caller tool candidate that was not safely executable";
 
@@ -3089,6 +3166,21 @@ fn send_unsafe_tool_replay_error(
     let sent = send_sse(sender, unsafe_tool_replay_value());
     trace.caller_delivery(stream_error_delivery(sender, sent));
     sent
+}
+
+fn send_unsafe_tool_replay_or_checkpoint_error(
+    checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
+    trace: &crate::debug::Trace,
+    transport: &TransportProjection,
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
+    permit: crate::traffic::Permit,
+) {
+    if let Err(error) = settle_unsafe_tool_replay_checkpoint(checkpoint, trace, transport) {
+        permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
+        send_sse_error(trace, sender, "checkpoint_error", &error.to_string());
+        return;
+    }
+    send_unsafe_tool_replay_error(trace, sender, permit);
 }
 
 fn tool_choice_requires_call(choice: &Value) -> bool {
@@ -18456,6 +18548,195 @@ mod tests {
     #[tokio::test]
     async fn hermes_repeated_duplicate_fallback_is_typed_stream_error() {
         assert_repeated_duplicate_fallback_fails_closed(true).await;
+    }
+
+    async fn assert_unsafe_replay_does_not_poison_the_next_user_turn(stream: bool) {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "The prior inspection result is accepted.",
+            "```inspect\n{}\n```",
+            "```inspect\n{}\n```",
+            "```inspect\n{}\n```",
+            "```inspect\n{}\n```",
+            "The next user turn can continue.",
+        ]));
+        let root = tempfile::tempdir().unwrap();
+        let (gateway, key) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            None,
+        );
+        let app = Gateway::router(gateway.clone());
+        let mut request = completed_duplicate_request(stream, 1);
+        request["session_key"] = json!("unsafe-replay-settle");
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.contains("The prior inspection result is accepted."));
+        request["messages"].as_array_mut().unwrap().push(json!({
+            "role":"assistant", "content":"The prior inspection result is accepted."
+        }));
+
+        let checkpoint_path = root.path().join("transport-checkpoints.json");
+        let accepted: Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        let prior = &accepted["records"][0];
+        assert_eq!(
+            prior["toolLedger"]["completed"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(prior["toolLedger"]["completed"][0]["id"], "completed-call");
+
+        request["messages"].as_array_mut().unwrap().push(json!({
+            "role":"assistant", "content":"Continue the current turn."
+        }));
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(
+            status,
+            if stream {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+        assert!(body.contains("unsafe_tool_replay"), "body={body}");
+        assert!(body.contains("\"retryable\":false"));
+        let caller_dispatch_count = body.matches("\"tool_calls\"").count();
+        assert_eq!(
+            caller_dispatch_count, 0,
+            "rejected candidate reached caller"
+        );
+        let rejected: Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(
+            rejected["records"][0], *prior,
+            "rejected turn must not change the accepted checkpoint or ledger"
+        );
+        assert_eq!(chat.requests.lock().unwrap().len(), 3);
+        assert_eq!(
+            gateway.debug.records_for_test().last().unwrap()["checkpointTurnOutcome"],
+            "rejected_without_effect"
+        );
+
+        request["messages"].as_array_mut().unwrap().push(json!({
+            "role":"assistant", "content":"Continue without re-executing the prior call."
+        }));
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(
+            status,
+            if stream {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+        assert!(body.contains("unsafe_tool_replay"), "body={body}");
+        let caller_dispatch_count = body.matches("\"tool_calls\"").count();
+        assert_eq!(
+            caller_dispatch_count, 0,
+            "repeated candidate reached caller"
+        );
+        let repeated: Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(repeated["records"][0], *prior);
+        assert_eq!(chat.requests.lock().unwrap().len(), 5);
+
+        drop(app);
+        drop(gateway);
+        let reopened = CheckpointStore::open(&checkpoint_path).unwrap();
+        let (gateway, _) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            Some(reopened),
+        );
+        let app = Gateway::router(gateway);
+
+        request["messages"].as_array_mut().unwrap().push(json!({
+            "role":"user", "content":"Give a fresh read-only status."
+        }));
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(
+            body.contains("The next user turn can continue."),
+            "body={body}"
+        );
+        assert_eq!(chat.requests.lock().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn hermes_unsafe_replay_settles_non_stream_checkpoint_for_next_turn() {
+        assert_unsafe_replay_does_not_poison_the_next_user_turn(false).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_unsafe_replay_settles_stream_checkpoint_for_next_turn() {
+        assert_unsafe_replay_does_not_poison_the_next_user_turn(true).await;
+    }
+
+    async fn assert_first_unsafe_replay_allows_immediate_user_turn(stream: bool) {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "The prior inspection result is accepted.",
+            "```inspect\n{}\n```",
+            "```inspect\n{}\n```",
+            "The ordinary user turn can continue.",
+        ]));
+        let root = tempfile::tempdir().unwrap();
+        let (gateway, key) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            None,
+        );
+        let app = Gateway::router(gateway.clone());
+        let mut request = completed_duplicate_request(stream, 1);
+        request["session_key"] = json!("unsafe-replay-immediate-user");
+        let (status, _) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::OK);
+        request["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant", "content":"The prior inspection result is accepted."}),
+            json!({"role":"assistant", "content":"Continue the current turn."}),
+        ]);
+
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(
+            status,
+            if stream {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+        assert!(body.contains("unsafe_tool_replay"), "body={body}");
+        assert_eq!(body.matches("\"tool_calls\"").count(), 0);
+        let checkpoint_path = root.path().join("transport-checkpoints.json");
+        let after_rejection: Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert!(after_rejection["records"][0].get("inFlight").is_none());
+        assert_eq!(
+            after_rejection["records"][0]["toolLedger"]["completed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        request["messages"].as_array_mut().unwrap().push(json!({
+            "role":"user", "content":"Give a fresh read-only status."
+        }));
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.contains("The ordinary user turn can continue."));
+        assert_eq!(chat.requests.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn hermes_unsafe_replay_allows_immediate_user_turn_non_stream() {
+        assert_first_unsafe_replay_allows_immediate_user_turn(false).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_unsafe_replay_allows_immediate_user_turn_stream() {
+        assert_first_unsafe_replay_allows_immediate_user_turn(true).await;
     }
 
     #[tokio::test]

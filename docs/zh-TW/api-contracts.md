@@ -196,6 +196,7 @@ Checkpoint 的目標是安全續接 transport，不是保存 Agent lifecycle。
 
 - history prefix、role、tool ID、arguments 與 transcript identity 要精確對上；
 - upstream 尚未開始的 reservation 可以安全回收；
+- upstream 已回覆、Gateway replay protection 明確拒絕且 caller tool 未派送、final 未接受的 `unsafe_tool_replay`，只回滾本次未接受的 turn；先前已接受的 checkpoint 與 tool ledger 保留，回應仍為 terminal 409；
 - upstream 已開始但 outcome 不確定時，必須保留 recovery-required state；
 - process restart 本身不證明 replay 安全；
 - 同一 checkpoint 同時只允許一個 recovery attempt；
