@@ -250,9 +250,9 @@ impl AgentLedger {
             };
             let identity = format!("{name}\0{argument_digest}");
             let duplicate_in_batch = !batch.insert(identity);
-            // A pending effect is never safe to replay. A completed read-only
-            // effect may be a new observation, but only its caller contract
-            // can authorize that distinction.
+            // Pending calls exist only within this request. A completed
+            // read-only call may be a new observation only when its caller
+            // contract authorizes that distinction.
             let duplicate_pending = self
                 .pending
                 .iter()
@@ -389,9 +389,36 @@ impl AgentLedger {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn validate_tool_conversation(messages: &[OpenAiMessage]) -> Result<(), String> {
     validate_tool_conversation_with_prior(messages, &AgentLedger::default())
+}
+
+pub(crate) fn validate_fresh_tool_ids(
+    messages: &[OpenAiMessage],
+    prior: &AgentLedger,
+) -> Result<(), String> {
+    let completed = prior
+        .completed
+        .iter()
+        .map(|evidence| evidence.id.as_str())
+        .collect::<HashSet<_>>();
+    for message in messages {
+        if message.role == "tool" && completed.contains(message.tool_call_id.as_str()) {
+            return Err(format!(
+                "completed tool call id reused: {}",
+                message.tool_call_id
+            ));
+        }
+        if message.role == "assistant" {
+            for call in &message.tool_calls {
+                let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                if completed.contains(id) {
+                    return Err(format!("completed tool call id reused: {id}"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_tool_conversation_with_prior(
@@ -452,18 +479,13 @@ pub(crate) fn execution_ledger(prior: &AgentLedger, messages: &[OpenAiMessage]) 
         return build_with_prior(messages, prior.clone());
     };
 
-    let pending = if last_user == 0 {
-        prior.pending.clone()
-    } else {
-        build_with_prior(&messages[..last_user], prior.clone()).pending
-    };
-    build_with_prior(
-        &messages[last_user..],
-        AgentLedger {
-            pending,
-            ..AgentLedger::default()
-        },
-    )
+    let mut ledger = build_with_prior(messages, prior.clone());
+    // Pending calls are transient to the current user turn; completed results
+    // remain replay evidence across turns and restarts.
+    let active = build(&messages[last_user..]);
+    ledger.pending = active.pending;
+    ledger.tool_rounds = active.tool_rounds;
+    ledger
 }
 
 pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -> AgentLedger {
@@ -512,6 +534,9 @@ pub(crate) fn build_with_prior(messages: &[OpenAiMessage], prior: AgentLedger) -
         if message.role == "tool"
             && let Some(evidence) = calls.get_mut(&message.tool_call_id)
         {
+            if evidence.has_result {
+                continue;
+            }
             let result = content_string(&message.content);
             evidence.result_length = result.len();
             evidence.result_digest = digest(result.as_bytes());
@@ -1261,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn new_user_turn_resets_round_scope_but_full_ledger_keeps_pending_evidence() {
+    fn new_user_turn_discards_transient_pending_evidence() {
         let messages = vec![
             call("pending", "deploy", "{}"),
             OpenAiMessage::text("user", "Continue after interruption"),
@@ -1271,19 +1296,19 @@ mod tests {
         assert_eq!(build(active_messages(&messages)).tool_rounds, 0);
 
         let ledger = execution_ledger(&AgentLedger::default(), &messages);
-        assert_eq!(ledger.pending.len(), 1);
+        assert!(ledger.pending.is_empty());
         let candidate = DetectedToolCall {
             id: "retry".to_owned(),
             kind: "function".to_owned(),
             function: json!({"name": "deploy", "arguments": "{}"}),
         };
         let filtered = ledger.filter_known_calls(vec![candidate], |_| false);
-        assert!(filtered.calls.is_empty());
-        assert!(filtered.suppressed());
+        assert_eq!(filtered.calls.len(), 1);
+        assert!(!filtered.suppressed());
     }
 
     #[test]
-    fn completed_call_from_previous_user_turn_can_be_reissued() {
+    fn completed_call_from_previous_user_turn_remains_replay_evidence() {
         let messages = vec![
             OpenAiMessage::text("user", "Read the current task."),
             call("c1", "kanban_show", r#"{"task_id":"t_c3de88aa"}"#),
@@ -1300,8 +1325,8 @@ mod tests {
             }),
         };
         let filtered = ledger.filter_known_calls(vec![candidate], |_| false);
-        assert_eq!(filtered.calls.len(), 1);
-        assert!(!filtered.suppressed());
+        assert!(filtered.calls.is_empty());
+        assert!(filtered.suppressed());
     }
 
     #[test]
@@ -1447,6 +1472,21 @@ mod tests {
         assert_eq!(
             ledger.completed[0].result_status(),
             ToolResultStatus::Success
+        );
+    }
+
+    #[test]
+    fn completed_result_cannot_be_rewritten_by_a_later_result() {
+        let prior = build(&[
+            call("completed", "deploy", r#"{"target":"service-a"}"#),
+            result("completed", r#"{"status":"completed","exit_code":0}"#),
+        ]);
+        let original = prior.completed[0].clone();
+        let later = [result("completed", r#"{"status":"failed","exit_code":1}"#)];
+        let ledger = execution_ledger(&prior, &later);
+        assert_eq!(
+            serde_json::to_value(&ledger.completed[0]).unwrap(),
+            serde_json::to_value(&original).unwrap()
         );
     }
 }

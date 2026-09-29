@@ -26,7 +26,7 @@ use crate::{
         Account, Attachment, AttachmentFailureKind, ChatError, ChatRequest, ChatResult,
         StreamEvent, Tool,
     },
-    checkpoint::{Binding, CheckpointMessage, CheckpointTurn},
+    checkpoint::{Binding, CheckpointError, CheckpointMessage, CheckpointTurn},
     debug::{
         AdmissionResult, BreakerProjection, CallerDelivery, ProvenanceClass, SpillDecision,
         SpillReason, UpstreamAttempt, UpstreamResult,
@@ -150,11 +150,7 @@ async fn execute_chat_request_inner(
         return response;
     }
     clear_untracked_transport_identity(&path, &mut body);
-    let authenticated_empty_recovery = scope_execution_control_provenance(
-        &path,
-        &mut body,
-        &gateway.hermes_recall_provenance_secret,
-    );
+    scope_execution_control_provenance(&path, &mut body, &gateway.hermes_recall_provenance_secret);
     let class = request_class(&path, &body);
     trace.request(class, ProvenanceClass::None);
     let stream_options = match parse_stream_options(&body.stream_options, body.stream) {
@@ -225,29 +221,16 @@ async fn execute_chat_request_inner(
         && body.checkpoint_mode.is_empty()
         && !body.session_key.trim().is_empty();
     let checkpoint_result = if implicit_hermes {
-        if authenticated_empty_recovery {
-            gateway
-                .checkpoints
-                .begin_full_recovery(
-                    "hermes",
-                    &owner,
-                    &body.session_key,
-                    &checkpoint_messages,
-                    false,
-                )
-                .map(Some)
-        } else {
-            gateway
-                .checkpoints
-                .begin_full(
-                    "hermes",
-                    &owner,
-                    &body.session_key,
-                    &checkpoint_messages,
-                    false,
-                )
-                .map(Some)
-        }
+        gateway
+            .checkpoints
+            .begin_full(
+                "hermes",
+                &owner,
+                &body.session_key,
+                &checkpoint_messages,
+                false,
+            )
+            .map(Some)
     } else {
         match body.checkpoint_mode.as_str() {
             "full" => gateway
@@ -279,22 +262,12 @@ async fn execute_chat_request_inner(
     let mut checkpoint = match checkpoint_result {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
-            let status = if matches!(
-                error,
-                crate::checkpoint::CheckpointError::UnknownCursor
-                    | crate::checkpoint::CheckpointError::KeyRequired
-                    | crate::checkpoint::CheckpointError::InvalidArguments
-            ) {
-                StatusCode::BAD_REQUEST
+            trace.checkpoint_turn_outcome(if matches!(error, CheckpointError::RecoveryRequired) {
+                "unresolved_effect"
             } else {
-                StatusCode::CONFLICT
-            };
-            return openai_error(
-                status,
-                "checkpoint_error",
-                "checkpoint_error",
-                &error.to_string(),
-            );
+                "discarded_generation"
+            });
+            return checkpoint_error_response(&error);
         }
     };
     let prior_ledger = checkpoint
@@ -312,8 +285,24 @@ async fn execute_chat_request_inner(
         })
         .unwrap_or_else(|| body.messages.clone());
     normalize_internal_message_roles(&mut prompt_messages);
+    // Matching caller results must be established from messages in this
+    // request. Accepted tool candidates carry no durable dispatch authority.
+    // Responses parent cursors can carry result-only input. The cursor is
+    // accepted transport lineage, but without a matching call in this request
+    // the result must not become completed replay evidence.
+    let parent_result_only = body.checkpoint_mode == "parent"
+        && !body.messages.is_empty()
+        && body.messages.iter().all(|message| message.role == "tool");
     if let Err(message) =
-        crate::agent_ledger::validate_tool_conversation_with_prior(&prompt_messages, &prior_ledger)
+        crate::agent_ledger::validate_fresh_tool_ids(&prompt_messages, &prior_ledger).and_then(
+            |()| {
+                if parent_result_only {
+                    Ok(())
+                } else {
+                    crate::agent_ledger::validate_tool_conversation(&body.messages)
+                }
+            },
+        )
     {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -322,7 +311,11 @@ async fn execute_chat_request_inner(
             &message,
         );
     }
-    let agent_ledger = crate::agent_ledger::execution_ledger(&prior_ledger, &prompt_messages);
+    let agent_ledger = if parent_result_only {
+        prior_ledger.clone()
+    } else {
+        crate::agent_ledger::execution_ledger(&prior_ledger, &body.messages)
+    };
     let active_ledger =
         crate::agent_ledger::build(crate::agent_ledger::active_messages(&body.messages));
     let settings = gateway.settings.current();
@@ -773,7 +766,6 @@ async fn execute_chat_request_inner(
         continuation_messages: Some(Arc::new(prompt_messages)),
         continuation_recall_range,
         continuation_usage: None,
-        upstream_start: None,
     };
     trace.upstream_attempt(UpstreamAttempt::Initial);
     if body.stream {
@@ -846,28 +838,6 @@ fn admission_result(code: &str) -> AdmissionResult {
     }
 }
 
-fn checkpoint_start_hook(
-    checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
-    trace: &crate::debug::Trace,
-) -> crate::chathub::UpstreamStartHook {
-    let checkpoint = Arc::clone(checkpoint);
-    let trace = trace.observer();
-    crate::chathub::UpstreamStartHook::new(move || {
-        let mut checkpoint = checkpoint
-            .lock()
-            .map_err(|_| ChatError::Protocol("checkpoint handle poisoned".to_owned()))?;
-        let Some(turn) = checkpoint.as_mut() else {
-            return Err(ChatError::Protocol(
-                "checkpoint start handle is unavailable".to_owned(),
-            ));
-        };
-        turn.mark_upstream_started()
-            .map_err(|error| ChatError::Protocol(format!("checkpoint start failed: {error}")))?;
-        trace.checkpoint_turn_outcome("unresolved");
-        Ok(())
-    })
-}
-
 fn take_checkpoint(checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>) -> Option<CheckpointTurn> {
     checkpoint
         .lock()
@@ -912,14 +882,11 @@ async fn complete_chat(
     trace.caller_delivery(CallerDelivery::Failed);
     let checkpoint = Arc::new(Mutex::new(checkpoint));
     let _checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
-    let mut request = request;
+    let request = request;
     let had_checkpoint = checkpoint
         .lock()
         .expect("checkpoint handle poisoned")
         .is_some();
-    if had_checkpoint {
-        request.upstream_start = Some(checkpoint_start_hook(&checkpoint, &trace));
-    }
     let mut input_units = usage_input_units;
     let mut usage_estimate_scope = usage_estimate_scope;
     let tools = request.tools.clone();
@@ -927,23 +894,14 @@ async fn complete_chat(
     let tool_limit = request.tool_call_limit;
     let qualification_account = account.clone();
     let mut qualification_request = request.clone();
-    qualification_request.upstream_start = None;
     let fallback_account = account.clone();
-    let mut fallback_request = request.clone();
-    fallback_request.upstream_start = None;
+    let fallback_request = request.clone();
     let final_message_text_utf16 = Arc::clone(&request.final_message_text_utf16);
     let final_wire_utf16 = Arc::clone(&request.final_wire_utf16);
     let generated_attachment_reused = request.generated_attachment_reused.clone();
     let upstream_attempt_count = reset_upstream_attempts(&request);
     let mut sink = |_: StreamEvent| Ok(());
-    let upstream = async {
-        if !gateway.chat.upstream_start_after_preparation()
-            && let Some(start) = request.upstream_start.as_ref()
-        {
-            start.call()?;
-        }
-        gateway.chat.chat(account, request, &mut sink).await
-    };
+    let upstream = gateway.chat.chat(account, request, &mut sink);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(gateway.settings.current().chat_timeout_seconds),
         upstream,
@@ -1109,12 +1067,7 @@ async fn complete_chat(
             }
             if syntax_corrected && transport.suppressed {
                 trace.tool_correction_finished(Some("unsafe_tool_replay"));
-                return unsafe_tool_replay_or_checkpoint_error_response(
-                    &checkpoint,
-                    &trace,
-                    &transport,
-                    permit,
-                );
+                return discard_replayed_candidate_response(&checkpoint, &trace, permit);
             }
             if transport.completed_call_suppressed {
                 trace.tool_call_suppressed();
@@ -1273,12 +1226,7 @@ async fn complete_chat(
                     );
                 }
                 if transport.suppressed && transport.projection.calls.is_empty() {
-                    return unsafe_tool_replay_or_checkpoint_error_response(
-                        &checkpoint,
-                        &trace,
-                        &transport,
-                        permit,
-                    );
+                    return discard_replayed_candidate_response(&checkpoint, &trace, permit);
                 }
                 if tool_choice_requires_call(&tool_choice) && transport.projection.calls.is_empty()
                 {
@@ -1324,14 +1272,11 @@ async fn complete_chat(
                 if syntax_corrected {
                     trace.tool_correction_finished(Some("checkpoint_error"));
                 }
-                permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
+                let status = checkpoint_error_status(&error);
+                permit.finish(status, None);
                 trace.caller_delivery(CallerDelivery::Failed);
-                return openai_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "checkpoint_error",
-                    "checkpoint_error",
-                    &error,
-                );
+                trace.checkpoint_turn_outcome(checkpoint_failure_outcome(&error));
+                return checkpoint_error_response(&error);
             }
             if had_checkpoint {
                 trace.checkpoint_turn_outcome("accepted");
@@ -1429,14 +1374,11 @@ async fn stream_chat(
     let created = OffsetDateTime::now_utc().unix_timestamp();
     let checkpoint = Arc::new(Mutex::new(checkpoint));
     let checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
-    let mut request = request;
+    let request = request;
     let had_checkpoint = checkpoint
         .lock()
         .expect("checkpoint handle poisoned")
         .is_some();
-    if had_checkpoint {
-        request.upstream_start = Some(checkpoint_start_hook(&checkpoint, &trace));
-    }
     let mut input_units = usage_input_units;
     let include_usage = stream_options.include_usage;
     tokio::spawn(async move {
@@ -1446,10 +1388,8 @@ async fn stream_chat(
         let tool_limit = request.tool_call_limit;
         let qualification_account = account.clone();
         let mut qualification_request = request.clone();
-        qualification_request.upstream_start = None;
         let fallback_account = account.clone();
-        let mut fallback_request = request.clone();
-        fallback_request.upstream_start = None;
+        let fallback_request = request.clone();
         let final_message_text_utf16 = Arc::clone(&request.final_message_text_utf16);
         let final_wire_utf16 = Arc::clone(&request.final_wire_utf16);
         let generated_attachment_reused = request.generated_attachment_reused.clone();
@@ -1499,14 +1439,7 @@ async fn stream_chat(
             );
             Ok(())
         };
-        let upstream = async {
-            if !gateway.chat.upstream_start_after_preparation()
-                && let Some(start) = request.upstream_start.as_ref()
-            {
-                start.call()?;
-            }
-            gateway.chat.chat(account, request, &mut sink).await
-        };
+        let upstream = gateway.chat.chat(account, request, &mut sink);
         let result = tokio::select! {
             biased;
             _ = sender.closed() => {
@@ -1704,13 +1637,7 @@ async fn stream_chat(
                 }
                 if syntax_corrected && transport.suppressed {
                     trace.tool_correction_finished(Some("unsafe_tool_replay"));
-                    send_unsafe_tool_replay_or_checkpoint_error(
-                        &checkpoint,
-                        &trace,
-                        &transport,
-                        &sender,
-                        permit,
-                    );
+                    send_discarded_replay_error(&checkpoint, &trace, &sender, permit);
                     let _ = send_sse_done(&trace, &sender);
                     return;
                 }
@@ -1914,13 +1841,7 @@ async fn stream_chat(
                         return;
                     }
                     if transport.suppressed && transport.projection.calls.is_empty() {
-                        send_unsafe_tool_replay_or_checkpoint_error(
-                            &checkpoint,
-                            &trace,
-                            &transport,
-                            &sender,
-                            permit,
-                        );
+                        send_discarded_replay_error(&checkpoint, &trace, &sender, permit);
                         let _ = send_sse_done(&trace, &sender);
                         return;
                     }
@@ -2079,8 +2000,10 @@ async fn stream_chat(
                     if syntax_corrected {
                         trace.tool_correction_finished(Some("checkpoint_error"));
                     }
-                    permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
-                    send_sse_error(&trace, &sender, "checkpoint_error", &error);
+                    permit.finish(checkpoint_error_status(&error), None);
+                    trace.checkpoint_turn_outcome(checkpoint_failure_outcome(&error));
+                    let sent = send_sse(&sender, checkpoint_error_value(&error));
+                    trace.caller_delivery(stream_error_delivery(&sender, sent));
                     let _ = send_sse_done(&trace, &sender);
                     return;
                 }
@@ -2964,7 +2887,6 @@ fn completed_tool_answer_request_with_feedback(
     text_input_limit: usize,
 ) -> Result<ChatRequest, ContinuationProjectionError> {
     let mut answer = request.clone();
-    answer.upstream_start = None;
     answer.text = format!("{}\n\n{}", request.text, replay_feedback.as_str());
     if !result.conversation_id.is_empty() {
         answer.conversation_id = result.conversation_id.clone();
@@ -3027,7 +2949,7 @@ fn unsafe_tool_replay_value() -> Value {
             "code": "unsafe_tool_replay",
             "message": "A caller-tool candidate was rejected by replay protection; no new tool call or final checkpoint was accepted.",
             "retryable": false,
-            "recommended_action": "reconcile_the_existing_call_or_start_a_new_user_turn"
+            "recommended_action": "use_verified_existing_result_or_start_a_new_user_turn"
         }
     })
 }
@@ -3037,47 +2959,13 @@ fn unsafe_tool_replay_response(permit: crate::traffic::Permit) -> Response {
     (StatusCode::CONFLICT, Json(unsafe_tool_replay_value())).into_response()
 }
 
-fn settle_unsafe_tool_replay_checkpoint(
+fn discard_replayed_candidate_response(
     checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
     trace: &crate::debug::Trace,
-    transport: &TransportProjection,
-) -> Result<(), crate::checkpoint::CheckpointError> {
-    use crate::agent_ledger::SuppressionReason;
-    if transport.suppression_details.is_empty()
-        || !transport.suppression_details.iter().all(|detail| {
-            detail.candidate_not_dispatched
-                && matches!(
-                    detail.blocking_reason,
-                    SuppressionReason::SameBatchDuplicate
-                        | SuppressionReason::PendingSameCall
-                        | SuppressionReason::CompletedNotAuthorizedReadback
-                        | SuppressionReason::CompletedResultNotVerified
-                )
-        })
-    {
-        return Ok(());
-    }
-    if let Some(mut turn) = take_checkpoint(checkpoint) {
-        turn.reject_without_effect()?;
-        trace.checkpoint_turn_outcome("rejected_without_effect");
-    }
-    Ok(())
-}
-
-fn unsafe_tool_replay_or_checkpoint_error_response(
-    checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
-    trace: &crate::debug::Trace,
-    transport: &TransportProjection,
     permit: crate::traffic::Permit,
 ) -> Response {
-    if let Err(error) = settle_unsafe_tool_replay_checkpoint(checkpoint, trace, transport) {
-        permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
-        return openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "checkpoint_error",
-            "checkpoint_error",
-            &error.to_string(),
-        );
+    if take_checkpoint(checkpoint).is_some() {
+        trace.checkpoint_turn_outcome("discarded_generation");
     }
     unsafe_tool_replay_response(permit)
 }
@@ -3168,17 +3056,14 @@ fn send_unsafe_tool_replay_error(
     sent
 }
 
-fn send_unsafe_tool_replay_or_checkpoint_error(
+fn send_discarded_replay_error(
     checkpoint: &Arc<Mutex<Option<CheckpointTurn>>>,
     trace: &crate::debug::Trace,
-    transport: &TransportProjection,
     sender: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, Infallible>>,
     permit: crate::traffic::Permit,
 ) {
-    if let Err(error) = settle_unsafe_tool_replay_checkpoint(checkpoint, trace, transport) {
-        permit.finish(StatusCode::INTERNAL_SERVER_ERROR, None);
-        send_sse_error(trace, sender, "checkpoint_error", &error.to_string());
-        return;
+    if take_checkpoint(checkpoint).is_some() {
+        trace.checkpoint_turn_outcome("discarded_generation");
     }
     send_unsafe_tool_replay_error(trace, sender, permit);
 }
@@ -3198,7 +3083,7 @@ fn tool_choice_unsatisfied_value() -> Value {
             "code": "tool_choice_unsatisfied",
             "message": "The caller's tool_choice requires a legal tool call; no accepted tool call was produced.",
             "retryable": false,
-            "recommended_action": "reconcile_the_existing_call_or_start_a_new_user_turn"
+            "recommended_action": "start_a_new_user_turn_or_correct_the_request"
         }
     })
 }
@@ -3246,13 +3131,54 @@ fn tool_round_limit_response(
         .into_response()
 }
 
+fn checkpoint_failure_outcome(error: &CheckpointError) -> &'static str {
+    match error {
+        CheckpointError::RecoveryRequired => "unresolved_effect",
+        _ => "discarded_generation",
+    }
+}
+
+fn checkpoint_error_status(error: &CheckpointError) -> StatusCode {
+    match error {
+        CheckpointError::Stale
+        | CheckpointError::ConversationDrift
+        | CheckpointError::RecoveryRequired => StatusCode::CONFLICT,
+        CheckpointError::UnknownCursor
+        | CheckpointError::KeyRequired
+        | CheckpointError::InvalidArguments => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn checkpoint_error_value(error: &CheckpointError) -> Value {
+    json!({"error": {
+        "type": "checkpoint_error",
+        "code": match error {
+            CheckpointError::Stale => "checkpoint_stale",
+            CheckpointError::ConversationDrift => "conversation_drift",
+            CheckpointError::RecoveryRequired => "unresolved_effect",
+            _ => "checkpoint_error",
+        },
+        "message": error.to_string(),
+        "retryable": false,
+    }})
+}
+
+fn checkpoint_error_response(error: &CheckpointError) -> Response {
+    (
+        checkpoint_error_status(error),
+        Json(checkpoint_error_value(error)),
+    )
+        .into_response()
+}
+
 fn accept_checkpoint(
     turn: CheckpointTurn,
     result: &ChatResult,
     projection: &ToolProjection,
     response_id: &str,
     ledger: &crate::agent_ledger::AgentLedger,
-) -> Result<(), String> {
+) -> Result<(), CheckpointError> {
     let tool_calls = serde_json::to_value(&projection.calls)
         .ok()
         .and_then(|value| value.as_array().cloned())
@@ -3285,7 +3211,6 @@ fn accept_checkpoint(
     } else {
         turn.accept_response_with_ledger(binding, &produced, response_id, ledger)
     }
-    .map_err(|error| error.to_string())
 }
 
 #[derive(Default, Deserialize)]
@@ -3535,7 +3460,6 @@ async fn correct_tool_syntax(
     correction.conversation_id = original.conversation_id.clone();
     correction.session_id = original.session_id.clone();
     correction.started = false;
-    correction.upstream_start = None;
     correction.attachments.clear();
     correction.prepared_attachments = Arc::new(Mutex::new(
         crate::chathub::PreparedAttachmentState::default(),
@@ -3820,7 +3744,6 @@ fn internal_qualification_request(
         continuation_messages: None,
         continuation_recall_range: None,
         continuation_usage: None,
-        upstream_start: None,
     }
 }
 
@@ -6914,7 +6837,6 @@ mod tests {
             continuation_messages: Some(Arc::new(messages)),
             continuation_recall_range: None,
             continuation_usage: None,
-            upstream_start: None,
         }
     }
 
@@ -7314,37 +7236,6 @@ mod tests {
     ) -> (Arc<Gateway>, String) {
         let root = tempfile::tempdir().unwrap().keep();
         gateway_with_chat_and_oauth_at_root(chat, oauth_config, root, None)
-    }
-
-    fn app_with_durable_inflight_recovery(
-        chat: Arc<dyn ChatHubTransport>,
-        oauth_config: OAuthConfig,
-        session_key: &str,
-        messages: &[OpenAiMessage],
-    ) -> (Router, String) {
-        let root = tempfile::tempdir().unwrap().keep();
-        let checkpoints = CheckpointStore::open(root.join("transport-checkpoints.json")).unwrap();
-        let (gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
-            chat,
-            oauth_config,
-            root,
-            Some(Arc::clone(&checkpoints)),
-        );
-        let owner = gateway
-            .api_keys
-            .authenticate(&raw_key)
-            .expect("test API key");
-        let checkpoint_messages = messages
-            .iter()
-            .cloned()
-            .map(CheckpointMessage::from)
-            .collect::<Vec<_>>();
-        let mut turn = checkpoints
-            .begin_full("hermes", &owner, session_key, &checkpoint_messages, false)
-            .unwrap();
-        turn.mark_upstream_started().unwrap();
-        drop(turn);
-        (Gateway::router(gateway), raw_key)
     }
 
     fn gateway_with_chat_and_oauth_at_root(
@@ -8130,7 +8021,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                1
+                0
             );
             request["messages"].as_array_mut().unwrap().push(json!({
                 "role":"assistant","content":null,"tool_calls":[clarify_call]
@@ -8173,9 +8064,11 @@ mod tests {
                 checkpoint["records"][0]["toolLedger"]["completed"][0]["id"],
                 clarify_id
             );
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["pending"][0]["id"],
-                terminal_id
+            assert!(
+                checkpoint["records"][0]["toolLedger"]["pending"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
             );
             request["messages"].as_array_mut().unwrap().push(json!({
                 "role":"assistant","content":null,"tool_calls":[terminal_call]
@@ -8508,7 +8401,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                1
+                0
             );
             assert_eq!(
                 first_record["toolLedger"]["completed"]
@@ -8525,7 +8418,12 @@ mod tests {
             // Exercise the real caller-result assembly and next provider turn.
             tool_result["output"] = json!("S".repeat(85_000));
             let call_id = call["id"].clone();
-            assert_eq!(first_record["toolLedger"]["pending"][0]["id"], call_id);
+            assert!(
+                first_record["toolLedger"]["pending"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
             request["messages"]
                 .as_array_mut()
                 .unwrap()
@@ -8914,31 +8812,18 @@ mod tests {
                 );
                 assert_eq!(
                     gateway.checkpoints.recovery_views().unwrap().len(),
-                    1,
-                    "the upstream-started turn must remain recoverable"
+                    0,
+                    "a rejected generation did not dispatch a caller effect"
                 );
                 let checkpoint_raw =
                     std::fs::read_to_string(root.path().join("transport-checkpoints.json"))
-                        .unwrap();
+                        .unwrap_or_default();
                 assert!(!checkpoint_raw.contains(TOOL_PRIVATE_SENTINEL));
                 assert!(!checkpoint_raw.contains(EVENT_PRIVATE_SENTINEL));
-                let checkpoint: Value = serde_json::from_str(&checkpoint_raw).unwrap();
-                let checkpoint = &checkpoint["records"][0];
-                assert_eq!(checkpoint["acceptedCount"], 0);
-                assert_eq!(checkpoint["inFlight"], true);
-                assert_eq!(checkpoint["inFlightUpstreamStarted"], true);
-                assert!(
-                    checkpoint["toolLedger"]["pending"]
-                        .as_array()
-                        .unwrap()
-                        .is_empty()
-                );
-                assert!(
-                    checkpoint["toolLedger"]["completed"]
-                        .as_array()
-                        .unwrap()
-                        .is_empty()
-                );
+                if !checkpoint_raw.is_empty() {
+                    let checkpoint: Value = serde_json::from_str(&checkpoint_raw).unwrap();
+                    assert!(checkpoint["records"].as_array().unwrap().is_empty());
+                }
 
                 let expected_witness = if image_diagnostic {
                     json!({
@@ -9282,7 +9167,6 @@ mod tests {
             assert_eq!(requests[1].conversation_id, "syntax-conversation");
             assert_eq!(requests[1].session_id, "syntax-session");
             assert!(!requests[1].started);
-            assert!(requests[1].upstream_start.is_none());
             assert!(requests[1].attachments.is_empty());
             assert_eq!(requests[1].tool_choice, requests[0].tool_choice);
             assert_eq!(requests[1].tool_call_limit, requests[0].tool_call_limit);
@@ -9427,12 +9311,11 @@ mod tests {
                     record["acceptedCount"], 2,
                     "one caller message and only the accepted second proposal"
                 );
-                assert_eq!(record["toolLedger"]["pending"].as_array().unwrap().len(), 1);
+                assert_eq!(record["toolLedger"]["pending"].as_array().unwrap().len(), 0);
                 assert_eq!(
                     record["toolLedger"]["completed"].as_array().unwrap().len(),
                     0
                 );
-                assert_eq!(record["toolLedger"]["pending"][0]["id"], calls[0]["id"]);
                 assert!(
                     !String::from_utf8(std::fs::read(&checkpoint_path).unwrap())
                         .unwrap()
@@ -9607,7 +9490,7 @@ mod tests {
         .unwrap();
         assert_eq!(chat.count.load(Ordering::Acquire), 2);
         assert!(gateway.checkpoints.list().unwrap().is_empty());
-        assert_eq!(gateway.checkpoints.recovery_views().unwrap().len(), 1);
+        assert_eq!(gateway.checkpoints.recovery_views().unwrap().len(), 0);
         let record = gateway.debug.records_for_test().pop().unwrap();
         assert_eq!(record["toolCorrectionOutcome"], "failed");
         assert_eq!(record["toolCorrectionFailureClass"], "cancelled");
@@ -10055,7 +9938,7 @@ mod tests {
                 assert!(!body.contains("tool_calls"));
                 assert_eq!(chat.calls.load(Ordering::Acquire), 2);
                 assert!(gateway.checkpoints.list().unwrap().is_empty());
-                assert_eq!(gateway.checkpoints.recovery_views().unwrap().len(), 1);
+                assert_eq!(gateway.checkpoints.recovery_views().unwrap().len(), 0);
                 let record = gateway.debug.records_for_test().pop().unwrap();
                 assert_eq!(record["toolCorrectionOutcome"], "failed");
                 assert!(!record.to_string().contains("SYNTHETIC-PRIVATE-CORRECTION"));
@@ -10164,6 +10047,97 @@ mod tests {
         session_id: String,
     }
 
+    struct GenerationFailureThenSuccess(AtomicUsize);
+
+    struct ConcurrentGenerationsTransport {
+        calls: AtomicUsize,
+        first_entered: tokio::sync::Notify,
+        release_first: tokio::sync::Notify,
+    }
+
+    impl ChatHubTransport for ConcurrentGenerationsTransport {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                let ordinal = self.calls.fetch_add(1, Ordering::AcqRel);
+                if ordinal == 0 {
+                    self.first_entered.notify_one();
+                    self.release_first.notified().await;
+                }
+                Ok(ChatResult {
+                    text: match ordinal {
+                        0 => "loser response",
+                        1 => "winner response",
+                        _ => "ordinary continuation",
+                    }
+                    .to_owned(),
+                    conversation_id: "conversation-1".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
+    struct ProviderFailureThenSuccess {
+        attempts: AtomicUsize,
+        failure: &'static str,
+    }
+
+    impl ChatHubTransport for ProviderFailureThenSuccess {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                if self.attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                    return match self.failure {
+                        "429" => Err(ChatError::RateLimited {
+                            retry_after: None,
+                            soft: false,
+                        }),
+                        "502" => Err(ChatError::Transport("fixture 502".to_owned())),
+                        "timeout" => std::future::pending().await,
+                        _ => unreachable!(),
+                    };
+                }
+                Ok(ChatResult {
+                    text: "ordinary continuation".to_owned(),
+                    conversation_id: "conversation-1".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
+    impl ChatHubTransport for GenerationFailureThenSuccess {
+        fn chat<'a>(
+            &'a self,
+            _: Account,
+            _: ChatRequest,
+            _: &'a mut (dyn EventSink + Send),
+        ) -> ChatFuture<'a> {
+            Box::pin(async move {
+                if self.0.fetch_add(1, Ordering::AcqRel) == 0 {
+                    return Err(ChatError::Protocol("fixture generation failure".to_owned()));
+                }
+                Ok(ChatResult {
+                    text: "ordinary continuation".to_owned(),
+                    conversation_id: "conversation-1".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    ..ChatResult::default()
+                })
+            })
+        }
+    }
+
     impl DuplicateFallbackTransport {
         fn new(results: impl IntoIterator<Item = &'static str>) -> Self {
             Self::with_identity(results, "conversation-1", "session-1")
@@ -10180,59 +10154,6 @@ mod tests {
                 conversation_id: conversation_id.into(),
                 session_id: session_id.into(),
             }
-        }
-    }
-
-    struct HookAwareDuplicateFallbackTransport {
-        results: Mutex<VecDeque<String>>,
-        requests: Mutex<Vec<ChatRequest>>,
-        upstream_start_calls: AtomicUsize,
-    }
-
-    impl HookAwareDuplicateFallbackTransport {
-        fn new(results: impl IntoIterator<Item = &'static str>) -> Self {
-            Self {
-                results: Mutex::new(results.into_iter().map(str::to_owned).collect()),
-                requests: Mutex::new(Vec::new()),
-                upstream_start_calls: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl ChatHubTransport for HookAwareDuplicateFallbackTransport {
-        fn upstream_start_after_preparation(&self) -> bool {
-            true
-        }
-
-        fn chat<'a>(
-            &'a self,
-            _: Account,
-            request: ChatRequest,
-            _: &'a mut (dyn EventSink + Send),
-        ) -> ChatFuture<'a> {
-            Box::pin(async move {
-                if let Some(start) = request.upstream_start.as_ref() {
-                    if self.upstream_start_calls.fetch_add(1, Ordering::AcqRel) != 0 {
-                        return Err(ChatError::Protocol(
-                            "duplicate upstream start hook".to_owned(),
-                        ));
-                    }
-                    start.call()?;
-                }
-                self.requests.lock().unwrap().push(request);
-                let text = self
-                    .results
-                    .lock()
-                    .expect("hook-aware fallback sequence poisoned")
-                    .pop_front()
-                    .expect("unexpected upstream request");
-                Ok(ChatResult {
-                    text,
-                    conversation_id: "conversation-hook-aware".to_owned(),
-                    session_id: "session-hook-aware".to_owned(),
-                    ..ChatResult::default()
-                })
-            })
         }
     }
 
@@ -10255,57 +10176,6 @@ mod tests {
                     text,
                     conversation_id: self.conversation_id.clone(),
                     session_id: self.session_id.clone(),
-                    ..ChatResult::default()
-                })
-            })
-        }
-    }
-
-    struct RecoveryRaceTransport {
-        results: Mutex<VecDeque<String>>,
-        requests: AtomicUsize,
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-    }
-
-    impl RecoveryRaceTransport {
-        fn new(results: impl IntoIterator<Item = &'static str>) -> Self {
-            Self {
-                results: Mutex::new(results.into_iter().map(str::to_owned).collect()),
-                requests: AtomicUsize::new(0),
-                entered: Arc::new(tokio::sync::Notify::new()),
-                release: Arc::new(tokio::sync::Notify::new()),
-            }
-        }
-
-        fn request_count(&self) -> usize {
-            self.requests.load(Ordering::Acquire)
-        }
-    }
-
-    impl ChatHubTransport for RecoveryRaceTransport {
-        fn chat<'a>(
-            &'a self,
-            _: Account,
-            _: ChatRequest,
-            _: &'a mut (dyn EventSink + Send),
-        ) -> ChatFuture<'a> {
-            Box::pin(async move {
-                let request_index = self.requests.fetch_add(1, Ordering::AcqRel);
-                let text = self
-                    .results
-                    .lock()
-                    .expect("recovery race sequence poisoned")
-                    .pop_front()
-                    .expect("unexpected upstream request");
-                if request_index == 2 {
-                    self.entered.notify_one();
-                    self.release.notified().await;
-                }
-                Ok(ChatResult {
-                    text,
-                    conversation_id: "conversation-1".to_owned(),
-                    session_id: "session-1".to_owned(),
                     ..ChatResult::default()
                 })
             })
@@ -12154,7 +12024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_streaming_keyed_upstream_failure_retains_checkpoint_for_reconciliation() {
+    async fn non_streaming_keyed_generation_failure_allows_next_attempt() {
         let (app, raw_key) = app_with_chat(Arc::new(EmptyTransport));
         let request = r#"{"model":"gpt-5.6-terra","session_key":"non-stream-recovery","messages":[{"role":"user","content":"recover"}]}"#;
         let first = app
@@ -12179,251 +12049,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
         let body: Value =
             serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
                 .unwrap();
-        assert_eq!(body["error"]["code"], "checkpoint_error");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("in-flight"))
-        );
+        assert_eq!(body["error"]["code"], "upstream_empty_response");
     }
 
     #[tokio::test]
-    async fn hermes_keyed_empty_response_recovery_reaches_final_for_json_and_sse() {
-        let tool = json!({
-            "type":"function",
-            "function":{
-                "name":"inspect",
-                "description":"Read-only inspection.",
-                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
-            }
-        });
-        for stream in [false, true] {
-            let chat = Arc::new(DuplicateFallbackTransport::new([
-                "\x60\x60\x60inspect\n{\"target\":\"service-a\"}\n\x60\x60\x60",
-                "",
-                "Inspection completed successfully.",
-            ]));
-            let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-            let app = Gateway::router(Arc::clone(&gateway));
-            let session_key = if stream {
-                "json-sse-recovery-stream"
-            } else {
-                "json-sse-recovery-json"
-            };
-            let first = app
-                .clone()
-                .oneshot(
-                    Request::post("/hermes/v1/chat/completions")
-                        .header("x-api-key", &raw_key)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            serde_json::to_vec(&json!({
-                                "model":"gpt-5.6-terra",
-                                "stream":stream,
-                                "session_key":session_key,
-                                "messages":[{"role":"user","content":"Inspect service-a."}],
-                                "tools":[tool.clone()],
-                                "tool_choice":"auto"
-                            }))
-                            .unwrap(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(first.status(), StatusCode::OK, "stream={stream}");
-            let first_body = String::from_utf8(
-                to_bytes(first.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
-            assert!(first_body.contains("tool_calls"), "stream={stream}");
-            let assistant = if stream {
-                first_body
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("data: "))
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .find_map(|value| {
-                        value["choices"][0]["delta"]["tool_calls"]
-                            .as_array()
-                            .and_then(|calls| calls.first())
-                            .cloned()
-                    })
-                    .map(|call| json!({"role":"assistant","content":null,"tool_calls":[call]}))
-                    .expect("stream tool call frame")
-            } else {
-                serde_json::from_str::<Value>(&first_body).unwrap()["choices"][0]["message"].clone()
-            };
-            let tool_call_id = assistant["tool_calls"][0]["id"]
-                .as_str()
-                .expect("tool call id")
-                .to_owned();
-            let prefix = vec![
-                OpenAiMessage::text("user", "Inspect service-a."),
-                serde_json::from_value(assistant).unwrap(),
-                OpenAiMessage {
-                    role: "tool".to_owned(),
-                    content: Value::String(
-                        r#"{"output":"ok","exit_code":0,"status":"completed"}"#.to_owned(),
-                    ),
-                    tool_call_id: tool_call_id.clone(),
-                    ..OpenAiMessage::default()
-                },
-            ];
-            let second = app
-                .clone()
-                .oneshot(
-                    Request::post("/hermes/v1/chat/completions")
-                        .header("x-api-key", &raw_key)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            serde_json::to_vec(&json!({
-                                "model":"gpt-5.6-terra",
-                                "stream":stream,
-                                "session_key":session_key,
-                                "messages":prefix.clone(),
-                                "tools":[tool.clone()],
-                                "tool_choice":"auto"
-                            }))
-                            .unwrap(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                second.status(),
-                if stream {
-                    StatusCode::OK
-                } else {
-                    StatusCode::BAD_GATEWAY
-                }
-            );
-            let second_body = String::from_utf8(
-                to_bytes(second.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
-            assert!(second_body.contains("upstream_empty_response"));
-
-            let recovery_messages = [
-                prefix[0].clone(),
-                prefix[1].clone(),
-                prefix[2].clone(),
-                synthetic_empty_recovery_assistant(),
-                synthetic_empty_recovery_user(),
-            ];
-            let control = signed_execution_control_provenance_for_session(
-                &recovery_messages,
-                &[(2, 3, 4)],
-                session_key,
-            );
-            let third_request = serde_json::to_vec(&json!({
-                "model":"gpt-5.6-terra",
-                "stream":stream,
-                "session_key":session_key,
-                "messages":recovery_messages.to_vec(),
-                "m365_execution_control_provenance":control,
-                "tools":[tool.clone()],
-                "tool_choice":"auto"
-            }))
-            .unwrap();
-            let third = app
-                .oneshot(
-                    Request::post("/hermes/v1/chat/completions")
-                        .header("x-api-key", raw_key)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(third_request))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(third.status(), StatusCode::OK, "stream={stream}");
-            let third_body = String::from_utf8(
-                to_bytes(third.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
-            assert!(
-                third_body.contains("Inspection completed successfully."),
-                "stream={stream} body={third_body}"
-            );
-            assert_eq!(chat.requests.lock().unwrap().len(), 3);
-            assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn hermes_recovery_requires_a_durable_inflight_checkpoint_at_public_seam() {
-        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let app = Gateway::router(gateway.clone());
-        let session_key = "missing-recovery-checkpoint";
-        let messages = vec![
-            OpenAiMessage::text("user", "Inspect service-a."),
-            OpenAiMessage {
-                role: "assistant".to_owned(),
-                tool_calls: vec![json!({
-                    "id":"call-1",
-                    "type":"function",
-                    "function":{
-                        "name":"inspect",
-                        "arguments":"{\"target\":\"service-a\"}"
-                    }
-                })],
-                ..OpenAiMessage::default()
-            },
-            OpenAiMessage {
-                role: "tool".to_owned(),
-                content: Value::String(
-                    r#"{"output":"ok","exit_code":0,"status":"completed"}"#.to_owned(),
-                ),
-                tool_call_id: "call-1".to_owned(),
-                ..OpenAiMessage::default()
-            },
-            synthetic_empty_recovery_assistant(),
-            synthetic_empty_recovery_user(),
-        ];
-        let control =
-            signed_execution_control_provenance_for_session(&messages, &[(2, 3, 4)], session_key);
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model":"gpt-5.6-terra",
-                            "session_key":session_key,
-                            "messages":messages,
-                            "m365_execution_control_provenance":control,
-                            "tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}}],
-                            "tool_choice":"auto"
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(chat.0.lock().unwrap().is_none());
-        assert!(gateway.checkpoints.list().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn hermes_restarted_gateway_can_reconcile_an_inflight_checkpoint() {
+    async fn hermes_restarted_gateway_retains_historical_unresolved_checkpoint() {
         let tool = json!({
             "type":"function",
             "function":{
@@ -12481,7 +12115,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
         drop(initial_gateway);
 
@@ -12529,165 +12163,11 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert_eq!(status, StatusCode::OK, "body={body}");
-        assert!(body.contains("Inspection completed successfully."));
-        assert_eq!(chat.0.lock().unwrap().len(), 0);
-        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn hermes_keyed_empty_recovery_is_single_flight_at_public_seam() {
-        let tool = json!({
-            "type":"function",
-            "function":{
-                "name":"inspect",
-                "description":"Read-only inspection.",
-                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
-            }
-        });
-        let chat = Arc::new(RecoveryRaceTransport::new([
-            "```inspect\n{\"target\":\"service-a\"}\n```",
-            "",
-            "Inspection completed successfully.",
-            "Duplicate recovery completed successfully.",
-        ]));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let app = Gateway::router(Arc::clone(&gateway));
-        let session_key = "recovery-single-flight";
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", &raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model":"gpt-5.6-terra",
-                            "session_key":session_key,
-                            "messages":[{"role":"user","content":"Inspect service-a."}],
-                            "tools":[tool.clone()],
-                            "tool_choice":"auto"
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let first_body = String::from_utf8(
-            to_bytes(first.into_body(), 1024 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        let assistant: Value =
-            serde_json::from_str::<Value>(&first_body).unwrap()["choices"][0]["message"].clone();
-        let tool_call_id = assistant["tool_calls"][0]["id"]
-            .as_str()
-            .expect("tool call id")
-            .to_owned();
-        let prefix = vec![
-            OpenAiMessage::text("user", "Inspect service-a."),
-            serde_json::from_value(assistant).unwrap(),
-            OpenAiMessage {
-                role: "tool".to_owned(),
-                content: Value::String(r#"{"output":"ok","exit_code":0}"#.to_owned()),
-                tool_call_id,
-                ..OpenAiMessage::default()
-            },
-        ];
-        let second = app
-            .clone()
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", &raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model":"gpt-5.6-terra",
-                            "session_key":session_key,
-                            "messages":prefix.clone(),
-                            "tools":[tool.clone()],
-                            "tool_choice":"auto"
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
-        drop(second);
-
-        let recovery_messages = [
-            prefix[0].clone(),
-            prefix[1].clone(),
-            prefix[2].clone(),
-            synthetic_empty_recovery_assistant(),
-            synthetic_empty_recovery_user(),
-        ];
-        let control = signed_execution_control_provenance_for_session(
-            &recovery_messages,
-            &[(2, 3, 4)],
-            session_key,
-        );
-        let recovery_request = serde_json::to_vec(&json!({
-            "model":"gpt-5.6-terra",
-            "session_key":session_key,
-            "messages":recovery_messages,
-            "m365_execution_control_provenance":control,
-            "tools":[tool],
-            "tool_choice":"auto"
-        }))
-        .unwrap();
-
-        let entered = chat.entered.clone();
-        let release = chat.release.clone();
-        let first_recovery = tokio::spawn({
-            let app = app.clone();
-            let raw_key = raw_key.clone();
-            let recovery_request = recovery_request.clone();
-            async move {
-                app.oneshot(
-                    Request::post("/hermes/v1/chat/completions")
-                        .header("x-api-key", raw_key)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(recovery_request))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
-            .await
-            .expect("first recovery must reach the upstream seam");
-
-        let second_recovery = tokio::time::timeout(
-            Duration::from_secs(1),
-            app.clone().oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", &raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(recovery_request))
-                    .unwrap(),
-            ),
-        )
-        .await
-        .expect("second recovery must not wait for the upstream call")
-        .unwrap();
-        release.notify_one();
-        let first_recovery = tokio::time::timeout(Duration::from_secs(1), first_recovery)
-            .await
-            .expect("first recovery must finish after release")
-            .unwrap();
-
-        assert_eq!(second_recovery.status(), StatusCode::CONFLICT);
-        assert_eq!(first_recovery.status(), StatusCode::OK);
-        assert_eq!(chat.request_count(), 3);
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert!(body.contains("checkpoint_error"));
+        assert_eq!(chat.0.lock().unwrap().len(), 1);
+        assert_eq!(gateway.checkpoints.list().unwrap().len(), 0);
+        assert_eq!(gateway.checkpoints.recovery_views().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -13395,24 +12875,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_tool_answer_request_drops_checkpoint_start_hook() {
-        let request = ChatRequest {
-            upstream_start: Some(crate::chathub::UpstreamStartHook::new(|| Ok(()))),
-            ..ChatRequest::default()
-        };
-
-        let answer = completed_tool_answer_request(
-            &request,
-            &ChatResult::default(),
-            &crate::agent_ledger::AgentLedger::default(),
-            128_000,
-        )
-        .expect("continuation request should be valid");
-
-        assert!(answer.upstream_start.is_none());
-    }
-
-    #[test]
     fn completed_tool_answer_continuation_retains_native_attachment_once() {
         let native = Attachment {
             kind: "file".to_owned(),
@@ -13615,19 +13077,6 @@ mod tests {
             crate::attachment::validate_attachment_slots(&too_many_ordinary),
             Err("ordinary attachments exceed the two-slot limit")
         );
-    }
-
-    #[test]
-    fn internal_qualification_request_drops_checkpoint_start_hook() {
-        let request = ChatRequest {
-            upstream_start: Some(crate::chathub::UpstreamStartHook::new(|| Ok(()))),
-            ..ChatRequest::default()
-        };
-
-        let qualification =
-            internal_qualification_request(&request, "validate this response".to_owned(), false);
-
-        assert!(qualification.upstream_start.is_none());
     }
 
     #[test]
@@ -15681,7 +15130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attachment_preparation_failure_aborts_before_checkpoint_upstream_start() {
+    async fn attachment_preparation_failure_leaves_no_generation_checkpoint() {
         let root = tempfile::tempdir().unwrap();
         let checkpoints =
             CheckpointStore::open(root.path().join("transport-checkpoints.json")).unwrap();
@@ -15699,7 +15148,6 @@ mod tests {
         let turn = checkpoints
             .begin_full("hermes", "owner", "session-key", &messages, false)
             .unwrap();
-        let holder = Arc::new(Mutex::new(Some(turn)));
         let request = ChatRequest {
             text: "prompt".to_owned(),
             conversation_id: "conversation".to_owned(),
@@ -15712,17 +15160,6 @@ mod tests {
                 generated_oversize_text: true,
                 ..Attachment::default()
             }],
-            upstream_start: Some(crate::chathub::UpstreamStartHook::new({
-                let holder = Arc::clone(&holder);
-                move || {
-                    let mut holder = holder.lock().expect("checkpoint handle poisoned");
-                    holder
-                        .as_mut()
-                        .expect("checkpoint handle missing")
-                        .mark_upstream_started()
-                        .map_err(|error| ChatError::Protocol(error.to_string()))
-                }
-            })),
             ..ChatRequest::default()
         };
         let hub = crate::chathub::LiveChatHub::new(settings);
@@ -15735,44 +15172,9 @@ mod tests {
         let mut sink = |_: StreamEvent| Ok(());
         let result = hub.chat(account, request, &mut sink).await;
         assert!(matches!(result, Err(ChatError::Attachment { .. })));
-        drop(holder);
+        drop(turn);
         assert!(checkpoints.list().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn upstream_start_hook_runs_after_local_payload_preparation() {
-        let root = tempfile::tempdir().unwrap();
-        let config = Config::for_test(root.path().to_path_buf());
-        let settings = crate::runtime_settings::Store::open(root.path(), &config).unwrap();
-        let called = Arc::new(AtomicBool::new(false));
-        let hook = crate::chathub::UpstreamStartHook::new({
-            let called = Arc::clone(&called);
-            move || {
-                called.store(true, Ordering::Release);
-                Err(ChatError::Protocol("test upstream start stop".to_owned()))
-            }
-        });
-        let request = ChatRequest {
-            text: "prompt".to_owned(),
-            conversation_id: "conversation".to_owned(),
-            session_id: "session".to_owned(),
-            upstream_start: Some(hook),
-            ..ChatRequest::default()
-        };
-        let hub = crate::chathub::LiveChatHub::new(settings);
-        let account = Account {
-            access_token: "access".to_owned(),
-            graph_access_token: String::new(),
-            oid: "oid".to_owned(),
-            tid: "tid".to_owned(),
-        };
-        let mut sink = |_: StreamEvent| Ok(());
-        let result = hub.chat(account, request, &mut sink).await;
-        assert!(called.load(Ordering::Acquire));
-        assert!(matches!(
-            result,
-            Err(ChatError::Protocol(message)) if message == "test upstream start stop"
-        ));
+        assert!(checkpoints.recovery_views().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -16124,12 +15526,7 @@ mod tests {
             synthetic_empty_recovery_assistant(),
             synthetic_empty_recovery_user(),
         ];
-        let (app, raw_key) = app_with_durable_inflight_recovery(
-            chat.clone(),
-            oauth,
-            TEST_HERMES_SESSION_KEY,
-            &messages,
-        );
+        let (app, raw_key) = app_with_chat_and_oauth(chat.clone(), oauth);
         let control = signed_execution_control_provenance_for_session(
             &messages,
             &[(5, 6, 7)],
@@ -16566,7 +15963,6 @@ mod tests {
             issue_104_real_prepare_attachments,
             websocket_base,
         );
-        let upstream_starts = Arc::new(AtomicUsize::new(0));
         let request_upstream_attempts = Arc::new(AtomicUsize::new(0));
         let request = ChatRequest {
             text: "prompt".to_owned(),
@@ -16582,13 +15978,6 @@ mod tests {
             }],
             outbound_text_limit_utf16: 128_000,
             upstream_attempt_count: Arc::clone(&request_upstream_attempts),
-            upstream_start: Some(crate::chathub::UpstreamStartHook::new({
-                let upstream_starts = Arc::clone(&upstream_starts);
-                move || {
-                    upstream_starts.fetch_add(1, Ordering::AcqRel);
-                    Ok(())
-                }
-            })),
             ..ChatRequest::default()
         };
         let account = Account {
@@ -16600,7 +15989,6 @@ mod tests {
         let mut sink = |_: StreamEvent| Ok(());
         let result = hub.chat(account, request, &mut sink).await;
         assert!(result.is_ok(), "recovered request failed: {result:?}");
-        assert_eq!(upstream_starts.load(Ordering::Acquire), 1);
         assert_eq!(request_upstream_attempts.load(Ordering::Acquire), 1);
         assert_eq!(upload_state.create_calls.load(Ordering::Acquire), 2);
         assert_eq!(upload_state.put_calls.load(Ordering::Acquire), 2);
@@ -17527,7 +16915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyed_hermes_session_keeps_single_flight_checkpointing() {
+    async fn keyed_hermes_generation_disconnect_does_not_poison_next_attempt() {
         let started = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
         let (app, raw_key) = app_with_chat(Arc::new(HangingTransport {
@@ -17563,7 +16951,7 @@ mod tests {
             }
         })
         .await
-        .expect("dropping a keyed stream must leave the checkpoint for reconciliation");
+        .expect("dropping a keyed stream must cancel its generation");
 
         let second = app
             .oneshot(
@@ -17576,16 +16964,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(second.status(), StatusCode::CONFLICT);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(body["error"]["code"], "checkpoint_error");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("in-flight"))
-        );
+        assert_eq!(second.status(), StatusCode::OK);
+        drop(second);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17973,8 +17353,7 @@ mod tests {
             synthetic_empty_recovery_user(),
         ];
         let session_key = "issue95-synthetic-recovery";
-        let (app, raw_key) =
-            app_with_durable_inflight_recovery(chat, oauth(), session_key, &messages);
+        let (app, raw_key) = app_with_chat_and_oauth(chat, oauth());
         let control =
             signed_execution_control_provenance_for_session(&messages, &[(2, 3, 4)], session_key);
         let response = app
@@ -18053,8 +17432,7 @@ mod tests {
             synthetic_empty_recovery_user(),
         ];
         let session_key = "issue95-multiple-synthetic-recoveries";
-        let (app, raw_key) =
-            app_with_durable_inflight_recovery(chat, oauth(), session_key, &messages);
+        let (app, raw_key) = app_with_chat_and_oauth(chat, oauth());
         let control = signed_execution_control_provenance_for_session(
             &messages,
             &[(2, 3, 4), (6, 7, 8)],
@@ -18550,9 +17928,59 @@ mod tests {
         assert_repeated_duplicate_fallback_fails_closed(true).await;
     }
 
+    #[tokio::test]
+    async fn replay_rejection_discards_transient_generation_without_poison() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, _) = gateway_with_chat_and_oauth(chat, oauth());
+        let messages = [CheckpointMessage::from(OpenAiMessage {
+            role: "user".to_owned(),
+            content: json!("prompt"),
+            ..OpenAiMessage::default()
+        })];
+        for stream in [false, true] {
+            let key = if stream {
+                "stream-stale"
+            } else {
+                "non-stream-stale"
+            };
+            let stale = gateway
+                .checkpoints
+                .begin_full("hermes", "owner", key, &messages, false)
+                .unwrap();
+            let mut winner = gateway
+                .checkpoints
+                .begin_full("hermes", "owner", key, &messages, false)
+                .unwrap();
+            let checkpoint = Arc::new(Mutex::new(Some(stale)));
+            let trace = gateway
+                .debug
+                .start_request("POST", "/hermes/v1/chat/completions");
+            let permit = gateway
+                .traffic
+                .acquire(WorkloadClass::ExternalUser, TrafficLimits::default())
+                .await
+                .unwrap();
+            if stream {
+                let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+                send_discarded_replay_error(&checkpoint, &trace, &sender, permit);
+                let frame = receiver.recv().await.unwrap().unwrap();
+                assert!(String::from_utf8_lossy(&frame).contains("unsafe_tool_replay"));
+            } else {
+                let response = discard_replayed_candidate_response(&checkpoint, &trace, permit);
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("unsafe_tool_replay"));
+            }
+            winner.abort().unwrap();
+            assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+        }
+    }
+
     async fn assert_unsafe_replay_does_not_poison_the_next_user_turn(stream: bool) {
         let chat = Arc::new(DuplicateFallbackTransport::new([
             "The prior inspection result is accepted.",
+            "```inspect\n{}\n```",
+            "```inspect\n{}\n```",
             "```inspect\n{}\n```",
             "```inspect\n{}\n```",
             "```inspect\n{}\n```",
@@ -18614,7 +18042,7 @@ mod tests {
         assert_eq!(chat.requests.lock().unwrap().len(), 3);
         assert_eq!(
             gateway.debug.records_for_test().last().unwrap()["checkpointTurnOutcome"],
-            "rejected_without_effect"
+            "discarded_generation"
         );
 
         request["messages"].as_array_mut().unwrap().push(json!({
@@ -18651,6 +18079,19 @@ mod tests {
         );
         let app = Gateway::router(gateway);
 
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(
+            status,
+            if stream {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+        assert!(body.contains("unsafe_tool_replay"), "body={body}");
+        assert!(!body.contains("\"tool_calls\""));
+        assert_eq!(chat.requests.lock().unwrap().len(), 7);
+
         request["messages"].as_array_mut().unwrap().push(json!({
             "role":"user", "content":"Give a fresh read-only status."
         }));
@@ -18660,12 +18101,224 @@ mod tests {
             body.contains("The next user turn can continue."),
             "body={body}"
         );
-        assert_eq!(chat.requests.lock().unwrap().len(), 6);
+        assert_eq!(chat.requests.lock().unwrap().len(), 8);
     }
 
     #[tokio::test]
     async fn hermes_unsafe_replay_settles_non_stream_checkpoint_for_next_turn() {
         assert_unsafe_replay_does_not_poison_the_next_user_turn(false).await;
+    }
+
+    #[tokio::test]
+    async fn hermes_generation_failure_before_caller_effect_allows_ordinary_turn_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let chat = Arc::new(GenerationFailureThenSuccess(AtomicUsize::new(0)));
+        let (gateway, key) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            None,
+        );
+        let app = Gateway::router(gateway.clone());
+        let request = json!({
+            "model": "gpt-5.6-terra",
+            "session_key": "generation-failure-restart",
+            "messages": [{"role": "user", "content": "Continue."}]
+        });
+        let (status, _) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        drop(app);
+        drop(gateway);
+
+        let reopened =
+            CheckpointStore::open(root.path().join("transport-checkpoints.json")).unwrap();
+        assert!(reopened.recovery_views().unwrap().is_empty());
+        let (gateway, _) = gateway_with_chat_and_oauth_at_root(
+            chat,
+            oauth(),
+            root.path().to_owned(),
+            Some(reopened),
+        );
+        let app = Gateway::router(gateway);
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.contains("ordinary continuation"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_hermes_generations_discard_the_stale_loser_without_poison() {
+        for stream in [false, true] {
+            let chat = Arc::new(ConcurrentGenerationsTransport {
+                calls: AtomicUsize::new(0),
+                first_entered: tokio::sync::Notify::new(),
+                release_first: tokio::sync::Notify::new(),
+            });
+            let (gateway, key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+            let app = Gateway::router(gateway.clone());
+            let request = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "session_key":"concurrent-generation",
+                "messages":[{"role":"user","content":"Continue."}]
+            });
+            let first_app = app.clone();
+            let first_key = key.clone();
+            let first_request = request.clone();
+            let first = tokio::spawn(async move {
+                syntax_public_response(&first_app, &first_key, &first_request).await
+            });
+            chat.first_entered.notified().await;
+            let (winner_status, winner_body) = syntax_public_response(&app, &key, &request).await;
+            assert_eq!(winner_status, StatusCode::OK, "body={winner_body}");
+            assert!(winner_body.contains("winner response"));
+            chat.release_first.notify_one();
+            let (loser_status, loser_body) = first.await.unwrap();
+            assert_eq!(
+                loser_status,
+                if stream {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                },
+                "body={loser_body}"
+            );
+            assert!(loser_body.contains("checkpoint_stale"));
+            assert!(loser_body.contains("\"retryable\":false"));
+            assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+
+            let next = json!({
+                "model":"gpt-5.6-terra",
+                "stream":stream,
+                "session_key":"concurrent-generation",
+                "messages":[
+                    {"role":"user","content":"Continue."},
+                    {"role":"assistant","content":"winner response"},
+                    {"role":"user","content":"Next ordinary turn."}
+                ]
+            });
+            let (status, body) = syntax_public_response(&app, &key, &next).await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            assert!(body.contains("ordinary continuation"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hermes_provider_failures_before_caller_effect_do_not_poison_continuation() {
+        for failure in ["429", "502", "timeout"] {
+            for stream in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let chat = Arc::new(ProviderFailureThenSuccess {
+                    attempts: AtomicUsize::new(0),
+                    failure,
+                });
+                let (gateway, key) = gateway_with_chat_and_oauth_at_root(
+                    chat.clone(),
+                    oauth(),
+                    root.path().to_owned(),
+                    None,
+                );
+                if failure == "timeout" {
+                    let mut settings = gateway.settings.current();
+                    settings.chat_timeout_seconds = 5;
+                    gateway.settings.save(settings).unwrap();
+                }
+                let app = Gateway::router(gateway.clone());
+                let request = json!({
+                    "model":"gpt-5.6-terra",
+                    "stream":stream,
+                    "session_key":format!("provider-{failure}-{stream}"),
+                    "messages":[{"role":"user","content":"Continue."}]
+                });
+                let (_, first) = syntax_public_response(&app, &key, &request).await;
+                assert!(!first.contains("ordinary continuation"));
+                assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+                if let Ok(bytes) = std::fs::read(root.path().join("transport-checkpoints.json")) {
+                    let persisted: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert!(persisted["records"].as_array().unwrap().is_empty());
+                }
+                drop(app);
+                drop(gateway);
+
+                let reopened =
+                    CheckpointStore::open(root.path().join("transport-checkpoints.json")).unwrap();
+                assert!(reopened.recovery_views().unwrap().is_empty());
+                let (gateway, _) = gateway_with_chat_and_oauth_at_root(
+                    chat,
+                    oauth(),
+                    root.path().to_owned(),
+                    Some(reopened),
+                );
+                let app = Gateway::router(gateway);
+                let (status, body) = syntax_public_response(&app, &key, &request).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "failure={failure} stream={stream} body={body}"
+                );
+                assert!(body.contains("ordinary continuation"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hermes_delivered_tool_call_without_result_does_not_invent_effect_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{}\n```",
+            "ordinary continuation",
+            "fresh conversation",
+        ]));
+        let (gateway, key) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            None,
+        );
+        let app = Gateway::router(gateway.clone());
+        let mut request = json!({
+            "model": "gpt-5.6-terra",
+            "session_key": "lost-tool-result",
+            "messages": [{"role":"user","content":"Inspect."}],
+            "tools": [{"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}}]
+        });
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let response: Value = serde_json::from_str(&body).unwrap();
+        let call = response["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()[0]
+            .clone();
+        request["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":null,"tool_calls":[call]}),
+            json!({"role":"user","content":"Continue without the lost tool result."}),
+        ]);
+        drop(app);
+        drop(gateway);
+        let reopened =
+            CheckpointStore::open(root.path().join("transport-checkpoints.json")).unwrap();
+        let recoveries = reopened.recovery_views().unwrap();
+        assert!(recoveries.is_empty());
+        let (gateway, _) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            Some(reopened),
+        );
+        let app = Gateway::router(gateway);
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.contains("ordinary continuation"));
+        assert_eq!(chat.requests.lock().unwrap().len(), 2);
+
+        let new_lineage = json!({
+            "model":"gpt-5.6-terra",
+            "session_key":"fresh-new-session",
+            "messages":[{"role":"user","content":"Start a fresh conversation."}]
+        });
+        let (status, body) = syntax_public_response(&app, &key, &new_lineage).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body.contains("fresh conversation"));
+        assert_eq!(chat.requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -18740,8 +18393,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hermes_checkpoint_duplicate_fallback_starts_upstream_once() {
-        let chat = Arc::new(HookAwareDuplicateFallbackTransport::new([
+    async fn hermes_checkpoint_duplicate_fallback_uses_one_followup_generation() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
             "```inspect\n{}\n```",
             "The inspection result is already available.",
         ]));
@@ -18767,14 +18420,12 @@ mod tests {
             value["choices"][0]["message"]["content"],
             "The inspection result is already available."
         );
-        assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 1);
         assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        assert!(chat.requests.lock().unwrap()[1].upstream_start.is_none());
     }
 
     #[tokio::test]
-    async fn hermes_streaming_checkpoint_duplicate_fallback_starts_upstream_once() {
-        let chat = Arc::new(HookAwareDuplicateFallbackTransport::new([
+    async fn hermes_streaming_checkpoint_duplicate_fallback_uses_one_followup_generation() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
             "```inspect\n{}\n```",
             "The streaming inspection result is already available.",
         ]));
@@ -18802,14 +18453,12 @@ mod tests {
         .unwrap();
         assert!(body.contains("The streaming inspection result is already available."));
         assert!(body.ends_with("data: [DONE]\n\n"));
-        assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 1);
         assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        assert!(chat.requests.lock().unwrap()[1].upstream_start.is_none());
     }
 
     #[tokio::test]
-    async fn hermes_streaming_full_context_duplicate_fallback_starts_upstream_once() {
-        let chat = Arc::new(HookAwareDuplicateFallbackTransport::new([
+    async fn hermes_streaming_full_context_duplicate_fallback_uses_one_followup_generation() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
             "```inspect\n{}\n```",
             "The full-context streaming fallback is complete.",
         ]));
@@ -18844,14 +18493,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body={response_body}");
         assert!(response_body.contains("The full-context streaming fallback is complete."));
         assert!(response_body.ends_with("data: [DONE]\n\n"));
-        assert_eq!(chat.upstream_start_calls.load(Ordering::Acquire), 1);
         let requests = chat.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(
             serde_json::from_str::<Value>(&requests[0].text).unwrap()["transport_projection"]["kind"]
                 == "full_context_document"
         );
-        assert!(requests[1].upstream_start.is_none());
         token_server.abort();
     }
 
@@ -19305,6 +18952,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hermes_tool_round_limit_128_is_terminal_without_checkpoint_poison() {
+        let (gateway, key) = gateway_with_chat_and_oauth(Arc::new(FixedTransport), oauth());
+        let app = Gateway::router(gateway.clone());
+        let mut messages = vec![json!({"role":"user","content":"Run 128 read-only rounds."})];
+        for round in 0..128 {
+            let id = format!("call-{round}");
+            messages.push(json!({
+                "role":"assistant",
+                "content":null,
+                "tool_calls":[{"id":id,"type":"function","function":{"name":"inspect","arguments":"{}"}}]
+            }));
+            messages.push(json!({"role":"tool","tool_call_id":id,"content":"ok"}));
+        }
+        let request = json!({
+            "model":"gpt-5.6-terra",
+            "session_key":"round-limit-128",
+            "messages":messages
+        });
+        let (status, body) = syntax_public_response(&app, &key, &request).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        let error: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"]["code"], "tool_round_limit");
+        assert_eq!(error["error"]["completed_rounds"], 128);
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+
+        let mut next = request;
+        next["messages"].as_array_mut().unwrap().push(json!({
+            "role":"user", "content":"Start an ordinary new user turn."
+        }));
+        let (status, body) = syntax_public_response(&app, &key, &next).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn unexpected_tool_result_fails_before_upstream() {
         let (app, raw_key) = app();
         let response = app
@@ -19375,6 +19057,98 @@ mod tests {
             second["output"][0]["content"][0]["text"],
             "Inspection completed successfully."
         );
+    }
+
+    #[tokio::test]
+    async fn responses_parent_and_append_cannot_rewrite_completed_tool_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let (gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+            Arc::new(SequenceTransport::new([
+                "First accepted.",
+                "Unexpected generation.",
+            ])),
+            oauth(),
+            root.path().to_path_buf(),
+            None,
+        );
+        let app = Gateway::router(gateway.clone());
+        let first = json!({
+            "model":"gpt-5.6-terra",
+            "conversation":"stable-response-lineage",
+            "input":[
+                {"type":"message","role":"user","content":"Check the fixture."},
+                {"type":"function_call","call_id":"completed-id","name":"inspect","arguments":"{}"},
+                {"type":"function_call_output","call_id":"completed-id","output":"fixture-ok"}
+            ]
+        });
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("x-api-key", &raw_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&first).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body: Value = serde_json::from_slice(
+            &to_bytes(first_response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let parent = first_body["id"].as_str().unwrap();
+        let conversation = "stable-response-lineage";
+        let checkpoint_file: Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("transport-checkpoints.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_file["records"][0]["toolLedger"]["completed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let accepted_bytes = std::fs::read(root.path().join("transport-checkpoints.json")).unwrap();
+
+        for (index, request) in [
+            json!({
+                "model":"gpt-5.6-terra", "previous_response_id":parent,
+                "input":[{"type":"function_call_output","call_id":"completed-id","output":"rewritten"}]
+            }),
+            json!({
+                "model":"gpt-5.6-terra", "conversation":conversation,
+                "input":[
+                    {"type":"function_call","call_id":"completed-id","name":"inspect","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"completed-id","output":"rewritten"}
+                ]
+            }),
+        ].into_iter().enumerate() {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/responses")
+                        .header("x-api-key", &raw_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case {index}");
+            let error: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(error["error"]["type"], "tool_protocol_error");
+        }
+        assert!(
+            std::fs::read(root.path().join("transport-checkpoints.json")).unwrap()
+                == accepted_bytes
+        );
+        assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
     }
 
     #[tokio::test]

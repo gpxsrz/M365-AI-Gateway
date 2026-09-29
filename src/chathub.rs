@@ -326,8 +326,6 @@ pub struct ChatRequest {
     pub(crate) continuation_recall_range: Option<crate::protocol::ContinuationRecallRange>,
     #[doc(hidden)]
     pub(crate) continuation_usage: Option<crate::protocol::ContinuationUsage>,
-    #[doc(hidden)]
-    pub(crate) upstream_start: Option<UpstreamStartHook>,
 }
 
 impl fmt::Debug for ChatRequest {
@@ -1901,28 +1899,6 @@ pub enum ChatError {
     Protocol(String),
 }
 
-#[derive(Clone)]
-pub(crate) struct UpstreamStartHook(Arc<dyn Fn() -> Result<(), ChatError> + Send + Sync + 'static>);
-
-impl UpstreamStartHook {
-    pub(crate) fn new<F>(callback: F) -> Self
-    where
-        F: Fn() -> Result<(), ChatError> + Send + Sync + 'static,
-    {
-        Self(Arc::new(callback))
-    }
-
-    pub(crate) fn call(&self) -> Result<(), ChatError> {
-        (self.0)()
-    }
-}
-
-impl fmt::Debug for UpstreamStartHook {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("UpstreamStartHook(..)")
-    }
-}
-
 pub trait EventSink {
     fn send(&mut self, event: StreamEvent) -> Result<(), ChatError>;
 }
@@ -1962,10 +1938,6 @@ fn prepare_attachments<'a>(
 }
 
 pub trait ChatHubTransport: Send + Sync {
-    fn upstream_start_after_preparation(&self) -> bool {
-        false
-    }
-
     fn chat<'a>(
         &'a self,
         account: Account,
@@ -2007,10 +1979,6 @@ impl LiveChatHub {
 }
 
 impl ChatHubTransport for LiveChatHub {
-    fn upstream_start_after_preparation(&self) -> bool {
-        true
-    }
-
     fn chat<'a>(
         &'a self,
         account: Account,
@@ -2122,10 +2090,6 @@ async fn live_chat(
         &request_id,
         private_mode,
     )?;
-    if let Some(start) = request.upstream_start.as_ref() {
-        start.call()?;
-    }
-
     let mut socket = None;
     for attempt in 0..2 {
         request
@@ -5598,18 +5562,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_chat_checks_message_text_before_upstream_start() {
-        let started = Arc::new(AtomicBool::new(false));
-        let mut request = ChatRequest {
+    async fn live_chat_checks_message_text_before_upstream_connection() {
+        let request = ChatRequest {
             text: "x".repeat(128_001),
             outbound_text_limit_utf16: 128_000,
             ..ChatRequest::default()
         };
-        let started_for_hook = Arc::clone(&started);
-        request.upstream_start = Some(UpstreamStartHook::new(move || {
-            started_for_hook.store(true, Ordering::Release);
-            Ok(())
-        }));
         let account = Account {
             access_token: "access".to_owned(),
             graph_access_token: String::new(),
@@ -5634,13 +5592,10 @@ mod tests {
                 limit: 128_000,
             })
         ));
-        assert!(!started.load(Ordering::Acquire));
     }
 
     #[tokio::test]
     async fn live_chat_checks_native_manifest_in_final_utf16_fit() {
-        let started = Arc::new(AtomicBool::new(false));
-        let started_for_hook = Arc::clone(&started);
         let request = ChatRequest {
             text: "x".repeat(127_000),
             conversation_id: "conversation".to_owned(),
@@ -5666,10 +5621,6 @@ mod tests {
             }],
             native_attachment_indices: vec![0],
             outbound_text_limit_utf16: 128_000,
-            upstream_start: Some(UpstreamStartHook::new(move || {
-                started_for_hook.store(true, Ordering::Release);
-                Ok(())
-            })),
             ..ChatRequest::default()
         };
         let message_units = outbound_message_text(
@@ -5693,7 +5644,6 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap().text, "native attachment accepted");
-        assert!(started.load(Ordering::Acquire));
     }
 
     #[test]

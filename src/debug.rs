@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -1039,20 +1039,6 @@ pub(crate) struct Trace {
     inner: Arc<TraceInner>,
 }
 
-pub(crate) struct TraceObserver(Weak<TraceInner>);
-
-impl TraceObserver {
-    pub(crate) fn checkpoint_turn_outcome(&self, outcome: &'static str) {
-        if let Some(inner) = self.0.upgrade() {
-            inner
-                .record
-                .lock()
-                .expect("debug trace poisoned")
-                .checkpoint_turn_outcome = outcome.to_owned();
-        }
-    }
-}
-
 fn apply_tool_diagnostic(
     record: &mut Record,
     diagnostic: Option<&crate::tool_calls::ToolDiagnostic>,
@@ -1089,10 +1075,6 @@ fn apply_tool_diagnostic(
 }
 
 impl Trace {
-    pub(crate) fn observer(&self) -> TraceObserver {
-        TraceObserver(Arc::downgrade(&self.inner))
-    }
-
     fn update(&self, update: impl FnOnce(&mut Record)) {
         update(&mut self.inner.record.lock().expect("debug trace poisoned"));
     }

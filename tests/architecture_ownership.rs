@@ -9,7 +9,6 @@ fn checkpoint_error_surface(error: &CheckpointError) -> &'static str {
         CheckpointError::KeyRequired => "key_required",
         CheckpointError::UnknownCursor => "unknown_cursor",
         CheckpointError::Ambiguous => "ambiguous",
-        CheckpointError::Busy => "busy",
         CheckpointError::Capacity => "capacity",
         CheckpointError::HistoryLimit => "history_limit",
         CheckpointError::Stale => "stale",

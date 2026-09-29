@@ -195,20 +195,19 @@ Checkpoints provide safe transport continuation. They are not Agent lifecycle st
 Core invariants:
 
 - history prefix, role, tool ID, arguments, and transcript identity must match;
-- a reservation before upstream starts may be reclaimed safely;
-- when upstream has responded and Gateway replay protection rejects an `unsafe_tool_replay` candidate before caller-tool dispatch or final acceptance, only the current unaccepted turn is rolled back; the prior accepted checkpoint and tool ledger remain, and the response stays terminal 409;
-- once upstream starts and outcome is uncertain, recovery-required state must remain;
-- process restart alone does not prove replay safety;
-- only one recovery attempt may own a checkpoint at a time;
-- destructive checkpoint operations fail closed while unresolved in-flight work exists.
+- model generation is a transient optimistic attempt against the accepted revision; only a validated response can CAS-accept history, binding, cursor, and observed completed results. A stale loser is discarded without changing the accepted checkpoint;
+- when Gateway replay protection rejects an `unsafe_tool_replay` candidate before caller-tool delivery, only the current unaccepted generation is discarded; the prior accepted checkpoint and tool ledger remain, and the response stays terminal 409;
+- an accepted caller-tool candidate is accepted history, not proof of dispatch or outcome. Only a matching caller result observed in a request enters the durable completed replay ledger; an absent result does not create durable pending authority or block the next ordinary turn;
+- historical records already marked unknown remain fail-closed after the schema change;
+- destructive checkpoint operations fail closed for historical unknown records. Caller mutation uncertainty remains with Hermes and the tool domain; the Gateway neither asserts an outcome nor automatically replays a candidate.
 
-The current durable schema is `wp6-transport-checkpoints/rust-v3`. Existing raw message digests and hash chains remain forensic evidence; integrity binding also protects the added arguments comparison identity. Comparison uses shared strict JSON canonicalization, ignoring whitespace, object key order, and equivalent legal escapes without Unicode normalization, lossy numeric conversion, or merging integers with floats. Duplicate decoded keys, invalid JSON or surrogates, and trailing garbage are rejected.
+The current durable schema is `wp6-transport-checkpoints/rust-v5`. It writes no new generation reservation, pending caller effect, or terminal-unknown transition. Existing raw message digests and hash chains remain forensic evidence; integrity binding also protects the arguments comparison identity. Comparison uses shared strict JSON canonicalization, ignoring whitespace, object key order, and equivalent legal escapes without Unicode normalization, lossy numeric conversion, or merging integers with floats. Duplicate decoded keys, invalid JSON or surrogates, and trailing garbage are rejected.
 
-Legacy `rust-v1` and `rust-v2` records with only raw hashes still require a raw match to continue; semantic identity is never inferred from a hash. New identity may be saved only through a subsequently proven continuation. Unprovable `rust-v1` results remain unknown rather than being invented as success. In-flight, recovery, and tool replay authorization remain unchanged.
+Legacy `rust-v1` and `rust-v2` records with only raw hashes still require a raw match to continue; semantic identity is never inferred from a hash. New identity may be saved only through a subsequently proven continuation. Unprovable `rust-v1` results remain unknown rather than being invented as success. Ambiguous `rust-v3` in-flight records and existing terminal-unknown records remain fenced. Authenticated `rust-v4` generation-only reservations are reduced to their prior accepted snapshot after MAC verification; legacy pending candidates are never promoted to completed results.
 
 ### Admin recovery
 
-`GET /api/admin/checkpoints/recovery` projects opaque IDs and required metadata only; it does not expose private transcripts.
+`GET /api/admin/checkpoints/recovery` projects opaque IDs for historical legacy records only; it does not expose private transcripts. Current generations do not create recovery entries.
 
 `POST /api/admin/checkpoints/reconcile` may acknowledge an unknown external outcome as terminal unknown:
 
@@ -276,7 +275,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 - A hard 429 during a probe reopens the breaker; success enters RECOVERY.
 - RECOVERY lowers shared concurrency and returns to CLOSED only after the required quiet observation.
 
-WebSocket retry is limited to transient dial/upgrade failure before payload send. After payload send, an uncertain outcome follows checkpoint/reconciliation rules instead of blind replay.
+WebSocket retry is limited to transient dial/upgrade failure before payload send. After payload send, the provider retry policy decides whether another model generation is safe; it does not create Gateway caller-effect authority.
 
 ## Hindsight webhook
 
@@ -320,7 +319,8 @@ Delivery is treated as at-least-once, so consumers need bounded deduplication by
 | `400 text_input_too_large` | non-Memory caller text cannot safely fit the UTF-16 policy |
 | `400 context_length_exceeded` | Memory input needs compact/split recovery |
 | `409 tool_round_limit` | tool continuation safety ceiling exhausted |
-| `409 transport_checkpoint_recovery_required` | unknown external outcome must be reconciled first |
+| `409 unresolved_effect` | a historical unknown checkpoint remains fenced; inspect its retained record before operator reconciliation |
+| `409 checkpoint_stale` | generation revision was superseded; this generation is discarded with `retryable=false` |
 | `409 hermes_execution_identity_error` | safe Hermes execution identity/provenance cannot be established |
 | `429 upstream_throttle` | shared-breaker projection or upstream rate limit |
 | `502 attachment_upload_failed` | generated-document attachment transport failed after projection; use `attachment_failure` for the bounded stage/class |

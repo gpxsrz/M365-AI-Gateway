@@ -170,6 +170,29 @@ def _is_exact_unsafe_tool_replay(error_body: Any) -> bool:
     return True
 
 
+def _exact_checkpoint_error_context(error_body: Any) -> dict[str, Any] | None:
+    if not isinstance(error_body, dict):
+        return None
+    nested = error_body.get("error")
+    if "error" in error_body and not isinstance(nested, dict):
+        return None
+    candidates = [nested] if isinstance(nested, dict) else []
+    candidates.append(error_body)
+    valid_codes = {
+        "checkpoint_stale", "unresolved_effect", "conversation_drift", "checkpoint_error"
+    }
+    candidate = next(
+        (value for value in candidates if value.get("code") in valid_codes), None
+    )
+    if candidate is None or candidate.get("type") != "checkpoint_error" or candidate.get("retryable") is not False:
+        return None
+    for value in candidates:
+        for field in ("type", "code", "retryable"):
+            if field in value and value[field] != candidate[field]:
+                return None
+    return {"provider_error_code": candidate["code"]}
+
+
 def _exact_text_input_too_large_context(error_body: Any) -> dict[str, Any] | None:
     """Validate the Gateway's terminal text-overflow envelope without trusting prose."""
     if not isinstance(error_body, dict):
@@ -310,7 +333,7 @@ def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | Non
         return None
     status_code = kwargs.get("status_code")
     if status_code is not None and (
-        type(status_code) is not int or status_code not in (400, 409, 502)
+        type(status_code) is not int or status_code not in (400, 409, 500, 502)
     ):
         return None
     # OpenAI's HTTP-200 SSE error event is surfaced as a status-less APIError;
@@ -322,6 +345,10 @@ def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | Non
         None,
         "",
         "unsafe_tool_replay",
+        "checkpoint_stale",
+        "unresolved_effect",
+        "conversation_drift",
+        "checkpoint_error",
         "text_input_too_large",
         "invalid_tool_call",
     ):
@@ -343,6 +370,13 @@ def on_transform_api_error_classification(**kwargs: Any) -> dict[str, Any] | Non
         error_context = _exact_text_input_too_large_context(error_body)
     elif error_code in (None, "", "invalid_tool_call") and status_code in (None, 502):
         error_context = _exact_terminal_invalid_tool_call_context(error_body)
+    elif status_code in (None, 400, 409, 500):
+        checkpoint_context = _exact_checkpoint_error_context(error_body)
+        if checkpoint_context is not None:
+            code = checkpoint_context["provider_error_code"]
+            expected_status = (400, 500) if code == "checkpoint_error" else (409,)
+            if error_code in (None, "", code) and status_code in (None, *expected_status):
+                error_context = checkpoint_context
     if error_context is None:
         return None
     return {

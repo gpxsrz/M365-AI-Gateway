@@ -2399,7 +2399,7 @@ mod tests {
             .checkpoints
             .begin_full("hermes", "owner", "session", &[message], false)
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         gateway.checkpoints.list().unwrap()[0].id.clone()
     }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -16,7 +16,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{agent_ledger::AgentLedger, error::GatewayError, private_file};
 
-const SCHEMA: &str = "wp6-transport-checkpoints/rust-v3";
+const SCHEMA: &str = "wp6-transport-checkpoints/rust-v5";
+const PRIOR_SCHEMA: &str = "wp6-transport-checkpoints/rust-v4";
+const OLDER_SCHEMA: &str = "wp6-transport-checkpoints/rust-v3";
 const PREVIOUS_SCHEMA: &str = "wp6-transport-checkpoints/rust-v2";
 const LEGACY_SCHEMA: &str = "wp6-transport-checkpoints/rust-v1";
 const TTL: Duration = Duration::hours(24);
@@ -83,15 +85,13 @@ pub enum CheckpointError {
     UnknownCursor,
     #[error("transport checkpoint match is ambiguous")]
     Ambiguous,
-    #[error("transport checkpoint already has an in-flight turn")]
-    Busy,
     #[error("transport checkpoint capacity reached")]
     Capacity,
     #[error("transport checkpoint history limit reached")]
     HistoryLimit,
     #[error("transport checkpoint turn is stale")]
     Stale,
-    #[error("transport checkpoint has an unresolved in-flight turn; reconcile before retry")]
+    #[error("legacy transport checkpoint requires operator reconciliation")]
     RecoveryRequired,
     #[error("transport checkpoint conversation identity changed")]
     ConversationDrift,
@@ -156,6 +156,8 @@ struct Record {
     in_flight_message_digests: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     in_flight_message_identities: Vec<Option<String>>,
+    // Read-only compatibility for historical generation-unknown records.
+    // New generation reservations never set this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     in_flight_upstream_started: Option<bool>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -172,7 +174,10 @@ struct ResponseCursor {
 
 struct State {
     records: HashMap<String, Record>,
-    recovery_leases: HashSet<String>,
+}
+
+fn requires_reconciliation(record: &Record) -> bool {
+    !record.terminal_unknown && record.in_flight && record.in_flight_upstream_started == Some(true)
 }
 
 struct FileLease {
@@ -254,13 +259,12 @@ pub struct CheckpointTurn {
     store: Arc<CheckpointStore>,
     record_id: String,
     revision: u64,
-    rollback_record: Option<Record>,
+    base_record: Record,
+    observed_ids: Vec<String>,
     base_digests: Vec<String>,
     base_chain: Vec<String>,
     base_identities: Vec<Option<String>>,
     closed: bool,
-    upstream_started: bool,
-    recovery_lease: bool,
     _record_lease: Option<FileLease>,
     pub binding: Binding,
     pub outbound: Vec<CheckpointMessage>,
@@ -277,11 +281,8 @@ impl CheckpointStore {
         let path = path.into();
         let _lock = FileLease::blocking(&global_lock_path(&path))?;
         let integrity_key = load_or_create_integrity_key(&path)?;
-        let (records, migrated_legacy) = load_records(&path, &integrity_key, true)?;
-        let state = State {
-            records,
-            recovery_leases: HashSet::new(),
-        };
+        let (records, migrated_legacy) = load_records(&path, &integrity_key)?;
+        let state = State { records };
         if migrated_legacy {
             save_file(&path, &integrity_key, &state)?;
         }
@@ -308,7 +309,7 @@ impl CheckpointStore {
         messages: &[CheckpointMessage],
         force_new: bool,
     ) -> Result<CheckpointTurn, CheckpointError> {
-        self.begin_full_inner(namespace, owner, key, messages, force_new, false)
+        self.begin_full_inner(namespace, owner, key, messages, force_new)
     }
 
     fn begin_full_inner(
@@ -318,7 +319,6 @@ impl CheckpointStore {
         key: &str,
         messages: &[CheckpointMessage],
         force_new: bool,
-        allow_inflight_recovery: bool,
     ) -> Result<CheckpointTurn, CheckpointError> {
         if !valid_identity(namespace, 128) || !valid_identity(owner, 4_096) {
             return Err(CheckpointError::Identity);
@@ -338,19 +338,8 @@ impl CheckpointStore {
             digest(KEY_DOMAIN, key.as_bytes())
         };
         let now = OffsetDateTime::now_utc();
-        if allow_inflight_recovery {
-            return self.begin_full_recovery_inner(
-                namespace,
-                messages,
-                force_new,
-                digests,
-                identities,
-                owner_digest,
-                key_digest,
-            );
-        }
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         prune(&mut state, now);
@@ -365,7 +354,17 @@ impl CheckpointStore {
         }) {
             return Err(CheckpointError::RecoveryRequired);
         }
-        let snapshot = state.records.clone();
+        if force_new
+            && !key_digest.is_empty()
+            && state.records.values().any(|record| {
+                record.namespace == namespace
+                    && record.owner_digest == owner_digest
+                    && record.key_digest == key_digest
+                    && record.accepted_count > 0
+            })
+        {
+            return Err(CheckpointError::ConversationDrift);
+        }
         let mut candidates = state
             .records
             .values()
@@ -397,29 +396,21 @@ impl CheckpointStore {
                     record.namespace == namespace && record.owner_digest == owner_digest
                 }));
         if let Some(id) = selected {
-            let record = state.records.get_mut(&id).unwrap();
-            let rollback_record = record.clone();
+            let record = state.records.get(&id).unwrap();
             let accepted = record.accepted_count;
             let mut retained_digests = record.message_digests.clone();
             retained_digests.extend(digests.iter().skip(accepted).cloned());
             let retained_chain = hash_chain(&retained_digests);
-            record.in_flight = true;
-            record.in_flight_message_digests = digests.clone();
-            record.in_flight_message_identities = identities.clone();
-            record.in_flight_upstream_started = Some(false);
-            record.revision += 1;
-            record.updated_at = now;
             let turn = CheckpointTurn {
                 store: Arc::clone(self),
                 record_id: id.clone(),
                 revision: record.revision,
-                rollback_record: Some(rollback_record),
+                base_record: record.clone(),
+                observed_ids: state.records.keys().cloned().collect(),
                 base_digests: retained_digests,
                 base_chain: retained_chain,
                 base_identities: identities,
                 closed: false,
-                upstream_started: false,
-                recovery_lease: false,
                 _record_lease: None,
                 binding: Binding {
                     conversation_id: record.conversation_id.clone(),
@@ -429,10 +420,6 @@ impl CheckpointStore {
                 rebound,
                 prior_ledger: record.tool_ledger.clone(),
             };
-            if let Err(error) = self.save(&state) {
-                state.records = snapshot.clone();
-                return Err(error);
-            }
             return Ok(turn);
         }
 
@@ -446,23 +433,6 @@ impl CheckpointStore {
             })
         {
             return Err(CheckpointError::ConversationDrift);
-        }
-        if state.records.len() >= MAX_RECORDS {
-            let evict = state
-                .records
-                .values()
-                .filter(|record| !record.in_flight && !record.terminal_unknown)
-                .min_by_key(|record| record.updated_at)
-                .map(|record| record.id.clone())
-                .ok_or(CheckpointError::Capacity)?;
-            state.records.remove(&evict);
-        }
-        if !key_digest.is_empty() {
-            state.records.retain(|_, record| {
-                !(record.namespace == namespace
-                    && record.owner_digest == owner_digest
-                    && record.key_digest == key_digest)
-            });
         }
         let chain = hash_chain(&digests);
         let id = random_hex(16);
@@ -481,177 +451,30 @@ impl CheckpointStore {
             tool_ledger: AgentLedger::default(),
             created_at: now,
             updated_at: now,
-            revision: 1,
-            in_flight: true,
-            in_flight_message_digests: digests.clone(),
-            in_flight_message_identities: identities.clone(),
-            in_flight_upstream_started: Some(false),
+            revision: 0,
+            in_flight: false,
+            in_flight_message_digests: Vec::new(),
+            in_flight_message_identities: Vec::new(),
+            in_flight_upstream_started: None,
             terminal_unknown: false,
             ledger_mac: String::new(),
         };
-        state.records.insert(id.clone(), record);
-        if let Err(error) = self.save(&state) {
-            state.records = snapshot;
-            return Err(error);
-        }
         Ok(CheckpointTurn {
             store: Arc::clone(self),
             record_id: id,
-            revision: 1,
-            rollback_record: None,
+            revision: 0,
+            base_record: record,
+            observed_ids: state.records.keys().cloned().collect(),
             base_digests: digests,
             base_chain: chain,
             base_identities: identities,
             closed: false,
-            upstream_started: false,
-            recovery_lease: false,
             _record_lease: None,
             binding: Binding::default(),
             outbound: messages.to_vec(),
             rebound,
             prior_ledger: AgentLedger::default(),
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn begin_full_recovery_inner(
-        self: &Arc<Self>,
-        namespace: &str,
-        messages: &[CheckpointMessage],
-        force_new: bool,
-        digests: Vec<String>,
-        identities: Vec<Option<String>>,
-        owner_digest: String,
-        key_digest: String,
-    ) -> Result<CheckpointTurn, CheckpointError> {
-        if force_new {
-            return Err(CheckpointError::RecoveryRequired);
-        }
-
-        let id = {
-            let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-            let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
-            let mut state = self.state.lock().expect("checkpoint state poisoned");
-            state.records = records;
-            prune(&mut state, OffsetDateTime::now_utc());
-            if migrated {
-                save_file(&self.path, &self.integrity_key, &state)?;
-            }
-            let mut candidates = state
-                .records
-                .values()
-                .filter(|record| {
-                    record.namespace == namespace
-                        && record.owner_digest == owner_digest
-                        && record.key_digest == key_digest
-                        && record.in_flight
-                        && identity_prefix(
-                            &record.message_digests,
-                            &record.in_flight_message_identities,
-                            &digests,
-                            &identities,
-                        )
-                })
-                .map(|record| record.id.clone())
-                .collect::<Vec<_>>();
-            candidates.sort_by_key(|candidate| {
-                std::cmp::Reverse(
-                    state
-                        .records
-                        .get(candidate)
-                        .map_or(0, |record| record.accepted_count),
-                )
-            });
-            match candidates.as_slice() {
-                [id] => id.clone(),
-                [] => return Err(CheckpointError::RecoveryRequired),
-                _ => return Err(CheckpointError::Ambiguous),
-            }
-        };
-
-        let record_lease = FileLease::try_record(&record_lock_path(&self.path, &id))?;
-        let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
-        let mut state = self.state.lock().expect("checkpoint state poisoned");
-        state.records = records;
-        prune(&mut state, OffsetDateTime::now_utc());
-        if migrated {
-            save_file(&self.path, &self.integrity_key, &state)?;
-        }
-        let record = state
-            .records
-            .get(&id)
-            .ok_or(CheckpointError::RecoveryRequired)?;
-        if !record.in_flight {
-            return Err(CheckpointError::RecoveryRequired);
-        }
-        if record.in_flight_message_digests.len() != digests.len()
-            || !identity_prefix(
-                &record.in_flight_message_digests,
-                &record.in_flight_message_identities,
-                &digests,
-                &identities,
-            )
-        {
-            return Err(CheckpointError::ConversationDrift);
-        }
-        if record.in_flight_upstream_started != Some(true) {
-            return Err(CheckpointError::RecoveryRequired);
-        }
-        if state.recovery_leases.contains(&id) {
-            return Err(CheckpointError::RecoveryRequired);
-        }
-        state.recovery_leases.insert(id.clone());
-        let record = state.records.get_mut(&id).expect("record was checked");
-        let rollback_record = record.clone();
-        let accepted = record.accepted_count;
-        let mut retained_digests = record.message_digests.clone();
-        retained_digests.extend(
-            record
-                .in_flight_message_digests
-                .iter()
-                .skip(accepted)
-                .cloned(),
-        );
-        let retained_chain = hash_chain(&retained_digests);
-        record.revision += 1;
-        record.updated_at = OffsetDateTime::now_utc();
-        let turn = CheckpointTurn {
-            store: Arc::clone(self),
-            record_id: id.clone(),
-            revision: record.revision,
-            rollback_record: Some(rollback_record),
-            base_digests: retained_digests,
-            base_chain: retained_chain,
-            base_identities: identities,
-            closed: false,
-            upstream_started: false,
-            recovery_lease: true,
-            _record_lease: Some(record_lease),
-            binding: Binding {
-                conversation_id: record.conversation_id.clone(),
-                session_id: record.session_id.clone(),
-            },
-            outbound: outbound_after_accepted(messages, accepted),
-            rebound: false,
-            prior_ledger: record.tool_ledger.clone(),
-        };
-        if let Err(error) = save_file(&self.path, &self.integrity_key, &state) {
-            state.recovery_leases.remove(&id);
-            return Err(error);
-        }
-        Ok(turn)
-    }
-
-    pub(crate) fn begin_full_recovery(
-        self: &Arc<Self>,
-        namespace: &str,
-        owner: &str,
-        key: &str,
-        messages: &[CheckpointMessage],
-        force_new: bool,
-    ) -> Result<CheckpointTurn, CheckpointError> {
-        self.begin_full_inner(namespace, owner, key, messages, force_new, true)
     }
 
     pub fn begin_delta(
@@ -670,7 +493,7 @@ impl CheckpointStore {
         let owner_digest = digest(OWNER_DOMAIN, owner.as_bytes());
         let key_digest = digest(KEY_DOMAIN, key.as_bytes());
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         prune(&mut state, OffsetDateTime::now_utc());
@@ -713,7 +536,7 @@ impl CheckpointStore {
         let owner_digest = digest(OWNER_DOMAIN, owner.as_bytes());
         let cursor_digest = digest(CURSOR_DOMAIN, parent.as_bytes());
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         prune(&mut state, OffsetDateTime::now_utc());
@@ -726,9 +549,7 @@ impl CheckpointStore {
             .filter(|record| {
                 record.owner_digest == owner_digest
                     && record.response_cursors.iter().any(|cursor| {
-                        cursor.digest == cursor_digest
-                            && (cursor.revision == record.revision
-                                || (record.in_flight && cursor.revision + 1 == record.revision))
+                        cursor.digest == cursor_digest && cursor.revision == record.revision
                     })
             })
             .map(|record| record.id.clone())
@@ -742,7 +563,7 @@ impl CheckpointStore {
 
     pub fn list(&self) -> Result<Vec<CheckpointView>, CheckpointError> {
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         prune(&mut state, OffsetDateTime::now_utc());
@@ -767,7 +588,7 @@ impl CheckpointStore {
 
     pub(crate) fn recovery_views(&self) -> Result<Vec<RecoveryView>, CheckpointError> {
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         prune(&mut state, OffsetDateTime::now_utc());
@@ -777,7 +598,7 @@ impl CheckpointStore {
         let mut views = state
             .records
             .values()
-            .filter(|record| record.in_flight && record.in_flight_upstream_started == Some(true))
+            .filter(|record| requires_reconciliation(record))
             .map(|record| RecoveryView {
                 id: record.id.clone(),
                 updated_at: record.updated_at,
@@ -793,64 +614,57 @@ impl CheckpointStore {
         }
         {
             let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-            let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+            let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
             let mut state = self.state.lock().expect("checkpoint state poisoned");
             state.records = records;
             prune(&mut state, OffsetDateTime::now_utc());
             if migrated {
                 save_file(&self.path, &self.integrity_key, &state)?;
             }
-            if state.recovery_leases.contains(id) {
-                return Err(CheckpointError::RecoveryRequired);
-            }
             let Some(record) = state.records.get(id) else {
                 return Ok(false);
             };
-            if !record.in_flight || record.in_flight_upstream_started != Some(true) {
+            if !requires_reconciliation(record) {
                 return Err(CheckpointError::RecoveryRequired);
             }
         }
         let _record_lease = FileLease::try_record(&record_lock_path(&self.path, id))?;
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         prune(&mut state, OffsetDateTime::now_utc());
         if migrated {
             save_file(&self.path, &self.integrity_key, &state)?;
         }
-        if state.recovery_leases.contains(id) {
-            return Err(CheckpointError::RecoveryRequired);
-        }
         let Some(record) = state.records.get_mut(id) else {
             return Err(CheckpointError::Persistence(
                 "checkpoint disappeared during reconciliation".to_owned(),
             ));
         };
-        if !record.in_flight || record.in_flight_upstream_started != Some(true) {
+        if !requires_reconciliation(record) {
             return Err(CheckpointError::RecoveryRequired);
         }
         record.in_flight = false;
         record.in_flight_message_digests.clear();
         record.in_flight_message_identities.clear();
-        record.in_flight_upstream_started = Some(false);
+        record.in_flight_upstream_started = None;
         record.terminal_unknown = true;
         record.revision += 1;
         record.updated_at = OffsetDateTime::now_utc();
         save_file(&self.path, &self.integrity_key, &state)?;
-        state.recovery_leases.remove(id);
         Ok(true)
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, CheckpointError> {
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         if migrated {
             self.save(&state)?;
         }
-        if state.records.values().any(|record| record.in_flight)
+        if state.records.values().any(requires_reconciliation)
             || state
                 .records
                 .get(id)
@@ -871,13 +685,13 @@ impl CheckpointStore {
 
     pub fn clear(&self) -> Result<(), CheckpointError> {
         let _global_lease = FileLease::blocking(&global_lock_path(&self.path))?;
-        let (records, migrated) = load_records(&self.path, &self.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.path, &self.integrity_key)?;
         let mut state = self.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         if migrated {
             self.save(&state)?;
         }
-        if state.records.values().any(|record| record.in_flight) {
+        if state.records.values().any(requires_reconciliation) {
             return Err(CheckpointError::RecoveryRequired);
         }
         let snapshot = state.records.clone();
@@ -897,7 +711,7 @@ impl CheckpointStore {
             Ok(lease) => lease,
             Err(_) => return Err(ClearThenError::Clear),
         };
-        let (records, migrated) = match load_records(&self.path, &self.integrity_key, false) {
+        let (records, migrated) = match load_records(&self.path, &self.integrity_key) {
             Ok(result) => result,
             Err(CheckpointError::RecoveryRequired) => {
                 return Err(ClearThenError::RecoveryRequired);
@@ -909,7 +723,7 @@ impl CheckpointStore {
         if migrated && self.save(&state).is_err() {
             return Err(ClearThenError::Clear);
         }
-        if state.records.values().any(|record| record.in_flight) {
+        if state.records.values().any(requires_reconciliation) {
             return Err(ClearThenError::RecoveryRequired);
         }
         let snapshot = state.records.clone();
@@ -977,18 +791,18 @@ impl CheckpointStore {
             &self.integrity_key,
             &State {
                 records: records.clone(),
-                recovery_leases: HashSet::new(),
             },
         )
     }
 }
 
 impl CheckpointTurn {
-    pub(crate) fn mark_upstream_started(&mut self) -> Result<(), CheckpointError> {
+    #[cfg(test)]
+    pub(crate) fn seed_legacy_unresolved_for_test(&mut self) -> Result<(), CheckpointError> {
         if self.closed {
             return Err(CheckpointError::Stale);
         }
-        if self.upstream_started {
+        if self._record_lease.is_some() {
             return Ok(());
         }
         if self._record_lease.is_none() {
@@ -998,27 +812,33 @@ impl CheckpointTurn {
             ))?);
         }
         let _global_lease = FileLease::blocking(&global_lock_path(&self.store.path))?;
-        let (records, migrated) = load_records(&self.store.path, &self.store.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.store.path, &self.store.integrity_key)?;
         let mut state = self.store.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         if migrated {
             self.store.save(&state)?;
         }
         let snapshot = state.records.clone();
-        let record = state
+        if state
             .records
-            .get_mut(&self.record_id)
-            .filter(|record| record.in_flight && record.revision == self.revision)
-            .ok_or(CheckpointError::Stale)?;
+            .get(&self.record_id)
+            .is_some_and(|record| record.revision != self.revision)
+        {
+            return Err(CheckpointError::Stale);
+        }
+        let mut record = self.base_record.clone();
+        record.revision = self.revision + 1;
+        record.in_flight = true;
         record.in_flight_upstream_started = Some(true);
+        record.in_flight_message_digests = self.base_digests.clone();
+        record.in_flight_message_identities = self.base_identities.clone();
         record.updated_at = OffsetDateTime::now_utc();
+        self.revision = record.revision;
+        state.records.insert(self.record_id.clone(), record);
         if let Err(error) = self.store.save(&state) {
             state.records = snapshot;
             return Err(error);
         }
-        state.recovery_leases.insert(self.record_id.clone());
-        self.recovery_lease = true;
-        self.upstream_started = true;
         Ok(())
     }
 
@@ -1073,6 +893,9 @@ impl CheckpointTurn {
         response_id: &str,
         ledger: Option<AgentLedger>,
     ) -> Result<(), CheckpointError> {
+        if self.closed {
+            return Err(CheckpointError::Stale);
+        }
         let produced_digests = message_digests(produced)?;
         let produced_identities = message_identities(produced)?;
         if self.base_digests.len() + produced_digests.len() > MAX_MESSAGES {
@@ -1080,40 +903,47 @@ impl CheckpointTurn {
             return Err(CheckpointError::HistoryLimit);
         }
         let _global_lease = FileLease::blocking(&global_lock_path(&self.store.path))?;
-        let (records, migrated) = load_records(&self.store.path, &self.store.integrity_key, false)?;
+        let (records, migrated) = load_records(&self.store.path, &self.store.integrity_key)?;
         let mut state = self.store.state.lock().expect("checkpoint state poisoned");
         state.records = records;
         if migrated {
             self.store.save(&state)?;
         }
         let snapshot = state.records.clone();
-        let drift = state
-            .records
-            .get(&self.record_id)
-            .filter(|record| record.in_flight && record.revision == self.revision)
-            .ok_or(CheckpointError::Stale)
-            .map(|record| {
-                !record.conversation_id.is_empty()
-                    && record.conversation_id != binding.conversation_id
-            })?;
-        if drift {
-            if self.upstream_started {
-                state.recovery_leases.remove(&self.record_id);
-                self.recovery_lease = false;
-                self.closed = true;
-                return Err(CheckpointError::ConversationDrift);
+        let current = state.records.get(&self.record_id);
+        if self
+            .observed_ids
+            .iter()
+            .any(|id| !state.records.contains_key(id))
+        {
+            return Err(CheckpointError::Stale);
+        }
+        if self.revision == 0 {
+            let same_lineage = state.records.values().any(|record| {
+                record.namespace == self.base_record.namespace
+                    && record.owner_digest == self.base_record.owner_digest
+                    && record.key_digest == self.base_record.key_digest
+                    && (!record.key_digest.is_empty()
+                        || identity_prefix(
+                            &self.base_digests,
+                            &self.base_identities,
+                            &record.message_digests,
+                            &record.message_identities,
+                        ))
+            });
+            if current.is_some() || same_lineage {
+                return Err(CheckpointError::Stale);
             }
-            state.records.remove(&self.record_id);
-            if let Err(error) = self.store.save(&state) {
-                state.records = snapshot;
-                return Err(error);
-            }
-            state.recovery_leases.remove(&self.record_id);
-            self.recovery_lease = false;
+        } else if current.is_none_or(|record| record.revision != self.revision) {
+            return Err(CheckpointError::Stale);
+        }
+        if !self.base_record.conversation_id.is_empty()
+            && self.base_record.conversation_id != binding.conversation_id
+        {
             self.closed = true;
             return Err(CheckpointError::ConversationDrift);
         }
-        let record = state.records.get_mut(&self.record_id).unwrap();
+        let mut record = current.cloned().unwrap_or_else(|| self.base_record.clone());
         record.conversation_id = binding.conversation_id;
         record.session_id = binding.session_id;
         record.message_digests = self.base_digests.clone();
@@ -1130,7 +960,10 @@ impl CheckpointTurn {
             record.hash_chain.push(digest_chain(previous, digest));
         }
         record.accepted_count = record.message_digests.len();
-        if let Some(ledger) = ledger {
+        if let Some(mut ledger) = ledger {
+            // A candidate is not evidence that Hermes dispatched a tool. Only
+            // matching results observed in this request may cross the boundary.
+            ledger.pending.clear();
             record.tool_ledger = ledger;
         }
         if !response_id.is_empty() {
@@ -1149,152 +982,35 @@ impl CheckpointTurn {
                 }
             }
         }
-        record.in_flight = false;
-        record.in_flight_message_digests.clear();
-        record.in_flight_message_identities.clear();
-        record.in_flight_upstream_started = Some(false);
         record.revision += 1;
         record.updated_at = OffsetDateTime::now_utc();
+        if self.revision == 0 && state.records.len() >= MAX_RECORDS {
+            let evict = state
+                .records
+                .values()
+                .filter(|existing| !existing.terminal_unknown && !requires_reconciliation(existing))
+                .min_by_key(|existing| existing.updated_at)
+                .map(|existing| existing.id.clone())
+                .ok_or(CheckpointError::Capacity)?;
+            state.records.remove(&evict);
+        }
+        state.records.insert(self.record_id.clone(), record);
         if let Err(error) = self.store.save(&state) {
             state.records = snapshot;
             return Err(error);
-        }
-        if self.recovery_lease {
-            state.recovery_leases.remove(&self.record_id);
-            self.recovery_lease = false;
         }
         self.closed = true;
         Ok(())
     }
 
     pub fn abort(&mut self) -> Result<(), CheckpointError> {
-        if self.closed {
-            return Ok(());
-        }
-        if self.upstream_started {
+        #[cfg(test)]
+        if self._record_lease.is_some() {
             return Err(CheckpointError::RecoveryRequired);
         }
-        let _global_lease = FileLease::blocking(&global_lock_path(&self.store.path))?;
-        let (records, migrated) = load_records(&self.store.path, &self.store.integrity_key, false)?;
-        let mut state = self.store.state.lock().expect("checkpoint state poisoned");
-        state.records = records;
-        if migrated {
-            self.store.save(&state)?;
-        }
-        let snapshot = state.records.clone();
-        let stale = state
-            .records
-            .get(&self.record_id)
-            .is_none_or(|record| !record.in_flight || record.revision != self.revision);
-        if stale {
-            if self.recovery_lease {
-                state.recovery_leases.remove(&self.record_id);
-                self.recovery_lease = false;
-            }
-            self.closed = true;
-            return Err(CheckpointError::Stale);
-        }
-        if let Some(record) = self.rollback_record.clone() {
-            state.records.insert(self.record_id.clone(), record);
-        } else {
-            state.records.remove(&self.record_id);
-        }
-        if let Err(error) = self.store.save(&state) {
-            state.records = snapshot;
-            return Err(error);
-        }
-        if self.recovery_lease {
-            state.recovery_leases.remove(&self.record_id);
-            self.recovery_lease = false;
-        }
+        // Generation has no durable reservation to roll back.
         self.closed = true;
         Ok(())
-    }
-
-    // Only a Gateway policy path that has received the upstream response and
-    // withheld every caller effect may settle a started turn this way.
-    pub(crate) fn reject_without_effect(&mut self) -> Result<(), CheckpointError> {
-        if self.closed || !self.upstream_started || !self.recovery_lease {
-            return Err(CheckpointError::RecoveryRequired);
-        }
-        let _global_lease = FileLease::blocking(&global_lock_path(&self.store.path))?;
-        let (records, migrated) = load_records(&self.store.path, &self.store.integrity_key, false)?;
-        let mut state = self.store.state.lock().expect("checkpoint state poisoned");
-        state.records = records;
-        if migrated {
-            self.store.save(&state)?;
-        }
-        let record = state
-            .records
-            .get(&self.record_id)
-            .ok_or(CheckpointError::Stale)?;
-        let same_ledger = serde_json::to_value(&record.tool_ledger)
-            .map_err(|error| CheckpointError::Persistence(error.to_string()))?
-            == serde_json::to_value(
-                self.rollback_record
-                    .as_ref()
-                    .map_or_else(AgentLedger::default, |prior| prior.tool_ledger.clone()),
-            )
-            .map_err(|error| CheckpointError::Persistence(error.to_string()))?;
-        let accepted_state_unchanged = self.rollback_record.as_ref().map_or_else(
-            || {
-                record.accepted_count == 0
-                    && record.message_digests.is_empty()
-                    && record.message_identities.is_empty()
-                    && record.hash_chain.is_empty()
-                    && record.response_cursors.is_empty()
-                    && record.conversation_id.is_empty()
-                    && record.session_id.is_empty()
-            },
-            |prior| {
-                record.accepted_count == prior.accepted_count
-                    && record.message_digests == prior.message_digests
-                    && record.message_identities == prior.message_identities
-                    && record.hash_chain == prior.hash_chain
-                    && record.conversation_id == prior.conversation_id
-                    && record.session_id == prior.session_id
-                    && record.response_cursors == prior.response_cursors
-                    && record.terminal_unknown == prior.terminal_unknown
-            },
-        );
-        if !record.in_flight
-            || record.in_flight_upstream_started != Some(true)
-            || record.revision != self.revision
-            || record.in_flight_message_digests != self.base_digests
-            || record.in_flight_message_identities != self.base_identities
-            || !accepted_state_unchanged
-            || !same_ledger
-        {
-            return Err(CheckpointError::Stale);
-        }
-        let snapshot = state.records.clone();
-        if let Some(prior) = self.rollback_record.clone() {
-            state.records.insert(self.record_id.clone(), prior);
-        } else {
-            state.records.remove(&self.record_id);
-        }
-        if let Err(error) = self.store.save(&state) {
-            state.records = snapshot;
-            return Err(error);
-        }
-        state.recovery_leases.remove(&self.record_id);
-        self.recovery_lease = false;
-        self.closed = true;
-        Ok(())
-    }
-}
-
-impl Drop for CheckpointTurn {
-    fn drop(&mut self) {
-        if !self.upstream_started {
-            let _ = self.abort();
-        } else if self.recovery_lease {
-            let store = Arc::clone(&self.store);
-            if let Ok(mut state) = store.state.lock() {
-                state.recovery_leases.remove(&self.record_id);
-                self.recovery_lease = false;
-            }
-        }
     }
 }
 
@@ -1372,7 +1088,6 @@ fn load_or_create_integrity_key(path: &Path) -> Result<String, CheckpointError> 
 fn load_records(
     path: &Path,
     integrity_key: &str,
-    recover_pre_upstream: bool,
 ) -> Result<(HashMap<String, Record>, bool), CheckpointError> {
     if clear_then_recovery_path(path).exists() {
         return Err(CheckpointError::RecoveryRequired);
@@ -1384,13 +1099,18 @@ fn load_records(
     };
     let legacy_schema = file.schema == LEGACY_SCHEMA;
     let previous_schema = file.schema == PREVIOUS_SCHEMA;
-    if file.schema != SCHEMA && !legacy_schema && !previous_schema {
+    let prior_schema = file.schema == PRIOR_SCHEMA;
+    let older_schema = file.schema == OLDER_SCHEMA;
+    if file.schema != SCHEMA && !legacy_schema && !previous_schema && !prior_schema && !older_schema
+    {
         return Err(CheckpointError::Persistence(format!(
             "unsupported schema {:?}",
             file.schema
         )));
     }
     let mut records = HashMap::new();
+    // Preserve signed historical unknown records byte-for-byte on open. Only
+    // proven safe legacy reservations and changed records need a rewrite.
     let mut migrated = legacy_schema;
     for mut record in file.records {
         // v1 has no authenticated comparison evidence. v2 authenticates only
@@ -1408,6 +1128,15 @@ fn load_records(
                 "invalid checkpoint record".to_owned(),
             ));
         }
+        if file.schema == SCHEMA
+            && !record.tool_ledger.pending.is_empty()
+            && !record.in_flight
+            && !record.terminal_unknown
+        {
+            return Err(CheckpointError::Persistence(
+                "current checkpoint contains transient pending evidence".to_owned(),
+            ));
+        }
         if legacy_schema {
             // A pre-integrity file is readable only as a conservative
             // migration.  Existing result bytes cannot authorize an effect.
@@ -1417,7 +1146,7 @@ fn load_records(
                 // preserve it as uncertain rather than risk a replay.
                 record.in_flight_upstream_started = Some(true);
             } else {
-                record.in_flight_upstream_started = Some(false);
+                record.in_flight_upstream_started = None;
             }
             migrated = true;
         } else {
@@ -1431,28 +1160,57 @@ fn load_records(
             }
             record.ledger_mac = provided;
         }
-        if recover_pre_upstream
+        if (previous_schema || older_schema)
+            && record.in_flight_upstream_started.is_none()
             && record.in_flight
-            && record.in_flight_upstream_started == Some(false)
         {
+            // Historical signed records with an absent phase cannot prove
+            // whether an effect was exposed. Preserve the old fail-closed state.
+            record.in_flight_upstream_started = Some(true);
+        }
+        if record.in_flight_upstream_started == Some(false) && !record.in_flight {
+            record.in_flight_upstream_started = None;
+            migrated = true;
+        }
+        if record.in_flight
+            && (prior_schema
+                || ((previous_schema || older_schema)
+                    && record.in_flight_upstream_started == Some(false)))
+        {
+            // v4 reservations were generation-only. Signed v2/v3 records
+            // explicitly marked pre-upstream are also proven no-effect.
+            // Restore only the prior accepted snapshot.
             if record.accepted_count == 0
                 && record.message_digests.is_empty()
                 && record.conversation_id.is_empty()
                 && record.session_id.is_empty()
+                && record.tool_ledger.completed.is_empty()
             {
                 migrated = true;
                 continue;
             }
+            let accepted_revision = record.revision - 1;
             record.in_flight = false;
             record.in_flight_message_digests.clear();
             record.in_flight_message_identities.clear();
+            record.in_flight_upstream_started = None;
+            record.revision += 1;
+            if let Some(cursor) = record.response_cursors.last_mut()
+                && cursor.revision == accepted_revision
+            {
+                cursor.revision = record.revision;
+            }
             migrated = true;
         }
-        if record.in_flight_upstream_started.is_none() {
-            record.in_flight_upstream_started = Some(record.in_flight);
+        if !record.tool_ledger.pending.is_empty() && !record.in_flight && !record.terminal_unknown {
+            record.tool_ledger.pending.clear();
             migrated = true;
         }
-        if now - record.updated_at <= TTL || record.in_flight || record.terminal_unknown {
+        if now - record.updated_at <= TTL
+            || record.in_flight
+            || record.terminal_unknown
+            || requires_reconciliation(&record)
+        {
             records.insert(record.id.clone(), record);
         } else {
             migrated = true;
@@ -1500,10 +1258,9 @@ fn begin_append(
     }
     let delta_digests = message_digests(messages)?;
     let delta_identities = message_identities(messages)?;
-    let snapshot = state.records.clone();
     let record = state
         .records
-        .get_mut(record_id)
+        .get(record_id)
         .ok_or(CheckpointError::UnknownCursor)?;
     if record.terminal_unknown {
         return Err(CheckpointError::RecoveryRequired);
@@ -1514,30 +1271,22 @@ fn begin_append(
     if record.message_digests.len() + delta_digests.len() > MAX_MESSAGES {
         return Err(CheckpointError::HistoryLimit);
     }
-    let rollback_record = record.clone();
     let mut digests = record.message_digests.clone();
     digests.extend(delta_digests);
     let chain = hash_chain(&digests);
     let mut identities = record.message_identities.clone();
     identities.resize(record.accepted_count, None);
     identities.extend(delta_identities);
-    record.in_flight = true;
-    record.in_flight_message_digests = digests.clone();
-    record.in_flight_message_identities = identities.clone();
-    record.in_flight_upstream_started = Some(false);
-    record.revision += 1;
-    record.updated_at = OffsetDateTime::now_utc();
     let turn = CheckpointTurn {
         store: Arc::clone(store),
         record_id: record_id.to_owned(),
         revision: record.revision,
-        rollback_record: Some(rollback_record),
+        base_record: record.clone(),
+        observed_ids: state.records.keys().cloned().collect(),
         base_digests: digests,
         base_chain: chain,
         base_identities: identities,
         closed: false,
-        upstream_started: false,
-        recovery_lease: false,
         _record_lease: None,
         binding: Binding {
             conversation_id: record.conversation_id.clone(),
@@ -1547,10 +1296,6 @@ fn begin_append(
         rebound: false,
         prior_ledger: record.tool_ledger.clone(),
     };
-    if let Err(error) = store.save(state) {
-        state.records = snapshot;
-        return Err(error);
-    }
     Ok(turn)
 }
 
@@ -1560,7 +1305,10 @@ fn is_false(value: &bool) -> bool {
 
 fn prune(state: &mut State, now: OffsetDateTime) {
     state.records.retain(|_, record| {
-        record.in_flight || record.terminal_unknown || now - record.updated_at <= TTL
+        record.in_flight
+            || record.terminal_unknown
+            || requires_reconciliation(record)
+            || now - record.updated_at <= TTL
     });
 }
 
@@ -1785,6 +1533,113 @@ mod tests {
         message
     }
 
+    fn accepted_pending_store() -> (tempfile::TempDir, Arc<CheckpointStore>, String) {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::open(root.path().join("checkpoints.json")).unwrap();
+        let call = json!({
+            "id":"call-1","type":"function",
+            "function":{"name":"inspect","arguments":"{}"}
+        });
+        let pending = crate::agent_ledger::build(&[crate::protocol::OpenAiMessage {
+            role: "assistant".to_owned(),
+            tool_calls: vec![call.clone()],
+            ..crate::protocol::OpenAiMessage::default()
+        }]);
+        let mut candidate = message("assistant", "");
+        candidate.content = Value::Null;
+        candidate.tool_calls = vec![call];
+        store
+            .begin_full(
+                "hermes",
+                "owner",
+                "pending-session",
+                &[message("user", "inspect")],
+                false,
+            )
+            .unwrap()
+            .accept_with_ledger(
+                Binding {
+                    conversation_id: "conversation".to_owned(),
+                    session_id: "upstream".to_owned(),
+                },
+                &[candidate],
+                pending,
+            )
+            .unwrap();
+        let id = store.list().unwrap()[0].id.clone();
+        (root, store, id)
+    }
+
+    #[test]
+    fn accepted_candidate_is_not_pending_effect_or_cleanup_authority() {
+        let (root, store, id) = accepted_pending_store();
+        assert!(store.recovery_views().unwrap().is_empty());
+        assert!(
+            store.state.lock().unwrap().records[&id]
+                .tool_ledger
+                .pending
+                .is_empty()
+        );
+        {
+            let _global_lease = FileLease::blocking(&global_lock_path(&store.path)).unwrap();
+            let mut state = store.state.lock().unwrap();
+            let record = state.records.get_mut(&id).unwrap();
+            record.created_at = OffsetDateTime::now_utc() - TTL - Duration::minutes(2);
+            record.updated_at = OffsetDateTime::now_utc() - TTL - Duration::minutes(1);
+            store.save(&state).unwrap();
+        }
+        drop(store);
+
+        let reopened = CheckpointStore::open(root.path().join("checkpoints.json")).unwrap();
+        assert!(reopened.recovery_views().unwrap().is_empty());
+        assert!(!reopened.delete(&id).unwrap());
+        reopened.clear().unwrap();
+        reopened.clear_then(|| Ok::<(), ()>(())).unwrap();
+    }
+
+    #[test]
+    fn generation_only_reservation_does_not_block_cleanup() {
+        for action in ["delete", "clear", "clear_then"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = CheckpointStore::open(root.path().join("checkpoints.json")).unwrap();
+            store
+                .begin_full(
+                    "hermes",
+                    "owner",
+                    "stable",
+                    &[message("user", "one")],
+                    false,
+                )
+                .unwrap()
+                .accept(
+                    Binding {
+                        conversation_id: "conversation".to_owned(),
+                        session_id: "upstream".to_owned(),
+                    },
+                    &[message("assistant", "answer")],
+                )
+                .unwrap();
+            let stable_id = store.list().unwrap()[0].id.clone();
+            let turn = store
+                .begin_full(
+                    "hermes",
+                    "owner",
+                    "generation",
+                    &[message("user", "two")],
+                    false,
+                )
+                .unwrap();
+            match action {
+                "delete" => assert!(store.delete(&stable_id).unwrap()),
+                "clear" => store.clear().unwrap(),
+                _ => store.clear_then(|| Ok::<(), ()>(())).unwrap(),
+            }
+            let accepted = turn.accept(Binding::default(), &[message("assistant", "late")]);
+            assert!(matches!(accepted, Err(CheckpointError::Stale)));
+            assert!(store.recovery_views().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn legacy_hash_only_history_requires_raw_proof_before_semantic_upgrade() {
         for schema in [PREVIOUS_SCHEMA, LEGACY_SCHEMA] {
@@ -1855,33 +1710,12 @@ mod tests {
                 "hash-only denial must never rewrite old evidence"
             );
             let done = message("assistant", "Legacy continuation verified.");
-            let mut verified = reopened
+            reopened
                 .begin_full(
                     "hermes",
                     "owner",
                     "key",
                     &[user.clone(), original, result.clone()],
-                    false,
-                )
-                .unwrap();
-            verified.mark_upstream_started().unwrap();
-            drop(verified);
-            assert!(matches!(
-                reopened.begin_full(
-                    "hermes",
-                    "owner",
-                    "key",
-                    &[user.clone(), escaped.clone(), result.clone()],
-                    false
-                ),
-                Err(CheckpointError::RecoveryRequired)
-            ));
-            reopened
-                .begin_full_recovery(
-                    "hermes",
-                    "owner",
-                    "key",
-                    &[user.clone(), escaped.clone(), result.clone()],
                     false,
                 )
                 .unwrap()
@@ -1987,16 +1821,7 @@ mod tests {
             .begin_full("hermes", "owner", "key", &[user, calls, result], false)
             .unwrap();
         let before = serde_json::to_value(&turn.prior_ledger).unwrap();
-        for (name, reason) in [
-            (
-                "completed",
-                crate::agent_ledger::SuppressionReason::CompletedNotAuthorizedReadback,
-            ),
-            (
-                "pending",
-                crate::agent_ledger::SuppressionReason::PendingSameCall,
-            ),
-        ] {
+        for name in ["completed", "pending"] {
             let filtered = turn.prior_ledger.filter_known_calls(
                 vec![crate::tool_calls::DetectedToolCall {
                     id: format!("new-{name}"),
@@ -2005,8 +1830,15 @@ mod tests {
                 }],
                 |_| false,
             );
-            assert!(filtered.calls.is_empty());
-            assert_eq!(filtered.suppression_details[0].blocking_reason, reason);
+            if name == "completed" {
+                assert!(filtered.calls.is_empty());
+                assert_eq!(
+                    filtered.suppression_details[0].blocking_reason,
+                    crate::agent_ledger::SuppressionReason::CompletedNotAuthorizedReadback
+                );
+            } else {
+                assert_eq!(filtered.calls.len(), 1);
+            }
         }
         let prior = turn.prior_ledger.clone();
         turn.accept_with_ledger(binding, &[], prior).unwrap();
@@ -2020,7 +1852,7 @@ mod tests {
             "continuation must preserve historical ledger evidence"
         );
         assert_eq!(after["completed"][0]["arguments_digest"], old_digest);
-        assert_eq!(after["pending"][0]["arguments_digest"], old_digest);
+        assert!(after["pending"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -2173,7 +2005,406 @@ mod tests {
             )
             .unwrap();
         retry.abort().unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("inFlight"));
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains("inFlight")
+        );
+    }
+
+    #[test]
+    fn signed_v3_inflight_without_phase_remains_unresolved() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let mut turn = store
+            .begin_full(
+                "hermes",
+                "owner",
+                "historical",
+                &[message("user", "one")],
+                false,
+            )
+            .unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
+        {
+            let mut state = store.state.lock().unwrap();
+            let record = state.records.get_mut(&turn.record_id).unwrap();
+            record.in_flight_upstream_started = None;
+            store.save(&state).unwrap();
+        }
+        let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["schema"] = Value::String(OLDER_SCHEMA.to_owned());
+        private_file::write_json(&path, &file).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        std::mem::forget(turn);
+        drop(store);
+
+        let reopened = CheckpointStore::open(&path).unwrap();
+        assert!(std::fs::read(&path).unwrap() == original_bytes);
+        assert_eq!(reopened.recovery_views().unwrap().len(), 1);
+        assert!(matches!(
+            reopened.begin_full(
+                "hermes",
+                "owner",
+                "historical",
+                &[message("user", "one")],
+                false
+            ),
+            Err(CheckpointError::RecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn signed_v2_v3_pre_upstream_reservation_restores_accepted_snapshot() {
+        for schema in [PREVIOUS_SCHEMA, OLDER_SCHEMA] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("checkpoints.json");
+            let store = CheckpointStore::open(&path).unwrap();
+            let user = message("user", "one");
+            let answer = message("assistant", "answer");
+            store
+                .begin_full(
+                    "hermes",
+                    "owner",
+                    "session",
+                    std::slice::from_ref(&user),
+                    false,
+                )
+                .unwrap()
+                .accept(Binding::default(), std::slice::from_ref(&answer))
+                .unwrap();
+            let mut turn = store
+                .begin_full(
+                    "hermes",
+                    "owner",
+                    "session",
+                    &[user.clone(), answer.clone()],
+                    false,
+                )
+                .unwrap();
+            turn.seed_legacy_unresolved_for_test().unwrap();
+            {
+                let mut state = store.state.lock().unwrap();
+                let record = state.records.get_mut(&turn.record_id).unwrap();
+                record.in_flight_upstream_started = Some(false);
+                record.message_identities.clear();
+                record.in_flight_message_identities.clear();
+                store.save(&state).unwrap();
+            }
+            let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            file["schema"] = Value::String(schema.to_owned());
+            private_file::write_json(&path, &file).unwrap();
+            std::mem::forget(turn);
+            drop(store);
+
+            let reopened = CheckpointStore::open(&path).unwrap();
+            assert!(reopened.recovery_views().unwrap().is_empty());
+            reopened
+                .begin_full(
+                    "hermes",
+                    "owner",
+                    "session",
+                    &[user, answer, message("user", "two")],
+                    false,
+                )
+                .unwrap()
+                .accept(Binding::default(), &[message("assistant", "continued")])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn authenticated_v4_generation_and_pending_downgrade_to_accepted_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let user = message("user", "one");
+        let answer = message("assistant", "answer");
+        store
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                std::slice::from_ref(&user),
+                false,
+            )
+            .unwrap()
+            .accept(Binding::default(), std::slice::from_ref(&answer))
+            .unwrap();
+        let pending = crate::agent_ledger::build(&[crate::protocol::OpenAiMessage {
+            role: "assistant".to_owned(),
+            tool_calls: vec![json!({
+                "id":"candidate", "type":"function",
+                "function":{"name":"inspect","arguments":"{}"}
+            })],
+            ..crate::protocol::OpenAiMessage::default()
+        }]);
+        {
+            let mut state = store.state.lock().unwrap();
+            let record = state.records.values_mut().next().unwrap();
+            record.tool_ledger = pending;
+            record.in_flight = true;
+            record.in_flight_upstream_started = Some(true);
+            record.in_flight_message_digests = record.message_digests.clone();
+            record.in_flight_message_identities = record.message_identities.clone();
+            record.revision += 1;
+            store.save(&state).unwrap();
+        }
+        let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["schema"] = Value::String(PRIOR_SCHEMA.to_owned());
+        private_file::write_json(&path, &file).unwrap();
+        drop(store);
+
+        let reopened = CheckpointStore::open(&path).unwrap();
+        assert!(reopened.recovery_views().unwrap().is_empty());
+        let current: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(current["schema"], SCHEMA);
+        assert!(current["records"][0]["inFlight"].is_null());
+        assert!(
+            current["records"][0]["toolLedger"]["pending"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let history = [user, answer, message("user", "two")];
+        reopened
+            .begin_full("hermes", "owner", "session", &history, false)
+            .unwrap()
+            .accept(Binding::default(), &[message("assistant", "continued")])
+            .unwrap();
+    }
+
+    #[test]
+    fn generation_attempt_is_not_durable_before_accept() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let turn = store
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[message("user", "one")],
+                false,
+            )
+            .unwrap();
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.recovery_views().unwrap().is_empty());
+        let file = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!file.contains("inFlight"));
+        drop(turn);
+        let reopened = CheckpointStore::open(&path).unwrap();
+        assert!(reopened.recovery_views().unwrap().is_empty());
+        reopened
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[message("user", "one")],
+                false,
+            )
+            .unwrap()
+            .accept(Binding::default(), &[message("assistant", "answer")])
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_generations_accept_one_revision_without_poisoning_the_next_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::open(root.path().join("checkpoints.json")).unwrap();
+        let input = [message("user", "one")];
+        let loser = store
+            .begin_full("hermes", "owner", "session", &input, false)
+            .unwrap();
+        let winner = store
+            .begin_full("hermes", "owner", "session", &input, false)
+            .unwrap();
+        let binding = Binding {
+            conversation_id: "conversation".to_owned(),
+            session_id: "upstream-session".to_owned(),
+        };
+        winner
+            .accept(binding.clone(), &[message("assistant", "winner")])
+            .unwrap();
+        assert!(matches!(
+            loser.accept(binding, &[message("assistant", "loser")]),
+            Err(CheckpointError::Stale)
+        ));
+        assert!(store.recovery_views().unwrap().is_empty());
+        let next = [
+            message("user", "one"),
+            message("assistant", "winner"),
+            message("user", "two"),
+        ];
+        let mut continuation = store
+            .begin_full("hermes", "owner", "session", &next, false)
+            .unwrap();
+        assert_eq!(continuation.outbound.len(), 1);
+        continuation.abort().unwrap();
+    }
+
+    #[test]
+    fn concurrent_different_session_keys_preserve_both_generations() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::open(root.path().join("checkpoints.json")).unwrap();
+        let input = [message("user", "one")];
+        let first = store
+            .begin_full("hermes", "owner", "session-a", &input, false)
+            .unwrap();
+        let second = store
+            .begin_full("hermes", "owner", "session-b", &input, false)
+            .unwrap();
+        for (turn, conversation) in [(first, "conversation-a"), (second, "conversation-b")] {
+            turn.accept(
+                Binding {
+                    conversation_id: conversation.to_owned(),
+                    session_id: conversation.to_owned(),
+                },
+                &[message("assistant", "answer")],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert!(store.recovery_views().unwrap().is_empty());
+    }
+
+    #[test]
+    fn superseded_response_generation_keeps_accepted_parent_cursor_after_abort() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        store
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[message("user", "one")],
+                false,
+            )
+            .unwrap()
+            .accept_response(
+                Binding::default(),
+                &[message("assistant", "answer")],
+                "parent",
+            )
+            .unwrap();
+        let input = [message("user", "next")];
+        let loser = store.begin_response("owner", "parent", &input).unwrap();
+        let winner = store.begin_response("owner", "parent", &input).unwrap();
+        winner
+            .accept_response(
+                Binding::default(),
+                &[message("assistant", "continued")],
+                "child",
+            )
+            .unwrap();
+        assert!(matches!(
+            loser.accept(Binding::default(), &[]),
+            Err(CheckpointError::Stale)
+        ));
+        drop(store);
+        let reopened = CheckpointStore::open(&path).unwrap();
+        let retry = reopened.begin_response("owner", "child", &input).unwrap();
+        retry
+            .accept_response(
+                Binding::default(),
+                &[message("assistant", "later")],
+                "grandchild",
+            )
+            .unwrap();
+        assert!(reopened.recovery_views().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keyless_generation_failure_does_not_block_different_ordinary_request() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::open(root.path().join("checkpoints.json")).unwrap();
+        let loser = store
+            .begin_full("aux", "owner", "", &[message("user", "one")], false)
+            .unwrap();
+        store
+            .begin_full("aux", "owner", "", &[message("user", "two")], false)
+            .unwrap()
+            .accept(Binding::default(), &[message("assistant", "answer")])
+            .unwrap();
+        loser.accept(Binding::default(), &[]).unwrap();
+        assert_eq!(store.state.lock().unwrap().records.len(), 2);
+        assert!(store.recovery_views().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conversation_drift_does_not_erase_accepted_history() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checkpoints.json");
+        let store = CheckpointStore::open(&path).unwrap();
+        let input = [message("user", "one")];
+        let accepted = Binding {
+            conversation_id: "conversation-a".to_owned(),
+            session_id: "session-a".to_owned(),
+        };
+        store
+            .begin_full("hermes", "owner", "session", &input, false)
+            .unwrap()
+            .accept(accepted.clone(), &[message("assistant", "answer")])
+            .unwrap();
+        let before: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let next = [
+            message("user", "one"),
+            message("assistant", "answer"),
+            message("user", "two"),
+        ];
+        let turn = store
+            .begin_full("hermes", "owner", "session", &next, false)
+            .unwrap();
+        assert!(matches!(
+            turn.accept(
+                Binding {
+                    conversation_id: "conversation-b".to_owned(),
+                    session_id: "session-b".to_owned(),
+                },
+                &[message("assistant", "wrong")]
+            ),
+            Err(CheckpointError::ConversationDrift)
+        ));
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(before, after);
+        let mut continuation = store
+            .begin_full("hermes", "owner", "session", &next, false)
+            .unwrap();
+        assert_eq!(
+            continuation.binding.conversation_id,
+            accepted.conversation_id
+        );
+        continuation.abort().unwrap();
+    }
+
+    #[test]
+    fn force_new_cannot_erase_accepted_history_for_the_same_session_key() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::open(root.path().join("checkpoints.json")).unwrap();
+        let input = [message("user", "one")];
+        store
+            .begin_full("hermes", "owner", "session", &input, false)
+            .unwrap()
+            .accept(
+                Binding {
+                    conversation_id: "conversation".to_owned(),
+                    session_id: "upstream".to_owned(),
+                },
+                &[message("assistant", "answer")],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.begin_full("hermes", "owner", "session", &input, true),
+            Err(CheckpointError::ConversationDrift)
+        ));
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(
+            store
+                .begin_full("hermes", "owner", "new-session", &input, false)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2218,62 +2449,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_requires_a_durable_inflight_record() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("checkpoints.json");
-        let store = CheckpointStore::open(&path).unwrap();
-
-        assert!(matches!(
-            store.begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "one")],
-                false,
-            ),
-            Err(CheckpointError::RecoveryRequired)
-        ));
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn recovery_cannot_promote_an_accepted_checkpoint() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("checkpoints.json");
-        let store = CheckpointStore::open(&path).unwrap();
-        store
-            .begin_full(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "one")],
-                false,
-            )
-            .unwrap()
-            .accept(
-                Binding {
-                    conversation_id: "conversation".to_owned(),
-                    session_id: "upstream-session".to_owned(),
-                },
-                &[message("assistant", "answer")],
-            )
-            .unwrap();
-        let before = std::fs::read(&path).unwrap();
-
-        assert!(matches!(
-            store.begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "one")],
-                false,
-            ),
-            Err(CheckpointError::RecoveryRequired)
-        ));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-    }
-
-    #[test]
     fn terminal_unknown_cannot_be_bypassed_by_force_new_for_same_key() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("checkpoints.json");
@@ -2287,7 +2462,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
 
         let recovery_id = store.recovery_views().unwrap()[0].id.clone();
@@ -2313,17 +2488,13 @@ mod tests {
         let mut turn = store
             .begin_full("hermes", "owner", "keyed-session", &messages, false)
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
 
         let keyless = store
             .begin_full("hermes", "owner", "", &messages, false)
             .expect("keyless execution must not inherit a keyed in-flight fence");
         drop(keyless);
-        assert!(matches!(
-            store.begin_full_recovery("hermes", "owner", "", &messages, false),
-            Err(CheckpointError::RecoveryRequired)
-        ));
         assert!(matches!(
             store.begin_full("hermes", "owner", "keyed-session", &messages, false),
             Err(CheckpointError::RecoveryRequired)
@@ -2388,7 +2559,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
         let recovery_id = store.recovery_views().unwrap()[0].id.clone();
         assert!(store.reconcile_unknown(&recovery_id).unwrap());
@@ -2426,7 +2597,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        unknown.mark_upstream_started().unwrap();
+        unknown.seed_legacy_unresolved_for_test().unwrap();
         drop(unknown);
         let tombstone_id = store.recovery_views().unwrap()[0].id.clone();
         assert!(store.reconcile_unknown(&tombstone_id).unwrap());
@@ -2493,7 +2664,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        unknown.mark_upstream_started().unwrap();
+        unknown.seed_legacy_unresolved_for_test().unwrap();
         drop(unknown);
         let tombstone_id = store.recovery_views().unwrap()[0].id.clone();
         assert!(store.reconcile_unknown(&tombstone_id).unwrap());
@@ -2575,7 +2746,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
         let recovery_id = store.recovery_views().unwrap()[0].id.clone();
         assert!(store.reconcile_unknown(&recovery_id).unwrap());
@@ -2616,7 +2787,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
         let recovery_id = store.recovery_views().unwrap()[0].id.clone();
         assert!(store.reconcile_unknown(&recovery_id).unwrap());
@@ -2671,7 +2842,7 @@ mod tests {
         let mut turn = store
             .begin_full("hermes", "owner", "", &[message("user", "original")], false)
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
 
         assert!(matches!(
@@ -2790,7 +2961,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
         drop(store);
 
@@ -2808,7 +2979,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_without_effect_restores_only_the_current_turn() {
+    fn rejected_generation_restores_only_the_current_turn() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("checkpoints.json");
         let store = CheckpointStore::open(&path).unwrap();
@@ -2835,12 +3006,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
-        assert!(matches!(
-            turn.abort(),
-            Err(CheckpointError::RecoveryRequired)
-        ));
-        turn.reject_without_effect().unwrap();
+        turn.abort().unwrap();
         let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(after, before);
         drop(turn);
@@ -2860,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_without_effect_cannot_overwrite_a_newer_revision() {
+    fn stale_generation_cannot_overwrite_a_newer_revision() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("checkpoints.json");
         let store = CheckpointStore::open(&path).unwrap();
@@ -2873,30 +3039,37 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
-        {
-            let mut state = store.state.lock().unwrap();
-            state.records.get_mut(&turn.record_id).unwrap().revision += 1;
-            store.save(&state).unwrap();
-        }
-        let drifted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(matches!(
-            turn.reject_without_effect(),
-            Err(CheckpointError::Stale)
-        ));
-        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(after, drifted);
-        drop(turn);
-        assert!(matches!(
-            store.begin_full(
+        store
+            .begin_full(
                 "hermes",
                 "owner",
                 "session",
                 &[message("user", "one")],
-                false
-            ),
-            Err(CheckpointError::RecoveryRequired)
-        ));
+                false,
+            )
+            .unwrap()
+            .accept(Binding::default(), &[message("assistant", "winner")])
+            .unwrap();
+        let drifted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        turn.abort().unwrap();
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, drifted);
+        drop(turn);
+        store
+            .begin_full(
+                "hermes",
+                "owner",
+                "session",
+                &[
+                    message("user", "one"),
+                    message("assistant", "winner"),
+                    message("user", "two"),
+                ],
+                false,
+            )
+            .unwrap()
+            .abort()
+            .unwrap();
     }
 
     #[test]
@@ -2934,7 +3107,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
 
         let result = turn.accept(
             Binding {
@@ -3015,7 +3188,7 @@ mod tests {
             state
                 .records
                 .get(&record_id)
-                .is_some_and(|record| record.in_flight)
+                .is_some_and(|record| !record.in_flight && record.conversation_id == "conversation")
         );
     }
 
@@ -3024,7 +3197,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("checkpoints.json");
         let store = CheckpointStore::open(&path).unwrap();
-        let turn = store
+        let mut turn = store
             .begin_full(
                 "hermes",
                 "owner",
@@ -3033,6 +3206,7 @@ mod tests {
                 false,
             )
             .unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         {
             let mut state = store.state.lock().unwrap();
             let record = state.records.get_mut(&turn.record_id).unwrap();
@@ -3048,7 +3222,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("checkpoints.json");
         let store = CheckpointStore::open(&path).unwrap();
-        let turn = store
+        let mut turn = store
             .begin_full(
                 "hermes",
                 "owner",
@@ -3057,6 +3231,7 @@ mod tests {
                 false,
             )
             .unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         std::mem::forget(turn);
         drop(store);
 
@@ -3084,7 +3259,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         let result = store.begin_full(
             "hermes",
             "owner",
@@ -3386,7 +3561,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         drop(turn);
         drop(store);
 
@@ -3644,7 +3819,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        in_flight.mark_upstream_started().unwrap();
+        in_flight.seed_legacy_unresolved_for_test().unwrap();
 
         assert!(matches!(
             store.delete(&stable_id),
@@ -3662,207 +3837,6 @@ mod tests {
         ));
         drop(in_flight);
         assert_eq!(store.list().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn matching_recovery_can_reopen_an_inflight_full_turn() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("checkpoints.json");
-        let store = CheckpointStore::open(&path).unwrap();
-        let mut first = store
-            .begin_full(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "one")],
-                false,
-            )
-            .unwrap();
-        first.mark_upstream_started().unwrap();
-        drop(first);
-
-        let mut recovery = store
-            .begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "one")],
-                false,
-            )
-            .unwrap();
-        assert_eq!(recovery.outbound.len(), 1);
-        recovery.abort().unwrap();
-        assert!(matches!(
-            store.begin_full(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "one")],
-                false,
-            ),
-            Err(CheckpointError::RecoveryRequired)
-        ));
-    }
-
-    #[test]
-    fn matching_recovery_rejects_a_retargeted_inflight_suffix() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("checkpoints.json");
-        let store = CheckpointStore::open(&path).unwrap();
-        let mut first = store
-            .begin_full(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            )
-            .unwrap();
-        first.mark_upstream_started().unwrap();
-        drop(first);
-
-        let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            persisted["records"][0]["inFlightMessageDigests"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1,
-            "the unresolved non-synthetic transcript must be durable"
-        );
-
-        assert!(matches!(
-            store.begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original"), message("user", "retargeted")],
-                false,
-            ),
-            Err(CheckpointError::ConversationDrift)
-        ));
-    }
-
-    #[test]
-    fn matching_recovery_is_single_flight_per_checkpoint() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("checkpoints.json");
-        let store = CheckpointStore::open(&path).unwrap();
-        let mut first = store
-            .begin_full(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            )
-            .unwrap();
-        first.mark_upstream_started().unwrap();
-        drop(first);
-
-        let recovery = store
-            .begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            )
-            .unwrap();
-        assert!(matches!(
-            store.begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            ),
-            Err(CheckpointError::RecoveryRequired)
-        ));
-        drop(recovery);
-        assert!(
-            store
-                .begin_full_recovery(
-                    "hermes",
-                    "owner",
-                    "session",
-                    &[message("user", "original")],
-                    false,
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn separate_store_instances_share_the_os_recovery_lease() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("checkpoints.json");
-        let store = CheckpointStore::open(&path).unwrap();
-        let mut first = store
-            .begin_full(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            )
-            .unwrap();
-        first.mark_upstream_started().unwrap();
-        drop(first);
-        drop(store);
-
-        let first_store = CheckpointStore::open(&path).unwrap();
-        let second_store = CheckpointStore::open(&path).unwrap();
-        let recovery = first_store
-            .begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            )
-            .unwrap();
-        assert!(matches!(
-            second_store.begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            ),
-            Err(CheckpointError::RecoveryRequired)
-        ));
-        drop(recovery);
-    }
-
-    #[test]
-    fn an_already_open_store_discovers_a_recovery_written_by_another_store() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("checkpoints.json");
-        let stale_store = CheckpointStore::open(&path).unwrap();
-        let writer = CheckpointStore::open(&path).unwrap();
-        let mut first = writer
-            .begin_full(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            )
-            .unwrap();
-        first.mark_upstream_started().unwrap();
-        drop(first);
-
-        let mut recovery = stale_store
-            .begin_full_recovery(
-                "hermes",
-                "owner",
-                "session",
-                &[message("user", "original")],
-                false,
-            )
-            .unwrap();
-        recovery.abort().unwrap();
     }
 
     #[test]
@@ -4158,7 +4132,7 @@ mod tests {
             )
             .unwrap();
         let id = turn.record_id.clone();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
 
         assert!(matches!(
             store.delete(&id),
@@ -4186,7 +4160,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        turn.mark_upstream_started().unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
         let mut called = false;
 
         let result = store.clear_then(|| {

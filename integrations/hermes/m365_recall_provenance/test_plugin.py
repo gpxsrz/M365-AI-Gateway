@@ -470,6 +470,43 @@ class RecallProvenanceTests(unittest.TestCase):
                     )
                 )
 
+    def test_checkpoint_conflicts_are_terminal_only_for_exact_gateway_envelopes(self):
+        request = types.SimpleNamespace(url="https://m365.example/hermes/v1/chat/completions")
+        with patch.dict(os.environ, {"M365_HERMES_PROVIDER": "m365-copilot"}):
+            for code, http_status in (
+                ("checkpoint_stale", 409),
+                ("unresolved_effect", 409),
+                ("conversation_drift", 409),
+                ("checkpoint_error", 500),
+            ):
+                body = {"error": {"type": "checkpoint_error", "code": code, "retryable": False}}
+                for status, error_type in ((http_status, "APIError"), (None, "APIError")):
+                    result = plugin.on_transform_api_error_classification(
+                        provider="custom",
+                        status_code=status,
+                        error_type=error_type,
+                        error_code=code,
+                        error=types.SimpleNamespace(request=request),
+                        error_body=body,
+                    )
+                    self.assertIsNotNone(result)
+                    self.assertFalse(result["retryable"])
+                    self.assertFalse(result["should_fallback"])
+                for invalid in (
+                    {"error": {"type": "checkpoint_error", "code": code, "retryable": True}},
+                    {"error": {"type": "tool_protocol_error", "code": code, "retryable": False}},
+                    {"error": {"type": "checkpoint_error", "code": code, "retryable": False}, "retryable": True},
+                ):
+                    self.assertIsNone(plugin.on_transform_api_error_classification(
+                        provider="custom",
+                        status_code=http_status,
+                        error_type="ConflictError",
+                        error_code=code,
+                        error=types.SimpleNamespace(request=request),
+                        error_body=invalid,
+                    ))
+
+
     def test_text_input_too_large_transform_is_terminal_and_exact(self):
         request = types.SimpleNamespace(
             request=types.SimpleNamespace(
@@ -910,6 +947,14 @@ class RecallProvenanceTests(unittest.TestCase):
                                 "retryable": False,
                             }
                         }
+                    if error_code in ("checkpoint_stale", "unresolved_effect"):
+                        return {
+                            "error": {
+                                "type": "checkpoint_error",
+                                "code": error_code,
+                                "retryable": False,
+                            }
+                        }
                     if error_code == "invalid_tool_call":
                         return {
                             "error": {
@@ -953,6 +998,8 @@ class RecallProvenanceTests(unittest.TestCase):
                             )
                         status = {
                             "unsafe_tool_replay": 409,
+                            "checkpoint_stale": 409,
+                            "unresolved_effect": 409,
                             "text_input_too_large": 400,
                             "invalid_tool_call": 502,
                         }[error_code]
@@ -970,6 +1017,8 @@ class RecallProvenanceTests(unittest.TestCase):
                 try:
                     for error_code in (
                         "unsafe_tool_replay",
+                        "checkpoint_stale",
+                        "unresolved_effect",
                         "text_input_too_large",
                         "invalid_tool_call",
                     ):
@@ -1011,6 +1060,8 @@ class RecallProvenanceTests(unittest.TestCase):
 
                     for error_code in (
                         "unsafe_tool_replay",
+                        "checkpoint_stale",
+                        "unresolved_effect",
                         "text_input_too_large",
                         "invalid_tool_call",
                     ):

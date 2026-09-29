@@ -195,20 +195,19 @@ Checkpoint 的目標是安全續接 transport，不是保存 Agent lifecycle。
 核心 invariant：
 
 - history prefix、role、tool ID、arguments 與 transcript identity 要精確對上；
-- upstream 尚未開始的 reservation 可以安全回收；
-- upstream 已回覆、Gateway replay protection 明確拒絕且 caller tool 未派送、final 未接受的 `unsafe_tool_replay`，只回滾本次未接受的 turn；先前已接受的 checkpoint 與 tool ledger 保留，回應仍為 terminal 409；
-- upstream 已開始但 outcome 不確定時，必須保留 recovery-required state；
-- process restart 本身不證明 replay 安全；
-- 同一 checkpoint 同時只允許一個 recovery attempt；
-- destructive checkpoint operation 遇到 unresolved in-flight work 會 fail closed。
+- model generation 是以 accepted revision 為基礎的 transient optimistic attempt；只有通過驗證的 response 才能以 CAS 接受 history、binding、cursor 與已觀測到的 completed result。stale loser 直接丟棄，不改 accepted checkpoint；
+- Gateway replay protection 在 caller tool 交付前拒絕 `unsafe_tool_replay` 時，只丟棄本次未接受的 generation；先前已接受的 checkpoint 與 tool ledger 保留，回應仍為 terminal 409；
+- 已接受的 caller tool candidate 只屬於 accepted history，不證明 dispatch 或 outcome。只有本次 request 中可配對的 caller result 才進 durable completed replay ledger；缺少 result 不建立 durable pending authority，也不阻止下一個 ordinary turn；
+- 舊版已標記 unknown 的紀錄保留 fail-closed，不因 schema 更新自動清除；
+- destructive checkpoint operation 遇到歷史 unknown 仍 fail closed。Caller mutation 的不確定性由 Hermes 與工具領域處理；Gateway 不聲稱 outcome，也不自動重播 candidate。
 
-Current durable schema 是 `wp6-transport-checkpoints/rust-v3`。既有 raw message digest/hash-chain 保留作鑑識；完整性 binding 同時保護新增的 arguments comparison identity。比較共用 strict JSON canonicalization，只忽略空白、object key order 與合法 escape 表示差異，不做 Unicode normalization 或有損數字轉換，也不合併 integer/float。Duplicate decoded keys、非法 JSON/surrogate 與 trailing garbage 都會拒絕。
+Current durable schema 是 `wp6-transport-checkpoints/rust-v5`。它不寫入新的 generation reservation、pending caller effect 或 terminal-unknown transition。既有 raw message digest/hash-chain 保留作鑑識；完整性 binding 同時保護 arguments comparison identity。比較共用 strict JSON canonicalization，只忽略空白、object key order 與合法 escape 表示差異，不做 Unicode normalization 或有損數字轉換，也不合併 integer/float。Duplicate decoded keys、非法 JSON/surrogate 與 trailing garbage 都會拒絕。
 
-Legacy `rust-v1`／`rust-v2` 若只有 raw hash，仍須 raw 相符才能續接，不會倒推 semantic identity；只有經證明的後續 continuation 才能保存新 identity。`rust-v1` 無法證明的 legacy result 仍降級成 unknown，不會補成成功。這不改變 in-flight、recovery 或工具重播授權。
+Legacy `rust-v1`／`rust-v2` 若只有 raw hash，仍須 raw 相符才能續接，不會倒推 semantic identity；只有經證明的後續 continuation 才能保存新 identity。`rust-v1` 無法證明的 legacy result 仍降級成 unknown，不會補成成功。模糊的 `rust-v3` in-flight 與既有 terminal-unknown 紀錄仍保留 fence。已驗 MAC 的 `rust-v4` generation-only reservation 降回前一個 accepted snapshot；legacy pending candidate 絕不升格 completed result。
 
 ### Admin recovery
 
-`GET /api/admin/checkpoints/recovery` 只投影 opaque ID 與必要 metadata，不回傳私密 transcript。
+`GET /api/admin/checkpoints/recovery` 只投影歷史 legacy record 的 opaque ID，不回傳私密 transcript。新 generation 不建立 recovery entry。
 
 `POST /api/admin/checkpoints/reconcile` 可把未知 external outcome 明確 acknowledge 為 terminal unknown：
 
@@ -276,7 +275,7 @@ CLOSED → OPEN → HALF_OPEN_READY → PROBE_IN_FLIGHT → RECOVERY
 - Probe hard-429 會重新 OPEN；成功才進 RECOVERY。
 - RECOVERY 會降低 shared concurrency，完成安靜觀察後才回 CLOSED。
 
-WebSocket transport retry 只允許在 payload 尚未送出前的暫時 dial/upgrade failure。Payload 已送出後，未知 outcome 走 checkpoint/reconcile，不盲目重送。
+WebSocket transport retry 只允許在 payload 尚未送出前的暫時 dial/upgrade failure。Payload 已送出後，由 provider retry policy 判定能否安全再做 model generation；它不建立 Gateway caller-effect authority。
 
 ## Hindsight webhook
 
@@ -320,7 +319,8 @@ Delivery 視為 at-least-once，所以 consumer 需以 event / operation identit
 | `400 text_input_too_large` | 非 Memory caller text 無法安全縮回 UTF-16 limit |
 | `400 context_length_exceeded` | Memory input 太長，需要 compact/split |
 | `409 tool_round_limit` | Tool continuation safety ceiling 已耗盡 |
-| `409 transport_checkpoint_recovery_required` | 已有未知 external outcome，先 reconcile |
+| `409 unresolved_effect` | 歷史 unknown checkpoint 仍受保護；operator reconciliation 前先核對保留的紀錄 |
+| `409 checkpoint_stale` | generation revision 已被取代；本次 generation 丟棄，`retryable=false` |
 | `409 hermes_execution_identity_error` | Hermes execution identity / provenance 無法安全建立 |
 | `429 upstream_throttle` | Shared breaker 投影或 upstream rate limit |
 | `502 attachment_upload_failed` | projection 成功後 generated document 的 attachment transport 失敗；看 `attachment_failure` 判斷 bounded stage/class |
