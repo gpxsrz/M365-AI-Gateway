@@ -882,7 +882,6 @@ async fn complete_chat(
     trace.caller_delivery(CallerDelivery::Failed);
     let checkpoint = Arc::new(Mutex::new(checkpoint));
     let _checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
-    let request = request;
     let had_checkpoint = checkpoint
         .lock()
         .expect("checkpoint handle poisoned")
@@ -1374,7 +1373,6 @@ async fn stream_chat(
     let created = OffsetDateTime::now_utc().unix_timestamp();
     let checkpoint = Arc::new(Mutex::new(checkpoint));
     let checkpoint_cleanup = CheckpointCleanup(Arc::clone(&checkpoint));
-    let request = request;
     let had_checkpoint = checkpoint
         .lock()
         .expect("checkpoint handle poisoned")
