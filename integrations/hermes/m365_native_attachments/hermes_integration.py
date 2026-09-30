@@ -56,7 +56,6 @@ class _Capture:
         self._chat: list[dict[str, Any]] = []
         self.stage_requests = 0
         self.release_requests = 0
-        self.turn_requests = 0
 
     def record(self, path: str, body: bytes) -> None:
         with self._lock:
@@ -65,9 +64,6 @@ class _Capture:
                 return
             if path.endswith("/attachments/release"):
                 self.release_requests += 1
-                return
-            if path.endswith("/attachments/turn"):
-                self.turn_requests += 1
                 return
             if not path.endswith("/chat/completions"):
                 return
@@ -729,6 +725,64 @@ class HermesNativeAttachmentIntegrationTests(unittest.TestCase):
             self.assertEqual(request["extra_body"], {"caller_marker": "integration-fixture", "session_key": session})
         finally:
             self._end_turn(session, turn)
+
+    def test_unfinalized_old_turn_does_not_block_fresh_stage(self) -> None:
+        session = "integration-unfinalized"
+        fixture = self.root / "unfinalized-fixture.txt"
+        fixture.write_text("synthetic attachment bytes\n", encoding="utf-8")
+        attach_entry = self.registry.get_entry("m365_native_attach")
+        self.assertIsNotNone(attach_entry)
+        try:
+            old_context = None
+            for turn in ("old-turn", "fresh-turn"):
+                self._plugin_projection_request(
+                    session, turn, "Stage the synthetic fixture.", api_call_count=1
+                )
+                prepared = self.apply_tool_request_middleware(
+                    "m365_native_attach",
+                    {"files": [{"local_path": str(fixture)}]},
+                    session_id=session,
+                    turn_id=turn,
+                    tool_call_id=f"attach-{turn}",
+                )
+                result = json.loads(attach_entry.handler(prepared.payload))
+                self.assertTrue(result.get("ok"), result)
+                if turn == "old-turn":
+                    _, old_request = self._plugin_projection_request(
+                        session, turn, "Stage the synthetic fixture.", api_call_count=2
+                    )
+                    old_context = old_request.payload["extra_body"]["m365_native_attachment_context"]
+            _, fresh_request = self._plugin_projection_request(
+                session, "fresh-turn", "Stage the synthetic fixture.", api_call_count=2
+            )
+            self._assert_common_projection(fresh_request.payload, session, native=True)
+            self.assertEqual(
+                fresh_request.payload["extra_body"]["m365_native_attachment_context"]["turn_id"],
+                "fresh-turn",
+            )
+            tampered = copy.deepcopy(fresh_request.payload)
+            tampered["extra_body"]["m365_native_attachment_context"] = old_context
+            import httpx
+            from openai import OpenAI
+
+            client = OpenAI(
+                api_key=self.gateway.api_key,
+                base_url=self.gateway.base_url,
+                http_client=httpx.Client(
+                    verify=ssl.create_default_context(cafile=str(self.gateway.cert)), timeout=15
+                ),
+            )
+            try:
+                with self.assertRaises(Exception) as raised:
+                    client.chat.completions.create(**tampered)
+                response = getattr(raised.exception, "response", None)
+                self.assertIsNotNone(response)
+                self.assertEqual(response.json().get("error", {}).get("code"), "native_attachment_binding_invalid")
+            finally:
+                client.close()
+        finally:
+            self._end_turn(session, "old-turn")
+            self._end_turn(session, "fresh-turn")
 
     def test_read_modify_read_exact_path_reaches_gateway_ledger(self) -> None:
         session, turn = "integration-readback", "turn-readback"

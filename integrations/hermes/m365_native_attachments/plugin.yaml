@@ -11,5 +11,7 @@ requires_env:
   - M365_HERMES_ATTACHMENT_ALLOWED_ROOTS
 hooks:
   - on_session_end
+  - on_session_reset
+  - on_session_finalize
 provides_tools:
   - m365_native_attach

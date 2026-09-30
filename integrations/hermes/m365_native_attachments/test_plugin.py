@@ -81,25 +81,6 @@ class FakeContext:
         self.tools[kwargs["name"]] = kwargs
 
 
-class NativeAttachmentTurnRouteTests(unittest.TestCase):
-    def test_bind_route_reaches_gateway(self):
-        connection = FakeConnection(FakeResponse(b'{"ok":true}'))
-        with patch.dict(
-            os.environ,
-            {"M365_HERMES_RECALL_PROVENANCE_SECRET": "test-secret"},
-            clear=False,
-        ), patch.object(plugin, "_connection", return_value=connection) as factory:
-            self.assertTrue(
-                plugin._turn_route(
-                    "https://m365.example/hermes/v1",
-                    "session",
-                    "turn",
-                    "bind",
-                )
-            )
-        factory.assert_called_once_with("m365.example", None, True)
-
-
 class NativeAttachmentPluginTests(unittest.TestCase):
     def setUp(self):
         self.environment = patch.dict(
@@ -113,25 +94,20 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             clear=False,
         )
         self.environment.start()
-        self.turn_route = patch.object(plugin, "_turn_route", return_value=True)
-        self.turn_route.start()
         with plugin._lock:
             plugin._sessions.clear()
             plugin._outcomes.clear()
             plugin._ended.clear()
-            plugin._pending_ends.clear()
         with recall._lock:
             recall._turns.clear()
             recall._routes.clear()
 
     def tearDown(self):
         self.environment.stop()
-        self.turn_route.stop()
         with plugin._lock:
             plugin._sessions.clear()
             plugin._outcomes.clear()
             plugin._ended.clear()
-            plugin._pending_ends.clear()
         with recall._lock:
             recall._turns.clear()
             recall._routes.clear()
@@ -168,20 +144,31 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             turn_id=turn,
         )
 
-    def _llm(self, session="session", turn="turn", provider="m365", request=None):
-        with patch.object(plugin, "_turn_route", return_value=True):
-            return plugin.on_llm_request(
-                request
-                or {
-                    "messages": [{"role": "user", "content": "sentinel"}],
-                    "extra_body": {"session_key": session},
-                },
-                session_id=session,
-                turn_id=turn,
-                provider=provider,
-                api_mode="chat_completions",
-                base_url="https://m365.example/hermes/v1",
+    def test_missing_binding_is_typed_before_file_open(self):
+        with patch.object(plugin, "_open_allowed_file") as opened:
+            result = json.loads(
+                plugin.m365_native_attach(
+                    {"files": [{"local_path": "/synthetic/never-opened.txt"}]},
+                    session_id="session",
+                    turn_id="fresh-turn",
+                )
             )
+        self.assertEqual(result["error"]["code"], "native_attachment_binding_invalid")
+        opened.assert_not_called()
+
+    def _llm(self, session="session", turn="turn", provider="m365", request=None):
+        return plugin.on_llm_request(
+            request
+            or {
+                "messages": [{"role": "user", "content": "sentinel"}],
+                "extra_body": {"session_key": session},
+            },
+            session_id=session,
+            turn_id=turn,
+            provider=provider,
+            api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
+        )
 
     def test_tool_accepts_one_or_two_and_rejects_zero_or_three(self):
         with tempfile.TemporaryDirectory() as root, patch.dict(
@@ -400,7 +387,7 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                     self.assertTrue(second_done.wait(2))
                     self.assertFalse(results["second"]["ok"])
                     self.assertEqual(
-                        results["second"]["error"]["code"], "stage_transport_failed"
+                        results["second"]["error"]["code"], "native_attachment_binding_invalid"
                     )
                 finally:
                     release_first.set()
@@ -477,7 +464,7 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                     )
                 )
 
-            self.assertEqual(result["error"]["code"], "stage_transport_failed")
+            self.assertEqual(result["error"]["code"], "native_attachment_integrity_failed")
             self.assertIn(["A" * 43], released)
             self.assertNotIn(
                 plugin._CONTEXT_FIELD, self._llm()["request"].get("extra_body", {})
@@ -553,6 +540,13 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                 self.assertEqual(result["request"]["extra_body"]["session_key"], "session")
                 context = result["request"]["extra_body"][plugin._CONTEXT_FIELD]
                 self.assertEqual(context["session_key"], "session")
+                self.assertEqual(
+                    result["request"]["extra_body"][plugin._REQUEST_TURN_FIELD], "turn"
+                )
+                self.assertEqual(
+                    result["request"]["extra_body"][plugin._REQUEST_BINDING_FIELD],
+                    plugin._turn_binding("session", "turn"),
+                )
 
     def test_signed_context_binds_unicode_fields_and_state_loss_fails_closed(self):
         with tempfile.TemporaryDirectory() as root, patch.dict(
@@ -639,6 +633,32 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             values = [value for _name, value in connection.headers]
             self.assertNotIn("test-secret", values)
             self.assertNotEqual(values[2], "test-secret")
+
+    def test_stage_network_http_and_schema_failures_keep_transport_error(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"M365_HERMES_ATTACHMENT_ALLOWED_ROOTS": root}
+        ):
+            path = Path(root) / "stage.txt"
+            path.write_bytes(b"synthetic")
+            for failure in ("network", "http", "schema"):
+                with self.subTest(failure=failure):
+                    response = FakeResponse(b"{}")
+                    if failure == "http":
+                        response.status = 502
+                    connection = FakeConnection(response)
+                    source = plugin._open_allowed_file(str(path))
+                    try:
+                        with patch.object(plugin, "_connection", return_value=connection):
+                            if failure == "network":
+                                with patch.object(connection, "getresponse", side_effect=OSError):
+                                    with self.assertRaises(plugin._AttachmentFailure) as raised:
+                                        plugin._stage_file(source, "https://m365.example/hermes/v1", "session", "turn")
+                            else:
+                                with self.assertRaises(plugin._AttachmentFailure) as raised:
+                                    plugin._stage_file(source, "https://m365.example/hermes/v1", "session", "turn")
+                    finally:
+                        source.handle.close()
+                    self.assertEqual(raised.exception.reason, "stage_transport_failed")
 
     def test_injected_file_ceiling_is_enforced_without_a_large_fixture(self):
         with tempfile.TemporaryDirectory() as root, patch.dict(
@@ -790,21 +810,17 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                 "messages": [{"role": "user", "content": "fixture"}],
                 "extra_body": {"session_key": session_id},
             }
-            with patch.object(plugin, "_turn_route", return_value=True) as turn_route:
-                activation = plugin.on_llm_request(
-                    request,
-                    provider="custom",
-                    api_mode="chat_completions",
-                    base_url="https://m365.example/hermes/v1",
-                    model="gpt-5.6-reasoning",
-                    session_id=session_id,
-                    turn_id=turn_id,
-                )
-                with plugin._lock:
-                    route_established = (session_id, turn_id) in plugin._sessions
-            turn_route.assert_called_once_with(
-                "https://m365.example/hermes/v1", session_id, turn_id, "bind"
+            activation = plugin.on_llm_request(
+                request,
+                provider="custom",
+                api_mode="chat_completions",
+                base_url="https://m365.example/hermes/v1",
+                model="gpt-5.6-reasoning",
+                session_id=session_id,
+                turn_id=turn_id,
             )
+            with plugin._lock:
+                route_established = (session_id, turn_id) in plugin._sessions
 
             path = Path(root) / "fixture.txt"
             path.write_bytes(b"fixture")
@@ -1030,20 +1046,18 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                 with plugin._lock:
                     before = json.loads(json.dumps(plugin._sessions[("session", "turn")]))
 
-                with patch.object(plugin, "_turn_route", return_value=True) as turn_route:
-                    retargeted = plugin.on_llm_request(
-                        {
-                            "messages": [{"role": "user", "content": "sentinel"}],
-                            "extra_body": {"session_key": "other-session"},
-                        },
-                        provider="m365",
-                        api_mode="chat_completions",
-                        base_url="https://m365.example/hermes/v1",
-                        session_id="session",
-                        turn_id="turn",
-                    )
+                retargeted = plugin.on_llm_request(
+                    {
+                        "messages": [{"role": "user", "content": "sentinel"}],
+                        "extra_body": {"session_key": "other-session"},
+                    },
+                    provider="m365",
+                    api_mode="chat_completions",
+                    base_url="https://m365.example/hermes/v1",
+                    session_id="session",
+                    turn_id="turn",
+                )
 
-                turn_route.assert_not_called()
                 self.assertEqual(
                     retargeted["request"]["extra_body"][plugin._CONTEXT_FIELD]["error"],
                     "native_attachment_binding_invalid",
@@ -1057,7 +1071,7 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                         "M365_HERMES_PROVIDER": "m365-copilot",
                         "M365_HERMES_GATEWAY_BASE_URL": "https://other.example",
                     },
-                ), patch.object(plugin, "_turn_route", return_value=True) as turn_route:
+                ):
                     result = plugin.on_llm_request(
                         {
                             "messages": [{"role": "user", "content": "sentinel"}],
@@ -1070,7 +1084,6 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                         turn_id="turn",
                     )
 
-                turn_route.assert_not_called()
                 context = result["request"]["extra_body"][plugin._CONTEXT_FIELD]
                 self.assertEqual(context["error"], "native_attachment_binding_invalid")
                 with plugin._lock:
@@ -1131,7 +1144,13 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                 self._route()
                 result = json.loads(self._attach(path))
                 self.assertEqual(result["error"]["code"], "stage_transport_failed")
-                self.assertNotIn(plugin._CONTEXT_FIELD, self._llm()["request"].get("extra_body", {}))
+                extra = self._llm()["request"].get("extra_body", {})
+                for field in (
+                    plugin._CONTEXT_FIELD,
+                    plugin._REQUEST_TURN_FIELD,
+                    plugin._REQUEST_BINDING_FIELD,
+                ):
+                    self.assertNotIn(field, extra)
 
     def test_session_end_is_turn_scoped_and_non_m365_is_not_injected(self):
         with tempfile.TemporaryDirectory() as root, patch.dict(
@@ -1141,12 +1160,18 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             path.write_bytes(b"turn")
             with patch.object(plugin, "_stage_file", side_effect=self._stage_fake({str(path): b"turn"})), patch.object(
                 plugin, "_release_route"
-            ):
+            ) as release:
                 for turn in ("turn-a", "turn-b"):
                     self._route("session", turn)
                     self.assertTrue(json.loads(self._attach(path, "session", turn))["ok"])
-                with patch.object(plugin, "_turn_route", return_value=True):
-                    plugin.on_session_end(session_id="session", turn_id="turn-a")
+                plugin.on_session_end(session_id="session", turn_id="turn-a")
+                release_count = release.call_count
+                plugin.on_session_end(session_id="session", turn_id="turn-a")
+                self.assertEqual(release.call_count, release_count)
+                self.assertTrue(any(
+                    call.args[2] == "turn-a" and call.args[3]
+                    for call in release.call_args_list
+                ))
                 self.assertIsNotNone(self._llm("session", "turn-b"))
                 ended = self._llm("session", "turn-a")
                 self.assertEqual(
@@ -1178,65 +1203,72 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             ):
                 self._route()
                 result = json.loads(self._attach(path))
-            self.assertEqual(result["error"]["code"], "stage_transport_failed")
+            self.assertEqual(result["error"]["code"], "native_attachment_binding_invalid")
             self.assertIn(["D" * 43], released)
             with plugin._lock:
                 self.assertNotIn(("session", "turn"), plugin._sessions)
-                self.assertNotIn(("session", "turn"), plugin._outcomes)
 
-    def test_delayed_llm_callback_fails_closed_after_session_end(self):
-        with patch.object(plugin, "_turn_route", return_value=True):
-            self._route()
-            plugin.on_session_end(session_id="session", turn_id="turn")
-            result = self._llm()
+    def test_delayed_llm_callback_has_no_native_context_after_session_end(self):
+        self._route()
+        plugin.on_session_end(session_id="session", turn_id="turn")
+        result = self._llm()
 
-        context = result["request"]["extra_body"][plugin._CONTEXT_FIELD]
-        self.assertEqual(context["error"], "native_attachment_binding_invalid")
+        self.assertEqual(
+            result["request"]["extra_body"][plugin._CONTEXT_FIELD]["error"],
+            "native_attachment_binding_invalid",
+        )
+        self.assertEqual(
+            json.loads(self._attach(Path("/synthetic/never-opened.txt")))["error"]["code"],
+            "native_attachment_binding_invalid",
+        )
 
-    def test_failed_turn_end_is_retried_before_the_next_turn_binds(self):
+    def test_plugin_visible_terminal_events_leave_a_fresh_turn_independent(self):
+        # Hermes 641f7c8: agent/conversation_loop.py returns directly at
+        # 1497/1542/1555/1566/1573, bypassing finalize_turn and its
+        # on_session_end call (agent/turn_finalizer.py:663-677). Other exits
+        # reach that hook; /new and session teardown emit reset/finalize.
+        # Exercise the four event sequences visible to this plugin, rather
+        # than claiming each upstream error cause ran in this unit test.
         with tempfile.TemporaryDirectory() as root, patch.dict(
             os.environ, {"M365_HERMES_ATTACHMENT_ALLOWED_ROOTS": root}
         ):
-            path = Path(root) / "retry-end.txt"
-            path.write_bytes(b"retry-end")
-            calls = []
-            end_attempts = 0
+            path = Path(root) / "synthetic.txt"
+            path.write_bytes(b"synthetic")
+            for event in ("end", "no_terminal_hook", "reset", "finalize"):
+                with self.subTest(event=event):
+                    with plugin._lock:
+                        plugin._sessions.clear()
+                        plugin._outcomes.clear()
+                        plugin._ended.clear()
+                    with patch.object(
+                        plugin, "_stage_file",
+                        side_effect=self._stage_fake({str(path): b"synthetic"}),
+                    ), patch.object(plugin, "_release_route") as release:
+                        self._route("session", "old-turn")
+                        self.assertTrue(json.loads(self._attach(path, "session", "old-turn"))["ok"])
+                        if event == "end":
+                            plugin.on_session_end("session", "old-turn")
+                        elif event == "reset":
+                            plugin.on_session_reset(session_id="new-session", old_session_id="session")
+                        elif event == "finalize":
+                            plugin.on_session_finalize(session_id="session")
+                        self._route("session", "fresh-turn")
+                        self.assertTrue(json.loads(self._attach(path, "session", "fresh-turn"))["ok"])
+                        fresh = self._llm("session", "fresh-turn")["request"]["extra_body"][
+                            plugin._CONTEXT_FIELD
+                        ]
+                        self.assertEqual(fresh["turn_id"], "fresh-turn")
+                        if event in {"end", "reset", "finalize"}:
+                            self.assertIn(("session", "old-turn"), [
+                                (call.args[1], call.args[2]) for call in release.call_args_list
+                            ])
 
-            def route(_base, _session, turn, action):
-                nonlocal end_attempts
-                calls.append((turn, action))
-                if action == "end" and turn == "turn-a":
-                    end_attempts += 1
-                    return end_attempts > 1
-                return True
-
-            with patch.object(
-                plugin,
-                "_stage_file",
-                side_effect=self._stage_fake({str(path): b"retry-end"}),
-            ), patch.object(plugin, "_release_route"), patch.object(
-                plugin, "_turn_route", side_effect=route
-            ):
-                self._route("session", "turn-a")
-                self.assertTrue(
-                    json.loads(self._attach(path, "session", "turn-a"))["ok"]
-                )
-                plugin.on_session_end(session_id="session", turn_id="turn-a")
-                self._route("session", "turn-b")
-                self.assertTrue(
-                    json.loads(self._attach(path, "session", "turn-b"))["ok"]
-                )
-            self.assertEqual(
-                calls,
-                [
-                    ("turn-a", "bind"),
-                    ("turn-a", "end"),
-                    ("turn-a", "end"),
-                    ("turn-b", "bind"),
-                ],
-            )
-            with plugin._lock:
-                self.assertFalse(plugin._pending_ends)
+    def test_session_finalize_clears_outcome_after_reference_eviction(self):
+        with plugin._lock:
+            plugin._outcomes[("session", "evicted-turn")] = {"ok": True, "state_lost": True}
+        plugin.on_session_finalize(session_id="session")
+        with plugin._lock:
+            self.assertNotIn(("session", "evicted-turn"), plugin._outcomes)
 
     def test_tool_request_carries_exact_private_host_identity(self):
         result = plugin.on_tool_request(
@@ -1287,17 +1319,16 @@ class NativeAttachmentPluginTests(unittest.TestCase):
             )
 
             def apply(callback, value):
-                with patch.object(plugin, "_turn_route", return_value=True):
-                    result = callback(
-                        request=value,
-                        session_id="session",
-                        turn_id="turn",
-                        api_request_id="turn:api:1",
-                        api_call_count=1,
-                        provider="m365",
-                        api_mode="chat_completions",
-                        base_url="https://m365.example/hermes/v1",
-                    )
+                result = callback(
+                    request=value,
+                    session_id="session",
+                    turn_id="turn",
+                    api_request_id="turn:api:1",
+                    api_call_count=1,
+                    provider="m365",
+                    api_mode="chat_completions",
+                    base_url="https://m365.example/hermes/v1",
+                )
                 return result["request"] if result is not None else value
 
             if callback_order == "native_first":
@@ -1423,7 +1454,7 @@ class NativeAttachmentPluginTests(unittest.TestCase):
                 "tools.registry": registry_module,
                 "tools.file_tools": file_tools_module,
             },
-        ), patch.object(plugin, "_turn_route", return_value=True):
+        ):
             final = json.loads(json.dumps(request))
             for callback in callbacks:
                 result = callback(
@@ -1446,7 +1477,7 @@ class NativeAttachmentPluginTests(unittest.TestCase):
         with patch.object(plugin, "__package__", "hermes_plugins"), patch.dict(
             sys.modules,
             {"hermes_plugins.m365_recall_provenance": None},
-        ), patch.object(plugin, "_turn_route", return_value=True):
+        ):
             result = plugin.on_llm_request(
                 {
                     "messages": [{"role": "user", "content": "read"}],
@@ -1467,7 +1498,10 @@ class NativeAttachmentPluginTests(unittest.TestCase):
         context = FakeContext()
         plugin.register(context)
         self.assertIn("m365_native_attach", context.tools)
-        self.assertEqual(set(context.hooks), {"on_session_end"})
+        self.assertEqual(
+            set(context.hooks),
+            {"on_session_end", "on_session_reset", "on_session_finalize"},
+        )
         self.assertEqual(set(context.middleware), {"tool_request", "llm_request"})
         definition = context.tools["m365_native_attach"]["schema"]
         self.assertEqual(

@@ -23,7 +23,6 @@ use crate::{
 
 pub(crate) const STAGE_PATH: &str = "/hermes/v1/attachments/stage";
 pub(crate) const RELEASE_PATH: &str = "/hermes/v1/attachments/release";
-pub(crate) const TURN_PATH: &str = "/hermes/v1/attachments/turn";
 pub(crate) const CONTEXT_SCHEMA: &str = "m365-hermes-native-attachment-context/v1";
 pub(crate) const STAGE_SCHEMA: &str = "m365-hermes-native-attachment-stage/v2";
 const STAGE_AUTH_HEADER: &str = "x-m365-hermes-attachment-auth";
@@ -32,7 +31,6 @@ const TURN_HEADER: &str = "x-m365-hermes-turn-id";
 const BINDING_HEADER: &str = "x-m365-hermes-turn-binding";
 const EXPECTED_SIZE_HEADER: &str = "x-m365-expected-size";
 const STAGE_ID_HEADER: &str = "x-m365-hermes-stage-id";
-const TURN_ACTION_HEADER: &str = "x-m365-hermes-turn-action";
 const RELEASE_BODY_LIMIT: usize = 64 * 1024;
 const MAX_FILENAME_CHARS: usize = 512;
 const MAX_EXTENSION_CHARS: usize = 64;
@@ -44,7 +42,6 @@ const STAGE_AUTH_DOMAIN: &[u8] = b"m365-hermes-native-attachments/stage/v1";
 const RELEASE_AUTH_DOMAIN: &[u8] = b"m365-hermes-native-attachments/release/v1";
 const CONTEXT_SIGNATURE_DOMAIN: &[u8] = b"m365-hermes-native-attachments/context/v1";
 const BINDING_DOMAIN: &[u8] = b"m365-hermes-native-attachments/binding/v1";
-const TURN_AUTH_DOMAIN: &[u8] = b"m365-hermes-native-attachments/turn/v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -213,42 +210,11 @@ struct PreparedCache {
     order: VecDeque<String>,
 }
 
-const MAX_TURN_BINDINGS: usize = 1_024;
-
-#[derive(Clone, Copy)]
-enum TurnAction {
-    Bind,
-    End,
-}
-
-impl TurnAction {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "bind" => Some(Self::Bind),
-            "end" => Some(Self::End),
-            _ => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Bind => "bind",
-            Self::End => "end",
-        }
-    }
-}
-
-struct TurnAuthority {
-    values: HashMap<String, String>,
-    order: VecDeque<String>,
-}
-
 pub(crate) struct NativeAttachmentManager {
     store: Store,
     attach_key: [u8; 32],
     enabled: bool,
     prepared: Mutex<PreparedCache>,
-    turns: Mutex<TurnAuthority>,
 }
 
 impl std::fmt::Debug for NativeAttachmentManager {
@@ -270,10 +236,6 @@ impl NativeAttachmentManager {
                 values: HashMap::new(),
                 order: VecDeque::new(),
             }),
-            turns: Mutex::new(TurnAuthority {
-                values: HashMap::new(),
-                order: VecDeque::new(),
-            }),
         })
     }
 
@@ -284,10 +246,6 @@ impl NativeAttachmentManager {
             attach_key: hmac_sha256(recall_secret.as_bytes(), ATTACHMENT_KEY_DOMAIN),
             enabled: !recall_secret.trim().is_empty(),
             prepared: Mutex::new(PreparedCache {
-                values: HashMap::new(),
-                order: VecDeque::new(),
-            }),
-            turns: Mutex::new(TurnAuthority {
                 values: HashMap::new(),
                 order: VecDeque::new(),
             }),
@@ -310,83 +268,27 @@ impl NativeAttachmentManager {
         ))
     }
 
+    pub(crate) fn request_binding_valid(
+        &self,
+        session_key: &str,
+        turn_id: &str,
+        binding: &str,
+    ) -> bool {
+        self.enabled
+            && valid_identity(session_key, 512)
+            && valid_identity(turn_id, 512)
+            && valid_hex(binding, 64)
+            && constant_time_equal(
+                binding.as_bytes(),
+                self.turn_binding(session_key, turn_id).as_bytes(),
+            )
+    }
+
     pub(crate) fn context_signature(&self, context: &NativeAttachmentContext) -> String {
         format!(
             "sha256={}",
             hex(&hmac_sha256(&self.attach_key, &canonical_context(context)))
         )
-    }
-
-    fn bind_current_turn(&self, session_key: &str, turn_id: &str) -> bool {
-        let mut authority = self.turns.lock().expect("turn authority poisoned");
-        if authority
-            .values
-            .get(session_key)
-            .is_some_and(|value| value != turn_id)
-        {
-            return false;
-        }
-        authority
-            .values
-            .insert(session_key.to_owned(), turn_id.to_owned());
-        authority.order.retain(|value| value != session_key);
-        authority.order.push_back(session_key.to_owned());
-        while authority.order.len() > MAX_TURN_BINDINGS {
-            if let Some(old_session) = authority.order.pop_front() {
-                authority.values.remove(&old_session);
-            }
-        }
-        true
-    }
-
-    fn clear_current_turn(&self, session_key: &str, turn_id: &str) {
-        let mut authority = self.turns.lock().expect("turn authority poisoned");
-        if authority
-            .values
-            .get(session_key)
-            .is_some_and(|value| value == turn_id)
-        {
-            authority.values.remove(session_key);
-            authority.order.retain(|value| value != session_key);
-        }
-    }
-
-    fn is_current_turn(&self, session_key: &str, turn_id: &str) -> bool {
-        self.turns
-            .lock()
-            .expect("turn authority poisoned")
-            .values
-            .get(session_key)
-            .is_some_and(|value| value == turn_id)
-    }
-
-    fn turn_authenticated(&self, headers: &HeaderMap) -> Option<TurnAction> {
-        if !self.enabled {
-            return None;
-        }
-        let session = header_text(headers, SESSION_HEADER)?;
-        let turn = header_text(headers, TURN_HEADER)?;
-        let binding = header_text(headers, BINDING_HEADER)?;
-        let action = TurnAction::parse(header_text(headers, TURN_ACTION_HEADER)?)?;
-        let provided = header_text(headers, STAGE_AUTH_HEADER)?;
-        if !valid_identity(session, 512)
-            || !valid_identity(turn, 512)
-            || !valid_hex(binding, 64)
-            || binding != self.turn_binding(session, turn)
-        {
-            return None;
-        }
-        let expected = hex(&hmac_sha256(
-            &self.attach_key,
-            &join_lines(&[
-                TURN_AUTH_DOMAIN,
-                session.as_bytes(),
-                turn.as_bytes(),
-                binding.as_bytes(),
-                action.as_str().as_bytes(),
-            ]),
-        ));
-        constant_time_equal(provided.as_bytes(), expected.as_bytes()).then_some(action)
     }
 
     pub(crate) fn stage_authenticated(&self, headers: &HeaderMap) -> bool {
@@ -465,33 +367,6 @@ impl NativeAttachmentManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn turn_headers_for_test(
-        &self,
-        session_key: &str,
-        turn_id: &str,
-        action: &str,
-    ) -> HeaderMap {
-        let binding = self.turn_binding(session_key, turn_id);
-        let auth = hex(&hmac_sha256(
-            &self.attach_key,
-            &join_lines(&[
-                TURN_AUTH_DOMAIN,
-                session_key.as_bytes(),
-                turn_id.as_bytes(),
-                binding.as_bytes(),
-                action.as_bytes(),
-            ]),
-        ));
-        let mut headers = HeaderMap::new();
-        headers.insert(SESSION_HEADER, session_key.parse().unwrap());
-        headers.insert(TURN_HEADER, turn_id.parse().unwrap());
-        headers.insert(BINDING_HEADER, binding.parse().unwrap());
-        headers.insert(TURN_ACTION_HEADER, action.parse().unwrap());
-        headers.insert(STAGE_AUTH_HEADER, auth.parse().unwrap());
-        headers
-    }
-
-    #[cfg(test)]
     pub(crate) fn release_headers_for_test(
         &self,
         session_key: &str,
@@ -533,17 +408,11 @@ impl NativeAttachmentManager {
         turn_id: &str,
         bytes: &[u8],
     ) -> StageRecord {
-        self.bind_current_turn(session_key, turn_id);
         let binding = self.turn_binding(session_key, turn_id);
         self.store
             .stage_body_for_test(&binding, Body::from(bytes.to_vec()))
             .await
             .unwrap()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bind_turn_for_test(&self, session_key: &str, turn_id: &str) {
-        assert!(self.bind_current_turn(session_key, turn_id));
     }
 
     fn release_authenticated(&self, headers: &HeaderMap, stage_refs: &[String]) -> bool {
@@ -616,9 +485,6 @@ impl NativeAttachmentManager {
         }
         if context.attachments.is_empty() || context.attachments.len() > 2 {
             return Err(FailureReason::NativeAttachmentContextMalformed);
-        }
-        if !self.is_current_turn(&context.session_key, &context.turn_id) {
-            return Err(FailureReason::NativeAttachmentBindingInvalid);
         }
         if existing_attachment_count + context.attachments.len() > 2 {
             return Err(FailureReason::NativeAttachmentSlotConflict);
@@ -825,18 +691,6 @@ pub(crate) async fn stage(State(gateway): State<Arc<Gateway>>, request: Request)
             "Hermes attachment authentication required",
         );
     }
-    let session_key = header_text(request.headers(), SESSION_HEADER)
-        .unwrap_or_default()
-        .to_owned();
-    let turn_id = header_text(request.headers(), TURN_HEADER)
-        .unwrap_or_default()
-        .to_owned();
-    if !gateway
-        .hermes_attachments
-        .is_current_turn(&session_key, &turn_id)
-    {
-        return native_attachment_error(FailureReason::NativeAttachmentBindingInvalid);
-    }
     let binding = header_text(request.headers(), BINDING_HEADER)
         .unwrap_or_default()
         .to_owned();
@@ -856,7 +710,7 @@ pub(crate) async fn stage(State(gateway): State<Arc<Gateway>>, request: Request)
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|value| value != expected_size)
     {
-        return stage_upload_error(StatusCode::CONFLICT);
+        return stage_metadata_error();
     }
     let staged = match gateway
         .hermes_attachments
@@ -864,7 +718,7 @@ pub(crate) async fn stage(State(gateway): State<Arc<Gateway>>, request: Request)
         .await
     {
         Ok(staged) => staged,
-        Err(_) => return stage_upload_error(StatusCode::BAD_GATEWAY),
+        Err(_) => return stage_upload_error(),
     };
     if staged.size != expected_size {
         gateway
@@ -880,43 +734,6 @@ pub(crate) async fn stage(State(gateway): State<Arc<Gateway>>, request: Request)
         sha256: &staged.sha256,
     })
     .into_response()
-}
-
-pub(crate) async fn turn(State(gateway): State<Arc<Gateway>>, request: Request) -> Response {
-    let action = match gateway
-        .hermes_attachments
-        .turn_authenticated(request.headers())
-    {
-        Some(action) => action,
-        None => {
-            return openai_error(
-                StatusCode::UNAUTHORIZED,
-                "auth_error",
-                "auth_error",
-                "Hermes attachment authentication required",
-            );
-        }
-    };
-    let session_key = header_text(request.headers(), SESSION_HEADER)
-        .unwrap_or_default()
-        .to_owned();
-    let turn_id = header_text(request.headers(), TURN_HEADER)
-        .unwrap_or_default()
-        .to_owned();
-    match action {
-        TurnAction::Bind => {
-            if !gateway
-                .hermes_attachments
-                .bind_current_turn(&session_key, &turn_id)
-            {
-                return native_attachment_error(FailureReason::NativeAttachmentBindingInvalid);
-            }
-        }
-        TurnAction::End => gateway
-            .hermes_attachments
-            .clear_current_turn(&session_key, &turn_id),
-    }
-    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub(crate) async fn release(State(gateway): State<Arc<Gateway>>, request: Request) -> Response {
@@ -958,7 +775,7 @@ pub(crate) async fn release(State(gateway): State<Arc<Gateway>>, request: Reques
 }
 
 pub(crate) fn stage_path(path: &str) -> bool {
-    matches!(path, STAGE_PATH | RELEASE_PATH | TURN_PATH)
+    matches!(path, STAGE_PATH | RELEASE_PATH)
 }
 
 fn native_attachment_error(reason: FailureReason) -> Response {
@@ -979,9 +796,9 @@ fn stage_metadata_error() -> Response {
     )
 }
 
-fn stage_upload_error(status: StatusCode) -> Response {
+fn stage_upload_error() -> Response {
     openai_error(
-        status,
+        StatusCode::BAD_GATEWAY,
         "upstream_error",
         FailureReason::StageTransportFailed.code(),
         FailureReason::StageTransportFailed.message(),
@@ -1196,25 +1013,12 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_turn_authority_rejects_a_replayed_previous_turn() {
+    fn capability_for_one_turn_cannot_be_taken_by_another() {
         let manager =
             NativeAttachmentManager::open_for_test(tempfile::tempdir().unwrap().path(), "secret");
-        let bind_a = manager.turn_headers_for_test("session", "turn-a", "bind");
-        assert!(matches!(
-            manager.turn_authenticated(&bind_a),
-            Some(TurnAction::Bind)
-        ));
-        assert!(manager.bind_current_turn("session", "turn-a"));
-        let bind_b = manager.turn_headers_for_test("session", "turn-b", "bind");
-        assert!(matches!(
-            manager.turn_authenticated(&bind_b),
-            Some(TurnAction::Bind)
-        ));
-        assert!(!manager.bind_current_turn("session", "turn-b"));
-        manager.clear_current_turn("session", "turn-a");
-        assert!(manager.bind_current_turn("session", "turn-b"));
-        assert!(!manager.is_current_turn("session", "turn-a"));
-        assert!(manager.is_current_turn("session", "turn-b"));
+        let binding_a = manager.turn_binding("session", "turn-a");
+        let binding_b = manager.turn_binding("session", "turn-b");
+        assert_ne!(binding_a, binding_b);
     }
 
     #[tokio::test]
@@ -1243,14 +1047,13 @@ mod tests {
         };
         context.signature = manager.context_signature(&context);
 
-        manager.clear_current_turn("session", "turn");
-        assert!(manager.bind_current_turn("session", "other-turn"));
+        let mut taken_by_other_turn = context.clone();
+        taken_by_other_turn.turn_id = "other-turn".to_owned();
+        taken_by_other_turn.signature = manager.context_signature(&taken_by_other_turn);
         assert!(matches!(
-            manager.resolve_context(&context, "session", 0),
-            Err(FailureReason::NativeAttachmentBindingInvalid)
+            manager.resolve_context(&taken_by_other_turn, "session", 0),
+            Err(FailureReason::NativeAttachmentCapabilityInvalidOrExpired)
         ));
-        manager.clear_current_turn("session", "other-turn");
-        assert!(manager.bind_current_turn("session", "turn"));
 
         let mut prepared = manager.resolve_context(&context, "session", 0).unwrap();
         prepared.attachments[0].doc_id = "prepared-doc".to_owned();

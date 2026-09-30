@@ -252,10 +252,6 @@ impl Gateway {
                 post(crate::hermes_attachments::release),
             )
             .route(
-                crate::hermes_attachments::TURN_PATH,
-                post(crate::hermes_attachments::turn),
-            )
-            .route(
                 "/memory/v1/chat/completions",
                 post(crate::protocol::chat_completions),
             )
@@ -2512,22 +2508,6 @@ mod tests {
         let expected_sha256 = format!("{:x}", Sha256::digest(&bytes));
         let session_key = "session-key";
         let turn_id = "turn-1";
-        let mut turn_request = Request::post(crate::hermes_attachments::TURN_PATH)
-            .header(header::HOST, "127.0.0.1")
-            .body(Body::empty())
-            .unwrap();
-        turn_request
-            .headers_mut()
-            .extend(
-                gateway
-                    .hermes_attachments
-                    .turn_headers_for_test(session_key, turn_id, "bind"),
-            );
-        let turn_response = Gateway::router(Arc::clone(&gateway))
-            .oneshot(turn_request)
-            .await
-            .unwrap();
-        assert_eq!(turn_response.status(), StatusCode::OK);
         let stage_headers =
             gateway
                 .hermes_attachments
@@ -2614,90 +2594,99 @@ mod tests {
                 .resolve_context(&context, session_key, 0)
                 .is_err()
         );
+        let mut repeated_release = Request::post(crate::hermes_attachments::RELEASE_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"stage_refs": [capability]}).to_string(),
+            ))
+            .unwrap();
+        repeated_release
+            .headers_mut()
+            .extend(gateway.hermes_attachments.release_headers_for_test(
+                session_key,
+                turn_id,
+                std::slice::from_ref(&capability),
+            ));
+        let repeated = Gateway::router(Arc::clone(&gateway))
+            .oneshot(repeated_release)
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn hermes_turn_authority_rejects_a_replayed_previous_turn() {
+    async fn mismatched_stage_content_length_is_metadata_error() {
         let gateway = gateway();
-        let staged = gateway
-            .hermes_attachments
-            .stage_for_test("session-key", "turn-a", b"turn-a")
-            .await;
-        let mut context = crate::hermes_attachments::NativeAttachmentContext {
-            schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
-            session_key: "session-key".to_owned(),
-            turn_id: "turn-a".to_owned(),
-            attachments: vec![crate::hermes_attachments::NativeAttachmentReference {
-                stage_ref: staged.capability.clone(),
-                size: staged.size,
-                sha256: staged.sha256.clone(),
-                original_filename: "turn-a.txt".to_owned(),
-                extension: "txt".to_owned(),
-                mime_type: "text/plain".to_owned(),
-                attachment_id: String::new(),
-                source_message_id: String::new(),
-            }],
-            error: None,
-            signature: String::new(),
-        };
-        context.signature = gateway.hermes_attachments.context_signature(&context);
-
-        let mut bind_request = Request::post(crate::hermes_attachments::TURN_PATH)
-            .header(header::HOST, "127.0.0.1")
-            .body(Body::empty())
-            .unwrap();
-        let mut end_request = Request::post(crate::hermes_attachments::TURN_PATH)
-            .header(header::HOST, "127.0.0.1")
-            .body(Body::empty())
-            .unwrap();
-        end_request
-            .headers_mut()
-            .extend(gateway.hermes_attachments.turn_headers_for_test(
-                "session-key",
-                "turn-a",
-                "end",
-            ));
-        let end_response = Gateway::router(Arc::clone(&gateway))
-            .oneshot(end_request)
-            .await
-            .unwrap();
-        assert_eq!(end_response.status(), StatusCode::OK);
-        bind_request
-            .headers_mut()
-            .extend(gateway.hermes_attachments.turn_headers_for_test(
-                "session-key",
-                "turn-b",
-                "bind",
-            ));
-        let response = Gateway::router(Arc::clone(&gateway))
-            .oneshot(bind_request)
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let replay_body = b"replayed stage";
-        let mut replay_request = Request::post(crate::hermes_attachments::STAGE_PATH)
+        let mut request = Request::post(crate::hermes_attachments::STAGE_PATH)
             .header(header::HOST, "127.0.0.1")
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(Body::from(replay_body.as_slice()))
+            .header(header::CONTENT_LENGTH, "99")
+            .body(Body::from("fixture"))
             .unwrap();
-        replay_request
+        request.headers_mut().extend(
+            gateway
+                .hermes_attachments
+                .stage_headers_for_test("session", "turn", 7),
+        );
+        let response = Gateway::router(gateway).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_stage_metadata");
+    }
+
+    #[tokio::test]
+    async fn turn_endpoint_is_not_a_lifecycle_authority() {
+        let gateway = gateway();
+        let (_, key) = gateway.api_keys.create("missing-turn-route").unwrap();
+        let response = Gateway::router(gateway)
+            .oneshot(
+                Request::post("/hermes/v1/attachments/turn")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fresh_turn_can_stage_after_old_turn_misses_terminal_hook() {
+        let gateway = gateway();
+        let old = gateway
+            .hermes_attachments
+            .stage_for_test("session-key", "old-turn", b"old synthetic attachment")
+            .await;
+        let body = b"synthetic attachment";
+        let mut request = Request::post(crate::hermes_attachments::STAGE_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(body.as_slice()))
+            .unwrap();
+        request
             .headers_mut()
             .extend(gateway.hermes_attachments.stage_headers_for_test(
                 "session-key",
-                "turn-a",
-                replay_body.len() as u64,
+                "fresh-turn",
+                body.len() as u64,
             ));
-        let replay_response = Gateway::router(Arc::clone(&gateway))
-            .oneshot(replay_request)
+        let response = Gateway::router(Arc::clone(&gateway))
+            .oneshot(request)
             .await
             .unwrap();
-        assert_eq!(replay_response.status(), StatusCode::CONFLICT);
-        assert!(matches!(
-            gateway
-                .hermes_attachments
-                .resolve_context(&context, "session-key", 0),
-            Err(crate::hermes_attachments::FailureReason::NativeAttachmentBindingInvalid)
-        ));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(
+            old.capability,
+            serde_json::from_slice::<Value>(
+                &to_bytes(response.into_body(), 64 * 1024).await.unwrap()
+            )
+            .unwrap()["capability"]
+                .as_str()
+                .unwrap()
+        );
     }
 
     #[tokio::test]

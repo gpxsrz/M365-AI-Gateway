@@ -385,6 +385,16 @@ async fn execute_chat_request_inner(
     let mut native_attachment_stage_refs = Vec::new();
     let mut native_attachment_indices = Vec::new();
     if let Some(context) = body.native_attachment_context.as_ref() {
+        if context.error.is_none()
+            && (body.native_attachment_request_turn_id != context.turn_id
+                || !gateway.hermes_attachments.request_binding_valid(
+                    &body.session_key,
+                    &body.native_attachment_request_turn_id,
+                    &body.native_attachment_request_binding,
+                ))
+        {
+            return native_attachment_failure(FailureReason::NativeAttachmentBindingInvalid);
+        }
         let native_start = flattened.attachments.len();
         let native = match gateway.hermes_attachments.resolve_context(
             context,
@@ -3249,6 +3259,10 @@ pub(crate) struct ChatCompletionRequest {
     pub(crate) execution_identity_error: Option<Value>,
     #[serde(default, rename = "m365_native_attachment_context")]
     pub(crate) native_attachment_context: Option<NativeAttachmentContext>,
+    #[serde(default, rename = "m365_native_attachment_request_turn_id")]
+    pub(crate) native_attachment_request_turn_id: String,
+    #[serde(default, rename = "m365_native_attachment_request_binding")]
+    pub(crate) native_attachment_request_binding: String,
     #[serde(skip)]
     pub(crate) legacy_attachments: Vec<Attachment>,
     #[serde(skip)]
@@ -16119,6 +16133,13 @@ mod tests {
             request_body["conversation_id"] =
                 Value::String(format!("issue-104-base:{upload_base}"));
             request_body["session_key"] = Value::String(session_key);
+            request_body["m365_native_attachment_request_turn_id"] =
+                Value::String("issue-101-native-turn".to_owned());
+            request_body["m365_native_attachment_request_binding"] =
+                Value::String(gateway.hermes_attachments.turn_binding(
+                    request_body["session_key"].as_str().unwrap(),
+                    "issue-101-native-turn",
+                ));
             request_body["m365_native_attachment_context"] =
                 serde_json::to_value(native_context).unwrap();
             let response = Gateway::router(Arc::clone(&gateway))
@@ -18953,6 +18974,10 @@ mod tests {
     async fn hermes_tool_round_limit_128_is_terminal_without_checkpoint_poison() {
         let (gateway, key) = gateway_with_chat_and_oauth(Arc::new(FixedTransport), oauth());
         let app = Gateway::router(gateway.clone());
+        gateway
+            .hermes_attachments
+            .stage_for_test("round-limit-128", "old-turn", b"old synthetic attachment")
+            .await;
         let mut messages = vec![json!({"role":"user","content":"Run 128 read-only rounds."})];
         for round in 0..128 {
             let id = format!("call-{round}");
@@ -18982,6 +19007,22 @@ mod tests {
         let (status, body) = syntax_public_response(&app, &key, &next).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
+
+        let bytes = b"fresh synthetic attachment";
+        let mut stage = Request::post(crate::hermes_attachments::STAGE_PATH)
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(bytes.as_slice()))
+            .unwrap();
+        stage
+            .headers_mut()
+            .extend(gateway.hermes_attachments.stage_headers_for_test(
+                "round-limit-128",
+                "fresh-turn",
+                bytes.len() as u64,
+            ));
+        let staged = app.oneshot(stage).await.unwrap();
+        assert_eq!(staged.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -20181,6 +20222,10 @@ mod tests {
             messages: vec![OpenAiMessage::text("user", "inspect the image")],
             session_key: "session-key".to_owned(),
             native_attachment_context: Some(context),
+            native_attachment_request_turn_id: "turn-1".to_owned(),
+            native_attachment_request_binding: gateway
+                .hermes_attachments
+                .turn_binding("session-key", "turn-1"),
             ..ChatCompletionRequest::default()
         };
         let response = execute_chat_request(
@@ -20204,6 +20249,45 @@ mod tests {
         assert_eq!(attachment.url, "");
         assert_eq!(attachment.name, "sentinel.png");
         assert!(attachment.staged.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_native_context_cannot_cross_the_signed_request_turn() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let context = staged_native_context(
+            &gateway,
+            "session-key",
+            "old-turn",
+            "synthetic.txt",
+            "text/plain",
+            b"synthetic attachment",
+        )
+        .await;
+        let body = ChatCompletionRequest {
+            model: "gpt-5.6-terra".to_owned(),
+            messages: vec![OpenAiMessage::text("user", "fresh turn")],
+            session_key: "session-key".to_owned(),
+            native_attachment_context: Some(context),
+            native_attachment_request_turn_id: "fresh-turn".to_owned(),
+            native_attachment_request_binding: gateway
+                .hermes_attachments
+                .turn_binding("session-key", "fresh-turn"),
+            ..ChatCompletionRequest::default()
+        };
+        let response = execute_chat_request(
+            gateway,
+            "/hermes/v1/chat/completions".to_owned(),
+            "owner".to_owned(),
+            String::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "native_attachment_binding_invalid");
+        assert!(chat.0.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -20241,9 +20325,6 @@ mod tests {
     async fn invalid_native_capability_fails_before_microsoft_upstream() {
         let chat = Arc::new(RecordingTransport(Mutex::new(None)));
         let (gateway, _) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        gateway
-            .hermes_attachments
-            .bind_turn_for_test("session-key", "turn-1");
         let mut context = NativeAttachmentContext {
             schema: crate::hermes_attachments::CONTEXT_SCHEMA.to_owned(),
             session_key: "session-key".to_owned(),
@@ -20273,6 +20354,10 @@ mod tests {
                 messages: vec![OpenAiMessage::text("user", "inspect")],
                 session_key: "session-key".to_owned(),
                 native_attachment_context: Some(context),
+                native_attachment_request_turn_id: "turn-1".to_owned(),
+                native_attachment_request_binding: gateway
+                    .hermes_attachments
+                    .turn_binding("session-key", "turn-1"),
                 ..ChatCompletionRequest::default()
             },
         )
@@ -20367,6 +20452,10 @@ mod tests {
                 messages: vec![OpenAiMessage::text("user", "inspect")],
                 session_key: "session-key".to_owned(),
                 native_attachment_context: Some(native.clone()),
+                native_attachment_request_turn_id: "turn-1".to_owned(),
+                native_attachment_request_binding: gateway
+                    .hermes_attachments
+                    .turn_binding("session-key", "turn-1"),
                 legacy_attachments: vec![existing_image.clone()],
                 ..ChatCompletionRequest::default()
             },
@@ -20387,6 +20476,10 @@ mod tests {
                 messages: vec![OpenAiMessage::text("user", "inspect")],
                 session_key: "session-key".to_owned(),
                 native_attachment_context: Some(native.clone()),
+                native_attachment_request_turn_id: "turn-1".to_owned(),
+                native_attachment_request_binding: gateway
+                    .hermes_attachments
+                    .turn_binding("session-key", "turn-1"),
                 legacy_attachments: vec![
                     existing_image.clone(),
                     Attachment {
@@ -20430,6 +20523,10 @@ mod tests {
                 messages: vec![OpenAiMessage::text("user", "inspect")],
                 session_key: "session-key".to_owned(),
                 native_attachment_context: Some(two_native),
+                native_attachment_request_turn_id: "turn-1".to_owned(),
+                native_attachment_request_binding: gateway
+                    .hermes_attachments
+                    .turn_binding("session-key", "turn-1"),
                 legacy_attachments: vec![existing_image],
                 ..ChatCompletionRequest::default()
             },
@@ -20452,7 +20549,7 @@ mod tests {
             )
             .await;
             let response = execute_chat_request(
-                gateway,
+                Arc::clone(&gateway),
                 "/hermes/v1/chat/completions".to_owned(),
                 "owner".to_owned(),
                 String::new(),
@@ -20462,6 +20559,10 @@ mod tests {
                     stream,
                     session_key: "session-key".to_owned(),
                     native_attachment_context: Some(native),
+                    native_attachment_request_turn_id: "turn-1".to_owned(),
+                    native_attachment_request_binding: gateway
+                        .hermes_attachments
+                        .turn_binding("session-key", "turn-1"),
                     ..ChatCompletionRequest::default()
                 },
             )

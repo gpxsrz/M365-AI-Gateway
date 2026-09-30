@@ -33,21 +33,16 @@ class FinalContractTests(unittest.TestCase):
             clear=False,
         )
         self.environment.start()
-        self.turn_route = patch.object(plugin, "_turn_route", return_value=True)
-        self.turn_route.start()
         with plugin._lock:
             plugin._sessions.clear()
             plugin._outcomes.clear()
             plugin._ended.clear()
-            plugin._pending_ends.clear()
 
     def tearDown(self) -> None:
         with plugin._lock:
             plugin._sessions.clear()
             plugin._outcomes.clear()
             plugin._ended.clear()
-            plugin._pending_ends.clear()
-        self.turn_route.stop()
         self.environment.stop()
 
     @staticmethod
@@ -60,18 +55,17 @@ class FinalContractTests(unittest.TestCase):
 
     @staticmethod
     def llm(session: str, turn: str, provider: str = "m365") -> dict | None:
-        with patch.object(plugin, "_turn_route", return_value=True):
-            return plugin.on_llm_request(
-                {
-                    "messages": [{"role": "user", "content": "sentinel"}],
-                    "extra_body": {"session_key": session, "existing": "preserve"},
-                },
-                session_id=session,
-                turn_id=turn,
-                provider=provider,
-                api_mode="chat_completions",
-                base_url="https://m365.example/hermes/v1",
-            )
+        return plugin.on_llm_request(
+            {
+                "messages": [{"role": "user", "content": "sentinel"}],
+                "extra_body": {"session_key": session, "existing": "preserve"},
+            },
+            session_id=session,
+            turn_id=turn,
+            provider=provider,
+            api_mode="chat_completions",
+            base_url="https://m365.example/hermes/v1",
+        )
 
     @staticmethod
     def stage_fake(contents: dict[str, bytes], refs: list[str] | None = None):
@@ -216,15 +210,14 @@ class FinalContractTests(unittest.TestCase):
                     "_request_with_context",
                     side_effect=RuntimeError("synthetic callback failure"),
                 ):
-                    with patch.object(plugin, "_turn_route", return_value=True):
-                        failed_closed = plugin.on_llm_request(
-                            {"messages": [{"role": "user", "content": "keep"}]},
-                            session_id="session",
-                            turn_id="turn",
-                            provider="m365",
-                            api_mode="chat_completions",
-                            base_url="https://m365.example/hermes/v1",
-                        )
+                    failed_closed = plugin.on_llm_request(
+                        {"messages": [{"role": "user", "content": "keep"}]},
+                        session_id="session",
+                        turn_id="turn",
+                        provider="m365",
+                        api_mode="chat_completions",
+                        base_url="https://m365.example/hermes/v1",
+                    )
                 self.assertEqual(
                     failed_closed["request"]["messages"],
                     [{"role": "user", "content": "keep"}],

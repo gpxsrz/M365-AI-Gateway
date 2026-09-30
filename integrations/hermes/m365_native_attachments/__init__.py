@@ -26,16 +26,16 @@ from urllib.parse import urlsplit
 
 _STAGE_PATH = "/hermes/v1/attachments/stage"
 _RELEASE_PATH = "/hermes/v1/attachments/release"
-_TURN_PATH = "/hermes/v1/attachments/turn"
 _STAGE_SCHEMA = "m365-hermes-native-attachment-stage/v2"
 _CONTEXT_SCHEMA = "m365-hermes-native-attachment-context/v1"
 _CONTEXT_FIELD = "m365_native_attachment_context"
+_REQUEST_TURN_FIELD = "m365_native_attachment_request_turn_id"
+_REQUEST_BINDING_FIELD = "m365_native_attachment_request_binding"
 _MAX_NATIVE_ATTACHMENTS = 2
 _MAX_FILE_BYTES = 512 << 20
 _MAX_TURNS = 256
 _MAX_OUTCOMES = _MAX_TURNS * 2
 _MAX_ENDED_TURNS = _MAX_TURNS * 2
-_MAX_PENDING_ENDS = _MAX_TURNS * 4
 _CHUNK_SIZE = 128 * 1024
 _CAPABILITY = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -48,7 +48,6 @@ _STAGE_AUTH_DOMAIN = b"m365-hermes-native-attachments/stage/v1"
 _RELEASE_AUTH_DOMAIN = b"m365-hermes-native-attachments/release/v1"
 _CONTEXT_SIGNATURE_DOMAIN = b"m365-hermes-native-attachments/context/v1"
 _BINDING_DOMAIN = b"m365-hermes-native-attachments/binding/v1"
-_TURN_AUTH_DOMAIN = b"m365-hermes-native-attachments/turn/v1"
 _STAGE_ID_DOMAIN = b"m365-hermes-native-attachments/stage-id/v1"
 _GATEWAY_BASE_URL_ENV = "M365_HERMES_GATEWAY_BASE_URL"
 _FORMAL_M365_PROVIDER = "m365-copilot"
@@ -58,7 +57,6 @@ _TURN_HEADER = "X-M365-Hermes-Turn-Id"
 _BINDING_HEADER = "X-M365-Hermes-Turn-Binding"
 _EXPECTED_SIZE_HEADER = "X-M365-Expected-Size"
 _STAGE_ID_HEADER = "X-M365-Hermes-Stage-Id"
-_TURN_ACTION_HEADER = "X-M365-Hermes-Turn-Action"
 
 _TOOL_FAILURES = frozenset(
     {
@@ -91,20 +89,15 @@ TurnKey = tuple[str, str]
 
 _sessions: OrderedDict[TurnKey, dict[str, Any]] = OrderedDict()
 _outcomes: OrderedDict[TurnKey, dict[str, Any]] = OrderedDict()
-# A bounded exact-turn tombstone prevents a delayed callback from reviving a
-# turn after the host has delivered on_session_end.  This is turn lifecycle
-# state, not a session-wide failure/poison marker.
+# Hermes terminal events only: reject callbacks that arrive after their turn ended.
 _ended: OrderedDict[TurnKey, None] = OrderedDict()
-# A failed end is a retryable local cleanup operation. Keep its exact turn
-# binding until a later request observes a successful idempotent end.
-_pending_ends: OrderedDict[TurnKey, tuple[str, str]] = OrderedDict()
 _lock = threading.RLock()
 _operation_locks: dict[TurnKey, threading.Lock] = {}
 
 
 class _AttachmentFailure(Exception):
     def __init__(self, reason: str, stage_refs: list[str] | None = None):
-        self.reason = reason if reason in _ALL_FAILURES else "stage_transport_failed"
+        self.reason = reason if reason in _ALL_FAILURES else "native_attachment_context_malformed"
         self.stage_refs = list(stage_refs or [])
 
 
@@ -174,7 +167,7 @@ def _is_m365(provider: Any, api_mode: Any, base_url: Any) -> bool:
 def _attach_key() -> bytes:
     secret = os.environ.get("M365_HERMES_RECALL_PROVENANCE_SECRET", "").strip()
     if not secret:
-        raise _AttachmentFailure("stage_transport_failed")
+        raise _AttachmentFailure("native_attachment_binding_invalid")
     return hmac.new(secret.encode("utf-8"), _ATTACHMENT_KEY_DOMAIN, hashlib.sha256).digest()
 
 
@@ -275,6 +268,8 @@ def _request_with_context(
     else:
         raise _AttachmentFailure("native_attachment_context_malformed")
     extra[_CONTEXT_FIELD] = _context_wire(session_key, turn_id, references, error)
+    extra[_REQUEST_TURN_FIELD] = turn_id
+    extra[_REQUEST_BINDING_FIELD] = _turn_binding(session_key, turn_id)
     updated["extra_body"] = extra
     # The Gateway binds the signed context to the OpenAI-wire session_key. Hermes
     # does not add that field for custom providers, so put the same authority in
@@ -290,6 +285,8 @@ def _request_without_context(request: Any) -> Any:
     updated = _copy_request(request)
     extra = updated["extra_body"]
     extra.pop(_CONTEXT_FIELD, None)
+    extra.pop(_REQUEST_TURN_FIELD, None)
+    extra.pop(_REQUEST_BINDING_FIELD, None)
     updated["extra_body"] = extra
     return updated
 
@@ -363,12 +360,14 @@ def _safe_failure_request(request: Any, session_id: Any, turn_id: Any, reason: s
             extra = {}
     else:
         extra = {}
+    extra.pop(_REQUEST_TURN_FIELD, None)
+    extra.pop(_REQUEST_BINDING_FIELD, None)
     extra[_CONTEXT_FIELD] = marker
     updated["extra_body"] = extra
     return {
         "request": updated,
         "source": "m365-hermes-native-attachments",
-        "reason": "native attachment transport failed closed",
+        "reason": "native attachment request failed closed",
     }
 
 
@@ -473,37 +472,6 @@ def _remember_route(key: TurnKey, base_url: Any, request: Any = None) -> bool:
     return not route_drift
 
 
-def _remember_pending_end(key: TurnKey, route: str, session_key: str) -> None:
-    if not route or not session_key:
-        return
-    with _lock:
-        _pending_ends[key] = (route, session_key)
-        _pending_ends.move_to_end(key)
-        while len(_pending_ends) > _MAX_PENDING_ENDS:
-            _pending_ends.popitem(last=False)
-
-
-def _forget_pending_end(key: TurnKey) -> None:
-    with _lock:
-        _pending_ends.pop(key, None)
-
-
-def _retry_pending_ends(route: str, session_key: str) -> bool:
-    with _lock:
-        pending = [
-            (key, value)
-            for key, value in _pending_ends.items()
-            if value == (route, session_key)
-        ]
-    all_cleared = True
-    for key, (pending_route, pending_session_key) in pending:
-        if _turn_route(pending_route, pending_session_key, key[1], "end"):
-            _forget_pending_end(key)
-        else:
-            all_cleared = False
-    return all_cleared
-
-
 def _release_route(base_url: str, session_key: str, turn_id: str, stage_refs: list[str]) -> None:
     if not base_url or not stage_refs:
         return
@@ -537,42 +505,6 @@ def _release_route(base_url: str, session_key: str, turn_id: str, stage_refs: li
             connection.close()
     except Exception:
         return
-
-
-def _turn_route(base_url: str, session_key: str, turn_id: str, action: str) -> bool:
-    if not base_url or action not in {"bind", "end"}:
-        return False
-    try:
-        host, port, target, secure = _request_target(base_url, "turn")
-        if not secure:
-            raise _AttachmentFailure("stage_transport_failed")
-        binding = _turn_binding(session_key, turn_id)
-        auth = _hmac_hex(
-            _attach_key(),
-            _lines(_TURN_AUTH_DOMAIN, session_key, turn_id, binding, action),
-        )
-        connection = _connection(host, port, secure)
-        try:
-            connection.request(
-                "POST",
-                target,
-                body=b"",
-                headers={
-                    "Content-Length": "0",
-                    _AUTH_HEADER: auth,
-                    _SESSION_HEADER: session_key,
-                    _TURN_HEADER: turn_id,
-                    _BINDING_HEADER: binding,
-                    _TURN_ACTION_HEADER: action,
-                },
-            )
-            response = connection.getresponse()
-            response.read(64 * 1024)
-            return response.status == 200
-        finally:
-            connection.close()
-    except Exception:
-        return False
 
 
 def _clear_turn(key: TurnKey, outcome: dict[str, Any] | None = None) -> None:
@@ -651,7 +583,7 @@ def on_llm_request(
         key = _turn_key(session_id, turn_id)
         if key is not None:
             with _lock:
-                active_turn = key in _sessions or key in _outcomes or key in _ended
+                active_turn = key in _sessions or key in _ended
             raw_extra = request.get("extra_body") if isinstance(request, dict) else None
             has_native_context = (
                 isinstance(raw_extra, dict) and _CONTEXT_FIELD in raw_extra
@@ -681,11 +613,6 @@ def on_llm_request(
             base_url=base_url,
             **kwargs,
         )
-        with _lock:
-            if key in _ended:
-                return _safe_failure_request(
-                    request, session_id, turn_id, "native_attachment_binding_invalid"
-                )
         if not _remember_route(key, base_url, request):
             return _safe_failure_request(
                 request, session_id, turn_id, "native_attachment_binding_invalid"
@@ -694,19 +621,6 @@ def on_llm_request(
             outcome = copy.deepcopy(_outcomes.get(key))
             state = copy.deepcopy(_sessions.get(key))
         unresolved_context = _has_unresolved_native_context(request)
-        if state and state.get("route"):
-            pending_end_ok = _retry_pending_ends(
-                state["route"], state.get("session_key", key[0])
-            )
-            if not _turn_route(state["route"], state.get("session_key", key[0]), key[1], "bind"):
-                if (
-                    not pending_end_ok
-                    or state.get("refs")
-                    or (outcome is not None and outcome.get("ok"))
-                ):
-                    return _safe_failure_request(
-                        request, session_id, turn_id, "native_attachment_binding_invalid"
-                    )
         if outcome is not None and not outcome.get("ok"):
             return {
                 "request": _request_without_context(request),
@@ -715,7 +629,7 @@ def on_llm_request(
             }
         if not outcome:
             if unresolved_context or (state and state.get("refs")):
-                session_key = state.get("session_key", key[0])
+                session_key = state.get("session_key", key[0]) if state else key[0]
                 return {
                     "request": _request_with_context(
                         request, session_key, key[1], [], "native_attachment_state_lost"
@@ -735,8 +649,8 @@ def on_llm_request(
                     request, session_key, key[1], [], "native_attachment_state_lost"
                 ),
                 "source": "m365-hermes-native-attachments",
-                    "reason": "native attachment state loss failed closed",
-                }
+                "reason": "native attachment state loss failed closed",
+            }
         if not state.get("route"):
             session_key = state.get("session_key", key[0])
             return {
@@ -869,12 +783,12 @@ def _request_target(base_url: str, endpoint: str, *, test_only: bool = False) ->
             root = path + "/hermes/v1"
         return parsed.hostname, parsed.port, root.rstrip("/") + "/attachments/" + endpoint, parsed.scheme == "https"
     except (TypeError, ValueError):
-        raise _AttachmentFailure("stage_transport_failed") from None
+        raise _AttachmentFailure("native_attachment_binding_invalid") from None
 
 
 def _connection(host: str, port: int | None, secure: bool) -> http.client.HTTPConnection:
     if not secure:
-        raise _AttachmentFailure("stage_transport_failed")
+        raise _AttachmentFailure("native_attachment_binding_invalid")
     return http.client.HTTPSConnection(host, port=port, timeout=300)
 
 
@@ -966,45 +880,38 @@ def _release_operation(key: TurnKey, operation_lock: threading.Lock) -> None:
 
 
 def _attach_once(args: Any, key: TurnKey) -> str:
-    with _lock:
-        if key in _ended:
-            return _tool_error("stage_transport_failed")
     files = args.get("files") if isinstance(args, dict) else None
     if not isinstance(files, list) or not 1 <= len(files) <= _MAX_NATIVE_ATTACHMENTS:
         _clear_turn(key, {"ok": False, "error": "invalid_attachment_count"})
         return _tool_error("invalid_attachment_count")
     with _lock:
+        if key in _ended:
+            return _tool_error("native_attachment_binding_invalid")
         state = copy.deepcopy(_sessions.get(key))
     if not state or not state.get("route"):
-        _clear_turn(key, {"ok": False, "error": "stage_transport_failed"})
-        return _tool_error("stage_transport_failed")
-    if not _retry_pending_ends(state["route"], state["session_key"]):
-        _clear_turn(key, {"ok": False, "error": "stage_transport_failed"})
-        return _tool_error("stage_transport_failed")
-    if not _turn_route(state["route"], state["session_key"], key[1], "bind"):
-        _clear_turn(key, {"ok": False, "error": "stage_transport_failed"})
-        return _tool_error("stage_transport_failed")
+        _clear_turn(key, {"ok": False, "error": "native_attachment_binding_invalid"})
+        return _tool_error("native_attachment_binding_invalid")
     staged: list[dict[str, Any]] = []
     opened_files: list[_OpenedFile] = []
     try:
         for item in files:
             if not isinstance(item, dict) or not set(item).issubset(_ALLOWED_FILE_KEYS):
-                raise _AttachmentFailure("stage_transport_failed")
+                raise _AttachmentFailure("native_attachment_context_malformed")
             opened = _open_allowed_file(item.get("local_path"))
             opened_files.append(opened)
             filename = opened.path.name
             if len(filename) > 512 or not filename or _has_control(filename):
-                raise _AttachmentFailure("stage_transport_failed")
+                raise _AttachmentFailure("native_attachment_context_malformed")
             extension = _extension(filename)
             if len(extension) > 64:
-                raise _AttachmentFailure("stage_transport_failed")
+                raise _AttachmentFailure("native_attachment_context_malformed")
             attachment_id = item.get("attachment_id", "")
             source_message_id = item.get("source_message_id", "")
             for value in (attachment_id, source_message_id):
                 if value is not None and (
                     not isinstance(value, str) or len(value) > 512 or _has_control(value)
                 ):
-                    raise _AttachmentFailure("stage_transport_failed")
+                    raise _AttachmentFailure("native_attachment_context_malformed")
             expected = item.get("expected_sha256")
             if expected is not None and (
                 not isinstance(expected, str) or not _SHA256.fullmatch(expected)
@@ -1024,7 +931,7 @@ def _attach_once(args: Any, key: TurnKey) -> str:
             if expected is not None and expected != reference["sha256"]:
                 raise _AttachmentFailure("hash_mismatch")
             if any(item["stage_ref"] == reference["stage_ref"] for item in staged[:-1]):
-                raise _AttachmentFailure("stage_transport_failed", [reference["stage_ref"]])
+                raise _AttachmentFailure("native_attachment_integrity_failed", [reference["stage_ref"]])
     except _AttachmentFailure as failure:
         rollback_refs = [item["stage_ref"] for item in staged]
         rollback_refs.extend(failure.stage_refs)
@@ -1041,8 +948,8 @@ def _attach_once(args: Any, key: TurnKey) -> str:
         )
         for opened in opened_files:
             opened.handle.close()
-        _clear_turn(key, {"ok": False, "error": "stage_transport_failed"})
-        return _tool_error("stage_transport_failed")
+        _clear_turn(key, {"ok": False, "error": "native_attachment_context_malformed"})
+        return _tool_error("native_attachment_context_malformed")
     finally:
         for opened in opened_files:
             if not opened.handle.closed:
@@ -1052,8 +959,7 @@ def _attach_once(args: Any, key: TurnKey) -> str:
     with _lock:
         current = _sessions.get(key)
         if (
-            key in _ended
-            or current is None
+            current is None
             or current.get("route") != state["route"]
             or current.get("session_key") != state["session_key"]
         ):
@@ -1067,7 +973,7 @@ def _attach_once(args: Any, key: TurnKey) -> str:
             state["route"], state["session_key"], key[1],
             [item["stage_ref"] for item in staged],
         )
-        return _tool_error("stage_transport_failed")
+        return _tool_error("native_attachment_binding_invalid")
     new_refs = {item["stage_ref"] for item in staged}
     obsolete_refs = [
         reference["stage_ref"]
@@ -1081,7 +987,7 @@ def _attach_once(args: Any, key: TurnKey) -> str:
 def _attach(args: Any, key: TurnKey) -> str:
     operation_lock = _try_acquire_operation(key)
     if operation_lock is None:
-        return _tool_error("stage_transport_failed")
+        return _tool_error("native_attachment_binding_invalid")
     try:
         return _attach_once(args, key)
     finally:
@@ -1096,15 +1002,12 @@ def m365_native_attach(args: dict[str, Any], session_id: str = "", turn_id: str 
         turn_id = identity.get("turn_id", turn_id)
     key = _turn_key(session_id, turn_id)
     if key is None:
-        return _tool_error("stage_transport_failed")
+        return _tool_error("native_attachment_binding_invalid")
     try:
         return _attach(args, key)
     except Exception:
-        with _lock:
-            ended = key in _ended
-        if not ended:
-            _clear_turn(key, {"ok": False, "error": "stage_transport_failed"})
-        return _tool_error("stage_transport_failed")
+        _clear_turn(key, {"ok": False, "error": "native_attachment_context_malformed"})
+        return _tool_error("native_attachment_context_malformed")
 
 
 def on_session_end(session_id: Any = "", turn_id: Any = "", **_: Any) -> None:
@@ -1116,25 +1019,31 @@ def on_session_end(session_id: Any = "", turn_id: Any = "", **_: Any) -> None:
         _ended.move_to_end(key)
         while len(_ended) > _MAX_ENDED_TURNS:
             _ended.popitem(last=False)
-        state = copy.deepcopy(_sessions.get(key))
-    route = state.get("route", "") if state else ""
-    session_key = state.get("session_key", key[0]) if state else key[0]
-    _clear_turn(key)
-    if route:
-        _remember_pending_end(key, route, session_key)
-        if _turn_route(route, session_key, key[1], "end"):
-            _forget_pending_end(key)
-    with _lock:
-        _sessions.pop(key, None)
+        state = _sessions.pop(key, None)
         _outcomes.pop(key, None)
+    if state:
+        _release_route(
+            state.get("route", ""), state.get("session_key", key[0]), key[1],
+            [ref["stage_ref"] for ref in state.get("refs", [])],
+        )
 
 
-def on_session_reset(session_id: Any = "", turn_id: Any = "", **kwargs: Any) -> None:
-    on_session_end(session_id, turn_id, **kwargs)
+def _clear_session(session_id: Any) -> None:
+    session = _text_identity(session_id)
+    if session is None:
+        return
+    with _lock:
+        keys = {key for key in (*_sessions, *_outcomes) if key[0] == session}
+    for key in keys:
+        on_session_end(*key)
 
 
-def on_session_finalize(session_id: Any = "", turn_id: Any = "", **kwargs: Any) -> None:
-    on_session_end(session_id, turn_id, **kwargs)
+def on_session_reset(session_id: Any = "", old_session_id: Any = "", **_: Any) -> None:
+    _clear_session(old_session_id or session_id)
+
+
+def on_session_finalize(session_id: Any = "", **_: Any) -> None:
+    _clear_session(session_id)
 
 
 _TOOL_SCHEMA = {
@@ -1186,3 +1095,5 @@ def register(ctx: Any) -> None:
     ctx.register_middleware("tool_request", on_tool_request)
     ctx.register_middleware("llm_request", on_llm_request)
     ctx.register_hook("on_session_end", on_session_end)
+    ctx.register_hook("on_session_reset", on_session_reset)
+    ctx.register_hook("on_session_finalize", on_session_finalize)
