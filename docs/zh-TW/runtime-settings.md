@@ -64,9 +64,11 @@ Current defaults：
 | generic / Memory tool rounds | `16` |
 | Hermes tool rounds | `128` |
 
+只有 `hermesMaxToolRounds` 的明確 `0` 表示 Hermes 工具輪數無限制。正數仍為有限輪數；省略欄位保留已保存值。`M365_HERMES_MAX_TOOL_ROUNDS=0` 可直接覆蓋保存值，管理頁顯示 effective value 與 `env` 來源。空白、負數及非整數不能啟用無限制。一般／Memory 輪數與每輪工具呼叫數維持原有限制。
+
 `contextWindow` 是 token-oriented model metadata，不能和 `textInputLimitUTF16` 混為同一限制。
 
-Tool round ceiling 是 runaway protection。耗盡時回 terminal `tool_round_limit`，不是要求 Gateway 自動開新 execution。
+有限的 tool round ceiling 耗盡時回 terminal `tool_round_limit`。Hermes 設為 `0` 時只略過輪數比較，仍檢查工具結果與安全續接。
 
 ## Telemetry 與 privacy
 

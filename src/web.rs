@@ -3225,6 +3225,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hermes_zero_admin_put_is_durable_and_omission_preserves_it() {
+        let gateway = gateway();
+        let login = gateway
+            .admin
+            .login("correct-password", "127.0.0.1", OffsetDateTime::now_utc())
+            .unwrap();
+        let app = Gateway::router(gateway.clone());
+        for (patch, expected) in [
+            (
+                serde_json::json!({"hermesMaxToolRounds": 0}),
+                StatusCode::OK,
+            ),
+            (
+                serde_json::json!({"chatTimeoutSeconds": 321}),
+                StatusCode::OK,
+            ),
+            (
+                serde_json::json!({"hermesMaxToolRounds": null}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"hermesMaxToolRounds": -1}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"hermesMaxToolRounds": 1.5}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"hermesMaxToolRounds": ""}),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put("/api/admin/settings")
+                        .header(header::HOST, "127.0.0.1")
+                        .header(header::ORIGIN, "http://127.0.0.1")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                        .body(Body::from(patch.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(gateway.settings.current().hermes_max_tool_rounds, 0);
+        }
+        let root = gateway.tokens.path().parent().unwrap();
+        let reloaded =
+            crate::runtime_settings::Store::open(root, &Config::for_test(root.to_path_buf()))
+                .unwrap();
+        assert_eq!(reloaded.current().hermes_max_tool_rounds, 0);
+        let response = app
+            .oneshot(
+                Request::get("/api/admin/settings")
+                    .header(header::HOST, "127.0.0.1")
+                    .header(header::COOKIE, format!("{ADMIN_COOKIE}={}", login.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(value["toolRoundPolicy"]["hermes"], 0);
+        assert_eq!(
+            value["settingStatus"]["hermesMaxToolRounds"]["source"],
+            "file"
+        );
+        assert_eq!(
+            value["settingStatus"]["hermesMaxToolRounds"]["effective"],
+            0
+        );
+        assert_eq!(value["toolRoundPolicy"]["generic"], 16);
+        assert_eq!(value["toolRoundPolicy"]["memory"], 16);
+    }
+
+    #[tokio::test]
     async fn test_chat_mode_restore_failure_is_typed_and_leaves_recovery_required() {
         let gateway = gateway();
         seed_checkpoint(&gateway);

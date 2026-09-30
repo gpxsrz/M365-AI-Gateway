@@ -64,9 +64,11 @@ Current defaults:
 | generic / Memory tool rounds | `16` |
 | Hermes tool rounds | `128` |
 
+Only an explicit `hermesMaxToolRounds` value of `0` means unlimited Hermes tool rounds. Positive values remain finite, and omitting the field preserves the saved value. `M365_HERMES_MAX_TOOL_ROUNDS=0` directly overrides it; the admin page shows the effective value and `env` source. Blank, negative, and non-integer values do not enable unlimited rounds. Generic/Memory round limits and tool calls per turn remain finite.
+
 `contextWindow` is token-oriented model metadata and is not the same limit as `textInputLimitUTF16`.
 
-The tool-round ceiling is runaway protection. Exhaustion returns terminal `tool_round_limit`; it does not instruct the gateway to create a new execution.
+A finite tool-round ceiling returns terminal `tool_round_limit` when exhausted. Hermes `0` skips only the round comparison; tool-result and safe-continuation checks still apply.
 
 ## Telemetry and privacy
 

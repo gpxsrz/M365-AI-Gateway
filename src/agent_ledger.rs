@@ -185,8 +185,7 @@ pub(crate) struct AgentLedger {
 
 impl AgentLedger {
     pub(crate) fn can_continue(&self, limit: usize) -> Result<(), String> {
-        let limit = if limit == 0 { 16 } else { limit };
-        if self.tool_rounds >= limit {
+        if limit != 0 && self.tool_rounds >= limit {
             return Err(format!("tool round limit reached: {limit}"));
         }
         if !self.pending.is_empty() {
@@ -813,6 +812,18 @@ mod tests {
             tool_call_id: id.to_owned(),
             ..OpenAiMessage::default()
         }
+    }
+
+    #[test]
+    fn zero_round_limit_keeps_protocol_checks_after_513_rounds() {
+        let ledger = AgentLedger {
+            tool_rounds: 513,
+            ..AgentLedger::default()
+        };
+        assert!(ledger.can_continue(0).is_ok());
+        assert!(ledger.can_continue(512).is_err());
+        let pending = build(&[call("pending", "inspect", "{}")]);
+        assert!(pending.can_continue(0).is_err());
     }
 
     #[test]

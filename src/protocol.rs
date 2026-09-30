@@ -19026,6 +19026,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hermes_explicit_zero_passes_128_500_and_512_round_boundaries() {
+        let (gateway, key) = gateway_with_chat_and_oauth(Arc::new(FixedTransport), oauth());
+        let mut settings = gateway.settings.current();
+        settings.hermes_max_tool_rounds = 0;
+        settings.text_input_limit_utf16 = 4_000_000; // Fixture isolates the round policy.
+        gateway.settings.save(settings).unwrap();
+        let app = Gateway::router(gateway.clone());
+        for rounds in [128, 129, 500, 501, 512, 513] {
+            let mut messages = vec![json!({"role":"user","content":"Continue synthetic tools."})];
+            for round in 0..rounds {
+                let id = format!("call-{round}");
+                messages.push(json!({
+                    "role":"assistant", "content":null,
+                    "tool_calls":[{"id":id,"type":"function",
+                        "function":{"name":"inspect","arguments":"{}"}}]
+                }));
+                messages.push(json!({"role":"tool","tool_call_id":id,"content":"ok"}));
+            }
+            let request = json!({"model":"gpt-5.6-terra","messages":messages});
+            let (status, body) = syntax_public_response(&app, &key, &request).await;
+            assert_eq!(status, StatusCode::OK, "rounds={rounds}, body={body}");
+        }
+    }
+
+    #[tokio::test]
     async fn unexpected_tool_result_fails_before_upstream() {
         let (app, raw_key) = app();
         let response = app

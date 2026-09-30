@@ -40,7 +40,7 @@ impl Config {
             text_input_limit_utf16: env_usize("M365_TEXT_INPUT_LIMIT_UTF16", 128_000, 1)?,
             max_tool_calls_per_turn: env_usize("M365_MAX_TOOL_CALLS_PER_TURN", 2, 1)?,
             max_tool_rounds: env_usize("M365_MAX_TOOL_ROUNDS", 16, 1)?,
-            hermes_max_tool_rounds: env_usize("M365_HERMES_MAX_TOOL_ROUNDS", 128, 1)?,
+            hermes_max_tool_rounds: env_usize("M365_HERMES_MAX_TOOL_ROUNDS", 128, 0)?,
         })
     }
 

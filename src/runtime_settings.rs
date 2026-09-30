@@ -241,7 +241,7 @@ pub fn configured_hermes_max_tool_rounds(settings: &RuntimeSettings) -> usize {
         "M365_HERMES_MAX_TOOL_ROUNDS",
         settings.hermes_max_tool_rounds,
         128,
-        1,
+        0,
         512,
     )
 }
@@ -317,7 +317,7 @@ pub fn validate(settings: &RuntimeSettings) -> Result<(), String> {
     )?;
     bounded(settings.max_tool_calls_per_turn, 1, 64, "每輪工具呼叫數")?;
     bounded(settings.max_tool_rounds, 1, 512, "一般工具輪次")?;
-    bounded(settings.hermes_max_tool_rounds, 1, 512, "Hermes 工具輪次")?;
+    bounded(settings.hermes_max_tool_rounds, 0, 512, "Hermes 工具輪次")?;
     bounded(settings.chat_timeout_seconds as usize, 5, 3_600, "聊天逾時")?;
     bounded(
         settings.image_timeout_seconds as usize,
@@ -616,6 +616,22 @@ mod tests {
         assert_eq!(direct_override_value(Some("9999"), 32, 16, 1, 512), 16);
         assert_eq!(direct_override_value(Some("bad"), 32, 16, 1, 512), 16);
         assert_eq!(direct_override_value(None, 32, 16, 1, 512), 32);
+    }
+
+    #[test]
+    fn only_explicit_hermes_zero_is_unlimited() {
+        let mut settings = RuntimeSettings {
+            hermes_max_tool_rounds: 0,
+            ..RuntimeSettings::default()
+        };
+        validate(&settings).unwrap();
+        assert_eq!(direct_override_value(None, 0, 128, 0, 512), 0);
+        assert_eq!(direct_override_value(Some("0"), 128, 128, 0, 512), 0);
+        for bad in ["", " ", "-1", "1.2", "513"] {
+            assert_eq!(direct_override_value(Some(bad), 0, 128, 0, 512), 128);
+        }
+        settings.max_tool_rounds = 0;
+        assert!(validate(&settings).is_err());
     }
 
     #[test]
