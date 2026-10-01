@@ -46,7 +46,7 @@ After learning historical behavior, prove the conclusion again with current Rust
 | Chat Completions | non-stream / SSE, tools, usage, input policy, checkpoints |
 | Responses | Responses request/continuation projection |
 | Anthropic | Messages / tools / media projection |
-| Hermes | execution provenance, transport ledger, checkpoint / replay safety |
+| Hermes | execution provenance, stateless ordinary transport, explicit checkpoint recovery; explicit checkpoint adapters retain replay safety |
 | Hindsight | Memory queue, overflow, webhook, durability barrier |
 | OAuth | single-account credential lifecycle |
 | Files / Vision | validated transport and grounding |

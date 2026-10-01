@@ -16,7 +16,7 @@
 | Work | Route | Continuation semantics |
 |---|---|---|
 | General auxiliary / control work | `/v1/chat/completions` | ForceNew / untracked transport; no Hermes execution evidence inheritance |
-| Hermes / Atlas | `/hermes/v1/chat/completions` | may use Hermes execution identity, checkpoints, and duplicate-effect protection |
+| Hermes / Atlas | `/hermes/v1/chat/completions` | ordinary requests use the current complete messages in a fresh Microsoft Private conversation; explicit checkpoint adapters retain their separate contract |
 | Hindsight | `/memory/v1/chat/completions` | Memory queue class; no Hermes checkpoint authority |
 
 Model catalogs are also separated as `/v1/models`, `/hermes/v1/models`, and `/memory/v1/models` so consumers do not have to infer the profile.
@@ -28,7 +28,7 @@ Do not confuse M365's configured UTF-16 transport policy with the Hermes/model t
 - M365 `textInputLimitUTF16`: text policy before transport;
 - Hermes/model context: token-based context quality and compression policy.
 
-For non-Memory chat, M365 first evaluates the canonical inline text. When the effective text limit is exceeded, it directly places the current request's complete model-facing message projection in one deterministic `m365-full-context/v1` `.txt` attachment while keeping the current user ask, system/developer control, tool definitions/protocol, and required latest complete tool exchange inline. It does not use a largest-first bulk-candidate strategy. The document is not session history, memory, or a new governance authority, and it does not change Hermes checkpoint, ledger, compression, or replay contracts. Memory traffic does not use this auto-spill behavior.
+For non-Memory chat, M365 first evaluates the canonical inline text. When the effective text limit is exceeded, it directly places the current request's complete model-facing message projection in one deterministic `m365-full-context/v1` `.txt` attachment while keeping the current user ask, system/developer control, tool definitions/protocol, and required latest complete tool exchange inline. It does not use a largest-first bulk-candidate strategy. The document is a projection of the current request, not session history, memory, or a new governance authority. Explicit checkpoint adapters retain their own continuation contract. Memory traffic does not use this auto-spill behavior.
 
 Hermes compression should therefore be driven by model-context quality rather than by an old M365 transport threshold. When a full-context document is generated, Chat Completions usage reports `m365.usage_estimate_scope=full_context_document_and_inline_projection`; the document and non-overlapping inline projection are included in the transport estimate, so the caller can see context pressure. This does not change Hermes's compression policy. Effective context/compression values belong to the current Hermes profile and are not pinned to one upstream version in M365 public docs.
 
@@ -51,7 +51,7 @@ Hermes integration uses the versioned repository plugin under `integrations/herm
 Core rules:
 
 1. Stable execution identity comes from a trusted Hermes stock execution/session seam.
-2. The M365 wire `session_key` is transport checkpoint input, not caller-declared authority.
+2. The signed M365 wire `session_key` identifies the Hermes execution for provenance. It does not enable an implicit history checkpoint or an ordinary checkpoint lookup.
 3. Plugin and gateway share `M365_HERMES_RECALL_PROVENANCE_SECRET` for content-free provenance verification.
 4. `M365_HERMES_PROVIDER` may scope the plugin to the intended named provider.
 5. Session, transcript, tool call, tool result, or recovery-sequence drift invalidates previous provenance for retargeting.
@@ -73,9 +73,9 @@ Deployment/runtime wiring exposes names only; values must not enter the reposito
 
 ## Tool continuation and duplicate effects
 
-The Hermes transport ledger may recognize an already completed exact tool call, suppress the same transport effect, and request one bounded continuation that preserves the caller's tool contract when needed; only candidates rejected by the safety check are removed. If the continuation again receives only an unsafe replay, non-streaming returns typed HTTP `409 unsafe_tool_replay`; streaming emits the same error code and ends. If the original choice was `required` or a specific tool choice and no legal call is produced, it returns `tool_choice_unsatisfied`. Neither accepts a successful final or checkpoint.
+Ordinary Hermes requests do not suppress a new model tool call because an earlier request returned the same tool and arguments. A valid new call reaches the caller with `finish_reason=tool_calls`; a pure text answer remains `stop`. The gateway still checks current-request call/result pairing, candidate format, tool choice, and duplicates within one model output. The tool domain owns retries and receipts for effects.
 
-This answers “do we already have evidence for this transport tool effect?” It does not answer “is the Agent task complete?” Task / Run semantic completion remains an ACP acceptance decision.
+Explicit checkpoint adapters retain their existing history and replay protections. Historical `in_flight` and `terminal_unknown` Hermes checkpoint records remain on the explicit recovery path and do not block ordinary requests. Task / Run semantic completion remains an ACP acceptance decision.
 
 Hermes has a separate tool-round safety ceiling from generic/Memory traffic. Exact defaults and effective values are maintained only in [`runtime-settings.md`](runtime-settings.md). Exhaustion returns terminal `tool_round_limit`; it does not create a new execution automatically.
 

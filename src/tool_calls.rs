@@ -40,6 +40,7 @@ pub enum ToolRejectionClass {
     MoreCallsThanAllowed,
     KnownToolDisallowedByToolChoice,
     UnknownToolFence,
+    ArgumentsSchemaMismatch,
     Other,
 }
 
@@ -58,6 +59,7 @@ impl ToolRejectionClass {
             Self::MoreCallsThanAllowed => "more_calls_than_allowed",
             Self::KnownToolDisallowedByToolChoice => "known_tool_disallowed_by_tool_choice",
             Self::UnknownToolFence => "unknown_tool_fence",
+            Self::ArgumentsSchemaMismatch => "arguments_schema_mismatch",
             Self::Other => "other",
         }
     }
@@ -419,6 +421,54 @@ impl ToolDiagnostic {
 }
 
 pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> ToolProjection {
+    project_inner(text, tools, choice, limit, false)
+}
+
+pub(crate) fn project_ordinary_hermes(
+    text: &str,
+    tools: &[Tool],
+    choice: &Value,
+    limit: usize,
+) -> ToolProjection {
+    let mut projection = project_inner(text, tools, choice, limit, true);
+    if projection.rejected {
+        return projection;
+    }
+    let invalid_arguments = projection.calls.iter().find_map(|call| {
+        let name = call.function.get("name")?.as_str()?;
+        let arguments = call.function.get("arguments")?.as_str()?;
+        let schema = tool(tools, name)?.function.get("parameters")?;
+        let valid = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                jsonschema::validator_for(schema)
+                    .ok()
+                    .map(|validator| validator.is_valid(&value))
+            })
+            .unwrap_or(false);
+        (!valid).then(|| arguments.to_owned())
+    });
+    if let Some(arguments) = invalid_arguments {
+        projection.calls.clear();
+        reject(
+            &mut projection,
+            ToolRejectionClass::ArgumentsSchemaMismatch,
+            &arguments,
+            text,
+            tools,
+            None,
+        );
+    }
+    projection
+}
+
+fn project_inner(
+    text: &str,
+    tools: &[Tool],
+    choice: &Value,
+    limit: usize,
+    allow_trailing_text: bool,
+) -> ToolProjection {
     if tools.is_empty() {
         return ToolProjection {
             content: text.to_owned(),
@@ -443,6 +493,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                 &mut pre_call_content,
                 text,
                 tools,
+                allow_trailing_text,
             );
             cursor += 1;
             continue;
@@ -454,6 +505,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                 &mut pre_call_content,
                 text,
                 tools,
+                allow_trailing_text,
             );
             cursor += 1;
             continue;
@@ -516,6 +568,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                     &mut pre_call_content,
                     text,
                     tools,
+                    allow_trailing_text,
                 );
                 cursor += 1;
             } else {
@@ -535,6 +588,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                     &mut pre_call_content,
                     text,
                     tools,
+                    allow_trailing_text,
                 );
                 cursor += 1;
             }
@@ -577,6 +631,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                     &mut pre_call_content,
                     text,
                     tools,
+                    allow_trailing_text,
                 );
             }
         } else {
@@ -597,6 +652,7 @@ pub fn project(text: &str, tools: &[Tool], choice: &Value, limit: usize) -> Tool
                     &mut pre_call_content,
                     text,
                     tools,
+                    allow_trailing_text,
                 );
             }
         }
@@ -934,15 +990,17 @@ fn append_projection_content(
     pre_call_content: &mut bool,
     full_text: &str,
     tools: &[Tool],
+    allow_trailing_text: bool,
 ) {
     if output.calls.is_empty() && !line.trim().is_empty() {
         *pre_call_content = true;
     }
-    // A structured call must be the complete executable projection. Any
-    // non-whitespace material after it makes the candidate ambiguous (for
-    // example, a second Markdown/code example), so the caller must fail
-    // closed instead of executing only the first block.
-    if !output.calls.is_empty() && !line.trim().is_empty() {
+    // Generic projection rejects trailing prose. Ordinary Hermes preserves
+    // prose around one call but still rejects a second fenced candidate.
+    if !output.calls.is_empty()
+        && !line.trim().is_empty()
+        && (!allow_trailing_text || line.trim_start().starts_with("```"))
+    {
         let class = if line.trim_start().starts_with("```") {
             ToolRejectionClass::DuplicateOrAmbiguous
         } else {

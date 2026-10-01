@@ -24,10 +24,10 @@
 ## Tools 與 continuation
 
 - Parallel tools只在所有可選tool都明確read-only時開放；不能只看tool名稱猜測。
-- Tool round有bounded safety ceiling，不是無限agent loop。
+- Generic／Memory tool round 保留既有上限；Hermes 的 `0` 表示無限制，但不會把模型純文字回答強制變成工具呼叫。
 - 已送出的unknown transport outcome不能盲目retry；要先靠checkpoint / durable evidence判斷。
-- Hermes duplicate-effect protection只保護transport effect，不證明Task acceptance。
-- 若一次 bounded continuation 遇到被安全檢查拒絕的重播，Gateway只阻止該候選；保留caller原本的工具契約，讓不同且可解析的下一個tool call繼續。重播再次出現且沒有合法下一步時，非串流回 typed HTTP `409 unsafe_tool_replay`，串流送出同一錯誤代碼後結束；若原本是 `required` 或特定工具選擇而沒有合法 call，則回 `tool_choice_unsatisfied`。兩者都不產生成功checkpoint。
+- 普通 Hermes 不因前次相同工具參數而攔截新 call。副作用重試與 receipt 由工具領域負責；Gateway 仍檢查同批重複與當次 call/result 配對。
+- 明確 checkpoint adapter 保留 replay 保護；舊 Hermes `in_flight` 與 `terminal_unknown` 保留在明確 recovery 路徑，不阻擋普通請求。
 - Hermes的大型單行JSON即使已完整存成 persisted output，原生`read_file`仍可能受`max_line_length`截斷，且零換行單行的`total_lines`／`truncated` metadata不能單獨證明完整。應使用既有 terminal或`execute_code`在原檔解析，只輸出指定欄位或有限字元範圍；這不是 M365 full-context TXT spill。
 
 ## Microsoft surface variability

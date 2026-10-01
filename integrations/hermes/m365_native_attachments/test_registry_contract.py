@@ -37,7 +37,7 @@ class HermesRegistryContractTests(unittest.TestCase):
             runtime_root.mkdir()
             for filename in ("__init__.py", "plugin.yaml"):
                 shutil.copy2(Path(plugin_root) / filename, runtime_root / filename)
-            manager = PluginManager(scope_key=home)
+            manager = PluginManager(scope_key=str(Path(home).resolve()))
             # Hermes' post-2026-09-14 compatibility scanner evaluates external
             # plugin directories.  The source tree also contains this test file,
             # whose imports are not part of the runtime plugin.  Stage only the
@@ -46,12 +46,12 @@ class HermesRegistryContractTests(unittest.TestCase):
             manifest.path = str(runtime_root)
             manifest.source = "bundled"
             manager._load_plugin(manifest)
-            with _plugin_home_scope(Path(home)):
+            with _plugin_home_scope(manager.home_path):
                 definitions = registry.get_definitions(
                     {"m365_native_attach"}, quiet=True
                 )
                 entry = registry.get_entry(
-                    "m365_native_attach", scope=home
+                    "m365_native_attach", scope=manager.scope_key
                 )
 
             self.assertIsNotNone(entry)

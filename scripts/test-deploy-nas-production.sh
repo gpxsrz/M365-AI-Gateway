@@ -559,15 +559,15 @@ cmp -s "$tmp/rollback-index" "$remote/app/web/index.html" || { echo "FAIL: rollb
 cmp -s "$tmp/rollback-login" "$remote/app/web/login.html" || { echo "FAIL: rollback did not restore login" >&2; exit 1; }
 cmp -s "$tmp/rollback-debug" "$remote/app/web/debug.html" || { echo "FAIL: rollback did not restore debug" >&2; exit 1; }
 cmp -s "$tmp/rollback-compose" "$remote/compose.yaml" || { echo "FAIL: rollback did not restore compose" >&2; exit 1; }
-cmp -s "$tmp/rollback-settings" "$remote/data/settings.json" || { echo "FAIL: rollback did not restore settings" >&2; exit 1; }
-cmp -s "$tmp/rollback-checkpoints" "$remote/data/transport-checkpoints.json" || { echo "FAIL: rollback did not restore checkpoint state" >&2; exit 1; }
-cmp -s "$tmp/rollback-checkpoint-key" "$remote/data/.transport-checkpoints.json.key" || { echo "FAIL: rollback did not restore checkpoint integrity key" >&2; exit 1; }
+cmp -s "$tmp/rollback-settings" "$remote/data/settings.json" || { echo "FAIL: rollback changed settings" >&2; exit 1; }
+grep -Fq 'candidate-checkpoint' "$remote/data/transport-checkpoints.json" || { echo "FAIL: rollback overwrote later checkpoint state" >&2; exit 1; }
+grep -Fq 'candidate-integrity-key' "$remote/data/.transport-checkpoints.json.key" || { echo "FAIL: rollback overwrote later checkpoint integrity key" >&2; exit 1; }
 if find "$remote" -maxdepth 1 -type d -name '.deploy-backup-*' | grep -q .; then
   echo "FAIL: successful rollback left backup directory behind" >&2
   exit 1
 fi
 
-echo "PASS: injected failure rolls back runtime and checkpoint state together"
+echo "PASS: injected failure rolls back runtime without overwriting later checkpoint state"
 
 rm -rf "$remote"/.deploy-backup-*
 : > "$SSH_LOG"
@@ -728,10 +728,10 @@ if [[ $rc -ne 42 ]]; then
   exit 1
 fi
 grep -Fq 'rollback succeeded' "$tmp/rollback-absent.err" || { echo "FAIL: absent-state rollback did not report success" >&2; cat "$tmp/rollback-absent.err" >&2; exit 1; }
-[[ ! -e "$remote/data/transport-checkpoints.json" ]] || { echo "FAIL: rollback retained candidate-created checkpoint state" >&2; exit 1; }
-[[ ! -e "$remote/data/.transport-checkpoints.json.key" ]] || { echo "FAIL: rollback retained candidate-created checkpoint key" >&2; exit 1; }
+grep -Fq 'candidate-checkpoint' "$remote/data/transport-checkpoints.json" || { echo "FAIL: rollback deleted new checkpoint state" >&2; exit 1; }
+grep -Fq 'candidate-integrity-key' "$remote/data/.transport-checkpoints.json.key" || { echo "FAIL: rollback deleted new checkpoint integrity key" >&2; exit 1; }
 
-echo "PASS: rollback restores predeploy absence of checkpoint state and key"
+echo "PASS: rollback preserves checkpoint state and key created after deployment"
 
 unset DOCKER_MUTATE_CHECKPOINT_ON_FIRST_UP DOCKER_CHECKPOINT_PATH DOCKER_CHECKPOINT_KEY_PATH DOCKER_STOP_MARKER CP_REQUIRE_STOP_FOR
 

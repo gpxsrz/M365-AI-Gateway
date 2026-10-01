@@ -64,7 +64,7 @@ Projection 契約是：
 
 Effective 128K `textInputLimitUTF16` gate 約束的是 canonical ChatHub `message.text` 的 UTF-16 code units，由 `outbound_message_text()` 建立；其中包含 caller tool protocol、caller tool definitions 與 request text。這個限制不會自動套到外層 serialized ChatHub JSON、plugins、annotations 或 transport bytes。Gateway 仍會另外量測完整 serialized payload 作為 bounded diagnostics；本契約沒有宣稱存在另一個同為 128K 的 ChatHub payload limit。Attachment preparation 仍由 producer enforce 自己的 metadata bounds，`LiveChatHub` 也會在 upstream-start hook 前記錄準備完成後的 exact payload。
 
-Projection 前後的 fit check 都走同一個 canonical `message.text` builder。Full-context TXT 因此是在真正受限制的欄位中騰出空間，不會因重複的工具 schema 或 envelope metadata 讓無關的診斷 payload 變大就拒絕。Final-answer continuation 會繼承 caller 原本的 tool definitions、`tool_choice` 與 `tool_call_limit`，並在同一個 builder 中加入 transport continuation context、prepared attachment annotations 與 conversation/session binding；只移除被安全檢查拒絕的候選，不撤銷整組工具契約。若 bounded projection 後 message text 仍無法 fit，request 會在 upstream 前安全結束，依階段回報 `preliminary_outbound` 或 `final_outbound`。若一次 bounded continuation 又只收到被拒絕的重播，非串流回 typed HTTP `409 tool_protocol_error / unsafe_tool_replay`；串流則送出同一個 typed SSE error 後結束。若原本是 `required` 或特定工具選擇而續接沒有合法 call，兩種模式也都回 typed `tool_choice_unsatisfied`，不接受成功 final 或 checkpoint。既有 `received` 欄位仍表示搬移前 caller role-envelope 長度，不是搬移後剩餘的 message-text 長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。Projection 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
+Projection 前後的 fit check 都走同一個 canonical `message.text` builder。Full-context TXT 因此是在真正受限制的欄位中騰出空間，不會因重複的工具 schema 或 envelope metadata 讓無關的診斷 payload 變大就拒絕。明確 checkpoint adapter 的 bounded continuation 保留 caller 工具契約與原有安全檢查。若 bounded projection 後 message text 仍無法 fit，request 會在 upstream 前安全結束，依階段回報 `preliminary_outbound` 或 `final_outbound`。普通 Hermes 請求不進入 completed-call suppression 或 final-answer continuation。既有 `received` 欄位仍表示搬移前 caller role-envelope 長度，不是搬移後剩餘的 message-text 長度。文件不嵌入 user attachment 的 binary/base64，也不放 HTTP debug、credential、private URL 或未曾提供給模型的資料。Projection 不改 canonical messages、tool identity、checkpoint、ledger、HMAC 或 replay 語意；Memory route 仍不 auto-spill。
 
 公開 synthetic qualification input 是 [`fixtures/long-context-tool-calls.json`](../../fixtures/long-context-tool-calls.json)：50 個 model-facing messages、已完成的 tool-call/result pairs、compressed summary、29 個 tool definitions，以及 deterministic 的長 Python／shell argument expansion。它不含 private capture，只用於 transport qualification。
 
@@ -139,7 +139,7 @@ Full-context TXT 是 transport projection，不保證模型已讀完、正確使
 
 - 只有所有可選 tools 都明確 `annotations.readOnlyHint=true`，且沒有 mutating/destructive 訊號時，才允許 parallel tool calls。
 - 多訊息 role envelope 會在 caller-managed tool call/result 上標示 `execution_surface=caller_tool`。這是 transport provenance，不是 Microsoft native execution 或 Task completion 的證明；native event 不得取代 caller tool evidence。
-- 已有完成證據的相同 read-only caller call，在目前 tool contract 明確安全時可以用新的 call identity 做合法 readback；pending/unknown、未明確 read-only 或同一批次重複仍會 fail closed。
+- 普通 Hermes 可投影與前次已完成呼叫相同工具及參數的新合法 call；同一模型輸出內重複候選與當次 call/result 配對無效仍 fail closed。明確 checkpoint adapter 保留既有 replay 契約。
 - `tool_calls[].id` 與後續 `tool_call_id` 必須一致。
 - Arguments、result bytes 與 digest 不能在 repair / checkpoint 中被猜測或截半後補造。
 - Structured tool result 若明確標示 partial、cancelled/canceled、incomplete 或 `complete=false`，不能因 `exit_code=0` 就升格成成功。
@@ -164,7 +164,7 @@ Full-context TXT 是 transport projection，不保證模型已讀完、正確使
 展示 card 的 `text` 永遠不替換原始 model text；原始候選仍由既有 strict parser 驗證，card 與候選保持不同 identity。
 已驗證的 `TextBlock.text` 與同類回應文字使用內容預算：單一文字最多 64 KiB UTF-8 bytes，完整 transcript 的內容文字合計最多 1 MiB UTF-8 bytes。短 metadata 識別字串仍最多 1024 Unicode 字元；內容超限會拒絕修正資格，不會放寬事件、卡片或副作用判定。這個界限是資格驗證的本機資源保護，不是 outbound 128K UTF-16 限制。歷史 20:36 回應的精確 metadata 欄位仍未取得，合成回歸不代表精確事故重播。
 
-同一帳號、模型、conversation 與 session 接收明確的 transport feedback；rejected candidate 只存在記憶體。Gateway 不選擇 decoded argument、不拼接字串、不重新上傳附件，也不改寫 caller canonical history。模型的新提案必須是同一工具的唯一 strict JSON object、沒有 prose，並通過原有 tool choice、數量與 ledger 檢查。對 fence-only 分支，原始、修正與最後交給 caller 的 arguments 必須有相同 canonical identity；只忽略 JSON 空白、object key order 與合法 escape 表示差異，不合併 integer/float，也不把比較結果重新序列化成 caller arguments。既有 JSON syntax 分支仍不保證僅憑 SAME tool 可證明意圖等價。只有接受的新提案能進 checkpoint 與 caller response。再次 malformed、authority 漂移或 unsafe duplicate 都直接 fail closed，不進第三次 generation 或 final-answer fallback。Stream 與 non-stream 使用相同 gate；stream caller 中斷會取消等待中的 correction。這會多一次模型 generation，usage estimate 包含新增 outbound text；不代表 context 成本為零，也不能證明模型意圖完全不變。
+同一帳號、模型、conversation 與 session 接收明確的 transport feedback；rejected candidate 只存在記憶體。Gateway 不選擇 decoded argument、不拼接字串、不重新上傳附件，也不改寫 caller canonical history。模型的新提案必須是同一工具的唯一 strict JSON object、沒有 prose，並通過原有 tool choice、數量與 ledger 檢查。對 fence-only 分支，原始、修正與最後交給 caller 的 arguments 必須有相同 canonical identity；只忽略 JSON 空白、object key order 與合法 escape 表示差異，不合併 integer/float，也不把比較結果重新序列化成 caller arguments。既有 JSON syntax 分支仍不保證僅憑 SAME tool 可證明意圖等價。只有接受的新提案能進 caller response；明確 checkpoint adapter 也會寫入其 checkpoint。再次 malformed 或 authority 漂移直接 fail closed，不進第三次 generation。普通 Hermes 不會只因前次 request 使用相同參數而拒絕。Stream 與 non-stream 使用相同 gate；stream caller 中斷會取消等待中的 correction。這會多一次模型 generation，usage estimate 包含新增 outbound text；不代表 context 成本為零，也不能證明模型意圖完全不變。
 
 Authenticated live diagnostic 保留第一次 rejection witness，另外提供 `toolCorrectionAttempted`、`toolCorrectionOutcome`、`toolCorrectionFailureClass` 與原 candidate hash。這些既有 correction 欄位不寫 durable JSONL，restart 後消失。唯一例外是 closed、content-free 的 `toolCorrectionNativeEffectWitness`：rollback-compatible reader 會驗證 typed schema，而 initial-response classifier 會在第一次 `native_effect` rejection 時，將它與 failure reason 原子寫入同一筆 trace record。欄位不存在時仍相容既有 v1 JSONL；一旦寫入，這筆 bounded witness 可由 authenticated diagnostic 讀取，會在 restart / compaction 後保留，也不會被 corrected sibling 覆寫。它只代表 `policy_ineligible_structure`，不是 native action 已執行的證明。witness 內的 `transcriptEventCount` 是 `1..=4096` 的 bounded classifier transcript count，所有 event index 必須小於它；top-level `eventCount=0` 仍是既有 redacted placeholder，不可解讀為 transcript 為空。message index 是 event 內跨 arguments 的零起算 encounter ordinal；card index 是 message 內零起算 preorder ordinal。`collectorEventSha256` 是 SignalR frame 以 record separator (`U+001E`) 切分、沿用既有 Rust `str::trim` 移除外層 Unicode whitespace 後、JSON parse 前之完整非空 event UTF-8 bytes 的 SHA-256。它是 collector raw identity，不是 canonical JSON；key order、Unicode escaping、number spelling 與內層 whitespace 都會改變 hash。不保存 rejected candidate、feedback prompt、raw provider frame 或欄位值。Parser acceptance 與 guard verdict 都沒有放寬。
 
@@ -190,14 +190,16 @@ Effective round ceiling 來自 runtime settings。
 
 ## Transport checkpoint 與未知 outcome
 
-Checkpoint 的目標是安全續接 transport，不是保存 Agent lifecycle。
+普通 `/hermes/v1/chat/completions` 請求（`checkpoint_mode` 省略或空字串）每次使用完整當次 `messages`，建立新的 Microsoft Private 對話。Gateway 在附件 preparation 前只清上游 `conversation_id` 與 `session_id`；已簽署的 Hermes session、turn、附件與 recall 身份保留。普通請求不寫歷史 checkpoint，也不比較舊 accepted history 前綴。普通請求完全不讀 checkpoint 紀錄，包括舊 `in_flight` 或 `terminal_unknown`。非法 `checkpoint_mode` 會被拒絕。明確 full／append／parent adapter 保留既有 checkpoint 契約。Checkpoint 不是 Agent lifecycle storage。
 
-核心 invariant：
+當次 Private 選擇不改寫一般或 Memory 的聊天設定。
+
+明確 checkpoint 使用者的核心 invariant：
 
 - history prefix、role、tool ID、arguments 與 transcript identity 要精確對上；
 - model generation 是以 accepted revision 為基礎的 transient optimistic attempt；只有通過驗證的 response 才能以 CAS 接受 history、binding、cursor 與已觀測到的 completed result。stale loser 直接丟棄，不改 accepted checkpoint；
 - Gateway replay protection 在 caller tool 交付前拒絕 `unsafe_tool_replay` 時，只丟棄本次未接受的 generation；先前已接受的 checkpoint 與 tool ledger 保留，回應仍為 terminal 409；
-- 已接受的 caller tool candidate 只屬於 accepted history，不證明 dispatch 或 outcome。只有本次 request 中可配對的 caller result 才進 durable completed replay ledger；缺少 result 不建立 durable pending authority，也不阻止下一個 ordinary turn；
+- 已接受的 caller tool candidate 只屬於 accepted history，不證明 dispatch 或 outcome。只有本次 request 中可配對的 caller result 才進 durable completed replay ledger；缺少 result 不建立 durable pending authority，也不阻止下一個明確 checkpoint turn；
 - 舊版已標記 unknown 的紀錄保留 fail-closed，不因 schema 更新自動清除；
 - destructive checkpoint operation 遇到歷史 unknown 仍 fail closed。Caller mutation 的不確定性由 Hermes 與工具領域處理；Gateway 不聲稱 outcome，也不自動重播 candidate。
 
@@ -227,7 +229,7 @@ Hermes-only continuation metadata 只在 `/hermes/...` 生效。
 - Generic `/v1`、Responses、Anthropic 與 `/memory/...` 不因共用 transport core而取得 Hermes-only authority。
 - Caller 自稱 synthetic、done、verified 或自行塞 metadata都不建立 authority。
 
-M365 可以抑制 exact duplicate transport effect，不能據此決定 Task / Run 是否完成。Semantic authority 屬於 ACP。
+普通 Hermes 的副作用重試與 receipt 由工具領域決定。Gateway 不從相同工具參數推斷 Task / Run 完成。Semantic authority 屬於 ACP。
 
 ## Code Interpreter artifact
 

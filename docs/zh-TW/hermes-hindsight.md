@@ -16,7 +16,7 @@
 | 工作 | Route | 續接語意 |
 |---|---|---|
 | 一般 auxiliary / control work | `/v1/chat/completions` | ForceNew / untracked transport，不繼承 Hermes execution evidence |
-| Hermes / Atlas | `/hermes/v1/chat/completions` | 可使用 Hermes execution identity、checkpoint、duplicate-effect protection |
+| Hermes / Atlas | `/hermes/v1/chat/completions` | 普通請求以當次完整 messages 建立新的 Microsoft Private 對話；明確 checkpoint adapter 保留獨立契約 |
 | Hindsight | `/memory/v1/chat/completions` | Memory class queue；不使用 Hermes checkpoint authority |
 
 模型清單也分成 `/v1/models`、`/hermes/v1/models`、`/memory/v1/models`，讓 consumer 不必猜 profile。
@@ -28,7 +28,7 @@
 - M365 `textInputLimitUTF16`：送往 transport 前的文字政策。
 - Hermes / model context：token-based context quality / compression policy。
 
-非 Memory chat 先評估 canonical inline text。若有效文字上限超過，M365 直接把目前 request 的完整 model-facing message projection 放進一份 deterministic `m365-full-context/v1` `.txt` attachment，同時把 current user ask、system/developer control、工具定義／協定與必要的最近完整工具交換留 inline。不採用 largest-first bulk candidate 策略。這份文件不是 session history、memory 或新的治理 authority，且不改 Hermes 的 checkpoint、ledger、compression 或 replay 契約。Memory route 不做這種 auto-spill。
+非 Memory chat 先評估 canonical inline text。若有效文字上限超過，M365 直接把目前 request 的完整 model-facing message projection 放進一份 deterministic `m365-full-context/v1` `.txt` attachment，同時把 current user ask、system/developer control、工具定義／協定與必要的最近完整工具交換留 inline。不採用 largest-first bulk candidate 策略。這份文件只投影當次請求，不是 session history、memory 或新的治理 authority。明確 checkpoint adapter 保留原有續接契約。Memory route 不做這種 auto-spill。
 
 因此 Hermes compression 應依 model context quality 設計，不要只為了躲 M365 UTF-16 wall 提前壓縮。產生 full-context 文件時，Chat Completions usage 會用 `m365.usage_estimate_scope=full_context_document_and_inline_projection` 表示這份完整 model-facing 文件；文件與不重複的 inline projection 都已納入 transport estimate，讓 caller 看得到 context pressure。這不改 Hermes 的 compression policy。實際 context/compression 值由目前 Hermes profile 自己管理，不在 M365 public docs 固定某個上游版本數字。
 
@@ -51,7 +51,7 @@ Hermes integration 使用 repo 內 versioned `integrations/hermes/m365_recall_pr
 核心規則：
 
 1. 穩定 execution identity 要來自 Hermes stock execution/session seam。
-2. M365 wire `session_key` 只是 transport checkpoint input，不能由 caller 任意自稱可信。
+2. 已簽署的 M365 wire `session_key` 用於 Hermes execution provenance，不啟用隱式歷史 checkpoint 或普通請求的 checkpoint 查詢。
 3. Plugin 與 Gateway 共同使用 `M365_HERMES_RECALL_PROVENANCE_SECRET` 驗證 content-free provenance。
 4. `M365_HERMES_PROVIDER` 可把 plugin 限定在指定 named provider。
 5. session、transcript、tool call、tool result 或 recovery sequence 漂移時，舊簽章不能 retarget。
@@ -73,9 +73,9 @@ Deployment/runtime wiring 只設定名稱，不把值寫進 repo 或 log：`M365
 
 ## Tool continuation 與 duplicate effect
 
-Hermes transport ledger 可以辨識已完成的 exact tool call，避免同一 transport effect 被重送，並在需要時要求一次保留 caller 工具契約的 bounded continuation；只阻止被安全檢查拒絕的候選。若續接再次只收到不安全重播，非串流回 typed HTTP `409 unsafe_tool_replay`，串流送出同一錯誤代碼後結束；若原本是 `required` 或特定工具選擇而沒有合法 call，則回 `tool_choice_unsatisfied`。兩者都不接受成功 final 或 checkpoint。
+普通 Hermes 請求不會因為前次 request 已回傳相同工具與參數，就攔截模型這次提出的新工具呼叫。新的合法 call 會以 `finish_reason=tool_calls` 交給 caller；純文字回答維持 `stop`。Gateway 仍檢查當次 call/result 配對、候選格式、tool choice 與同一模型輸出內重複候選。副作用重試與 receipt 由工具領域負責。
 
-這只回答「這個 transport tool effect 是否已經有證據」，不回答「Agent 工作是否完成」。Task / Run semantic completion 仍由 ACP 的 acceptance contract 判定。
+明確 checkpoint adapter 保留既有歷史與 replay 保護。舊 Hermes checkpoint 的 `in_flight` 與 `terminal_unknown` 保留在明確 recovery 路徑，不阻擋普通請求。Task / Run semantic completion 仍由 ACP 的 acceptance contract 判定。
 
 Hermes 使用獨立於 generic / Memory 的 tool-round safety ceiling；精確 default / effective value 只在 [`runtime-settings.md`](runtime-settings.md) 維護。耗盡上限回 terminal `tool_round_limit`，不自動 replay。
 

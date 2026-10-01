@@ -1,4 +1,4 @@
-"""Mandatory real-Hermes/SDK checkpoint regression, launched by the Rust fixture.
+"""Real-Hermes/SDK ordinary-request regression, launched by the Rust fixture.
 
 Only synthetic files and a loopback Gateway are used. Missing prerequisites fail.
 This imports the pinned Hermes send path and real file handlers, not a copied
@@ -17,7 +17,7 @@ import sys
 
 def main() -> None:
     agent_root = Path(os.environ["HERMES_AGENT_ROOT"]).resolve()
-    expected = "641f7c810449d9af5c21b0a5ee33b29b192b4117"
+    expected = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
     actual = subprocess.check_output(["git", "-C", str(agent_root), "rev-parse", "HEAD"], text=True).strip()
     if actual != expected:
         raise RuntimeError("pinned Hermes fixture identity mismatch")
@@ -43,7 +43,7 @@ def main() -> None:
     history = [{"role": "user", "content": "Read the synthetic file, modify it once, then read and verify it."}]
     dispatches = []
     reserialized = False
-    denials = 0
+    pairing_denials = 0
 
     def send(messages, normalize=True, prove_unicode=False):
         nonlocal reserialized
@@ -87,48 +87,34 @@ def main() -> None:
 
         if step == 0:
             assert "中文😀" in call.function.arguments, "the fixture must expose literal Unicode before Hermes serialization"
-            for change in ["path", "type", "value", "id", "role", "name"]:
+            for change in ["id", "missing_result"]:
                 changed = copy.deepcopy(history)
-                tc = changed[1]["tool_calls"][0]
-                if change in {"path", "type"}:
-                    args = json.loads(tc["function"]["arguments"])
-                    args["path" if change == "path" else "limit"] = str(path) + ".changed" if change == "path" else 8.0
-                    tc["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
-                elif change == "value":
-                    args = json.loads(tc["function"]["arguments"])
-                    args["limit"] = 9
-                    tc["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
-                elif change == "id":
-                    tc["id"] += "-changed"
-                elif change == "role":
-                    changed[1]["role"] = "user"
+                if change == "id":
+                    changed[1]["tool_calls"][0]["id"] += "-changed"
                 else:
-                    tc["function"]["name"] = "write_file"
+                    changed.pop()
                 try:
                     send(changed)
                 except APIStatusError as error:
                     assert error.status_code in {400, 409}, error.status_code
-                    denials += 1
+                    pairing_denials += 1
                 else:
-                    raise AssertionError("changed accepted history reached success")
-            # Duplicate-key evidence must reach admission intact; Hermes's parser
-            # cannot reconstruct keys that a caller has already discarded.
-            changed = copy.deepcopy(history)
-            changed[1]["tool_calls"][0]["function"]["arguments"] = '{"x":1,"x":2}'
-            try:
-                send(changed, normalize=False)
-            except APIStatusError as error:
-                assert error.status_code == 400, error.status_code
-                denials += 1
-            else:
-                raise AssertionError("ambiguous arguments reached success")
+                    raise AssertionError(f"invalid current call/result pairing accepted: {change}")
+
+    # The caller owns ordinary current messages. A changed earlier argument
+    # with intact call/result pairing is allowed and starts a new conversation.
+    changed = copy.deepcopy(history)
+    changed_args = json.loads(changed[1]["tool_calls"][0]["function"]["arguments"])
+    changed_args["path"] = str(path) + ".changed"
+    changed[1]["tool_calls"][0]["function"]["arguments"] = json.dumps(changed_args, ensure_ascii=False)
+    assert "CURRENT_HISTORY_ACCEPTED" in (send(changed).choices[0].message.content or "")
 
     assert reserialized, "test never exercised Hermes argument reserialization"
     assert dispatches == ["read_file", "write_file", "read_file"]
     assert path.read_text(encoding="utf-8") == "modified 中文😀\n"
-    assert denials == 7
+    assert pairing_denials == 2
     client.close()
-    print(json.dumps({"result": "PASS", "tool_dispatches": 3, "writes": 1, "denials": denials}))
+    print(json.dumps({"result": "PASS", "tool_dispatches": 3, "writes": 1, "pairing_denials": pairing_denials}))
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ Rust可以用更安全或更清楚的implementation實現同一contract；不需
 | Chat Completions | non-stream / SSE、tools、usage、input policy、checkpoint |
 | Responses | Responses request/continuation projection |
 | Anthropic | Messages / tools / media projection |
-| Hermes | execution provenance、transport ledger、checkpoint / replay safety |
+| Hermes | execution provenance、普通無狀態 transport、明確 checkpoint recovery；明確 checkpoint adapter 保留 replay safety |
 | Hindsight | Memory queue、overflow、webhook、durability barrier |
 | OAuth | single-account credential lifecycle |
 | Files / Vision | validated transport與grounding |

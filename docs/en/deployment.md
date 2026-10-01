@@ -17,7 +17,7 @@ web/debug.html
 
 The Hermes Native Attachment Bridge is plugin/runtime wiring in the same release unit; it does not modify Hermes core. Production must retain `m365-recall-provenance` before loading `m365-native-attachments`. Configure names only, with values supplied by the existing secret/env mechanism: `M365_HERMES_RECALL_PROVENANCE_SECRET`, `M365_HERMES_PROVIDER`, `M365_HERMES_GATEWAY_BASE_URL`, and `M365_HERMES_ATTACHMENT_ALLOWED_ROOTS`. The Gateway base URL must use HTTPS, and allowed roots must be restricted to the Outlook KB original-attachment directory; values, credentials, and private paths do not belong in the repository.
 
-Transport checkpoint/integrity state is private durable runtime state, **not** a public release artifact. A rollback still has to respect its schema and exact predeploy presence/bytes.
+Transport checkpoint/integrity state is private durable runtime state, **not** a public release artifact. Runtime rollback must leave it and newer settings or business data untouched.
 
 ## Prerequisites before deployment
 
@@ -28,7 +28,7 @@ At minimum, pin:
 3. publication target and expected-old ref;
 4. exact-head CI / container build when required by the release flow;
 5. candidate artifact identity;
-6. rollback runtime and durable-state recovery plan.
+6. rollback runtime artifact plan and a read-compatibility check for retained durable state.
 
 Local PASS, GitHub publication, CI, NAS copy, VM source, and Production deployment are separate gates and cannot substitute for one another.
 
@@ -40,7 +40,7 @@ General sequence:
 2. Run the build/test gates required by that source.
 3. Build the candidate and record release-file SHA-256 identities.
 4. Read back the existing Production runtime and recovery baseline.
-5. Quiesce the service, then snapshot private state required for rollback.
+5. Quiesce the service, snapshot the runtime rollback files, and record durable-state identities without restoring those data files.
 6. Switch the candidate release unit within that stopped-service window.
 7. After startup, read back binary / Web assets, service state, restart count, listener, and health.
 8. If any required readback fails, use the verified recovery plan. A process merely starting does not prove rollback success.
@@ -58,11 +58,11 @@ transport-checkpoints.json
 
 They are not release-archive files.
 
-When deployment automation supports binary rollback, it must snapshot exact presence and bytes only after the service is truly stopped. If a file did not exist before deployment, rollback must be able to restore the “absent” state too.
+Binary rollback restores only the runtime binary, Web assets, and Compose file. It never restores or deletes checkpoint files, settings, or business data, even when those files were created or updated after deployment.
 
-An old binary starting does not prove it can safely read a newer checkpoint schema. Runtime-byte compatibility and durable-state compatibility are separate proofs.
+An old binary starting does not prove it can safely read a newer checkpoint schema. Confirm compatibility before rollback; if it cannot be established, retain durable state and use forward repair.
 
-If rollback cannot safely quiesce the candidate, stop restoring files and preserve the recovery material for manual handling instead of overwriting checkpoint state under a live process.
+If rollback cannot safely quiesce the candidate, stop restoring runtime files and preserve the recovery material for manual handling.
 
 ## Repository deployment helper
 

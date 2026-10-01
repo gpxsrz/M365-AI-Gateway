@@ -17,7 +17,7 @@ web/debug.html
 
 Hermes Native Attachment Bridge 是同一 release 的 plugin/runtime wiring，不是 Hermes core 變更。Production 需要保留 `m365-recall-provenance`，再載入 `m365-native-attachments`；只配置以下環境變數名稱並由既有 secret/env 機制提供值：`M365_HERMES_RECALL_PROVENANCE_SECRET`、`M365_HERMES_PROVIDER`、`M365_HERMES_GATEWAY_BASE_URL`、`M365_HERMES_ATTACHMENT_ALLOWED_ROOTS`。Gateway base URL 必須是 HTTPS，allowed roots 必須限制在 Outlook KB 原始附件目錄；不要把值、credential 或 private path 放入 repo。
 
-Transport checkpoint / integrity state 是 private durable runtime state，**不是**公開 release artifact；但 rollback 必須尊重它的 schema與 exact predeploy presence/bytes。
+Transport checkpoint / integrity state 是 private durable runtime state，**不是**公開 release artifact。Runtime rollback 不得回寫它、較新的 settings 或業務資料。
 
 ## 可以部署前要先有什麼
 
@@ -28,7 +28,7 @@ Transport checkpoint / integrity state 是 private durable runtime state，**不
 3. publication target與expected-old；
 4. exact-head CI / container build（如果該發布流程需要）；
 5. candidate artifact identity；
-6. rollback runtime與durable-state recovery plan。
+6. runtime artifact rollback 計畫，以及保留 durable state 的讀取相容性檢查。
 
 Local PASS、GitHub publication、CI、NAS copy、VM source與Production deployment是不同 gate，不能互相代替。
 
@@ -40,7 +40,7 @@ Local PASS、GitHub publication、CI、NAS copy、VM source與Production deploym
 2. 驗證該 source需要的 build/test gate。
 3. 建立 candidate並記錄 release file SHA-256。
 4. Read back現有 Production runtime與recovery baseline。
-5. Quiesce服務，再 snapshot rollback需要的 private state。
+5. Quiesce 服務，保存 runtime rollback 檔案，記錄 durable-state identity，但不還原這些資料檔。
 6. 在同一停止視窗切換 candidate release unit。
 7. 啟動後讀回 binary / Web assets、service state、restart count、listener、health。
 8. 任一必要 readback失敗，依已驗證 recovery plan rollback；不要只因 process能啟動就宣稱回復成功。
@@ -58,11 +58,11 @@ transport-checkpoints.json
 
 它們不是 release archive內容。
 
-若部署工具需要支援 binary rollback，必須在服務真正停止後，保存兩者的 exact presence與bytes。若 predeploy原本不存在，rollback也要能恢復成「不存在」。
+Binary rollback 只還原 runtime binary、Web assets 與 Compose；不還原也不刪除 checkpoint 檔案、settings 或業務資料，即使它們在部署後才建立或更新。
 
-舊 binary能啟動不代表它能安全讀新 checkpoint schema；runtime bytes與durable state compatibility必須分開證明。
+舊 binary能啟動不代表它能安全讀新 checkpoint schema；回滾前須確認讀取相容性。無法確認時保留 durable state，改走 forward repair。
 
-若 rollback本身無法安全quiesce candidate，應停止 restore並保留 recovery material給人工處理，不要在線上狀態下覆寫 checkpoint。
+若 rollback本身無法安全 quiesce candidate，應停止還原 runtime 檔案並保留 recovery material 給人工處理。
 
 ## Repo deployment helper
 

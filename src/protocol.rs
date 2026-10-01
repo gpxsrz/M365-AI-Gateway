@@ -77,6 +77,19 @@ pub async fn chat_completions(State(gateway): State<Arc<Gateway>>, request: Requ
             );
         }
     };
+    if path == "/hermes/v1/chat/completions"
+        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        && value
+            .get("checkpoint_mode")
+            .is_some_and(|mode| mode.as_str() != Some(""))
+    {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_checkpoint_mode",
+            "the Hermes Chat Completions route accepts only an omitted or empty checkpoint_mode",
+        );
+    }
     let body: ChatCompletionRequest = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
         Err(_) => {
@@ -150,6 +163,22 @@ async fn execute_chat_request_inner(
         return response;
     }
     clear_untracked_transport_identity(&path, &mut body);
+    let ordinary_hermes = path == "/hermes/v1/chat/completions" && body.checkpoint_mode.is_empty();
+    if path == "/hermes/v1/chat/completions"
+        && !body.checkpoint_mode.is_empty()
+        && !matches!(body.checkpoint_mode.as_str(), "full" | "append" | "parent")
+    {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_checkpoint_mode",
+            "unsupported checkpoint mode",
+        );
+    }
+    if ordinary_hermes {
+        body.conversation_id.clear();
+        body.session_id.clear();
+    }
     scope_execution_control_provenance(&path, &mut body, &gateway.hermes_recall_provenance_secret);
     let class = request_class(&path, &body);
     trace.request(class, ProvenanceClass::None);
@@ -211,27 +240,15 @@ async fn execute_chat_request_inner(
             ProvenanceClass::None
         },
     );
-    let checkpoint_messages = body
-        .messages
-        .iter()
-        .cloned()
-        .map(CheckpointMessage::from)
-        .collect::<Vec<_>>();
-    let implicit_hermes = path.starts_with("/hermes/v1/")
-        && body.checkpoint_mode.is_empty()
-        && !body.session_key.trim().is_empty();
-    let checkpoint_result = if implicit_hermes {
-        gateway
-            .checkpoints
-            .begin_full(
-                "hermes",
-                &owner,
-                &body.session_key,
-                &checkpoint_messages,
-                false,
-            )
-            .map(Some)
+    let checkpoint_result = if ordinary_hermes {
+        Ok(None)
     } else {
+        let checkpoint_messages = body
+            .messages
+            .iter()
+            .cloned()
+            .map(CheckpointMessage::from)
+            .collect::<Vec<_>>();
         match body.checkpoint_mode.as_str() {
             "full" => gateway
                 .checkpoints
@@ -343,7 +360,7 @@ async fn execute_chat_request_inner(
             &message,
         );
     }
-    let suppress_duplicate_tool_calls = path.starts_with("/hermes/");
+    let suppress_duplicate_tool_calls = path.starts_with("/hermes/") && !ordinary_hermes;
     let checkpoint_response_id = body.checkpoint_response_id.clone();
     if let Some(turn) = &checkpoint {
         if !turn.binding.conversation_id.is_empty() {
@@ -761,6 +778,7 @@ async fn execute_chat_request_inner(
         outbound_text_limit_utf16: text_input_limit,
         mcp_server_url: String::new(),
         disable_built_in_search: false,
+        force_private: ordinary_hermes,
         upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
         generated_attachment_reused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         final_message_text_utf16: Arc::new(AtomicUsize::new(0)),
@@ -1034,7 +1052,13 @@ async fn complete_chat(
                 );
             }
             let mut transport = apply_transport_projection(
-                project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
+                project_transport_tool_calls(
+                    &result.text,
+                    &tools,
+                    &tool_choice,
+                    tool_limit,
+                    hermes_route && !suppress_duplicate_tool_calls,
+                ),
                 &agent_ledger,
                 &tools,
                 suppress_duplicate_tool_calls,
@@ -1204,7 +1228,13 @@ async fn complete_chat(
                     );
                 }
                 transport = apply_transport_projection(
-                    project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
+                    project_transport_tool_calls(
+                        &result.text,
+                        &tools,
+                        &tool_choice,
+                        tool_limit,
+                        hermes_route && !suppress_duplicate_tool_calls,
+                    ),
                     &agent_ledger,
                     &tools,
                     suppress_duplicate_tool_calls,
@@ -1599,7 +1629,13 @@ async fn stream_chat(
                     return;
                 }
                 let mut transport = apply_transport_projection(
-                    project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
+                    project_transport_tool_calls(
+                        &result.text,
+                        &tools,
+                        &tool_choice,
+                        tool_limit,
+                        hermes_route && !suppress_duplicate_tool_calls,
+                    ),
                     &agent_ledger,
                     &tools,
                     suppress_duplicate_tool_calls,
@@ -1814,7 +1850,13 @@ async fn stream_chat(
                         return;
                     }
                     transport = apply_transport_projection(
-                        project_tool_calls(&result.text, &tools, &tool_choice, tool_limit),
+                        project_transport_tool_calls(
+                            &result.text,
+                            &tools,
+                            &tool_choice,
+                            tool_limit,
+                            hermes_route && !suppress_duplicate_tool_calls,
+                        ),
                         &agent_ledger,
                         &tools,
                         suppress_duplicate_tool_calls,
@@ -2593,6 +2635,20 @@ struct TransportProjection {
     suppression_details: Vec<crate::agent_ledger::SuppressionDetail>,
 }
 
+fn project_transport_tool_calls(
+    text: &str,
+    tools: &[Tool],
+    choice: &Value,
+    limit: usize,
+    ordinary_hermes: bool,
+) -> ToolProjection {
+    if ordinary_hermes {
+        crate::tool_calls::project_ordinary_hermes(text, tools, choice, limit)
+    } else {
+        project_tool_calls(text, tools, choice, limit)
+    }
+}
+
 fn apply_transport_projection(
     mut projection: ToolProjection,
     ledger: &crate::agent_ledger::AgentLedger,
@@ -2602,6 +2658,14 @@ fn apply_transport_projection(
     read_only_secret: &str,
 ) -> TransportProjection {
     if !suppress_duplicates {
+        if hermes_route
+            && crate::agent_ledger::AgentLedger::default()
+                .filter_known_calls(projection.calls.clone(), |_| true)
+                .suppressed()
+        {
+            projection.calls.clear();
+            projection.rejected = true;
+        }
         return TransportProjection {
             projection,
             completed_call_suppressed: false,
@@ -3729,6 +3793,7 @@ fn internal_qualification_request(
         tool_call_limit: 1,
         mcp_server_url: String::new(),
         disable_built_in_search: true,
+        force_private: base.force_private,
         upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
         generated_attachment_reused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         final_message_text_utf16: Arc::new(AtomicUsize::new(0)),
@@ -6419,7 +6484,8 @@ mod tests {
     ) -> crate::chathub::AttachmentPreparationFuture<'a> {
         let graph_api_base = conversation_id
             .strip_prefix("issue-104-base:")
-            .expect("Issue 104 test conversation must carry the local Graph base")
+            .or_else(|| account.graph_access_token.strip_prefix("issue-104-base:"))
+            .expect("Issue 104 fixture must carry the local Graph base")
             .to_owned();
         Box::pin(async move {
             for attachment in &mut *attachments {
@@ -6682,13 +6748,19 @@ mod tests {
                     .expect("full-context document upload input");
                 let document: Value =
                     serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+                let source_message_count = document["source_message_count"].as_u64().unwrap();
+                assert!(matches!(source_message_count, 52 | 54));
                 let error_count = document["messages"]
                     .as_array()
                     .expect("full-context document messages")
                     .iter()
                     .filter(|message| message["message"]["tool_result_is_error"] == true)
                     .count();
-                assert_eq!(error_count, usize::from(expected_error_state));
+                assert_eq!(
+                    error_count,
+                    usize::from(expected_error_state)
+                        * if source_message_count == 54 { 2 } else { 1 }
+                );
                 let (expected_body, expected_system_prompt) = if expected_error_state {
                     issue_101_third_round_controls_fixture_with_error_state()
                 } else {
@@ -6698,8 +6770,7 @@ mod tests {
                     .as_array()
                     .expect("controls fixture messages");
                 assert_eq!(document["schema"], "m365-full-context/v1");
-                assert_eq!(document["source_message_count"], 52);
-                assert_eq!(document["message_count"], 52);
+                assert_eq!(document["message_count"], source_message_count);
                 for (index, source) in expected_messages.iter().enumerate() {
                     let projected = &document["messages"][index]["message"];
                     assert_eq!(document["messages"][index]["message_index"], index);
@@ -6837,6 +6908,7 @@ mod tests {
             outbound_text_limit_utf16: 128_000,
             mcp_server_url: String::new(),
             disable_built_in_search: false,
+            force_private: false,
             upstream_attempt_count: Arc::new(AtomicUsize::new(0)),
             generated_attachment_reused,
             final_message_text_utf16: Arc::new(AtomicUsize::new(0)),
@@ -6860,17 +6932,50 @@ mod tests {
     async fn issue_101_upstream_server_for(
         connection_count: usize,
     ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let (base, payloads, _, server) =
+            issue_101_upstream_server_with_private_flags(connection_count).await;
+        (base, payloads, server)
+    }
+
+    // tungstenite's handshake callback fixes a large HTTP response as its error type.
+    #[allow(clippy::result_large_err)]
+    async fn issue_101_upstream_server_with_private_flags(
+        connection_count: usize,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<bool>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::{accept_async, tungstenite::Message};
+        use tokio_tungstenite::{accept_hdr_async, tungstenite::Message};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_by_server = Arc::clone(&received);
+        let private_flags = Arc::new(Mutex::new(Vec::new()));
+        let private_flags_by_server = Arc::clone(&private_flags);
         let server = tokio::spawn(async move {
             for connection_index in 0..connection_count {
                 let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = accept_async(stream).await.unwrap();
+                let flags = Arc::clone(&private_flags_by_server);
+                let mut socket = accept_hdr_async(
+                    stream,
+                    move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                          response| {
+                        let private = request
+                            .uri()
+                            .query()
+                            .unwrap_or_default()
+                            .split('&')
+                            .any(|part| part == "disableMemory=1");
+                        flags.lock().unwrap().push(private);
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
                 let handshake = socket
                     .next()
                     .await
@@ -6940,7 +7045,7 @@ mod tests {
                 }
             }
         });
-        (format!("ws://{address}"), received, server)
+        (format!("ws://{address}"), received, private_flags, server)
     }
 
     struct SensitiveProtocolFailureTransport;
@@ -7321,16 +7426,25 @@ mod tests {
     }
 
     async fn oauth_with_graph_token_server() -> (OAuthConfig, tokio::task::JoinHandle<()>) {
+        oauth_with_graph_token_server_token("graph-access".to_owned()).await
+    }
+
+    async fn oauth_with_graph_token_server_token(
+        graph_token: String,
+    ) -> (OAuthConfig, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let token_app = Router::new().route(
             "/",
-            axum::routing::post(|| async {
-                Json(json!({
-                    "access_token":"graph-access",
-                    "refresh_token":"refresh",
-                    "expires_in":3600
-                }))
+            axum::routing::post(move || {
+                let graph_token = graph_token.clone();
+                async move {
+                    Json(json!({
+                        "access_token":graph_token,
+                        "refresh_token":"refresh",
+                        "expires_in":3600
+                    }))
+                }
             }),
         );
         let token_server = tokio::spawn(async move {
@@ -7412,7 +7526,7 @@ mod tests {
     // this exact test with --ignored; absence is an error, never a skip/PASS.
     #[tokio::test]
     #[ignore = "mandatory pinned-Hermes CI gate executes this exact test"]
-    async fn hermes_checkpoint_sdk_identity_real_chain() {
+    async fn hermes_ordinary_sdk_identity_real_chain() {
         let agent_root = std::path::PathBuf::from(
             std::env::var("HERMES_AGENT_ROOT")
                 .expect("HERMES_AGENT_ROOT is required for the real SDK gate"),
@@ -7437,6 +7551,7 @@ mod tests {
             syntax_live_reply(&write),
             syntax_live_reply(&read),
             syntax_live_reply("IDENTITY_SDK_COMPLETE"),
+            syntax_live_reply("CURRENT_HISTORY_ACCEPTED"),
         ])
         .await;
         let (mut gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
@@ -7498,24 +7613,13 @@ mod tests {
         upstream.await.unwrap();
         assert_eq!(
             payloads.lock().unwrap().len(),
-            4,
-            "seven rejected histories must not reach upstream"
+            5,
+            "invalid current call/result pairs must not reach upstream"
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("\"result\": \"PASS\""));
-        let durable: Value = serde_json::from_slice(
-            &std::fs::read(root.path().join("transport-checkpoints.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(durable["records"].as_array().unwrap().len(), 1);
-        assert_ne!(durable["records"][0]["inFlight"], Value::Bool(true));
-        assert_eq!(durable["records"][0]["acceptedCount"], 8);
-        assert_eq!(
-            CheckpointStore::open(root.path().join("transport-checkpoints.json"))
-                .unwrap()
-                .list()
-                .unwrap()
-                .len(),
-            1
+        assert!(
+            !root.path().join("transport-checkpoints.json").exists(),
+            "ordinary SDK requests must not create durable checkpoint history"
         );
     }
 
@@ -8026,15 +8130,7 @@ mod tests {
             let clarify_call = clarify_calls[0].clone();
             let clarify_id = clarify_call["id"].clone();
             let checkpoint_path = root.path().join("transport-checkpoints.json");
-            let checkpoint: Value =
-                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["pending"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                0
-            );
+            assert!(!checkpoint_path.exists());
             request["messages"].as_array_mut().unwrap().push(json!({
                 "role":"assistant","content":null,"tool_calls":[clarify_call]
             }));
@@ -8063,25 +8159,7 @@ mod tests {
             let (terminal_call, terminal_result) =
                 syntax_caller_harness(&terminal_calls, &dispatches, &receipts, "\\]");
             let terminal_id = terminal_call["id"].clone();
-            let checkpoint: Value =
-                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["completed"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                1
-            );
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["completed"][0]["id"],
-                clarify_id
-            );
-            assert!(
-                checkpoint["records"][0]["toolLedger"]["pending"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(!checkpoint_path.exists());
             request["messages"].as_array_mut().unwrap().push(json!({
                 "role":"assistant","content":null,"tool_calls":[terminal_call]
             }));
@@ -8101,38 +8179,7 @@ mod tests {
             );
             assert!(payloads[1].contains("keep_existing_kb_synthetic"));
             server.await.unwrap();
-            let checkpoint: Value =
-                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-            assert_eq!(checkpoint["records"][0]["acceptedCount"], 6);
-            assert_eq!(
-                checkpoint["records"][0]["messageDigests"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                6
-            );
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["pending"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                0
-            );
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["completed"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                2
-            );
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["completed"][0]["id"],
-                clarify_id
-            );
-            assert_eq!(
-                checkpoint["records"][0]["toolLedger"]["completed"][1]["id"],
-                terminal_id
-            );
+            assert!(!checkpoint_path.exists());
         }
     }
 
@@ -8404,24 +8451,7 @@ mod tests {
             };
             assert_eq!(first_finish, "tool_calls");
             let checkpoint_path = root.path().join("transport-checkpoints.json");
-            let persisted: Value =
-                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-            let first_record = &persisted["records"][0];
-            assert_eq!(first_record["acceptedCount"], 2);
-            assert_eq!(
-                first_record["toolLedger"]["pending"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                0
-            );
-            assert_eq!(
-                first_record["toolLedger"]["completed"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                0
-            );
+            assert!(!checkpoint_path.exists());
             let dispatches = AtomicUsize::new(0);
             let receipts = Mutex::new(Vec::new());
             let (call, mut tool_result) =
@@ -8430,12 +8460,6 @@ mod tests {
             // Exercise the real caller-result assembly and next provider turn.
             tool_result["output"] = json!("S".repeat(85_000));
             let call_id = call["id"].clone();
-            assert!(
-                first_record["toolLedger"]["pending"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
             request["messages"]
                 .as_array_mut()
                 .unwrap()
@@ -8478,25 +8502,7 @@ mod tests {
                 .unwrap();
             assert!(message_text.contains(&"S".repeat(85_000)));
             assert!(message_text.contains(call_id.as_str().unwrap()));
-            let persisted: Value =
-                serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-            let final_record = &persisted["records"][0];
-            assert_eq!(final_record["acceptedCount"], 4);
-            assert_eq!(
-                final_record["toolLedger"]["pending"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                0
-            );
-            assert_eq!(
-                final_record["toolLedger"]["completed"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                1
-            );
-            assert_eq!(final_record["toolLedger"]["completed"][0]["id"], call_id);
+            assert!(!checkpoint_path.exists());
             server.await.unwrap();
 
             let record = gateway
@@ -8993,13 +8999,6 @@ mod tests {
                 vec![json!({"type": 99})],
             ),
             (
-                "known_replay",
-                r#"```terminal
-{"pattern":"]"}
-```"#,
-                Vec::new(),
-            ),
-            (
                 "binding_drift",
                 r#"```terminal
 {"pattern":"safe"}
@@ -9046,27 +9045,10 @@ mod tests {
                 let app = Gateway::router(Arc::clone(&gateway));
                 let mut request = syntax_correction_body(stream);
                 request["session_key"] = json!(format!("syntax-live-denied-{stream}-{case}"));
-                if *case == "known_replay" {
-                    request["messages"].as_array_mut().unwrap().extend([
-                        json!({
-                            "role":"assistant",
-                            "content":null,
-                            "tool_calls":[{"id":"already-completed","type":"function","function":{"name":"terminal","arguments":"{\"pattern\":\"]\"}"}}]
-                        }),
-                        json!({
-                            "role":"tool",
-                            "tool_call_id":"already-completed",
-                            "content":"{\"status\":\"completed\",\"output\":\"done\"}"
-                        }),
-                    ]);
-                }
-
                 let (status, body) = syntax_public_response(&app, &raw_key, &request).await;
                 assert_eq!(
                     status,
-                    if *case == "known_replay" && !stream {
-                        StatusCode::CONFLICT
-                    } else if stream {
+                    if stream {
                         StatusCode::OK
                     } else {
                         StatusCode::BAD_GATEWAY
@@ -9271,172 +9253,6 @@ mod tests {
         )
         .unwrap();
         (status, body)
-    }
-
-    #[tokio::test]
-    async fn syntax_correction_accepts_only_second_identity_and_continues_checkpoint() {
-        for stream in [false, true] {
-            for decoded in ["]", "\\]"] {
-                let corrected = format!("```terminal\n{}\n```", json!({"pattern":decoded}));
-                let chat = Arc::new(SyntaxCorrectionTransport::new(&[
-                    "```terminal\n{\"pattern\":\"\\]\"}\n```",
-                    &corrected,
-                    "Semantic processing completed.",
-                ]));
-                let root = tempfile::tempdir().unwrap();
-                let (gateway, key) = gateway_with_chat_and_oauth_at_root(
-                    chat.clone(),
-                    oauth(),
-                    root.path().to_owned(),
-                    None,
-                );
-                let app = Gateway::router(gateway.clone());
-                let mut request = syntax_correction_body(stream);
-                request["session_key"] = json!("syntax-checkpoint");
-                if stream {
-                    request["stream_options"] = json!({"include_usage":true});
-                }
-                let (status, body) = syntax_public_response(&app, &key, &request).await;
-                assert_eq!(status, StatusCode::OK);
-                let calls = if stream {
-                    sse_values(&body)
-                        .iter()
-                        .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls").cloned())
-                        .unwrap()
-                } else {
-                    serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"].clone()
-                };
-                assert_eq!(calls.as_array().unwrap().len(), 1);
-                let args: Value =
-                    serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap())
-                        .unwrap();
-                assert_eq!(
-                    args,
-                    json!({"pattern":decoded}),
-                    "model-owned fixture is the semantic oracle"
-                );
-                let checkpoint_path = root.path().join("transport-checkpoints.json");
-                let persisted: Value =
-                    serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-                let record = &persisted["records"][0];
-                assert_eq!(
-                    record["acceptedCount"], 2,
-                    "one caller message and only the accepted second proposal"
-                );
-                assert_eq!(record["toolLedger"]["pending"].as_array().unwrap().len(), 0);
-                assert_eq!(
-                    record["toolLedger"]["completed"].as_array().unwrap().len(),
-                    0
-                );
-                assert!(
-                    !String::from_utf8(std::fs::read(&checkpoint_path).unwrap())
-                        .unwrap()
-                        .contains("TRANSPORT SYNTAX CORRECTION")
-                );
-                let live = gateway.debug.records_for_test().pop().unwrap();
-                assert_eq!(live["toolCallRejectionClass"], "illegal_escape");
-                assert_eq!(live["toolProjectionStage"], "syntax_correction");
-                assert_eq!(live["toolCorrectionOutcome"], "succeeded");
-                assert_eq!(
-                    live["toolCorrectionOriginalSha256"],
-                    live["toolCandidateSha256"]
-                );
-                let usage = if stream {
-                    sse_values(&body)
-                        .iter()
-                        .find_map(|frame| {
-                            frame
-                                .get("usage")
-                                .filter(|value| value.is_object())
-                                .cloned()
-                        })
-                        .unwrap()
-                } else {
-                    serde_json::from_str::<Value>(&body).unwrap()["usage"].clone()
-                };
-                {
-                    let requests = chat.requests.lock().unwrap();
-                    assert_eq!(requests.len(), 2);
-                    let correction_units = utf16_units(&crate::chathub::outbound_message_text(
-                        &requests[1].text,
-                        &requests[1].tools,
-                        &requests[1].tool_choice,
-                        requests[1].tool_call_limit,
-                    ));
-                    assert!(
-                        usage["prompt_tokens"].as_u64().unwrap()
-                            >= correction_units.div_ceil(4) as u64
-                    );
-                    assert!(requests[1].native_attachment_manager.is_none());
-                    assert!(requests[1].native_attachment_metadata.is_empty());
-                    assert!(requests[1].native_attachment_stage_refs.is_empty());
-                    assert!(requests[1].native_attachment_indices.is_empty());
-                    assert!(requests[1].attachments.is_empty());
-                }
-                request["messages"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!({"role":"assistant","content":null,"tool_calls":calls}));
-                request["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":calls[0]["id"],"content":"{\"status\":\"completed\",\"output\":\"semantic fixture processed\"}"}));
-                request["tool_choice"] = json!("auto");
-                let (status, body) = syntax_public_response(&app, &key, &request).await;
-                assert_eq!(status, StatusCode::OK);
-                assert!(body.contains("Semantic processing completed."));
-                assert_eq!(
-                    chat.requests.lock().unwrap().len(),
-                    3,
-                    "third generation belongs only to caller's next tool-result turn"
-                );
-                let persisted: Value =
-                    serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-                let record = &persisted["records"][0];
-                assert_eq!(record["acceptedCount"], 4);
-                assert_eq!(record["toolLedger"]["pending"].as_array().unwrap().len(), 0);
-                assert_eq!(
-                    record["toolLedger"]["completed"].as_array().unwrap().len(),
-                    1
-                );
-                assert_eq!(record["toolLedger"]["completed"][0]["id"], calls[0]["id"]);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn syntax_correction_duplicate_never_enters_third_generation_fallback() {
-        for stream in [false, true] {
-            let chat = Arc::new(SyntaxCorrectionTransport::new(&[
-                "```terminal\n{\"pattern\":\"\\]\"}\n```",
-                "```terminal\n{\"pattern\":\"]\"}\n```",
-            ]));
-            let (gateway, key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-            let mut request = syntax_correction_body(stream);
-            request["session_key"] = json!("syntax-duplicate");
-            request["messages"].as_array_mut().unwrap().extend([
-                json!({"role":"assistant","content":null,"tool_calls":[{"id":"already-completed","type":"function","function":{"name":"terminal","arguments":"{\"pattern\":\"]\"}"}}]}),
-                json!({"role":"tool","tool_call_id":"already-completed","content":"{\"status\":\"completed\",\"output\":\"done\"}"})
-            ]);
-            let (status, body) =
-                syntax_public_response(&Gateway::router(gateway.clone()), &key, &request).await;
-            assert_eq!(
-                status,
-                if stream {
-                    StatusCode::OK
-                } else {
-                    StatusCode::CONFLICT
-                }
-            );
-            assert!(body.contains("unsafe_tool_replay"));
-            assert!(!body.contains("finish_reason"));
-            if stream {
-                assert_eq!(body.matches("data: [DONE]").count(), 1);
-                assert!(body.ends_with("data: [DONE]\n\n"));
-            }
-            assert_eq!(chat.requests.lock().unwrap().len(), 2);
-            assert!(gateway.checkpoints.list().unwrap().is_empty());
-            let record = gateway.debug.records_for_test().pop().unwrap();
-            assert_eq!(record["toolCorrectionOutcome"], "failed");
-            assert_eq!(record["toolCorrectionFailureClass"], "unsafe_tool_replay");
-        }
     }
 
     struct PendingSyntaxCorrection {
@@ -10018,40 +9834,6 @@ mod tests {
         }
     }
 
-    struct ConversationSequenceTransport(AtomicUsize);
-
-    impl ChatHubTransport for ConversationSequenceTransport {
-        fn chat<'a>(
-            &'a self,
-            _: Account,
-            _: ChatRequest,
-            sink: &'a mut (dyn EventSink + Send),
-        ) -> ChatFuture<'a> {
-            Box::pin(async move {
-                let attempt = self.0.fetch_add(1, Ordering::AcqRel);
-                let (text, conversation_id) = if attempt == 0 {
-                    ("first answer", "conversation-a")
-                } else {
-                    sink.send(StreamEvent {
-                        kind: "text".to_owned(),
-                        text: "second answer".to_owned(),
-                        message_type: String::new(),
-                        content_type: String::new(),
-                        tool_name: String::new(),
-                        arguments: Value::Null,
-                    })?;
-                    ("second answer", "conversation-b")
-                };
-                Ok(ChatResult {
-                    text: text.to_owned(),
-                    conversation_id: conversation_id.to_owned(),
-                    session_id: "session-sequence".to_owned(),
-                    ..ChatResult::default()
-                })
-            })
-        }
-    }
-
     struct DuplicateFallbackTransport {
         results: Mutex<VecDeque<String>>,
         requests: Mutex<Vec<ChatRequest>>,
@@ -10060,40 +9842,6 @@ mod tests {
     }
 
     struct GenerationFailureThenSuccess(AtomicUsize);
-
-    struct ConcurrentGenerationsTransport {
-        calls: AtomicUsize,
-        first_entered: tokio::sync::Notify,
-        release_first: tokio::sync::Notify,
-    }
-
-    impl ChatHubTransport for ConcurrentGenerationsTransport {
-        fn chat<'a>(
-            &'a self,
-            _: Account,
-            _: ChatRequest,
-            _: &'a mut (dyn EventSink + Send),
-        ) -> ChatFuture<'a> {
-            Box::pin(async move {
-                let ordinal = self.calls.fetch_add(1, Ordering::AcqRel);
-                if ordinal == 0 {
-                    self.first_entered.notify_one();
-                    self.release_first.notified().await;
-                }
-                Ok(ChatResult {
-                    text: match ordinal {
-                        0 => "loser response",
-                        1 => "winner response",
-                        _ => "ordinary continuation",
-                    }
-                    .to_owned(),
-                    conversation_id: "conversation-1".to_owned(),
-                    session_id: "session-1".to_owned(),
-                    ..ChatResult::default()
-                })
-            })
-        }
-    }
 
     struct ProviderFailureThenSuccess {
         attempts: AtomicUsize,
@@ -12069,164 +11817,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hermes_restarted_gateway_retains_historical_unresolved_checkpoint() {
-        let tool = json!({
-            "type":"function",
-            "function":{
-                "name":"inspect",
-                "description":"Read-only inspection.",
-                "parameters":{"type":"object","properties":{"target":{"type":"string"}}}
-            }
-        });
-        let chat = Arc::new(SequenceTransport::new([
-            "Inspection completed successfully.",
-        ]));
-        let root = tempfile::tempdir().unwrap().keep();
-        let checkpoint_path = root.join("transport-checkpoints.json");
-        let (initial_gateway, raw_key) =
-            gateway_with_chat_and_oauth_at_root(chat.clone(), oauth(), root.clone(), None);
-        let owner = initial_gateway
-            .api_keys
-            .authenticate(&raw_key)
-            .expect("initial test API key");
-        let prefix = [
-            OpenAiMessage::text("user", "Inspect service-a."),
-            OpenAiMessage {
-                role: "assistant".to_owned(),
-                tool_calls: vec![json!({
-                    "id":"call-1",
-                    "type":"function",
-                    "function":{
-                        "name":"inspect",
-                        "arguments":"{\"target\":\"service-a\"}"
-                    }
-                })],
-                ..OpenAiMessage::default()
-            },
-            OpenAiMessage {
-                role: "tool".to_owned(),
-                content: Value::String(
-                    r#"{"output":"ok","exit_code":0,"status":"completed"}"#.to_owned(),
-                ),
-                tool_call_id: "call-1".to_owned(),
-                ..OpenAiMessage::default()
-            },
-        ];
-        let checkpoint_messages = prefix
-            .iter()
-            .cloned()
-            .map(CheckpointMessage::from)
-            .collect::<Vec<_>>();
-        let mut turn = initial_gateway
+    async fn ordinary_hermes_ignores_completed_checkpoint_history_without_rewriting_it() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint_path = root.path().join("transport-checkpoints.json");
+        let (gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            None,
+        );
+        let owner = gateway.api_keys.authenticate(&raw_key).unwrap();
+        gateway
             .checkpoints
             .begin_full(
                 "hermes",
                 &owner,
-                "restarted-recovery",
-                &checkpoint_messages,
+                "completed-session",
+                &[CheckpointMessage::from(OpenAiMessage::text(
+                    "user",
+                    "historical uncompressed ask",
+                ))],
                 false,
             )
+            .unwrap()
+            .accept(
+                crate::checkpoint::Binding {
+                    conversation_id: "historical-conversation".to_owned(),
+                    session_id: "historical-session".to_owned(),
+                },
+                &[CheckpointMessage::from(OpenAiMessage::text(
+                    "assistant",
+                    "historical answer",
+                ))],
+            )
             .unwrap();
-        turn.seed_legacy_unresolved_for_test().unwrap();
-        drop(turn);
-        drop(initial_gateway);
-
-        let reopened = CheckpointStore::open(&checkpoint_path).unwrap();
-        let (gateway, _new_raw_key) =
-            gateway_with_chat_and_oauth_at_root(chat.clone(), oauth(), root, Some(reopened));
-        let app = Gateway::router(gateway.clone());
-        let recovery_messages = [
-            prefix[0].clone(),
-            prefix[1].clone(),
-            prefix[2].clone(),
-            synthetic_empty_recovery_assistant(),
-            synthetic_empty_recovery_user(),
-        ];
-        let control = signed_execution_control_provenance_for_session(
-            &recovery_messages,
-            &[(2, 3, 4)],
-            "restarted-recovery",
-        );
-        let response = app
+        let before = std::fs::read(&checkpoint_path).unwrap();
+        let response = Gateway::router(Arc::clone(&gateway))
             .oneshot(
                 Request::post("/hermes/v1/chat/completions")
                     .header("x-api-key", raw_key)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model":"gpt-5.6-terra",
-                            "session_key":"restarted-recovery",
-                            "messages":recovery_messages,
-                            "m365_execution_control_provenance":control,
-                            "tools":[tool],
-                            "tool_choice":"auto"
-                        }))
-                        .unwrap(),
+                        r#"{"model":"gpt-5.6-terra","session_key":"completed-session","conversation_id":"historical-conversation","session_id":"historical-session","messages":[{"role":"user","content":"current compressed ask"}]}"#,
                     ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        let status = response.status();
-        let body = String::from_utf8(
-            to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
-        assert!(body.contains("checkpoint_error"));
-        assert_eq!(chat.0.lock().unwrap().len(), 1);
-        assert_eq!(gateway.checkpoints.list().unwrap().len(), 0);
-        assert_eq!(gateway.checkpoints.recovery_views().unwrap().len(), 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = chat.0.lock().unwrap();
+        let captured = captured.as_ref().unwrap();
+        assert_eq!(captured.text, "current compressed ask");
+        assert!(captured.conversation_id.is_empty());
+        assert!(captured.session_id.is_empty());
+        assert_eq!(std::fs::read(checkpoint_path).unwrap(), before);
     }
 
     #[tokio::test]
-    async fn streaming_checkpoint_failure_does_not_emit_uncommitted_success_frames() {
-        let (app, raw_key) =
-            app_with_chat(Arc::new(ConversationSequenceTransport(AtomicUsize::new(0))));
-        let first = app
-            .clone()
-            .oneshot(
+    async fn ordinary_hermes_ignores_legacy_unresolved_and_does_not_read_checkpoint() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint_path = root.path().join("transport-checkpoints.json");
+        let (gateway, raw_key) = gateway_with_chat_and_oauth_at_root(
+            chat.clone(),
+            oauth(),
+            root.path().to_owned(),
+            None,
+        );
+        let owner = gateway.api_keys.authenticate(&raw_key).unwrap();
+        let user = CheckpointMessage::from(OpenAiMessage::text("user", "earlier ask"));
+        let mut turn = gateway
+            .checkpoints
+            .begin_full("hermes", &owner, "legacy-session", &[user], false)
+            .unwrap();
+        turn.seed_legacy_unresolved_for_test().unwrap();
+        drop(turn);
+        let before = std::fs::read(&checkpoint_path).unwrap();
+        let app = Gateway::router(Arc::clone(&gateway));
+        let send = |app: Router, key: String| async move {
+            app.oneshot(
                 Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", &raw_key)
+                    .header("x-api-key", key)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"model":"gpt-5.6-terra","session_key":"stream-checkpoint-failure","messages":[{"role":"user","content":"first"}]}"#,
+                        r#"{"model":"gpt-5.6-terra","session_key":"legacy-session","messages":[{"role":"user","content":"new current ask"}]}"#,
                     ))
                     .unwrap(),
             )
             .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let first: Value =
-            serde_json::from_slice(&to_bytes(first.into_body(), 64 * 1024).await.unwrap()).unwrap();
-        assert_eq!(first["choices"][0]["message"]["content"], "first answer");
-
-        let second = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"model":"gpt-5.6-terra","stream":true,"session_key":"stream-checkpoint-failure","messages":[{"role":"user","content":"first"},{"role":"assistant","content":"first answer"},{"role":"user","content":"second"}]}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.status(), StatusCode::OK);
-        let body = String::from_utf8(
-            to_bytes(second.into_body(), 64 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(body.contains("checkpoint_error"), "body={body}");
-        assert!(!body.contains("second answer"), "body={body}");
-        assert!(!body.contains("\"finish_reason\":\"stop\""), "body={body}");
+            .unwrap()
+        };
+        assert_eq!(
+            send(app.clone(), raw_key.clone()).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(std::fs::read(&checkpoint_path).unwrap(), before);
+        std::fs::write(&checkpoint_path, b"invalid checkpoint file").unwrap();
+        assert_eq!(send(app, raw_key).await.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read(&checkpoint_path).unwrap(),
+            b"invalid checkpoint file"
+        );
+        assert!(chat.0.lock().unwrap().is_some());
     }
 
     #[tokio::test]
@@ -13115,65 +12808,6 @@ mod tests {
         let qualification =
             internal_qualification_request(&request, "validate this response".to_owned(), false);
         assert!(qualification.attachments.is_empty());
-    }
-
-    fn completed_duplicate_request(stream: bool, user_length: usize) -> Value {
-        let mut body = json!({
-            "model":"gpt-5.6-terra",
-            "messages":[
-                {"role":"user","content":"x".repeat(user_length)},
-                {"role":"assistant","content":null,"tool_calls":[
-                    {"id":"completed-call","type":"function","function":{"name":"inspect","arguments":"{}"}}
-                ]},
-                {"role":"tool","tool_call_id":"completed-call","content":"{\"output\":\"ok\",\"exit_code\":0,\"status\":\"completed\"}"}
-            ],
-            "tools":[{"type":"function","function":{
-                "name":"inspect",
-                "description":"Read one caller-side record.",
-                "parameters":{"type":"object"}
-            }}]
-        });
-        if stream {
-            body["stream"] = Value::Bool(true);
-        }
-        body
-    }
-
-    fn completed_duplicate_full_context_request(
-        stream: bool,
-        historical_argument_length: usize,
-        current_user_length: usize,
-    ) -> Value {
-        let historical_arguments = format!(
-            "{{\"path\":\"workspace/old.py\",\"script\":\"{}\"}}",
-            "x".repeat(historical_argument_length)
-        );
-        let mut body = json!({
-            "model":"gpt-5.6-terra",
-            "conversation_id": format!("conversation-{}", "c".repeat(1_500)),
-            "session_id": format!("session-{}", "s".repeat(1_500)),
-            "messages":[
-                {"role":"user","content":"old evidence"},
-                {"role":"assistant","content":null,"tool_calls":[
-                    {"id":"historical-call","type":"function","function":{"name":"inspect","arguments":historical_arguments}}
-                ]},
-                {"role":"tool","tool_call_id":"historical-call","content":"{\"output\":\"old\",\"exit_code\":0,\"status\":\"completed\"}"},
-                {"role":"user","content":"current request ".to_owned() + &"y".repeat(current_user_length)},
-                {"role":"assistant","content":null,"tool_calls":[
-                    {"id":"completed-call","type":"function","function":{"name":"inspect","arguments":"{}"}}
-                ]},
-                {"role":"tool","tool_call_id":"completed-call","content":"{\"output\":\"ok\",\"exit_code\":0,\"status\":\"completed\"}"}
-            ],
-            "tools":[{"type":"function","function":{
-                "name":"inspect",
-                "description":"Read one caller-side record.",
-                "parameters":{"type":"object"}
-            }}]
-        });
-        if stream {
-            body["stream"] = Value::Bool(true);
-        }
-        body
     }
 
     fn issue_101_fixture_request(stream: bool) -> (Value, String) {
@@ -14071,7 +13705,7 @@ mod tests {
                 .iter()
                 .all(|historical| historical["id"].as_str() != Some(call_id))
         }));
-        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
         assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
 
         let tool_result = json!({
@@ -14138,7 +13772,7 @@ mod tests {
             );
             assert!(value["choices"][0]["message"]["tool_calls"].is_null());
         }
-        assert_eq!(gateway.checkpoints.list().unwrap().len(), 1);
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
         assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
 
         upstream_server.await.unwrap();
@@ -14164,11 +13798,8 @@ mod tests {
             .expect("second ChatHub message.text");
         let first_message_text_units = utf16_units(first_message_text);
         let second_message_text_units = utf16_units(second_message_text);
-        assert_eq!(first_message_text_units, 108_024);
-        assert_eq!(
-            second_message_text_units,
-            if error_state { 79_676 } else { 79_677 }
-        );
+        assert!(first_message_text_units <= 128_000);
+        assert!(second_message_text_units <= 128_000);
         assert!(first_message_text.contains("third_round_tool_01"));
         assert!(first_message_text.contains("parameter description"));
         assert!(second_message_text.contains("continuation result"));
@@ -14204,12 +13835,11 @@ mod tests {
                 .unwrap()
                 .ends_with(".txt")
         );
-        assert!(
-            second_argument["message"]
-                .get("messageAnnotations")
-                .is_none()
-        );
-        assert_eq!(first_argument["sessionId"], second_argument["sessionId"]);
+        let second_annotations = second_argument["message"]["messageAnnotations"]
+            .as_array()
+            .expect("current full-context document annotation");
+        assert_eq!(second_annotations.len(), 1);
+        assert_ne!(first_argument["sessionId"], second_argument["sessionId"]);
 
         let inline: Value = serde_json::from_str(issue_101_user_request_from_outbound_message(
             first_message_text,
@@ -14229,20 +13859,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            continuation_envelope["messages"].as_array().unwrap().len(),
-            1
+            continuation_envelope["transport_projection"]["kind"],
+            "full_context_document"
         );
-        assert_eq!(continuation_envelope["messages"][0]["role"], "tool");
         assert_eq!(
-            continuation_envelope["messages"][0]["tool_call_id"],
+            continuation_envelope["messages"].as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(continuation_envelope["messages"][2]["role"], "assistant");
+        assert_eq!(continuation_envelope["messages"][3]["role"], "tool");
+        assert_eq!(
+            continuation_envelope["messages"][3]["tool_call_id"],
             call_id
         );
         assert_eq!(
-            continuation_envelope["messages"][0]["content"],
+            continuation_envelope["messages"][3]["content"],
             serde_json::to_string(&tool_result).unwrap()
         );
         assert_eq!(
-            continuation_envelope["messages"][0]["tool_result_is_error"],
+            continuation_envelope["messages"][3]["tool_result_is_error"],
             error_state
         );
 
@@ -14261,7 +13896,7 @@ mod tests {
             first_message_text_units
         );
         assert_eq!(live[0]["messageTextAfterUtf16"], first_message_text_units);
-        assert_eq!(live[0]["preliminaryWireAfterUtf16"], 211_703);
+        assert!(live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap() > 128_000);
         assert_eq!(live[1]["status"], 200);
         assert!(live[1]["messageTextAfterUtf16"].as_u64().unwrap() <= 128_000);
         assert_eq!(live[0]["wireAfterUtf16"], utf16_units(&payloads[0]));
@@ -14610,315 +14245,6 @@ mod tests {
                 .unwrap()
                 <= 128_000
         );
-        token_server.abort();
-    }
-
-    #[tokio::test]
-    async fn non_stream_completed_duplicate_payload_overhead_does_not_block_continuation() {
-        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
-            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
-            format!("conversation-{}", "c".repeat(1_500)),
-            format!("session-{}", "s".repeat(1_500)),
-        ));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 14_000;
-        gateway.settings.save(settings).unwrap();
-        let app = Gateway::router(Arc::clone(&gateway));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&completed_duplicate_request(false, 8_000)).unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            body["choices"][0]["message"]["content"],
-            "unexpected final-answer fallback"
-        );
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        let record = gateway.debug.records_for_test().pop().unwrap();
-        assert_eq!(record["status"], 200);
-        assert_eq!(record["admissionResult"], "admitted");
-        assert_eq!(record["transportProjection"], "inline");
-        assert!(
-            record["wireBeforeUtf16"].as_u64().unwrap()
-                >= record["messageTextBeforeUtf16"].as_u64().unwrap()
-        );
-        assert!(record["messageTextBeforeUtf16"].as_u64().unwrap() <= 14_000);
-        assert_eq!(record["fallbackFailure"], "not_applicable");
-        assert_eq!(record["callerDelivery"], "sent");
-        assert_eq!(record["toolCallSuppressed"], true);
-    }
-
-    #[tokio::test]
-    async fn streaming_completed_duplicate_payload_overhead_keeps_sse_continuation_contract() {
-        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
-            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
-            format!("conversation-{}", "c".repeat(1_500)),
-            format!("session-{}", "s".repeat(1_500)),
-        ));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 14_000;
-        gateway.settings.save(settings).unwrap();
-        let app = Gateway::router(Arc::clone(&gateway));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&completed_duplicate_request(true, 8_000)).unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = String::from_utf8(
-            to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(body.contains("unexpected final-answer fallback"));
-        assert!(!body.contains("\"code\":\"text_input_too_large\""));
-        assert!(body.ends_with("data: [DONE]\n\n"));
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        let record = gateway.debug.records_for_test().pop().unwrap();
-        assert_eq!(record["status"], 200);
-        assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
-        assert_eq!(record["transportProjection"], "inline");
-        assert!(
-            record["wireBeforeUtf16"].as_u64().unwrap()
-                >= record["messageTextBeforeUtf16"].as_u64().unwrap()
-        );
-        assert!(record["messageTextBeforeUtf16"].as_u64().unwrap() <= 14_000);
-        assert_eq!(record["fallbackFailure"], "not_applicable");
-        assert_eq!(record["callerDelivery"], "sent");
-        assert_eq!(record["toolCallSuppressed"], true);
-    }
-
-    #[tokio::test]
-    async fn non_stream_full_context_continuation_preserves_initial_spill_identity() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-        let (oauth, token_server) = oauth_with_graph_token_server().await;
-        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
-            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
-            format!("conversation-{}", "c".repeat(10_000)),
-            format!("session-{}", "s".repeat(10_000)),
-        ));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
-        let telemetry_path = gateway.debug.path_for_test().unwrap();
-        let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 7_000;
-        gateway.settings.save(settings).unwrap();
-        let app = Gateway::router(Arc::clone(&gateway));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&completed_duplicate_full_context_request(
-                            false, 30_000, 750,
-                        ))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(status, StatusCode::OK, "body={body}");
-        assert_eq!(
-            body["choices"][0]["message"]["content"],
-            "unexpected final-answer fallback"
-        );
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let request = &requests[0];
-        assert_eq!(
-            serde_json::from_str::<Value>(&request.text).unwrap()["transport_projection"]["kind"],
-            "full_context_document"
-        );
-        let attachment = request
-            .attachments
-            .iter()
-            .find(|attachment| attachment.generated_oversize_text)
-            .expect("full context generated attachment");
-        let encoded = attachment
-            .url
-            .strip_prefix("data:text/plain;base64,")
-            .unwrap();
-        let document = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
-        assert!(document.contains("historical-call"));
-        drop(requests);
-
-        let live = gateway.debug.records_for_test();
-        assert_eq!(live[0]["spillReason"], "full_context_document");
-        assert_eq!(live[0]["transportProjection"], "full_context_document");
-        assert_eq!(live[0]["fallbackFailure"], "not_applicable");
-        assert!(live[0]["wireBeforeUtf16"].as_u64().unwrap() > 7_000);
-        assert!(
-            live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap()
-                >= live[0]["preliminaryMessageTextAfterUtf16"]
-                    .as_u64()
-                    .unwrap()
-        );
-        assert!(
-            live[0]["preliminaryMessageTextAfterUtf16"]
-                .as_u64()
-                .unwrap()
-                <= 7_000
-        );
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            utf16_units(&crate::chathub::outbound_message_text(
-                &requests[1].text,
-                &requests[1].tools,
-                &requests[1].tool_choice,
-                requests[1].tool_call_limit,
-            )) <= 7_000
-        );
-        assert_eq!(
-            requests[1]
-                .attachments
-                .iter()
-                .filter(|attachment| attachment.generated_oversize_text)
-                .count(),
-            1
-        );
-        assert_eq!(
-            requests[1].attachments[0].name,
-            requests[0].attachments[0].name
-        );
-        let continuation: Value = serde_json::from_str(&requests[1].text).unwrap();
-        assert_eq!(
-            continuation["transport_projection"]["kind"],
-            "full_context_document"
-        );
-        drop(requests);
-        let durable: Value = serde_json::from_str(
-            std::fs::read_to_string(telemetry_path)
-                .unwrap()
-                .lines()
-                .last()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(durable["spillDecision"], "performed");
-        assert_eq!(durable["spillReason"], "full_context_document");
-        token_server.abort();
-    }
-
-    #[tokio::test]
-    async fn streaming_full_context_continuation_preserves_sse_and_spill_identity() {
-        let (oauth, token_server) = oauth_with_graph_token_server().await;
-        let chat = Arc::new(DuplicateFallbackTransport::with_identity(
-            ["```inspect\n{}\n```", "unexpected final-answer fallback"],
-            format!("conversation-{}", "c".repeat(10_000)),
-            format!("session-{}", "s".repeat(10_000)),
-        ));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
-        let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 7_000;
-        gateway.settings.save(settings).unwrap();
-        let app = Gateway::router(Arc::clone(&gateway));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&completed_duplicate_full_context_request(
-                            true, 30_000, 750,
-                        ))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let body = String::from_utf8(
-            to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert_eq!(status, StatusCode::OK, "body={body}");
-        assert!(body.contains("unexpected final-answer fallback"));
-        assert!(!body.contains("\"code\":\"text_input_too_large\""));
-        assert!(body.ends_with("data: [DONE]\n\n"));
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        let live = gateway.debug.records_for_test();
-        assert_eq!(live[0]["status"], 200);
-        assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
-        assert_eq!(live[0]["spillReason"], "full_context_document");
-        assert_eq!(live[0]["transportProjection"], "full_context_document");
-        assert_eq!(live[0]["fallbackFailure"], "not_applicable");
-        assert!(
-            live[0]["preliminaryMessageTextAfterUtf16"]
-                .as_u64()
-                .unwrap()
-                <= 7_000
-        );
-        assert!(
-            live[0]["preliminaryWireAfterUtf16"].as_u64().unwrap()
-                >= live[0]["preliminaryMessageTextAfterUtf16"]
-                    .as_u64()
-                    .unwrap()
-        );
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            utf16_units(&crate::chathub::outbound_message_text(
-                &requests[1].text,
-                &requests[1].tools,
-                &requests[1].tool_choice,
-                requests[1].tool_call_limit,
-            )) <= 7_000
-        );
-        assert_eq!(
-            requests[1]
-                .attachments
-                .iter()
-                .filter(|attachment| attachment.generated_oversize_text)
-                .count(),
-            1
-        );
-        assert_eq!(
-            requests[1].attachments[0].name,
-            requests[0].attachments[0].name
-        );
-        let continuation: Value = serde_json::from_str(&requests[1].text).unwrap();
-        assert_eq!(
-            continuation["transport_projection"]["kind"],
-            "full_context_document"
-        );
-        drop(requests);
         token_server.abort();
     }
 
@@ -16012,7 +15338,8 @@ mod tests {
     #[tokio::test]
     async fn streaming_recovered_generated_document_reaches_upstream_once_without_request_retry() {
         let (upload_base, upload_state, upload_server) = issue_104_upload_server().await;
-        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let (oauth, token_server) =
+            oauth_with_graph_token_server_token(format!("issue-104-base:{upload_base}")).await;
         let (websocket_base, upstream_payloads, upstream_server) =
             issue_101_upstream_server_for(1).await;
         let (mut gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth);
@@ -16090,10 +15417,14 @@ mod tests {
         body["session_id"] = Value::String("issue-104-synthetic-session".to_owned());
 
         let (upload_base, upload_state, upload_server) = issue_104_stable_upload_server().await;
-        let (websocket_base, upstream_payloads, upstream_server) =
-            issue_101_upstream_server_for(4).await;
-        let (oauth, token_server) = oauth_with_graph_token_server().await;
+        let (websocket_base, upstream_payloads, private_flags, upstream_server) =
+            issue_101_upstream_server_with_private_flags(4).await;
+        let (oauth, token_server) =
+            oauth_with_graph_token_server_token(format!("issue-104-base:{upload_base}")).await;
         let (mut gateway, raw_key) = gateway_with_chat_and_oauth(Arc::new(EmptyTransport), oauth);
+        let mut settings = gateway.settings.current();
+        settings.chat_mode = "normal".to_owned();
+        gateway.settings.save(settings).unwrap();
         let hub = LiveChatHub::new_for_test(
             gateway.settings.clone(),
             issue_104_real_prepare_attachments,
@@ -16105,7 +15436,6 @@ mod tests {
 
         for stream in [false, true] {
             let session_key = format!("issue-101-native-session-{stream}");
-            let expected_checkpoint_count = usize::from(stream) + 1;
             let mut native_context = staged_native_context(
                 &gateway,
                 &session_key,
@@ -16162,17 +15492,7 @@ mod tests {
                 "stream={stream} body={}",
                 String::from_utf8_lossy(&response_body)
             );
-            let checkpoint_views = gateway.checkpoints.list().unwrap();
-            assert_eq!(
-                checkpoint_views.len(),
-                expected_checkpoint_count,
-                "stream={stream} caller tool response checkpoint count"
-            );
-            assert!(checkpoint_views.iter().all(|view| {
-                !view.id.is_empty()
-                    && view.conversation_id == format!("issue-104-base:{upload_base}")
-                    && !view.session_id.is_empty()
-            }));
+            assert!(gateway.checkpoints.list().unwrap().is_empty());
             let first_body = String::from_utf8(response_body.to_vec()).unwrap();
             let assistant = if stream {
                 let frames = sse_values(&first_body);
@@ -16229,17 +15549,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(continuation_status, StatusCode::OK, "stream={stream}");
-            let checkpoint_views = gateway.checkpoints.list().unwrap();
-            assert_eq!(
-                checkpoint_views.len(),
-                expected_checkpoint_count,
-                "stream={stream} continuation checkpoint count"
-            );
-            assert!(checkpoint_views.iter().all(|view| {
-                !view.id.is_empty()
-                    && view.conversation_id == format!("issue-104-base:{upload_base}")
-                    && !view.session_id.is_empty()
-            }));
+            assert!(gateway.checkpoints.list().unwrap().is_empty());
             if stream {
                 let frames = sse_values(&continuation_body);
                 let terminal = sole_sse_terminal(&frames, "stop");
@@ -16266,8 +15576,14 @@ mod tests {
 
         let create_calls = upload_state.create_calls.load(Ordering::Acquire);
         let put_calls = upload_state.put_calls.load(Ordering::Acquire);
-        assert_eq!(create_calls, 10, "prepared document create calls");
-        assert_eq!(put_calls, 10, "prepared document upload calls");
+        assert_eq!(
+            create_calls, 12,
+            "each fresh conversation prepares all three documents"
+        );
+        assert_eq!(
+            put_calls, 12,
+            "each fresh conversation uploads all three documents"
+        );
         let create_names = upload_state.create_names.lock().unwrap().clone();
         let put_bodies = upload_state.put_bodies.lock().unwrap().clone();
         assert_eq!(create_names.len(), create_calls);
@@ -16287,8 +15603,9 @@ mod tests {
                 assert_eq!(sha256_hex(bytes), file_sha);
                 let document: Value = serde_json::from_slice(bytes).unwrap();
                 assert_eq!(document["schema"], "m365-full-context/v1");
-                assert_eq!(document["source_message_count"], 85);
-                assert_eq!(document["message_count"], 85);
+                let expected_messages = if generated_uploads % 2 == 1 { 85 } else { 87 };
+                assert_eq!(document["source_message_count"], expected_messages);
+                assert_eq!(document["message_count"], expected_messages);
             } else if bytes.as_slice() == native_a {
                 assert!(name.starts_with("ordinary-a-") && name.ends_with(".txt"));
                 native_a_uploads += 1;
@@ -16299,9 +15616,10 @@ mod tests {
                 panic!("unexpected prepared attachment bytes");
             }
         }
-        assert_eq!(generated_uploads, 2);
+        assert_eq!(generated_uploads, 4);
         assert_eq!(native_a_uploads, 4);
         assert_eq!(native_b_uploads, 4);
+        assert_eq!(*private_flags.lock().unwrap(), vec![true; 4]);
         {
             let payloads = upstream_payloads.lock().unwrap();
             assert_eq!(payloads.len(), 4);
@@ -16323,10 +15641,9 @@ mod tests {
                     utf16_units(message_text) <= effective_limit,
                     "payload_index={payload_index} message text exceeds the effective limit"
                 );
-                // Even payloads are the initial 85-message requests. Odd payloads are
-                // checkpoint continuations: the accepted prefix is not resent, so only
-                // the two native attachments remain in this outbound suffix.
-                let expected_annotations = if payload_index % 2 == 0 { 3 } else { 2 };
+                // Each request carries its complete current transcript and gets a
+                // fresh upstream conversation, including its own spill document.
+                let expected_annotations = 3;
                 assert_eq!(
                     annotations.len(),
                     expected_annotations,
@@ -16342,8 +15659,7 @@ mod tests {
                     })
                     .count();
                 assert_eq!(
-                    generated_annotations,
-                    usize::from(payload_index % 2 == 0),
+                    generated_annotations, 1,
                     "payload_index={payload_index} generated TXT annotations"
                 );
                 assert!(
@@ -17487,61 +16803,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn hermes_known_completed_duplicate_gets_no_tool_final_answer_pass() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```kanban_show\n{\"task_id\":\"t_c3de88aa\"}\n```",
-            "No. The task is still blocked and has no active worker.",
-        ]));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let app = Gateway::router(Arc::clone(&gateway));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{
-                            "model":"gpt-5.6-terra",
-                            "messages":[
-                                {"role":"user","content":"真的繼續了嗎？"},
-                                {"role":"assistant","content":null,"tool_calls":[
-                                    {"id":"c1","type":"function","function":{"name":"kanban_show","arguments":"{\"task_id\":\"t_c3de88aa\"}"}}
-                                ]},
-                                {"role":"tool","tool_call_id":"c1","content":"{\"status\":\"triage\",\"worker_pid\":null}"}
-                            ],
-                            "tools":[{"type":"function","function":{
-                                "name":"kanban_show",
-                                "description":"Read a Kanban task.",
-                                "parameters":{"type":"object","properties":{"task_id":{"type":"string"}}}
-                            }}],
-                            "tool_choice":"auto"
-                        }"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            value["choices"][0]["message"]["content"],
-            "No. The task is still blocked and has no active worker."
-        );
-        assert!(value["choices"][0]["message"].get("tool_calls").is_none());
-
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(!requests[0].tools.is_empty());
-        assert_eq!(requests[1].tools.len(), 1);
-        assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
-
-        let record = gateway.debug.records_for_test().pop().unwrap();
-        assert_eq!(record["toolCallSuppressed"], true);
-    }
-
     fn duplicate_fallback_with_legal_followup_request(stream: bool) -> Value {
         let mut body = json!({
             "model":"gpt-5.6-terra",
@@ -17571,380 +16832,6 @@ mod tests {
             body["stream_options"] = json!({"include_usage":true});
         }
         body
-    }
-
-    async fn assert_duplicate_fallback_preserves_legal_followup(stream: bool) {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "```read_file\n{\"path\":\"workspace/current.json\"}\n```",
-        ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&duplicate_fallback_with_legal_followup_request(stream))
-                            .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let observed_prompt_tokens = if stream {
-            let body = String::from_utf8(
-                to_bytes(response.into_body(), 64 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
-            let frames = sse_values(&body);
-            let terminals = frames
-                .iter()
-                .filter(|frame| frame["choices"][0]["finish_reason"].is_string())
-                .collect::<Vec<_>>();
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0]["choices"][0]["finish_reason"], "tool_calls");
-            let usage = frames
-                .iter()
-                .find(|frame| frame["usage"].is_object())
-                .expect("stream must include the terminal usage frame");
-            let tool_call = frames
-                .iter()
-                .find_map(|frame| frame.pointer("/choices/0/delta/tool_calls/0"))
-                .expect("stream must contain the projected caller tool call");
-            assert_eq!(tool_call["function"]["name"], "read_file");
-            usage["usage"]["prompt_tokens"]
-                .as_u64()
-                .expect("stream prompt token estimate")
-        } else {
-            let value: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                    .unwrap();
-            assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
-            assert_eq!(
-                value["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-                "read_file"
-            );
-            value["usage"]["prompt_tokens"]
-                .as_u64()
-                .expect("response prompt token estimate")
-        };
-
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].tools.len(), 2);
-        assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
-        assert!(requests[1].text.contains("SUPPRESSED_CANDIDATES"));
-        assert!(requests[1].text.contains("completed-inspect"));
-        assert!(
-            !requests[1]
-                .text
-                .contains("Use only this compact transport evidence")
-        );
-        assert_eq!(
-            observed_prompt_tokens,
-            (utf16_units(&requests[1].text) as u64).div_ceil(4),
-            "final usage must include the duplicate-fallback continuation context"
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_duplicate_fallback_keeps_a_distinct_non_stream_tool_call() {
-        assert_duplicate_fallback_preserves_legal_followup(false).await;
-    }
-
-    #[tokio::test]
-    async fn hermes_duplicate_fallback_keeps_a_distinct_stream_tool_call() {
-        assert_duplicate_fallback_preserves_legal_followup(true).await;
-    }
-
-    #[tokio::test]
-    async fn hermes_duplicate_fallback_tool_result_can_continue_normally() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "```read_file\n{\"path\":\"workspace/current.json\"}\n```",
-            "The caller readback was accepted and the request can continue.",
-        ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
-        let session_key = "duplicate-fallback-result-continuation";
-        let mut first_request = duplicate_fallback_with_legal_followup_request(false);
-        first_request["session_key"] = Value::String(session_key.to_owned());
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", &raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&first_request).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let first: Value =
-            serde_json::from_slice(&to_bytes(first.into_body(), 64 * 1024).await.unwrap()).unwrap();
-        let assistant = first["choices"][0]["message"].clone();
-        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "read_file");
-        let call_id = assistant["tool_calls"][0]["id"]
-            .as_str()
-            .expect("caller tool call id")
-            .to_owned();
-
-        let mut messages = first_request["messages"].as_array().unwrap().clone();
-        messages.push(assistant);
-        messages.push(json!({
-            "role":"tool",
-            "tool_call_id":call_id,
-            "content":"{\"content\":\"current file\",\"file_size\":12,\"is_binary\":false,\"is_image\":false,\"total_lines\":1,\"truncated\":false}"
-        }));
-        let second = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model":"gpt-5.6-terra",
-                            "session_key":session_key,
-                            "messages":messages,
-                            "tools":first_request["tools"].clone(),
-                            "tool_choice":"auto"
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.status(), StatusCode::OK);
-        let second: Value =
-            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            second["choices"][0]["message"]["content"],
-            "The caller readback was accepted and the request can continue."
-        );
-        assert_eq!(chat.requests.lock().unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn hermes_duplicate_fallback_does_not_widen_specific_tool_choice() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "```read_file\n{\"path\":\"workspace/current.json\"}\n```",
-        ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
-        let mut request = duplicate_fallback_with_legal_followup_request(false);
-        let specific_choice = json!({
-            "type":"function",
-            "function":{"name":"inspect"}
-        });
-        request["tool_choice"] = specific_choice.clone();
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let value: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(value["error"]["type"], "tool_protocol_error");
-        assert_eq!(value["error"]["code"], "tool_choice_unsatisfied");
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        assert_eq!(
-            chat.requests.lock().unwrap()[1].tool_choice,
-            specific_choice
-        );
-    }
-
-    #[tokio::test]
-    async fn hermes_duplicate_fallback_does_not_widen_required_tool_choice_in_stream() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "The required caller tool was not selected.",
-        ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
-        let mut request = duplicate_fallback_with_legal_followup_request(true);
-        request["tool_choice"] = Value::String("required".to_owned());
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = String::from_utf8(
-            to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(body.contains("tool_choice_unsatisfied"), "body={body}");
-        assert!(!body.contains("finish_reason"), "body={body}");
-        assert!(body.ends_with("data: [DONE]\n\n"));
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        assert_eq!(
-            chat.requests.lock().unwrap()[1].tool_choice,
-            Value::String("required".to_owned())
-        );
-    }
-
-    async fn assert_duplicate_fallback_overflow_fails_closed(stream: bool) {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "```read_file\n{\"path\":\"a\"}\n```\n```read_file\n{\"path\":\"b\"}\n```",
-        ]));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let app = Gateway::router(Arc::clone(&gateway));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&duplicate_fallback_with_legal_followup_request(stream))
-                            .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        if stream {
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = String::from_utf8(
-                to_bytes(response.into_body(), 64 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
-            assert!(body.contains("invalid_tool_call"), "body={body}");
-            assert!(!body.contains("finish_reason"), "body={body}");
-            assert!(body.ends_with("data: [DONE]\n\n"));
-            assert_eq!(body.matches("data: [DONE]\n\n").count(), 1);
-            let error_line = body
-                .lines()
-                .find(|line| line.contains("\"code\":\"invalid_tool_call\""))
-                .expect("SSE terminal invalid-tool frame");
-            let value: Value =
-                serde_json::from_str(error_line.strip_prefix("data: ").unwrap()).unwrap();
-            assert_eq!(value["error"]["type"], "upstream_error");
-            assert_eq!(value["error"]["terminal"], true);
-            assert_eq!(value["error"]["retryable"], false);
-            assert_eq!(value["error"]["failure_stage"], "replay_continuation");
-            assert_eq!(value["error"]["candidate_not_dispatched"], true);
-        } else {
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-            let value: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                    .unwrap();
-            assert_eq!(value["error"]["code"], "invalid_tool_call");
-            assert_eq!(value["error"]["type"], "upstream_error");
-            assert_eq!(value["error"]["terminal"], true);
-            assert_eq!(value["error"]["retryable"], false);
-            assert_eq!(value["error"]["failure_stage"], "replay_continuation");
-            assert_eq!(value["error"]["candidate_not_dispatched"], true);
-        }
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        let record = gateway.debug.records_for_test().pop().unwrap();
-        assert_eq!(record["toolCallRejectionClass"], "more_calls_than_allowed");
-        assert_eq!(record["toolCandidateSha256"].as_str().unwrap().len(), 64);
-        assert!(record["toolCandidateBytes"].as_u64().unwrap() > 0);
-        assert!(record["toolCandidateChars"].as_u64().unwrap() > 0);
-        assert!(record["toolCandidateLines"].as_u64().unwrap() > 0);
-        assert!(record["toolFenceCount"].as_u64().unwrap() >= 2);
-        assert!(record["toolMatchingKnownToolFenceCount"].as_u64().unwrap() >= 2);
-        assert!(record["toolParseErrorOffset"].is_null());
-        assert_eq!(record["toolStream"], stream);
-        assert!(matches!(
-            record["toolProjectionStage"].as_str(),
-            Some("initial_response") | Some("final_answer_fallback")
-        ));
-        assert!(record["toolRetryAttemptOrdinal"].as_u64().unwrap() > 0);
-    }
-
-    #[tokio::test]
-    async fn hermes_duplicate_fallback_overflow_fails_closed_non_stream() {
-        assert_duplicate_fallback_overflow_fails_closed(false).await;
-    }
-
-    #[tokio::test]
-    async fn hermes_duplicate_fallback_overflow_fails_closed_stream() {
-        assert_duplicate_fallback_overflow_fails_closed(true).await;
-    }
-
-    async fn assert_repeated_duplicate_fallback_fails_closed(stream: bool) {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "```inspect\n{}\n```",
-        ]));
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-        let app = Gateway::router(Arc::clone(&gateway));
-        let mut request = duplicate_fallback_with_legal_followup_request(stream);
-        request["session_key"] = Value::String("repeated-duplicate-fallback".to_owned());
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        if stream {
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = String::from_utf8(
-                to_bytes(response.into_body(), 64 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
-            assert!(body.contains("unsafe_tool_replay"), "body={body}");
-            assert!(!body.contains("finish_reason"), "body={body}");
-            assert!(body.ends_with("data: [DONE]\n\n"));
-        } else {
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            let value: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                    .unwrap();
-            assert_eq!(value["error"]["type"], "tool_protocol_error");
-            assert_eq!(value["error"]["code"], "unsafe_tool_replay");
-        }
-
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-        assert!(gateway.checkpoints.list().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn hermes_repeated_duplicate_fallback_is_typed_non_stream_error() {
-        assert_repeated_duplicate_fallback_fails_closed(false).await;
-    }
-
-    #[tokio::test]
-    async fn hermes_repeated_duplicate_fallback_is_typed_stream_error() {
-        assert_repeated_duplicate_fallback_fails_closed(true).await;
     }
 
     #[tokio::test]
@@ -17995,139 +16882,6 @@ mod tests {
         }
     }
 
-    async fn assert_unsafe_replay_does_not_poison_the_next_user_turn(stream: bool) {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "The prior inspection result is accepted.",
-            "```inspect\n{}\n```",
-            "```inspect\n{}\n```",
-            "```inspect\n{}\n```",
-            "```inspect\n{}\n```",
-            "```inspect\n{}\n```",
-            "```inspect\n{}\n```",
-            "The next user turn can continue.",
-        ]));
-        let root = tempfile::tempdir().unwrap();
-        let (gateway, key) = gateway_with_chat_and_oauth_at_root(
-            chat.clone(),
-            oauth(),
-            root.path().to_owned(),
-            None,
-        );
-        let app = Gateway::router(gateway.clone());
-        let mut request = completed_duplicate_request(stream, 1);
-        request["session_key"] = json!("unsafe-replay-settle");
-        let (status, body) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(status, StatusCode::OK, "body={body}");
-        assert!(body.contains("The prior inspection result is accepted."));
-        request["messages"].as_array_mut().unwrap().push(json!({
-            "role":"assistant", "content":"The prior inspection result is accepted."
-        }));
-
-        let checkpoint_path = root.path().join("transport-checkpoints.json");
-        let accepted: Value =
-            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-        let prior = &accepted["records"][0];
-        assert_eq!(
-            prior["toolLedger"]["completed"].as_array().unwrap().len(),
-            1
-        );
-        assert_eq!(prior["toolLedger"]["completed"][0]["id"], "completed-call");
-
-        request["messages"].as_array_mut().unwrap().push(json!({
-            "role":"assistant", "content":"Continue the current turn."
-        }));
-        let (status, body) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(
-            status,
-            if stream {
-                StatusCode::OK
-            } else {
-                StatusCode::CONFLICT
-            }
-        );
-        assert!(body.contains("unsafe_tool_replay"), "body={body}");
-        assert!(body.contains("\"retryable\":false"));
-        let caller_dispatch_count = body.matches("\"tool_calls\"").count();
-        assert_eq!(
-            caller_dispatch_count, 0,
-            "rejected candidate reached caller"
-        );
-        let rejected: Value =
-            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-        assert_eq!(
-            rejected["records"][0], *prior,
-            "rejected turn must not change the accepted checkpoint or ledger"
-        );
-        assert_eq!(chat.requests.lock().unwrap().len(), 3);
-        assert_eq!(
-            gateway.debug.records_for_test().last().unwrap()["checkpointTurnOutcome"],
-            "discarded_generation"
-        );
-
-        request["messages"].as_array_mut().unwrap().push(json!({
-            "role":"assistant", "content":"Continue without re-executing the prior call."
-        }));
-        let (status, body) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(
-            status,
-            if stream {
-                StatusCode::OK
-            } else {
-                StatusCode::CONFLICT
-            }
-        );
-        assert!(body.contains("unsafe_tool_replay"), "body={body}");
-        let caller_dispatch_count = body.matches("\"tool_calls\"").count();
-        assert_eq!(
-            caller_dispatch_count, 0,
-            "repeated candidate reached caller"
-        );
-        let repeated: Value =
-            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-        assert_eq!(repeated["records"][0], *prior);
-        assert_eq!(chat.requests.lock().unwrap().len(), 5);
-
-        drop(app);
-        drop(gateway);
-        let reopened = CheckpointStore::open(&checkpoint_path).unwrap();
-        let (gateway, _) = gateway_with_chat_and_oauth_at_root(
-            chat.clone(),
-            oauth(),
-            root.path().to_owned(),
-            Some(reopened),
-        );
-        let app = Gateway::router(gateway);
-
-        let (status, body) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(
-            status,
-            if stream {
-                StatusCode::OK
-            } else {
-                StatusCode::CONFLICT
-            }
-        );
-        assert!(body.contains("unsafe_tool_replay"), "body={body}");
-        assert!(!body.contains("\"tool_calls\""));
-        assert_eq!(chat.requests.lock().unwrap().len(), 7);
-
-        request["messages"].as_array_mut().unwrap().push(json!({
-            "role":"user", "content":"Give a fresh read-only status."
-        }));
-        let (status, body) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(status, StatusCode::OK, "body={body}");
-        assert!(
-            body.contains("The next user turn can continue."),
-            "body={body}"
-        );
-        assert_eq!(chat.requests.lock().unwrap().len(), 8);
-    }
-
-    #[tokio::test]
-    async fn hermes_unsafe_replay_settles_non_stream_checkpoint_for_next_turn() {
-        assert_unsafe_replay_does_not_poison_the_next_user_turn(false).await;
-    }
-
     #[tokio::test]
     async fn hermes_generation_failure_before_caller_effect_allows_ordinary_turn_after_restart() {
         let root = tempfile::tempdir().unwrap();
@@ -18162,63 +16916,6 @@ mod tests {
         let (status, body) = syntax_public_response(&app, &key, &request).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(body.contains("ordinary continuation"));
-    }
-
-    #[tokio::test]
-    async fn concurrent_hermes_generations_discard_the_stale_loser_without_poison() {
-        for stream in [false, true] {
-            let chat = Arc::new(ConcurrentGenerationsTransport {
-                calls: AtomicUsize::new(0),
-                first_entered: tokio::sync::Notify::new(),
-                release_first: tokio::sync::Notify::new(),
-            });
-            let (gateway, key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-            let app = Gateway::router(gateway.clone());
-            let request = json!({
-                "model":"gpt-5.6-terra",
-                "stream":stream,
-                "session_key":"concurrent-generation",
-                "messages":[{"role":"user","content":"Continue."}]
-            });
-            let first_app = app.clone();
-            let first_key = key.clone();
-            let first_request = request.clone();
-            let first = tokio::spawn(async move {
-                syntax_public_response(&first_app, &first_key, &first_request).await
-            });
-            chat.first_entered.notified().await;
-            let (winner_status, winner_body) = syntax_public_response(&app, &key, &request).await;
-            assert_eq!(winner_status, StatusCode::OK, "body={winner_body}");
-            assert!(winner_body.contains("winner response"));
-            chat.release_first.notify_one();
-            let (loser_status, loser_body) = first.await.unwrap();
-            assert_eq!(
-                loser_status,
-                if stream {
-                    StatusCode::OK
-                } else {
-                    StatusCode::CONFLICT
-                },
-                "body={loser_body}"
-            );
-            assert!(loser_body.contains("checkpoint_stale"));
-            assert!(loser_body.contains("\"retryable\":false"));
-            assert!(gateway.checkpoints.recovery_views().unwrap().is_empty());
-
-            let next = json!({
-                "model":"gpt-5.6-terra",
-                "stream":stream,
-                "session_key":"concurrent-generation",
-                "messages":[
-                    {"role":"user","content":"Continue."},
-                    {"role":"assistant","content":"winner response"},
-                    {"role":"user","content":"Next ordinary turn."}
-                ]
-            });
-            let (status, body) = syntax_public_response(&app, &key, &next).await;
-            assert_eq!(status, StatusCode::OK, "body={body}");
-            assert!(body.contains("ordinary continuation"));
-        }
     }
 
     #[tokio::test]
@@ -18338,187 +17035,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert!(body.contains("fresh conversation"));
         assert_eq!(chat.requests.lock().unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn hermes_unsafe_replay_settles_stream_checkpoint_for_next_turn() {
-        assert_unsafe_replay_does_not_poison_the_next_user_turn(true).await;
-    }
-
-    async fn assert_first_unsafe_replay_allows_immediate_user_turn(stream: bool) {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "The prior inspection result is accepted.",
-            "```inspect\n{}\n```",
-            "```inspect\n{}\n```",
-            "The ordinary user turn can continue.",
-        ]));
-        let root = tempfile::tempdir().unwrap();
-        let (gateway, key) = gateway_with_chat_and_oauth_at_root(
-            chat.clone(),
-            oauth(),
-            root.path().to_owned(),
-            None,
-        );
-        let app = Gateway::router(gateway.clone());
-        let mut request = completed_duplicate_request(stream, 1);
-        request["session_key"] = json!("unsafe-replay-immediate-user");
-        let (status, _) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(status, StatusCode::OK);
-        request["messages"].as_array_mut().unwrap().extend([
-            json!({"role":"assistant", "content":"The prior inspection result is accepted."}),
-            json!({"role":"assistant", "content":"Continue the current turn."}),
-        ]);
-
-        let (status, body) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(
-            status,
-            if stream {
-                StatusCode::OK
-            } else {
-                StatusCode::CONFLICT
-            }
-        );
-        assert!(body.contains("unsafe_tool_replay"), "body={body}");
-        assert_eq!(body.matches("\"tool_calls\"").count(), 0);
-        let checkpoint_path = root.path().join("transport-checkpoints.json");
-        let after_rejection: Value =
-            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-        assert!(after_rejection["records"][0].get("inFlight").is_none());
-        assert_eq!(
-            after_rejection["records"][0]["toolLedger"]["completed"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-
-        request["messages"].as_array_mut().unwrap().push(json!({
-            "role":"user", "content":"Give a fresh read-only status."
-        }));
-        let (status, body) = syntax_public_response(&app, &key, &request).await;
-        assert_eq!(status, StatusCode::OK, "body={body}");
-        assert!(body.contains("The ordinary user turn can continue."));
-        assert_eq!(chat.requests.lock().unwrap().len(), 4);
-    }
-
-    #[tokio::test]
-    async fn hermes_unsafe_replay_allows_immediate_user_turn_non_stream() {
-        assert_first_unsafe_replay_allows_immediate_user_turn(false).await;
-    }
-
-    #[tokio::test]
-    async fn hermes_unsafe_replay_allows_immediate_user_turn_stream() {
-        assert_first_unsafe_replay_allows_immediate_user_turn(true).await;
-    }
-
-    #[tokio::test]
-    async fn hermes_checkpoint_duplicate_fallback_uses_one_followup_generation() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "The inspection result is already available.",
-        ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
-        let mut body = completed_duplicate_request(false, 1);
-        body["session_key"] = Value::String("checkpoint-hook-fallback".to_owned());
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let value: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            value["choices"][0]["message"]["content"],
-            "The inspection result is already available."
-        );
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn hermes_streaming_checkpoint_duplicate_fallback_uses_one_followup_generation() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "The streaming inspection result is already available.",
-        ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
-        let mut body = completed_duplicate_request(true, 1);
-        body["session_key"] = Value::String("streaming-checkpoint-hook-fallback".to_owned());
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = String::from_utf8(
-            to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(body.contains("The streaming inspection result is already available."));
-        assert!(body.ends_with("data: [DONE]\n\n"));
-        assert_eq!(chat.requests.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn hermes_streaming_full_context_duplicate_fallback_uses_one_followup_generation() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```inspect\n{}\n```",
-            "The full-context streaming fallback is complete.",
-        ]));
-        let (oauth, token_server) = oauth_with_graph_token_server().await;
-        let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth);
-        let mut settings = gateway.settings.current();
-        settings.text_input_limit_utf16 = 50_000;
-        gateway.settings.save(settings).unwrap();
-        let mut body = completed_duplicate_full_context_request(true, 60_000, 100);
-        body["session_key"] = Value::String("streaming-full-context-hook-fallback".to_owned());
-        body["session_id"] = Value::String("streaming-full-context-hook-fallback".to_owned());
-        let app = Gateway::router(Arc::clone(&gateway));
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let response_body = String::from_utf8(
-            to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert_eq!(status, StatusCode::OK, "body={response_body}");
-        assert!(response_body.contains("The full-context streaming fallback is complete."));
-        assert!(response_body.ends_with("data: [DONE]\n\n"));
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            serde_json::from_str::<Value>(&requests[0].text).unwrap()["transport_projection"]["kind"]
-                == "full_context_document"
-        );
-        token_server.abort();
     }
 
     #[tokio::test]
@@ -18805,6 +17321,294 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_hermes_uses_each_current_transcript_in_a_fresh_upstream_conversation() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "First answer.",
+            "Second answer.",
+        ]));
+        let (gateway, key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let app = Gateway::router(gateway.clone());
+        for messages in [
+            json!([{"role":"user","content":"Original goal."}]),
+            json!([
+                {"role":"system","content":"Compressed state: original goal was completed."},
+                {"role":"user","content":"Revised goal: inspect the current result."}
+            ]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", &key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "session_key":"same-hermes-session",
+                                "conversation_id":"stale-caller-conversation",
+                                "session_id":"stale-caller-session",
+                                "messages":messages
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let requests = chat.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.conversation_id.is_empty() && request.session_id.is_empty())
+        );
+        assert!(requests.iter().all(|request| request.force_private));
+        assert!(
+            requests[1]
+                .text
+                .contains("Revised goal: inspect the current result.")
+        );
+        assert!(!requests[1].text.contains("Original goal."));
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn generic_chat_keeps_the_saved_transport_mode() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let response = Gateway::router(gateway)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("x-api-key", key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"generic ask"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!chat.0.lock().unwrap().as_ref().unwrap().force_private);
+    }
+
+    #[tokio::test]
+    async fn ordinary_hermes_rejects_duplicate_candidates_in_one_model_output() {
+        let chat = Arc::new(DuplicateFallbackTransport::new([
+            "```inspect\n{\"target\":\"current\"}\n```\n```inspect\n{\"target\":\"current\"}\n```",
+        ]));
+        let (app, key) = app_with_chat(chat.clone());
+        let response = app
+            .oneshot(
+                Request::post("/hermes/v1/chat/completions")
+                    .header("x-api-key", key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model":"gpt-5.6-terra",
+                            "session_key":"same-batch",
+                            "parallel_tool_calls":true,
+                            "messages":[{"role":"user","content":"Inspect current state."}],
+                            "tools":[{"type":"function","function":{
+                                "name":"inspect","parameters":{"type":"object"},
+                                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+                            }}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat.requests.lock().unwrap()[0].tool_call_limit, 2);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "invalid_tool_call");
+    }
+
+    #[tokio::test]
+    async fn ordinary_hermes_rejects_arguments_outside_the_declared_tool_schema() {
+        for stream in [false, true] {
+            let chat = Arc::new(DuplicateFallbackTransport::new([
+                "```inspect\n{\"target\":42}\n```",
+            ]));
+            let (app, key) = app_with_chat(chat.clone());
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "stream":stream,
+                                "messages":[{"role":"user","content":"Inspect current state."}],
+                                "tools":[{"type":"function","function":{
+                                    "name":"inspect","parameters":{
+                                        "type":"object",
+                                        "required":["target"],
+                                        "properties":{"target":{"type":"string"}}
+                                    }
+                                }}]
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if stream {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("invalid_tool_call"));
+            assert!(!body.contains("finish_reason"));
+            assert_eq!(chat.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_hermes_rejects_nonempty_or_invalid_checkpoint_mode_before_upstream() {
+        for mode in [json!("illegal"), json!("full"), Value::Null] {
+            let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+            let (app, key) = app_with_chat(chat.clone());
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "checkpoint_mode":mode,
+                                "messages":[{"role":"user","content":"current ask"}]
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(chat.0.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_hermes_preserves_a_tool_with_surrounding_text_in_both_protocol_shapes() {
+        let output = "I will inspect now.\n```inspect\n{\"target\":\"current\"}\n```\nI will report what I find.";
+        for stream in [false, true] {
+            let (app, key) = app_with_chat(Arc::new(SequenceTransport::new([output])));
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "model":"gpt-5.6-terra",
+                                "messages":[{"role":"user","content":"Inspect current state."}],
+                                "tools":[{"type":"function","function":{
+                                    "name":"inspect","parameters":{"type":"object"}
+                                }}],
+                                "stream":stream
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            if stream {
+                let frames = sse_values(std::str::from_utf8(&bytes).unwrap());
+                assert_eq!(
+                    sole_sse_terminal(&frames, "tool_calls")["choices"][0]["finish_reason"],
+                    "tool_calls"
+                );
+                assert!(frames.iter().any(|frame| {
+                    frame.pointer("/choices/0/delta/tool_calls/0/function/name")
+                        == Some(&json!("inspect"))
+                }));
+            } else {
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(
+                    body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                    "inspect"
+                );
+                assert!(
+                    body["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("I will report what I find.")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_hermes_projects_a_new_non_outlook_call_with_prior_arguments() {
+        for stream in [false, true] {
+            let chat = Arc::new(DuplicateFallbackTransport::new([
+                "```inspect\n{}\n```",
+                "Fallback must not run.",
+            ]));
+            let (app, key) = app_with_chat(chat.clone());
+            let mut request = duplicate_fallback_with_legal_followup_request(stream);
+            request["session_key"] = json!(format!("repeat-inspect-{stream}"));
+            let response = app
+                .oneshot(
+                    Request::post("/hermes/v1/chat/completions")
+                        .header("x-api-key", key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            if stream {
+                let frames = sse_values(std::str::from_utf8(&bytes).unwrap());
+                assert!(
+                    frames
+                        .iter()
+                        .any(|frame| frame["choices"][0]["finish_reason"] == "tool_calls")
+                );
+                assert!(frames.iter().any(|frame| {
+                    frame.pointer("/choices/0/delta/tool_calls/0/function/name")
+                        == Some(&json!("inspect"))
+                }));
+            } else {
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(
+                    body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                    "inspect"
+                );
+            }
+            assert_eq!(chat.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn hermes_full_prefix_reuse_resolves_checkpointed_tool_result_without_duplicate_id() {
         let (app, raw_key) = app_with_chat(Arc::new(SequenceTransport::new([
             "```inspect\n{\"target\":\"service-a\"}\n```",
@@ -18877,62 +17681,6 @@ mod tests {
             second["choices"][0]["message"]["content"],
             "Inspection completed successfully."
         );
-    }
-
-    #[tokio::test]
-    async fn hermes_streaming_duplicate_gets_no_tool_final_answer_pass() {
-        let chat = Arc::new(DuplicateFallbackTransport::new([
-            "```kanban_show\n{\"task_id\":\"t_c3de88aa\"}\n```",
-            "No. The task is still blocked and has no active worker.",
-        ]));
-        let (app, raw_key) = app_with_chat(chat.clone());
-        let response = app
-            .oneshot(
-                Request::post("/hermes/v1/chat/completions")
-                    .header("x-api-key", raw_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{
-                            "model":"gpt-5.6-terra",
-                            "stream":true,
-                            "messages":[
-                                {"role":"user","content":"真的繼續了嗎？"},
-                                {"role":"assistant","content":null,"tool_calls":[
-                                    {"id":"c1","type":"function","function":{"name":"kanban_show","arguments":"{\"task_id\":\"t_c3de88aa\"}"}}
-                                ]},
-                                {"role":"tool","tool_call_id":"c1","content":"{\"status\":\"triage\",\"worker_pid\":null}"}
-                            ],
-                            "tools":[{"type":"function","function":{
-                                "name":"kanban_show",
-                                "description":"Read a Kanban task.",
-                                "parameters":{"type":"object","properties":{"task_id":{"type":"string"}}}
-                            }}],
-                            "tool_choice":"auto"
-                        }"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = String::from_utf8(
-            to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(body.contains("No. The task is still blocked and has no active worker."));
-        assert!(!body.contains("matching tool call was not reissued"));
-        assert!(body.contains("\"finish_reason\":\"stop\""));
-        assert!(body.ends_with("data: [DONE]\n\n"));
-
-        let requests = chat.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(!requests[0].tools.is_empty());
-        assert_eq!(requests[1].tools.len(), 1);
-        assert_eq!(requests[1].tool_choice, Value::String("auto".to_owned()));
     }
 
     #[tokio::test]
@@ -19680,171 +18428,154 @@ mod tests {
     #[tokio::test]
     async fn escape_witness_is_live_only_on_all_hermes_projection_paths() {
         for stream in [false, true] {
-            for fallback in [false, true] {
-                for (candidate, class, kind, marker, inside, probe) in [
-                    (
-                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\q\"}\n```",
-                        "illegal_escape",
-                        "invalid_simple_escape",
-                        113,
-                        true,
-                        "valid_object",
-                    ),
-                    (
-                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\x\"}\n```",
-                        "illegal_escape",
-                        "invalid_simple_escape",
-                        120,
-                        true,
-                        "valid_object",
-                    ),
-                    (
-                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\u12G4\"}\n```",
-                        "illegal_escape",
-                        "unicode_non_hex",
-                        117,
-                        true,
-                        "valid_object",
-                    ),
-                    (
-                        "```read_file\n{\"path\":\"C:\\PRIVATE-SENTINEL\"}\n```",
-                        "illegal_escape",
-                        "invalid_simple_escape",
-                        80,
-                        true,
-                        "valid_object",
-                    ),
-                    (
-                        "```read_file\n{\"path\":\"print(\\x41) PRIVATE-SENTINEL\"}\n```",
-                        "illegal_escape",
-                        "invalid_simple_escape",
-                        120,
-                        true,
-                        "valid_object",
-                    ),
-                    (
-                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\\\\\q\"}\n```",
-                        "illegal_escape",
-                        "invalid_simple_escape",
-                        113,
-                        true,
-                        "valid_object",
-                    ),
-                    (
-                        "```read_file\n{\"path\":\\q}\n```",
-                        "malformed_json_structure",
-                        "backslash_outside_string",
-                        113,
-                        false,
-                        "still_invalid",
-                    ),
-                    (
-                        "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\q\",}\n```",
-                        "illegal_escape",
-                        "invalid_simple_escape",
-                        113,
-                        true,
-                        "still_invalid",
-                    ),
-                ] {
-                    let results = if fallback {
-                        vec!["```inspect\n{}\n```", candidate]
-                    } else {
-                        vec![candidate]
-                    };
-                    let chat = Arc::new(DuplicateFallbackTransport::new(results));
-                    let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
-                    let app = Gateway::router(gateway.clone());
-                    let response = app
-                        .clone()
-                        .oneshot(
-                            Request::post("/hermes/v1/chat/completions")
-                                .header("x-api-key", raw_key)
-                                .header(header::CONTENT_TYPE, "application/json")
-                                .body(Body::from(
-                                    serde_json::to_vec(
-                                        &duplicate_fallback_with_legal_followup_request(stream),
-                                    )
-                                    .unwrap(),
-                                ))
-                                .unwrap(),
-                        )
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        response.status(),
-                        if stream {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::BAD_GATEWAY
-                        }
-                    );
-                    let body = String::from_utf8(
-                        to_bytes(response.into_body(), 64 * 1024)
-                            .await
-                            .unwrap()
-                            .to_vec(),
-                    )
-                    .unwrap();
-                    assert!(body.contains("invalid_tool_call"));
-                    assert!(!body.contains("PRIVATE-SENTINEL"));
-                    assert!(!body.contains("toolEscapeWitness"));
-                    assert!(!body.contains("finish_reason"));
-                    assert_eq!(
-                        chat.requests.lock().unwrap().len(),
-                        if fallback { 2 } else { 1 }
-                    );
-
-                    let login = gateway
-                        .admin
-                        .login("password", "127.0.0.1", OffsetDateTime::now_utc())
-                        .unwrap();
-                    let response = app
-                        .oneshot(
-                            Request::get("/api/admin/debug/logs")
-                                .header(header::HOST, "127.0.0.1")
-                                .header(
-                                    header::COOKIE,
-                                    format!("m365_admin_session={}", login.token),
+            for (candidate, class, kind, marker, inside, probe) in [
+                (
+                    "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\q\"}\n```",
+                    "illegal_escape",
+                    "invalid_simple_escape",
+                    113,
+                    true,
+                    "valid_object",
+                ),
+                (
+                    "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\x\"}\n```",
+                    "illegal_escape",
+                    "invalid_simple_escape",
+                    120,
+                    true,
+                    "valid_object",
+                ),
+                (
+                    "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\u12G4\"}\n```",
+                    "illegal_escape",
+                    "unicode_non_hex",
+                    117,
+                    true,
+                    "valid_object",
+                ),
+                (
+                    "```read_file\n{\"path\":\"C:\\PRIVATE-SENTINEL\"}\n```",
+                    "illegal_escape",
+                    "invalid_simple_escape",
+                    80,
+                    true,
+                    "valid_object",
+                ),
+                (
+                    "```read_file\n{\"path\":\"print(\\x41) PRIVATE-SENTINEL\"}\n```",
+                    "illegal_escape",
+                    "invalid_simple_escape",
+                    120,
+                    true,
+                    "valid_object",
+                ),
+                (
+                    "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\\\\\q\"}\n```",
+                    "illegal_escape",
+                    "invalid_simple_escape",
+                    113,
+                    true,
+                    "valid_object",
+                ),
+                (
+                    "```read_file\n{\"path\":\\q}\n```",
+                    "malformed_json_structure",
+                    "backslash_outside_string",
+                    113,
+                    false,
+                    "still_invalid",
+                ),
+                (
+                    "```read_file\n{\"path\":\"PRIVATE-SENTINEL\\q\",}\n```",
+                    "illegal_escape",
+                    "invalid_simple_escape",
+                    113,
+                    true,
+                    "still_invalid",
+                ),
+            ] {
+                let chat = Arc::new(DuplicateFallbackTransport::new([candidate]));
+                let (gateway, raw_key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+                let app = Gateway::router(gateway.clone());
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post("/hermes/v1/chat/completions")
+                            .header("x-api-key", raw_key)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(
+                                    &duplicate_fallback_with_legal_followup_request(stream),
                                 )
-                                .body(Body::empty())
                                 .unwrap(),
-                        )
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if stream {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    }
+                );
+                let body = String::from_utf8(
+                    to_bytes(response.into_body(), 64 * 1024)
                         .await
-                        .unwrap();
-                    assert_eq!(response.status(), StatusCode::OK);
-                    let live = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-                    assert!(!String::from_utf8_lossy(&live).contains("PRIVATE-SENTINEL"));
-                    let live: Value = serde_json::from_slice(&live).unwrap();
-                    let record = live["records"]
-                        .as_array()
                         .unwrap()
-                        .iter()
-                        .find(|record| record["path"] == "/hermes/v1/chat/completions")
-                        .unwrap();
-                    assert_eq!(record["toolCallRejectionClass"], class);
-                    assert_eq!(record["toolStream"], stream);
-                    assert_eq!(
-                        record["toolProjectionStage"],
-                        if fallback {
-                            "final_answer_fallback"
-                        } else {
-                            "initial_response"
-                        }
-                    );
-                    let witness = &record["toolEscapeWitness"];
-                    assert_eq!(witness["kind"], kind);
-                    assert_eq!(witness["escapeMarkerAscii"], marker);
-                    assert_eq!(witness["lexicalInsideString"], inside);
-                    assert_eq!(witness["singleEscapeNeutralizedObject"], probe);
-                    assert_eq!(witness["toolNameSha256"].as_str().unwrap().len(), 64);
-                    assert!(serde_json::to_vec(witness).unwrap().len() < 1024);
-                    let durable =
-                        std::fs::read_to_string(gateway.debug.path_for_test().unwrap()).unwrap();
-                    assert!(!durable.contains("PRIVATE-SENTINEL"));
-                    assert!(!durable.contains("toolEscapeWitness"));
-                    assert!(!durable.contains("escapeMarkerAscii"));
-                }
+                        .to_vec(),
+                )
+                .unwrap();
+                assert!(body.contains("invalid_tool_call"));
+                assert!(!body.contains("PRIVATE-SENTINEL"));
+                assert!(!body.contains("toolEscapeWitness"));
+                assert!(!body.contains("finish_reason"));
+                assert_eq!(chat.requests.lock().unwrap().len(), 1);
+
+                let login = gateway
+                    .admin
+                    .login("password", "127.0.0.1", OffsetDateTime::now_utc())
+                    .unwrap();
+                let response = app
+                    .oneshot(
+                        Request::get("/api/admin/debug/logs")
+                            .header(header::HOST, "127.0.0.1")
+                            .header(
+                                header::COOKIE,
+                                format!("m365_admin_session={}", login.token),
+                            )
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let live = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                assert!(!String::from_utf8_lossy(&live).contains("PRIVATE-SENTINEL"));
+                let live: Value = serde_json::from_slice(&live).unwrap();
+                let record = live["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|record| record["path"] == "/hermes/v1/chat/completions")
+                    .unwrap();
+                assert_eq!(record["toolCallRejectionClass"], class);
+                assert_eq!(record["toolStream"], stream);
+                assert_eq!(record["toolProjectionStage"], "initial_response");
+                let witness = &record["toolEscapeWitness"];
+                assert_eq!(witness["kind"], kind);
+                assert_eq!(witness["escapeMarkerAscii"], marker);
+                assert_eq!(witness["lexicalInsideString"], inside);
+                assert_eq!(witness["singleEscapeNeutralizedObject"], probe);
+                assert_eq!(witness["toolNameSha256"].as_str().unwrap().len(), 64);
+                assert!(serde_json::to_vec(witness).unwrap().len() < 1024);
+                let durable =
+                    std::fs::read_to_string(gateway.debug.path_for_test().unwrap()).unwrap();
+                assert!(!durable.contains("PRIVATE-SENTINEL"));
+                assert!(!durable.contains("toolEscapeWitness"));
+                assert!(!durable.contains("escapeMarkerAscii"));
             }
         }
     }

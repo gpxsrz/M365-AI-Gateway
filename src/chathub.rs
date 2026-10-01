@@ -305,6 +305,7 @@ pub struct ChatRequest {
     pub(crate) outbound_text_limit_utf16: usize,
     pub mcp_server_url: String,
     pub disable_built_in_search: bool,
+    pub(crate) force_private: bool,
     pub upstream_attempt_count: Arc<AtomicUsize>,
     pub generated_attachment_reused: Arc<AtomicBool>,
     pub(crate) final_message_text_utf16: Arc<AtomicUsize>,
@@ -344,6 +345,7 @@ impl fmt::Debug for ChatRequest {
             .field("outbound_text_limit_utf16", &self.outbound_text_limit_utf16)
             .field("mcp_server_url", &"<redacted>")
             .field("disable_built_in_search", &self.disable_built_in_search)
+            .field("force_private", &self.force_private)
             .field(
                 "native_attachment_manager",
                 &self.native_attachment_manager.is_some(),
@@ -1985,7 +1987,7 @@ impl ChatHubTransport for LiveChatHub {
         request: ChatRequest,
         events: &'a mut (dyn EventSink + Send),
     ) -> ChatFuture<'a> {
-        let private_mode = self.settings.current().chat_mode != "normal";
+        let private_mode = request.force_private || self.settings.current().chat_mode != "normal";
         let attachment_preparer = self.attachment_preparer;
         #[cfg(test)]
         let websocket_base = self.websocket_base.clone();

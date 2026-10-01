@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-HERMES_FIXTURE_COMMIT = "641f7c810449d9af5c21b0a5ee33b29b192b4117"
+HERMES_FIXTURE_COMMIT = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
 _FIXTURE_SECRET = "fixture-" + hashlib.sha256(
     b"m365-native-attachments-hermes-integration"
 ).hexdigest()

@@ -43,7 +43,7 @@ Hermes, Hindsight, and Semantica are external upstreams. M365 compatibility must
 | Need | Surface | Key behavior |
 |---|---|---|
 | Auxiliary / control Chat Completions | `/v1/chat/completions` | ForceNew / untracked transport |
-| Hermes / Atlas | `/hermes/v1/chat/completions` | Hermes execution identity / checkpoint seam |
+| Hermes / Atlas | `/hermes/v1/chat/completions` | current messages in a fresh Private conversation; signed execution identity; explicit checkpoint recovery remains separate |
 | Hindsight Memory | `/memory/v1/chat/completions` | Memory queue class; no Hermes authority |
 | Responses | `/v1/responses` | compatible projection over the same transport core |
 | Anthropic Messages | `/v1/messages` | Anthropic-compatible projection |

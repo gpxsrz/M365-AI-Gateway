@@ -26,7 +26,8 @@ Optional environment overrides:
 
 The deployment creates a temporary rollback backup and removes it after a
 successful deployment or a successful rollback. A backup is retained only if
-rollback itself fails.
+rollback itself fails. Rollback restores only runtime files and compose;
+settings and checkpoint data are never rewound.
 EOF
 }
 
@@ -213,10 +214,7 @@ compose_cmd=("$docker_bin" compose -p "$project" -f "$compose")
 backup="$(dirname "$compose")/.deploy-backup-$(date +%Y%m%d-%H%M%S)-$$"
 stage_dir="${stage%.tar}.dir"
 web_dir="$(dirname "$app")/web"
-checkpoint_state="$data/transport-checkpoints.json"
-checkpoint_key="$data/.transport-checkpoints.json.key"
 backup_ready=0
-checkpoint_backup_ready=0
 rollback_running=0
 
 sha256_file() {
@@ -267,71 +265,12 @@ atomic_restore_file() {
   mv -f "$tmp" "$target"
 }
 
-snapshot_optional_file() {
-  local source=$1 name=$2 marker
-  marker="$backup/$name.presence"
-  if [[ -L "$source" ]]; then
-    echo "unsafe rollback source symlink: $source" >&2
-    return 1
-  fi
-  if [[ -e "$source" ]]; then
-    [[ -f "$source" ]] || { echo "unsafe rollback source: $source" >&2; return 1; }
-    cp -p "$source" "$backup/$name"
-    [[ -s "$backup/$name" ]] || { echo "backup verification failed: $name" >&2; return 1; }
-    printf 'present\n' > "$marker"
-  else
-    printf 'absent\n' > "$marker"
-  fi
-}
-
-restore_optional_file() {
-  local name=$1 target=$2 marker state
-  marker="$backup/$name.presence"
-  [[ -f "$marker" ]] || return 1
-  state=$(cat "$marker")
-  case "$state" in
-    present)
-      [[ -f "$backup/$name" ]] || return 1
-      atomic_restore_file "$backup/$name" "$target"
-      ;;
-    absent)
-      rm -f "$target"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-verify_optional_restore() {
-  local name=$1 target=$2 marker state
-  marker="$backup/$name.presence"
-  [[ -f "$marker" ]] || return 1
-  state=$(cat "$marker")
-  case "$state" in
-    present)
-      [[ -f "$target" && -f "$backup/$name" ]] && cmp -s "$backup/$name" "$target"
-      ;;
-    absent)
-      [[ ! -e "$target" ]]
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 verify_restored_files() {
   [[ "$(sha256_file "$backup/m365-native")" == "$(sha256_file "$app")" ]] || return 1
   [[ "$(sha256_file "$backup/index.html")" == "$(sha256_file "$web_dir/index.html")" ]] || return 1
   [[ "$(sha256_file "$backup/login.html")" == "$(sha256_file "$web_dir/login.html")" ]] || return 1
   [[ "$(sha256_file "$backup/debug.html")" == "$(sha256_file "$web_dir/debug.html")" ]] || return 1
   [[ "$(sha256_file "$backup/compose.yaml")" == "$(sha256_file "$compose")" ]] || return 1
-  [[ "$(sha256_file "$backup/settings.json")" == "$(sha256_file "$data/settings.json")" ]] || return 1
-  if ((checkpoint_backup_ready)); then
-    verify_optional_restore "transport-checkpoints.json" "$checkpoint_state" || return 1
-    verify_optional_restore "transport-checkpoints.key" "$checkpoint_key" || return 1
-  fi
 }
 
 rollback() {
@@ -352,11 +291,6 @@ rollback() {
   atomic_restore_file "$backup/login.html" "$web_dir/login.html" || rollback_ok=0
   atomic_restore_file "$backup/debug.html" "$web_dir/debug.html" || rollback_ok=0
   atomic_restore_file "$backup/compose.yaml" "$compose" || rollback_ok=0
-  atomic_restore_file "$backup/settings.json" "$data/settings.json" || rollback_ok=0
-  if ((checkpoint_backup_ready)); then
-    restore_optional_file "transport-checkpoints.json" "$checkpoint_state" || rollback_ok=0
-    restore_optional_file "transport-checkpoints.key" "$checkpoint_key" || rollback_ok=0
-  fi
   if ((rollback_ok)) && ! verify_restored_files; then
     rollback_ok=0
   fi
@@ -448,8 +382,7 @@ cp -p "$web_dir/index.html" "$backup/index.html"
 cp -p "$web_dir/login.html" "$backup/login.html"
 cp -p "$web_dir/debug.html" "$backup/debug.html"
 cp -p "$compose" "$backup/compose.yaml"
-cp -p "$data/settings.json" "$backup/settings.json"
-for path in m365-native index.html login.html debug.html compose.yaml settings.json; do
+for path in m365-native index.html login.html debug.html compose.yaml; do
   [[ -s "$backup/$path" ]] || { echo "backup verification failed: $path" >&2; exit 1; }
 done
 backup_ready=1
@@ -498,9 +431,6 @@ PY
 }
 
 "${compose_cmd[@]}" stop "$service"
-snapshot_optional_file "$checkpoint_state" "transport-checkpoints.json"
-snapshot_optional_file "$checkpoint_key" "transport-checkpoints.key"
-checkpoint_backup_ready=1
 atomic_install_file "$stage_dir/m365-native" "$app" "$expected_sha"
 atomic_install_file "$stage_dir/web/index.html" "$web_dir/index.html" "$index_sha"
 atomic_install_file "$stage_dir/web/login.html" "$web_dir/login.html" "$login_sha"

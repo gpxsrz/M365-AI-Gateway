@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: NousResearch/hermes-agent
-          ref: 641f7c810449d9af5c21b0a5ee33b29b192b4117
+          ref: f97608f178d1ffeca59860195ab7da295f7c8e5f
           path: .ci/hermes-agent
           persist-credentials: false
       - uses: actions/setup-python@v6
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: NousResearch/hermes-agent
-          ref: 641f7c810449d9af5c21b0a5ee33b29b192b4117
+          ref: f97608f178d1ffeca59860195ab7da295f7c8e5f
           path: .ci/hermes-agent
           persist-credentials: false
       - uses: actions/setup-python@v6
@@ -87,18 +87,18 @@ jobs:
       - name: Run real default M365 PluginManager to SDK to Gateway regression
         env:
           HERMES_AGENT_ROOT: ${{ github.workspace }}/.ci/hermes-agent
-          HERMES_EXPECTED_COMMIT: 641f7c810449d9af5c21b0a5ee33b29b192b4117
+          HERMES_EXPECTED_COMMIT: f97608f178d1ffeca59860195ab7da295f7c8e5f
           M365_GATEWAY_BINARY: ${{ github.workspace }}/target/release/m365-native
           M365_NATIVE_ATTACHMENTS_PLUGIN_ROOT: ${{ github.workspace }}/integrations/hermes/m365_native_attachments
           M365_RECALL_PROVENANCE_PLUGIN_ROOT: ${{ github.workspace }}/integrations/hermes/m365_recall_provenance
         run: >-
           .ci/hermes-agent/.venv/bin/python -m unittest -v
           integrations.hermes.m365_native_attachments.hermes_integration
-      - name: Require real Hermes SDK checkpoint continuation and read-modify-read
+      - name: Require real Hermes SDK ordinary continuation and read-modify-read
         env:
           HERMES_AGENT_ROOT: ${{ github.workspace }}/.ci/hermes-agent
         run: >-
-          cargo test --locked --lib protocol::tests::hermes_checkpoint_sdk_identity_real_chain
+          cargo test --locked --lib protocol::tests::hermes_ordinary_sdk_identity_real_chain
           -- --ignored --exact --nocapture
 
   rust:
