@@ -26,7 +26,7 @@ Remember these six points:
 - Parallel tools are enabled only when all selectable tools are explicitly read-only; tool names alone are not trusted.
 - Generic and Memory tool rounds retain their configured ceiling. Hermes supports `0` for unlimited rounds; this does not force a text-only model answer into a tool call.
 - An already-sent transport outcome that is unknown cannot be replayed blindly; checkpoint/durable evidence must be reconciled first.
-- Ordinary Hermes requests do not suppress a new tool call based on earlier equal arguments. The tool domain owns effect retries and receipts; Gateway still checks same-output duplicates and current-request call/result pairing.
+- Ordinary Hermes requests do not suppress a new tool call based on earlier equal arguments. Gateway projects each parseable candidate in one response and checks the current OpenAI call/result message format; Hermes and the tool domain own repeated calls, effect retries, and receipts.
 - Explicit checkpoint adapters keep their replay protection. Historical Hermes `in_flight` and `terminal_unknown` records remain on the explicit recovery path and do not block ordinary requests.
 - Even when Hermes stores a large single-line JSON result completely as persisted output, native `read_file` may still clamp it at `max_line_length`; for a zero-newline single line, `total_lines`/`truncated` metadata alone cannot prove completeness. Use the existing terminal or `execute_code` to parse the original file and emit only a requested field or bounded character range; this is separate from M365 full-context TXT spill.
 

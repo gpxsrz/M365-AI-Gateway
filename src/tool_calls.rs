@@ -40,7 +40,6 @@ pub enum ToolRejectionClass {
     MoreCallsThanAllowed,
     KnownToolDisallowedByToolChoice,
     UnknownToolFence,
-    ArgumentsSchemaMismatch,
     Other,
 }
 
@@ -59,7 +58,6 @@ impl ToolRejectionClass {
             Self::MoreCallsThanAllowed => "more_calls_than_allowed",
             Self::KnownToolDisallowedByToolChoice => "known_tool_disallowed_by_tool_choice",
             Self::UnknownToolFence => "unknown_tool_fence",
-            Self::ArgumentsSchemaMismatch => "arguments_schema_mismatch",
             Self::Other => "other",
         }
     }
@@ -79,143 +77,6 @@ pub struct ToolDiagnostic {
 }
 
 pub type ToolRejection = ToolDiagnostic;
-
-// Select one known caller tool for model-owned correction; never repair its bytes.
-pub(crate) fn syntax_correction_tool<'a>(
-    text: &'a str,
-    tools: &[Tool],
-    choice: &Value,
-    limit: usize,
-) -> Option<(&'a str, ToolProjection, Option<String>)> {
-    let projection = project(text, tools, choice, limit);
-    let diagnostic = projection.rejection.as_ref()?;
-    let (name, arguments) = match diagnostic.class {
-        ToolRejectionClass::MalformedFence => terminal_malformed_closer_tool_fence(text, tools)?,
-        ToolRejectionClass::IllegalEscape
-        | ToolRejectionClass::MalformedJsonStructure
-        | ToolRejectionClass::UnclosedString => single_tool_fence(text)?,
-        _ => return None,
-    };
-    tool(tools, name).filter(|_| choice_allows(choice, name))?;
-    if !single_argument_object_boundary(arguments) {
-        return None;
-    }
-    let fence_arguments = if diagnostic.class == ToolRejectionClass::MalformedFence {
-        Some(canonical_arguments(arguments.trim()).ok()?)
-    } else {
-        None
-    };
-    // The fence branch uses the parsed terminal shape above; diagnostic counts
-    // can miss a tool name preceded by whitespace after the backticks.
-    (matches!(
-        diagnostic.class,
-        ToolRejectionClass::IllegalEscape
-            | ToolRejectionClass::MalformedJsonStructure
-            | ToolRejectionClass::UnclosedString
-            | ToolRejectionClass::MalformedFence
-    ) && projection.calls.is_empty()
-        && !projection.overflowed
-        && (diagnostic.class == ToolRejectionClass::MalformedFence
-            || (diagnostic.fence_count == 2 && diagnostic.matching_known_tool_fence_count == 1)))
-        .then_some((name, projection, fence_arguments))
-}
-
-// Ownership boundary only, not JSON validation. An unfinished object/string may
-// be re-expressed by the model; a second value or trailing prose must not be.
-fn single_argument_object_boundary(arguments: &str) -> bool {
-    let raw = arguments.trim();
-    if !raw.starts_with('{') {
-        return false;
-    }
-    let mut stack = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, byte) in raw.bytes().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-        } else {
-            match byte {
-                b'"' => in_string = true,
-                b'{' | b'[' => stack.push(byte),
-                b'}' | b']' => {
-                    if stack.pop() != Some(if byte == b'}' { b'{' } else { b'[' }) {
-                        return false;
-                    }
-                    if stack.is_empty() {
-                        return raw[index + 1..].trim().is_empty();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    true
-}
-
-pub(crate) fn strict_correction_arguments(text: &str, expected_tool: &str) -> Option<String> {
-    let (name, arguments) = single_tool_fence(text)?;
-    (name == expected_tool)
-        .then(|| canonical_arguments(arguments.trim()).ok())
-        .flatten()
-}
-
-fn single_tool_fence(text: &str) -> Option<(&str, &str)> {
-    let (opening, rest) = text.trim().split_once('\n')?;
-    let name = opening.trim().strip_prefix("```")?.trim();
-    if name.is_empty() || name.contains(char::is_whitespace) {
-        return None;
-    }
-    let (arguments, closing) = rest.rsplit_once('\n')?;
-    if closing.trim() != "```" || arguments.lines().any(|line| line.trim().starts_with("```")) {
-        return None;
-    }
-    Some((name, arguments))
-}
-
-// Correction may own one narrowly bounded Markdown closer typo without
-// executing or locally repairing it: an otherwise isolated known-tool fence
-// whose final line is another terminal fence marker carrying only one
-// ASCII info-string token (for example, ```json). The existing opening tag
-// and closing line both permit surrounding whitespace; the closing token
-// cannot name any registered tool.
-// Any extra material,
-// nested fence, second known tool, or non-object argument remains ineligible.
-fn terminal_malformed_closer_tool_fence<'a>(
-    text: &'a str,
-    tools: &[Tool],
-) -> Option<(&'a str, &'a str)> {
-    let (opening, rest) = text.trim().split_once('\n')?;
-    let name = opening.trim().strip_prefix("```")?.trim();
-    if name.is_empty() || name.contains(char::is_whitespace) {
-        return None;
-    }
-    let (arguments, closing) = rest.rsplit_once('\n')?;
-    let closing = closing.trim();
-    if closing == "```" || !closing.starts_with("```") {
-        return None;
-    }
-    let tag = closing[3..].trim();
-    if tag.is_empty()
-        || tools
-            .iter()
-            .any(|tool| tool.function.get("name").and_then(Value::as_str) == Some(tag))
-        || !tag
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '+'))
-        || arguments
-            .lines()
-            .any(|line| line.trim_start().starts_with("```"))
-    {
-        return None;
-    }
-    Some((name, arguments))
-}
 
 const MAX_ESCAPE_WITNESS_BYTES: usize = 64 * 1024;
 
@@ -430,36 +291,7 @@ pub(crate) fn project_ordinary_hermes(
     choice: &Value,
     limit: usize,
 ) -> ToolProjection {
-    let mut projection = project_inner(text, tools, choice, limit, true);
-    if projection.rejected {
-        return projection;
-    }
-    let invalid_arguments = projection.calls.iter().find_map(|call| {
-        let name = call.function.get("name")?.as_str()?;
-        let arguments = call.function.get("arguments")?.as_str()?;
-        let schema = tool(tools, name)?.function.get("parameters")?;
-        let valid = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                jsonschema::validator_for(schema)
-                    .ok()
-                    .map(|validator| validator.is_valid(&value))
-            })
-            .unwrap_or(false);
-        (!valid).then(|| arguments.to_owned())
-    });
-    if let Some(arguments) = invalid_arguments {
-        projection.calls.clear();
-        reject(
-            &mut projection,
-            ToolRejectionClass::ArgumentsSchemaMismatch,
-            &arguments,
-            text,
-            tools,
-            None,
-        );
-    }
-    projection
+    project_inner(text, tools, choice, limit, true)
 }
 
 fn project_inner(
@@ -480,9 +312,13 @@ fn project_inner(
         };
     }
     let mut output = ToolProjection::default();
-    let lines = text.lines().collect::<Vec<_>>();
+    let lines = text.split_terminator('\n').collect::<Vec<_>>();
     let mut cursor = 0;
-    let limit = limit.max(1);
+    let limit = if allow_trailing_text {
+        usize::MAX
+    } else {
+        limit.max(1)
+    };
     let mut pre_call_content = false;
     while cursor < lines.len() {
         let line = lines[cursor].trim();
@@ -517,17 +353,17 @@ fn project_inner(
                 .and_then(Value::as_str)
                 .is_some_and(|candidate| candidate == name)
         });
-        let allowed_tool = tool(tools, name).filter(|_| choice_allows_name);
+        let allowed_tool = tool(tools, name).filter(|_| allow_trailing_text || choice_allows_name);
         let Some(relative_end) = lines[cursor + 1..]
             .iter()
             .position(|candidate| candidate.trim() == "```")
         else {
             if let Some(tool) = allowed_tool {
                 match escaped_closing_fence_arguments(&lines[cursor + 1..]) {
-                    Some(raw) => match parse_object_arguments(raw) {
-                        ArgumentParseOutcome::Success { value, class } => {
+                    Some(raw) => match parse_object_arguments(raw, allow_trailing_text) {
+                        ArgumentParseOutcome::Success { wire, class } => {
                             set_diagnostic(&mut output, class, raw, text, tools, None);
-                            append_call(&mut output, tool, name, value, limit);
+                            append_call(&mut output, tool, name, wire, limit);
                         }
                         ArgumentParseOutcome::Failure { class, offset } => {
                             reject(&mut output, class, raw, text, tools, offset);
@@ -597,10 +433,10 @@ fn project_inner(
         let end = cursor + 1 + relative_end;
         let raw_arguments = lines[cursor + 1..end].join("\n");
         if let Some(tool) = allowed_tool {
-            match parse_object_arguments(&raw_arguments) {
-                ArgumentParseOutcome::Success { value, class } => {
+            match parse_object_arguments(&raw_arguments, allow_trailing_text) {
+                ArgumentParseOutcome::Success { wire, class } => {
                     set_diagnostic(&mut output, class, &raw_arguments, text, tools, None);
-                    append_call(&mut output, tool, name, value, limit);
+                    append_call(&mut output, tool, name, wire, limit);
                 }
                 ArgumentParseOutcome::Failure { class, offset } => {
                     reject(&mut output, class, &raw_arguments, text, tools, offset);
@@ -658,7 +494,7 @@ fn project_inner(
         }
         cursor = end + 1;
     }
-    output.content = if choice.as_str() == Some("none") {
+    output.content = if choice.as_str() == Some("none") && !allow_trailing_text {
         text.to_owned()
     } else {
         output.content.trim().to_owned()
@@ -689,7 +525,7 @@ fn project_inner(
 
 enum ArgumentParseOutcome {
     Success {
-        value: Value,
+        wire: String,
         class: ToolRejectionClass,
     },
     Failure {
@@ -715,12 +551,46 @@ fn argument_round_trip_is_lossless(raw: &str, value: &Value) -> bool {
         .is_some_and(|encoded| encoded == original)
 }
 
-fn parse_object_arguments(raw: &str) -> ArgumentParseOutcome {
+fn parse_object_arguments(raw: &str, preserve_raw: bool) -> ArgumentParseOutcome {
+    let original = raw;
     let raw = raw.trim();
+    if preserve_raw {
+        // Validate grammar and duplicate keys without decoding numbers or
+        // rewriting the provider's JSON representation.
+        let unambiguous =
+            |candidate: &str| canonical_arguments(&format!("{{\"value\":{candidate}}}")).is_ok();
+        if unambiguous(raw) {
+            return ArgumentParseOutcome::Success {
+                wire: original.to_owned(),
+                class: ToolRejectionClass::StrictJsonValid,
+            };
+        }
+        if serde_json::from_str::<Box<serde_json::value::RawValue>>(raw).is_ok() {
+            return ArgumentParseOutcome::Failure {
+                class: ToolRejectionClass::DuplicateOrAmbiguous,
+                offset: None,
+            };
+        }
+        let scan = scan_json_string(raw);
+        if scan.changed && unambiguous(&scan.repaired) {
+            return ArgumentParseOutcome::Success {
+                wire: scan.repaired,
+                class: ToolRejectionClass::LiteralControlCharInsideJsonString,
+            };
+        }
+        return ArgumentParseOutcome::Failure {
+            class: scan_failure_class(&scan),
+            offset: scan.illegal_escape_offset.or_else(|| {
+                serde_json::from_str::<Box<serde_json::value::RawValue>>(raw)
+                    .err()
+                    .map(|error| parse_error_offset(raw, &error))
+            }),
+        };
+    }
     match serde_json::from_str::<Value>(raw) {
         Ok(value) if argument_round_trip_is_lossless(raw, &value) => {
             ArgumentParseOutcome::Success {
-                value,
+                wire: serde_json::to_string(&value).expect("parsed JSON is serializable"),
                 class: ToolRejectionClass::StrictJsonValid,
             }
         }
@@ -734,7 +604,8 @@ fn parse_object_arguments(raw: &str) -> ArgumentParseOutcome {
                 match serde_json::from_str::<Value>(&scan.repaired) {
                     Ok(value) if argument_round_trip_is_lossless(&scan.repaired, &value) => {
                         ArgumentParseOutcome::Success {
-                            value,
+                            wire: serde_json::to_string(&value)
+                                .expect("parsed JSON is serializable"),
                             class: ToolRejectionClass::LiteralControlCharInsideJsonString,
                         }
                     }
@@ -894,14 +765,14 @@ fn scan_json_string(raw: &str) -> JsonStringScan {
 fn escaped_closing_fence_arguments<'a>(lines: &[&'a str]) -> Option<&'a str> {
     (lines.len() == 1)
         .then(|| lines[0])
-        .and_then(|raw| raw.strip_suffix(r"\n```").map(str::trim))
+        .and_then(|raw| raw.strip_suffix(r"\n```"))
 }
 
 fn append_call(
     output: &mut ToolProjection,
     tool: &Tool,
     name: &str,
-    arguments: Value,
+    arguments: String,
     limit: usize,
 ) {
     if output.calls.len() < limit {
@@ -914,7 +785,7 @@ fn append_call(
             },
             function: json!({
                 "name": name,
-                "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_owned())
+                "arguments": arguments
             }),
         });
     } else {
@@ -995,12 +866,9 @@ fn append_projection_content(
     if output.calls.is_empty() && !line.trim().is_empty() {
         *pre_call_content = true;
     }
-    // Generic projection rejects trailing prose. Ordinary Hermes preserves
-    // prose around one call but still rejects a second fenced candidate.
-    if !output.calls.is_empty()
-        && !line.trim().is_empty()
-        && (!allow_trailing_text || line.trim_start().starts_with("```"))
-    {
+    // A fenced line that is not a known tool candidate remains ordinary text.
+    // Generic projection keeps its existing no-trailing-prose contract.
+    if !allow_trailing_text && !output.calls.is_empty() && !line.trim().is_empty() {
         let class = if line.trim_start().starts_with("```") {
             ToolRejectionClass::DuplicateOrAmbiguous
         } else {
@@ -1030,198 +898,6 @@ mod tests {
             kind: "function".to_owned(),
             function: json!({"name":"read_file","parameters":{"type":"object"}}),
         }]
-    }
-
-    #[test]
-    fn syntax_correction_selects_only_one_known_object_candidate() {
-        // Public decision-boundary fixtures, not recovered incident candidates.
-        let malformed = "```read_file\n{\"path\":\"\\q\"}\n```";
-        for (case, text, expected_class) in [
-            ("illegal_escape", malformed, Some("illegal_escape")),
-            (
-                "terminal_malformed_closing_fence",
-                "```read_file\n{\"path\":\"README.md\"}\n```json",
-                Some("malformed_fence"),
-            ),
-            (
-                "malformed_structure",
-                "```read_file\n{\"path\":\"a\",}\n```",
-                Some("malformed_json_structure"),
-            ),
-            (
-                "unclosed_string",
-                "```read_file\n{\"path\":\"a\n```",
-                Some("unclosed_string"),
-            ),
-            (
-                "unfinished_nested_object",
-                "```read_file\n{\"paths\":[{\"path\":\"a\"\n```",
-                Some("malformed_json_structure"),
-            ),
-            (
-                "braces_and_escaped_quote_in_string",
-                "```read_file\n{\"path\":\"{[}] \\\" \\q\"}\n```",
-                Some("illegal_escape"),
-            ),
-            ("root_array", "```read_file\n[]\n```", None),
-            ("malformed_array", "```read_file\n[\n```", None),
-            (
-                "root_unclosed_string",
-                "```read_file\n\"unfinished\n```",
-                None,
-            ),
-            ("malformed_scalar", "```read_file\n1e\n```", None),
-            ("root_null", "```read_file\nnull\n```", None),
-            (
-                "second_object",
-                "```read_file\n{\"path\":\"\\q\"} {\"path\":\"other\"}\n```",
-                None,
-            ),
-            (
-                "trailing_prose_inside_fence",
-                "```read_file\n{\"path\":\"\\q\"} explanation\n```",
-                None,
-            ),
-            (
-                "mismatched_delimiters",
-                "```read_file\n{\"paths\":[}\n```",
-                None,
-            ),
-            ("unknown_tool", "```unknown\n{\"path\":\"\\q\"}\n```", None),
-            ("duplicate_declaration", malformed, None),
-            ("disallowed_named_choice", malformed, None),
-            ("choice_none", malformed, None),
-            (
-                "multiple_fences",
-                "```read_file\n{\"path\":\"\\q\"}\n```\n```read_file\n{\"path\":\"other\"}\n```",
-                None,
-            ),
-            ("broken_fence", "```read_file\n{\"path\":\"\\q\"}", None),
-            (
-                "malformed_closer_is_second_known_tool",
-                "```read_file\n{\"path\":\"README.md\"}\n```read_file",
-                None,
-            ),
-            (
-                "malformed_closer_spaced_known_tool",
-                "```read_file\n{\"path\":\"README.md\"}\n``` read_file",
-                None,
-            ),
-            (
-                "malformed_closer_tabbed_known_tool",
-                "```read_file\n{\"path\":\"README.md\"}\n```\tread_file",
-                None,
-            ),
-            (
-                "malformed_closer_duplicate_keys",
-                "```read_file\n{\"path\":\"one\",\"path\":\"two\"}\n```json",
-                None,
-            ),
-            (
-                "malformed_closer_truncated_arguments",
-                "```read_file\n{\"path\":\"unfinished\n```json",
-                None,
-            ),
-            (
-                "malformed_closer_nested_fence",
-                "```read_file\n{\"path\":\"README.md\"}\n```json\n```other",
-                None,
-            ),
-            (
-                "malformed_closer_has_trailing_material",
-                "```read_file\n{\"path\":\"README.md\"}\n```json extra",
-                None,
-            ),
-            (
-                "malformed_closer_followed_by_prose",
-                "```read_file\n{\"path\":\"README.md\"}\n```json\nexplanation",
-                None,
-            ),
-            (
-                "malformed_closer_second_object",
-                "```read_file\n{\"path\":\"README.md\"} {\"path\":\"other\"}\n```json",
-                None,
-            ),
-            (
-                "malformed_closer_root_array",
-                "```read_file\n[]\n```json",
-                None,
-            ),
-            (
-                "malformed_closer_unknown_tool",
-                "```unknown\n{\"path\":\"README.md\"}\n```json",
-                None,
-            ),
-            (
-                "malformed_closer_duplicate_declaration",
-                "```read_file\n{\"path\":\"README.md\"}\n```json",
-                None,
-            ),
-            (
-                "malformed_closer_choice_none",
-                "```read_file\n{\"path\":\"README.md\"}\n```json",
-                None,
-            ),
-            (
-                "malformed_closer_disallowed_choice",
-                "```read_file\n{\"path\":\"README.md\"}\n```json",
-                None,
-            ),
-            (
-                "prose_before",
-                "explanation\n```read_file\n{\"path\":\"\\q\"}\n```",
-                None,
-            ),
-            (
-                "prose_after",
-                "```read_file\n{\"path\":\"\\q\"}\n```\nexplanation",
-                None,
-            ),
-            (
-                "duplicate_argument_keys",
-                "```read_file\n{\"path\":\"one\",\"path\":\"two\"}\n```",
-                None,
-            ),
-            (
-                "already_valid",
-                "```read_file\n{\"path\":\"README.md\"}\n```",
-                None,
-            ),
-        ] {
-            let mut available = tools();
-            if matches!(
-                case,
-                "duplicate_declaration" | "malformed_closer_duplicate_declaration"
-            ) {
-                available.push(available[0].clone());
-            }
-            let choice = match case {
-                "disallowed_named_choice" | "malformed_closer_disallowed_choice" => {
-                    json!({"type":"function","function":{"name":"other"}})
-                }
-                "choice_none" | "malformed_closer_choice_none" => json!("none"),
-                _ => json!("auto"),
-            };
-            assert_eq!(
-                syntax_correction_tool(text, &available, &choice, 1)
-                    .as_ref()
-                    .map(|(name, _, _)| *name),
-                expected_class.map(|_| "read_file"),
-                "case={case}"
-            );
-            if let Some(expected_class) = expected_class {
-                let projection = project(text, &available, &choice, 1);
-                assert!(
-                    projection.rejected && projection.calls.is_empty(),
-                    "case={case}"
-                );
-                assert_eq!(
-                    projection.rejection.unwrap().class.as_str(),
-                    expected_class,
-                    "case={case}"
-                );
-            }
-        }
     }
 
     #[test]

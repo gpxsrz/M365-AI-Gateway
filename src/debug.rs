@@ -326,23 +326,10 @@ struct Record {
     tool_stream: bool,
     #[serde(skip_serializing, default, deserialize_with = "deserialize_zero_usize")]
     tool_retry_attempt_ordinal: usize,
-    #[serde(skip)]
-    tool_correction_attempted: bool,
-    #[serde(skip)]
-    tool_correction_outcome: String,
-    #[serde(skip)]
-    tool_correction_failure_class: String,
-    #[serde(skip)]
-    tool_correction_original_sha256: String,
     // None preserves the frozen v1 bytes; Some survives rollback, including
     // Store compaction, instead of being reset or discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_correction_native_effect_witness: Option<crate::chathub::NativeEffectWitness>,
-    // The image-origin counterfactual is intentionally live-only. A rollback
-    // reader must neither ingest nor persist this bounded diagnostic.
-    #[serde(skip)]
-    tool_correction_native_effect_image_diagnostic:
-        Option<crate::chathub::NativeEffectImageDiagnostic>,
     // Transport details are a bounded live projection. They are deliberately
     // absent from the v1 JSONL record so an older rollback reader can still
     // read the authoritative durable surface.
@@ -655,12 +642,7 @@ impl Record {
             tool_projection_stage: "not_evaluated".to_owned(),
             tool_stream: false,
             tool_retry_attempt_ordinal: 0,
-            tool_correction_attempted: false,
-            tool_correction_outcome: "not_attempted".to_owned(),
-            tool_correction_failure_class: String::new(),
-            tool_correction_original_sha256: String::new(),
             tool_correction_native_effect_witness: None,
-            tool_correction_native_effect_image_diagnostic: None,
             transport_projection: "not_evaluated".to_owned(),
             wire_before_utf16: 0,
             inline_core_utf16: 0,
@@ -826,15 +808,6 @@ impl Record {
                         && matches!(self.upstream_attempt_class.as_str(), "initial" | "retried")
                         && self.upstream_result_class == "success"
                         && witness.valid()
-                })
-            && self
-                .tool_correction_native_effect_image_diagnostic
-                .as_ref()
-                .is_none_or(|diagnostic| {
-                    self.tool_correction_native_effect_witness.is_some()
-                        && self.tool_correction_failure_class == "native_effect"
-                        && !self.tool_correction_attempted
-                        && diagnostic.valid()
                 })
             && valid_transport_projection(&self.transport_projection)
             && self.wire_before_utf16 <= MAX_RECORDED_UTF16
@@ -1018,10 +991,6 @@ struct TraceInner {
 impl Drop for TraceInner {
     fn drop(&mut self) {
         let mut record = self.record.lock().expect("debug trace poisoned").clone();
-        if record.tool_correction_attempted && record.tool_correction_outcome == "attempted" {
-            record.tool_correction_outcome = "failed".to_owned();
-            record.tool_correction_failure_class = "request_not_accepted".to_owned();
-        }
         record.duration_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         if record.checkpoint_turn_outcome != "not_evaluated" {
             tracing::info!(
@@ -1310,60 +1279,6 @@ impl Trace {
         });
     }
 
-    pub(crate) fn caller_tool_projection_stage(
-        &self,
-        stream: bool,
-        stage: &str,
-        retry_attempt_ordinal: usize,
-    ) {
-        self.update(|record| {
-            record.tool_projection_stage = stage.to_owned();
-            record.tool_stream = stream;
-            record.tool_retry_attempt_ordinal = retry_attempt_ordinal.clamp(1, 64);
-        });
-    }
-
-    pub(crate) fn tool_correction_started(&self, original_sha256: &str) {
-        self.update(|record| {
-            record.tool_correction_attempted = true;
-            record.tool_correction_outcome = "attempted".to_owned();
-            record.tool_correction_original_sha256 = original_sha256.to_owned();
-        });
-    }
-
-    pub(crate) fn tool_correction_finished(&self, failure_class: Option<&'static str>) {
-        self.update(|record| {
-            if !record.tool_correction_attempted {
-                return;
-            }
-            record.tool_correction_outcome = if failure_class.is_some() {
-                "failed"
-            } else {
-                "succeeded"
-            }
-            .to_owned();
-            record.tool_correction_failure_class = failure_class.unwrap_or_default().to_owned();
-        });
-    }
-
-    pub(crate) fn tool_correction_ineligible(
-        &self,
-        reason: &'static str,
-        witness: Option<crate::chathub::NativeEffectWitness>,
-        image_diagnostic: Option<crate::chathub::NativeEffectImageDiagnostic>,
-    ) {
-        self.update(move |record| {
-            if record.tool_correction_attempted || !record.tool_correction_failure_class.is_empty()
-            {
-                return;
-            }
-            record.tool_correction_outcome = "not_attempted".to_owned();
-            record.tool_correction_failure_class = reason.to_owned();
-            record.tool_correction_native_effect_witness = witness;
-            record.tool_correction_native_effect_image_diagnostic = image_diagnostic;
-        });
-    }
-
     pub(crate) fn http_status(&self, status: StatusCode) {
         self.update(|record| {
             record.status = status.as_u16();
@@ -1495,10 +1410,6 @@ pub(crate) async fn detail(
         "toolProjectionStage": record.tool_projection_stage,
         "toolStream": record.tool_stream,
         "toolRetryAttemptOrdinal": record.tool_retry_attempt_ordinal,
-        "toolCorrectionAttempted": record.tool_correction_attempted,
-        "toolCorrectionOutcome": record.tool_correction_outcome,
-        "toolCorrectionFailureClass": record.tool_correction_failure_class,
-        "toolCorrectionOriginalSha256": record.tool_correction_original_sha256,
         "transportProjection": record.transport_projection,
         "wireBeforeUtf16": record.wire_before_utf16,
         "inlineCoreUtf16": record.inline_core_utf16,
@@ -1521,12 +1432,6 @@ pub(crate) async fn detail(
     });
     if let Some(witness) = record.tool_correction_native_effect_witness.as_ref() {
         detail["toolCorrectionNativeEffectWitness"] = json!(witness);
-    }
-    if let Some(diagnostic) = record
-        .tool_correction_native_effect_image_diagnostic
-        .as_ref()
-    {
-        detail["toolCorrectionNativeEffectImageDiagnostic"] = json!(diagnostic);
     }
     Json(detail).into_response()
 }
@@ -1617,16 +1522,6 @@ fn public_record(record: &Record) -> serde_json::Value {
     value["toolProjectionStage"] = serde_json::Value::String(record.tool_projection_stage.clone());
     value["toolStream"] = serde_json::Value::Bool(record.tool_stream);
     value["toolRetryAttemptOrdinal"] = serde_json::Value::from(record.tool_retry_attempt_ordinal);
-    value["toolCorrectionAttempted"] = json!(record.tool_correction_attempted);
-    value["toolCorrectionOutcome"] = json!(record.tool_correction_outcome);
-    value["toolCorrectionFailureClass"] = json!(record.tool_correction_failure_class);
-    value["toolCorrectionOriginalSha256"] = json!(record.tool_correction_original_sha256);
-    if let Some(diagnostic) = record
-        .tool_correction_native_effect_image_diagnostic
-        .as_ref()
-    {
-        value["toolCorrectionNativeEffectImageDiagnostic"] = json!(diagnostic);
-    }
     value["toolEscapeWitness"] = json!(live_escape_witness(record));
     value["throttleKind"] = serde_json::Value::String(throttle_kind(record).to_owned());
     value["transportProjection"] = serde_json::Value::String(record.transport_projection.clone());
@@ -2120,257 +2015,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_correction_telemetry_is_live_only_and_old_schema_reopens_safely() {
-        use sha2::{Digest, Sha256};
-
-        let candidate = "synthetic-private-mail-body cookie=SYNTHETIC-SECRET";
-        let candidate_sha256 = format!("{:x}", Sha256::digest(candidate.as_bytes()));
-        for failure in [None, Some("binding")] {
-            let root = tempfile::tempdir().unwrap();
-            let path = root.path().join("debug-telemetry.jsonl");
-            let store = Store::open(path.clone(), "test").unwrap();
-            let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-            trace.caller_tool_rejection(Some(&crate::tool_calls::ToolRejection {
-                class: crate::tool_calls::ToolRejectionClass::IllegalEscape,
-                candidate_sha256: candidate_sha256.clone(),
-                candidate_bytes: candidate.len(),
-                candidate_chars: candidate.chars().count(),
-                candidate_lines: 1,
-                fence_count: 2,
-                matching_known_tool_fence_count: 1,
-                parse_error_offset: Some(7),
-                escape_witness: None,
-            }));
-            trace.tool_correction_started(&candidate_sha256);
-            trace.tool_correction_finished(failure);
-            drop(trace);
-
-            let live = store.records_for_test().pop().unwrap();
-            assert_eq!(live["toolCorrectionAttempted"], true);
-            assert_eq!(
-                live["toolCorrectionOutcome"],
-                if failure.is_some() {
-                    "failed"
-                } else {
-                    "succeeded"
-                }
-            );
-            assert_eq!(
-                live["toolCorrectionFailureClass"],
-                failure.unwrap_or_default()
-            );
-            assert_eq!(live["toolCorrectionOriginalSha256"], candidate_sha256);
-            assert_eq!(live["toolCallRejectionClass"], "illegal_escape");
-            assert_eq!(live["toolCandidateSha256"], candidate_sha256);
-            let live_json = serde_json::to_string(&live).unwrap();
-            let raw = std::fs::read_to_string(&path).unwrap();
-            for sentinel in [candidate, "SYNTHETIC-SECRET", "synthetic-private-mail-body"] {
-                assert!(!live_json.contains(sentinel));
-                assert!(!raw.contains(sentinel));
-            }
-            assert!(!raw.contains(&candidate_sha256));
-            let durable: serde_json::Value =
-                serde_json::from_str(raw.lines().next().unwrap()).unwrap();
-            for key in [
-                "toolCorrectionAttempted",
-                "toolCorrectionOutcome",
-                "toolCorrectionFailureClass",
-                "toolCorrectionOriginalSha256",
-                "toolCorrectionNativeEffectWitness",
-            ] {
-                assert!(durable.get(key).is_none());
-            }
-            let baseline =
-                serde_json::to_value(Record::new("POST", "/hermes/v1/chat/completions")).unwrap();
-            assert_eq!(
-                durable.as_object().unwrap().keys().collect::<Vec<_>>(),
-                baseline.as_object().unwrap().keys().collect::<Vec<_>>()
-            );
-            let reopened = Store::open(path, "test").unwrap();
-            let persisted = reopened.records_for_test().pop().unwrap();
-            assert_eq!(persisted["toolCorrectionAttempted"], false);
-            assert_eq!(persisted["toolCorrectionOutcome"], "");
-            assert_eq!(persisted["toolCorrectionFailureClass"], "");
-            assert_eq!(persisted["toolCorrectionOriginalSha256"], "");
-            assert_eq!(reopened.inner.lock().unwrap().reader_state, "ok");
-        }
-    }
-
-    #[test]
-    fn tool_correction_unresolved_attempt_is_failed_when_trace_drops() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("debug-telemetry.jsonl");
-        let store = Store::open(path, "test").unwrap();
-        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.tool_correction_started(&"a".repeat(64));
-        let retained = trace.clone();
-        drop(trace);
-        assert!(store.records_for_test().is_empty());
-        drop(retained);
-        let live = store.records_for_test().pop().unwrap();
-        assert_eq!(live["toolCorrectionAttempted"], true);
-        assert_eq!(live["toolCorrectionOutcome"], "failed");
-        assert_eq!(live["toolCorrectionFailureClass"], "request_not_accepted");
-        assert_eq!(live["toolCorrectionOriginalSha256"], "a".repeat(64));
-    }
-
-    #[test]
-    fn tool_correction_finish_without_start_is_ignored() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("debug-telemetry.jsonl");
-        let store = Store::open(path, "test").unwrap();
-        for failure in [None, Some("cancelled")] {
-            let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-            trace.tool_correction_finished(failure);
-            drop(trace);
-            let live = store.records_for_test().pop().unwrap();
-            assert_eq!(live["toolCorrectionAttempted"], false);
-            assert_eq!(live["toolCorrectionOutcome"], "not_attempted");
-            assert_eq!(live["toolCorrectionFailureClass"], "");
-            assert_eq!(live["toolCorrectionOriginalSha256"], "");
-        }
-    }
-
-    #[test]
-    fn tool_correction_ineligible_reason_is_live_static_and_not_an_attempt() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("debug-telemetry.jsonl");
-        let store = Store::open(path.clone(), "test").unwrap();
-        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.tool_correction_ineligible("completion_missing", None, None);
-        trace.tool_correction_finished(Some("cancelled"));
-        drop(trace);
-        let live = store.records_for_test().pop().unwrap();
-        assert_eq!(live["toolCorrectionAttempted"], false);
-        assert_eq!(live["toolCorrectionOutcome"], "not_attempted");
-        assert_eq!(live["toolCorrectionFailureClass"], "completion_missing");
-        assert_eq!(live["toolCorrectionOriginalSha256"], "");
-        let raw = std::fs::read_to_string(path).unwrap();
-        assert!(!raw.contains("toolCorrection"));
-        assert!(!raw.contains("completion_missing"));
-
-        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.tool_correction_started(&"a".repeat(64));
-        trace.tool_correction_finished(None);
-        trace.tool_correction_ineligible("completion_missing", None, None);
-        drop(trace);
-        let live = store.records_for_test().pop().unwrap();
-        assert_eq!(live["toolCorrectionAttempted"], true);
-        assert_eq!(live["toolCorrectionOutcome"], "succeeded");
-        assert_eq!(live["toolCorrectionFailureClass"], "");
-    }
-
-    #[test]
-    fn native_effect_first_rejection_atomically_records_reason_and_witness() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("debug-telemetry.jsonl");
-        let store = Store::open(path.clone(), "test").unwrap();
-        let witness_value = future_native_effect_witness(NativeEffectWitnessFixture {
-            branch: "non_chat_message_type",
-            event_index: Some(0),
-            message_index: Some(0),
-            event_type_class: Some("update"),
-            message_type_class: Some("generated_code"),
-            ..Default::default()
-        });
-        let witness: crate::chathub::NativeEffectWitness =
-            serde_json::from_value(witness_value.clone()).unwrap();
-        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.admission(AdmissionResult::Admitted);
-        trace.upstream_attempt(UpstreamAttempt::Initial);
-        trace.upstream_result(UpstreamResult::Success);
-        trace.tool_correction_ineligible("native_effect", Some(witness), None);
-        trace.tool_correction_ineligible("completion_missing", None, None);
-        trace.tool_correction_finished(Some("corrected_response_ineligible"));
-        drop(trace);
-
-        let live = store.records_for_test().pop().unwrap();
-        assert_eq!(live["toolCorrectionAttempted"], false);
-        assert_eq!(live["toolCorrectionOutcome"], "not_attempted");
-        assert_eq!(live["toolCorrectionFailureClass"], "native_effect");
-        assert_eq!(live["toolCorrectionNativeEffectWitness"], witness_value);
-        let raw = std::fs::read_to_string(path).unwrap();
-        assert!(raw.contains("toolCorrectionNativeEffectWitness"));
-        assert!(!raw.contains("toolCorrectionFailureClass"));
-        assert!(!raw.contains("native_effect"));
-    }
-
-    #[test]
-    fn native_effect_image_diagnostic_is_live_only_content_free_and_not_reloaded() {
-        const PRIVATE_URL: &str = "https://private.invalid/image.png";
-        const PRIVATE_TEXT: &str = "PRIVATE_IMAGE_DIAGNOSTIC_SENTINEL";
-
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("debug-telemetry.jsonl");
-        let store = Store::open(path.clone(), "test").unwrap();
-        let event = json!({"type": 4, "url": PRIVATE_URL, "private": PRIVATE_TEXT});
-        let result = crate::chathub::ChatResult {
-            text: "Synthetic malformed caller candidate".to_owned(),
-            events: vec![
-                event,
-                json!({"type": 2, "item": {"result": {"message": "Candidate"}}}),
-                json!({"type": 3}),
-            ],
-            collector_event_sha256: vec!["b".repeat(64), "c".repeat(64), "d".repeat(64)],
-            images: vec![PRIVATE_URL.to_owned()],
-            ..crate::chathub::ChatResult::default()
-        };
-        let (_, witness) = result
-            .correction_eligibility_with_witness(&"a".repeat(64))
-            .expect_err("image result must remain ineligible");
-        let witness = *witness.expect("durable native-effect witness");
-        let witness_value = serde_json::to_value(&witness).unwrap();
-        let diagnostic = result
-            .native_effect_image_diagnostic()
-            .expect("live image diagnostic");
-
-        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.admission(AdmissionResult::Admitted);
-        trace.upstream_attempt(UpstreamAttempt::Initial);
-        trace.upstream_result(UpstreamResult::Success);
-        trace.tool_correction_ineligible("native_effect", Some(witness), Some(diagnostic));
-        trace.tool_correction_ineligible("completion_missing", None, None);
-        drop(trace);
-
-        let live = store.records_for_test().pop().unwrap();
-        assert_eq!(live["toolCorrectionNativeEffectWitness"], witness_value);
-        assert_eq!(
-            live["toolCorrectionNativeEffectImageDiagnostic"]["schema"],
-            "m365-native-effect-image-diagnostic/v3"
-        );
-        assert_eq!(
-            live["toolCorrectionNativeEffectImageDiagnostic"]["candidateNodeTypeClass"],
-            "invalid"
-        );
-        assert!(live["toolCorrectionNativeEffectImageDiagnostic"]["knownMessageType"].is_null());
-        assert_eq!(
-            live["toolCorrectionNativeEffectImageDiagnostic"]["counterfactualBranch"],
-            "active_event_type"
-        );
-        assert!(!live.to_string().contains(PRIVATE_URL));
-        assert!(!live.to_string().contains(PRIVATE_TEXT));
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("toolCorrectionNativeEffectImageDiagnostic"));
-        assert!(!raw.contains(PRIVATE_URL));
-        assert!(!raw.contains(PRIVATE_TEXT));
-        let mut injected: serde_json::Value =
-            serde_json::from_str(raw.lines().next().unwrap()).unwrap();
-        injected["toolCorrectionNativeEffectImageDiagnostic"] = json!({"schema": "injected"});
-        assert!(serde_json::from_value::<Record>(injected).is_err());
-        drop(store);
-
-        let reopened = Store::open(path, "test").unwrap();
-        let reloaded = reopened.records_for_test().pop().unwrap();
-        assert_eq!(reloaded["toolCorrectionNativeEffectWitness"], witness_value);
-        assert!(
-            reloaded
-                .get("toolCorrectionNativeEffectImageDiagnostic")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn transport_projection_is_visible_live_without_breaking_v1_jsonl() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("debug-telemetry.jsonl");
@@ -2746,62 +2390,6 @@ mod tests {
             .find(|record| record["id"] == record_id)
             .unwrap();
         assert_eq!(retained["toolCorrectionNativeEffectWitness"], witness);
-    }
-
-    #[test]
-    fn producer_native_effect_witness_survives_restart_and_compaction() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("debug-telemetry.jsonl");
-        let witness_value = future_native_effect_witness(NativeEffectWitnessFixture {
-            branch: "active_event_type",
-            event_index: Some(0),
-            event_type_class: Some("native_5"),
-            ..Default::default()
-        });
-        let witness: crate::chathub::NativeEffectWitness =
-            serde_json::from_value(witness_value.clone()).unwrap();
-        let store = Store::open(path.clone(), "test").unwrap();
-        let trace = store.start_request("POST", "/hermes/v1/chat/completions");
-        trace.admission(AdmissionResult::Admitted);
-        trace.upstream_attempt(UpstreamAttempt::Initial);
-        trace.upstream_result(UpstreamResult::Success);
-        trace.tool_correction_ineligible("native_effect", Some(witness), None);
-        drop(trace);
-        let record_id = store.records_for_test().pop().unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        drop(store);
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("toolCorrectionNativeEffectWitness"));
-        assert!(!raw.contains("toolCorrectionFailureClass"));
-        assert!(!raw.contains("native_effect"));
-        let store = Store::open(path.clone(), "test").unwrap();
-        let reopened = store
-            .records_for_test()
-            .into_iter()
-            .find(|record| record["id"] == record_id)
-            .unwrap();
-        assert_eq!(reopened["toolCorrectionNativeEffectWitness"], witness_value);
-        for _ in 0..(MAX_RECORDS - 1) {
-            store.push(Record::new("GET", "/health"));
-        }
-        {
-            let inner = store.inner.lock().unwrap();
-            assert_eq!(inner.records.len(), MAX_RECORDS);
-            assert_eq!(inner.writes_since_compaction, 0);
-            assert_eq!(inner.writer_state, "ok");
-        }
-        drop(store);
-
-        let reopened = Store::open(path, "test").unwrap();
-        let retained = reopened
-            .records_for_test()
-            .into_iter()
-            .find(|record| record["id"] == record_id)
-            .unwrap();
-        assert_eq!(retained["toolCorrectionNativeEffectWitness"], witness_value);
     }
 
     #[test]

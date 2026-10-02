@@ -73,7 +73,7 @@ Deployment/runtime wiring exposes names only; values must not enter the reposito
 
 ## Tool continuation and duplicate effects
 
-Ordinary Hermes requests do not suppress a new model tool call because an earlier request returned the same tool and arguments. A valid new call reaches the caller with `finish_reason=tool_calls`; a pure text answer remains `stop`. The gateway still checks current-request call/result pairing, candidate format, tool choice, and duplicates within one model output. The tool domain owns retries and receipts for effects.
+Ordinary Hermes requests do not suppress a new model tool call because an earlier request returned the same tool and arguments. A known tool with unambiguously parsed JSON arguments reaches the caller with `finish_reason=tool_calls`; a pure text answer remains `stop`. The gateway checks current-request OpenAI call/result message format and provider candidate format. Hermes and the tool domain own argument schema, tool-choice semantics, repeated calls in one response, retries, and receipts for effects.
 
 Explicit checkpoint adapters retain their existing history and replay protections. Historical `in_flight` and `terminal_unknown` Hermes checkpoint records remain on the explicit recovery path and do not block ordinary requests. Task / Run semantic completion remains an ACP acceptance decision.
 

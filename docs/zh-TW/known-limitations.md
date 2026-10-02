@@ -26,7 +26,7 @@
 - Parallel tools只在所有可選tool都明確read-only時開放；不能只看tool名稱猜測。
 - Generic／Memory tool round 保留既有上限；Hermes 的 `0` 表示無限制，但不會把模型純文字回答強制變成工具呼叫。
 - 已送出的unknown transport outcome不能盲目retry；要先靠checkpoint / durable evidence判斷。
-- 普通 Hermes 不因前次相同工具參數而攔截新 call。副作用重試與 receipt 由工具領域負責；Gateway 仍檢查同批重複與當次 call/result 配對。
+- 普通 Hermes 不因前次相同工具參數而攔截新 call。Gateway 投影同回應中每個可解析的候選並檢查當次 OpenAI call/result 訊息格式；副作用重試、同批重複與 receipt 由 Hermes／工具領域負責。
 - 明確 checkpoint adapter 保留 replay 保護；舊 Hermes `in_flight` 與 `terminal_unknown` 保留在明確 recovery 路徑，不阻擋普通請求。
 - Hermes的大型單行JSON即使已完整存成 persisted output，原生`read_file`仍可能受`max_line_length`截斷，且零換行單行的`total_lines`／`truncated` metadata不能單獨證明完整。應使用既有 terminal或`execute_code`在原檔解析，只輸出指定欄位或有限字元範圍；這不是 M365 full-context TXT spill。
 

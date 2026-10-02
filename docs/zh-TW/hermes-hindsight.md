@@ -73,7 +73,7 @@ Deployment/runtime wiring 只設定名稱，不把值寫進 repo 或 log：`M365
 
 ## Tool continuation 與 duplicate effect
 
-普通 Hermes 請求不會因為前次 request 已回傳相同工具與參數，就攔截模型這次提出的新工具呼叫。新的合法 call 會以 `finish_reason=tool_calls` 交給 caller；純文字回答維持 `stop`。Gateway 仍檢查當次 call/result 配對、候選格式、tool choice 與同一模型輸出內重複候選。副作用重試與 receipt 由工具領域負責。
+普通 Hermes 請求不會因為前次 request 已回傳相同工具與參數，就攔截模型這次提出的新工具呼叫。可無歧義解析的已知工具名稱與 JSON arguments 會以 `finish_reason=tool_calls` 交給 caller；純文字回答維持 `stop`。Gateway 只檢查當次 OpenAI call/result 訊息格式與 provider 候選格式；arguments schema、tool choice 語意、同回應重複呼叫及副作用重試由 Hermes／工具領域負責。
 
 明確 checkpoint adapter 保留既有歷史與 replay 保護。舊 Hermes checkpoint 的 `in_flight` 與 `terminal_unknown` 保留在明確 recovery 路徑，不阻擋普通請求。Task / Run semantic completion 仍由 ACP 的 acceptance contract 判定。
 
