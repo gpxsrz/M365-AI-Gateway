@@ -1993,7 +1993,9 @@ async fn stream_chat(
 enum ChatFailureClass<'a> {
     RateLimited {
         retry_after: Option<&'a str>,
-        soft: bool,
+    },
+    TemporaryOverload {
+        retry_after: &'a str,
     },
     AutoSpillAttachment {
         failure: AttachmentFailureKind,
@@ -2071,6 +2073,8 @@ fn chat_error_telemetry_class(error: &ChatError) -> UpstreamResult {
     match error {
         ChatError::MissingIdentity => UpstreamResult::MissingIdentity,
         ChatError::EmptyPrompt => UpstreamResult::EmptyPrompt,
+        // The v1 durable encoding retains its legacy class; debug's public projection
+        // distinguishes soft notices using the existing breaker marker.
         ChatError::RateLimited { .. } => UpstreamResult::RateLimited429,
         ChatError::ServiceUnavailable => UpstreamResult::ServiceUnavailable503,
         ChatError::Attachment { .. } => UpstreamResult::AttachmentError,
@@ -2109,9 +2113,19 @@ fn classify_chat_failure<'a>(
     overflow_context: Option<&OverflowContext>,
 ) -> ChatFailureClass<'a> {
     match error {
-        ChatError::RateLimited { retry_after, soft } => ChatFailureClass::RateLimited {
+        ChatError::RateLimited {
+            retry_after,
+            soft: true,
+        } => ChatFailureClass::TemporaryOverload {
+            // Engineering backoff when the source-backed notice supplies no wait;
+            // this is not a Microsoft reset time.
+            retry_after: retry_after.as_deref().unwrap_or("60"),
+        },
+        ChatError::RateLimited {
+            retry_after,
+            soft: false,
+        } => ChatFailureClass::RateLimited {
             retry_after: retry_after.as_deref(),
-            soft: *soft,
         },
         ChatError::Attachment {
             generated_oversize_text: true,
@@ -2210,12 +2224,20 @@ fn chat_error_with_overflow(
         trace.generated_document_failed(failure.code());
     }
     match classify_chat_failure(&error, overflow_context) {
-        ChatFailureClass::RateLimited { retry_after, soft } => {
-            if soft {
-                permit.finish_soft_throttle();
-            } else {
-                permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
+        ChatFailureClass::TemporaryOverload { retry_after } => {
+            permit.finish_soft_throttle();
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(temporary_overload_value(retry_after)),
+            )
+                .into_response();
+            if let Ok(value) = HeaderValue::from_str(retry_after) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
             }
+            response
+        }
+        ChatFailureClass::RateLimited { retry_after } => {
+            permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
             let mut response = openai_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
@@ -2300,12 +2322,14 @@ fn send_stream_chat_error(
         trace.generated_document_failed(failure.code());
     }
     match classify_chat_failure(&error, overflow_context) {
-        ChatFailureClass::RateLimited { retry_after, soft } => {
-            if soft {
-                permit.finish_soft_throttle();
-            } else {
-                permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
-            }
+        ChatFailureClass::TemporaryOverload { retry_after } => {
+            permit.finish_soft_throttle();
+            let sent = send_sse(sender, temporary_overload_value(retry_after));
+            trace.caller_delivery(stream_error_delivery(sender, sent));
+            sent
+        }
+        ChatFailureClass::RateLimited { retry_after } => {
+            permit.finish(StatusCode::TOO_MANY_REQUESTS, retry_after);
             send_sse_error(trace, sender, "rate_limit_error", "ChatHub rate limited")
         }
         ChatFailureClass::AutoSpillAttachment { failure } => {
@@ -2348,6 +2372,15 @@ fn send_stream_chat_error(
             send_sse_error(trace, sender, "upstream_error", &error.to_string())
         }
     }
+}
+
+fn temporary_overload_value(retry_after: &str) -> Value {
+    json!({"error": {
+        "message": "ChatHub temporarily overloaded; capacity unavailable",
+        "type": "overloaded_error",
+        "code": "temporary_overload",
+        "retry_after": retry_after
+    }})
 }
 
 fn text_overflow_response(
@@ -6740,7 +6773,7 @@ mod tests {
         ) -> ChatFuture<'a> {
             Box::pin(async move {
                 Err(ChatError::RateLimited {
-                    retry_after: None,
+                    retry_after: (!self.soft).then(|| "1125".to_owned()),
                     soft: self.soft,
                 })
             })
@@ -9104,6 +9137,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn temporary_capacity_sdk_wire_contract() {
+        let mut fixtures = Vec::new();
+        for route in ["/v1", "/hermes/v1", "/memory/v1"] {
+            for stream in [false, true] {
+                for kind in ["capacity", "partial_capacity", "hard429"] {
+                    let (mut gateway, key) = gateway_with_chat_and_oauth(
+                        Arc::new(RateLimitedTransport { soft: false }),
+                        oauth(),
+                    );
+                    let upstream = if kind != "hard429" {
+                        let mut frames = Vec::new();
+                        if kind == "partial_capacity" {
+                            frames.push(json!({"type":1,"target":"update","arguments":[{
+                                "messages":[{"author":"bot","text":"Already delivered answer.","messageType":""}]
+                            }]}));
+                        }
+                        frames.extend([
+                            json!({"type":2,"item":{"result":{
+                                "author":"bot","contentOrigin":"BotConnection","messageType":"",
+                                "message":"目前為高流量。請稍後再試一次。"
+                            }}}),
+                            json!({"type":3}),
+                        ]);
+                        let (base, payloads, server) =
+                            syntax_live_upstream_server(vec![SyntaxLiveReply {
+                                message: String::new(),
+                                extra_events: Vec::new(),
+                                frames: Some(frames),
+                            }])
+                            .await;
+                        let live = LiveChatHub::new_for_test(
+                            gateway.settings.clone(),
+                            syntax_prepare_attachments,
+                            base,
+                        );
+                        Arc::get_mut(&mut gateway).unwrap().chat = Arc::new(live);
+                        Some((payloads, server))
+                    } else {
+                        None
+                    };
+                    let telemetry = gateway.debug.path_for_test().unwrap();
+                    let response = Gateway::router(Arc::clone(&gateway)).oneshot(
+                        Request::post(format!("{route}/chat/completions"))
+                            .header("x-api-key", key)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(json!({"model":"gpt-5.6-terra","stream":stream,
+                                "messages":[{"role":"user","content":"synthetic capacity contract"}]
+                            }).to_string())).unwrap()
+                    ).await.unwrap();
+                    let status = response.status().as_u16();
+                    let headers = response
+                        .headers()
+                        .iter()
+                        .filter(|(name, _)| {
+                            **name == header::CONTENT_TYPE || **name == header::RETRY_AFTER
+                        })
+                        .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let body = String::from_utf8(
+                        to_bytes(response.into_body(), 64 * 1024)
+                            .await
+                            .unwrap()
+                            .to_vec(),
+                    )
+                    .unwrap();
+                    if let Some((payloads, server)) = upstream {
+                        server.await.unwrap();
+                        assert_eq!(
+                            payloads.lock().unwrap().len(),
+                            1,
+                            "Gateway must not replay capacity failures"
+                        );
+                    }
+                    let snapshot = gateway.traffic.snapshot();
+                    assert_eq!(snapshot.shared_429_count, u64::from(kind == "hard429"));
+                    assert_eq!(
+                        snapshot.shared_cooldown_level,
+                        usize::from(kind == "hard429")
+                    );
+                    assert_eq!(
+                        snapshot.shared_circuit_state,
+                        if kind == "hard429" {
+                            crate::traffic::CircuitState::Open
+                        } else {
+                            crate::traffic::CircuitState::Closed
+                        }
+                    );
+                    let records = std::fs::read_to_string(&telemetry).unwrap();
+                    let durable: Value =
+                        serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                    assert_eq!(
+                        durable["upstreamResultClass"], "rate_limited_429",
+                        "retain the v1 encoding accepted by rollback readers"
+                    );
+                    let reopened = crate::debug::Store::open(telemetry, "test").unwrap();
+                    let record = reopened.records_for_test().pop().unwrap();
+                    let detail = crate::debug::detail(
+                        axum::extract::State(Arc::clone(&gateway)),
+                        axum::extract::Query(std::collections::HashMap::from([(
+                            "id".to_owned(),
+                            record["id"].as_str().unwrap().to_owned(),
+                        )])),
+                    )
+                    .await;
+                    let detail: Value = serde_json::from_slice(
+                        &to_bytes(detail.into_body(), 64 * 1024).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(detail["upstreamResultClass"], record["upstreamResultClass"]);
+                    assert_eq!(
+                        record["throttleKind"],
+                        if kind == "hard429" {
+                            "hard_http_429"
+                        } else {
+                            "soft_bot_notice"
+                        }
+                    );
+                    fixtures.push(
+                        json!({"route":route,"stream":stream,"kind":kind,"status":status,
+                        "headers":headers,"body":body,"telemetry":record["upstreamResultClass"]}),
+                    );
+                }
+            }
+        }
+        // Export actual Gateway bytes for the pinned offline SDK consumer; no hand-written wire fixture.
+        if let Ok(path) = std::env::var("M365_CAPACITY_FIXTURES") {
+            std::fs::write(path, serde_json::to_vec_pretty(&fixtures).unwrap()).unwrap();
+        }
+        for row in fixtures {
+            let stream = row["stream"].as_bool().unwrap();
+            let hard = row["kind"] == "hard429";
+            let body = row["body"].as_str().unwrap();
+            let value: Value = if stream {
+                assert!(body.ends_with("data: [DONE]\n\n"));
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|value| value.get("error").is_some())
+                    .unwrap()
+            } else {
+                serde_json::from_str(body).unwrap()
+            };
+            assert_eq!(
+                row["status"],
+                if stream {
+                    200
+                } else if hard {
+                    429
+                } else {
+                    503
+                }
+            );
+            assert_eq!(
+                row["telemetry"],
+                if hard {
+                    "rate_limited_429"
+                } else {
+                    "temporary_overload"
+                }
+            );
+            if hard {
+                assert_eq!(
+                    value["error"]["code"],
+                    if stream {
+                        "rate_limit_error"
+                    } else {
+                        "upstream_throttle"
+                    }
+                );
+                assert_eq!(
+                    value["error"]["type"],
+                    if stream {
+                        "upstream_error"
+                    } else {
+                        "rate_limit_error"
+                    }
+                );
+                assert!(value["error"].get("retry_after").is_none());
+            } else {
+                assert_eq!(value["error"]["type"], "overloaded_error");
+                assert_eq!(value["error"]["code"], "temporary_overload");
+                assert_eq!(value["error"]["retry_after"], "60");
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("overloaded")
+                );
+                if stream && row["kind"] == "partial_capacity" {
+                    assert_eq!(body.matches("Already delivered answer.").count(), 1);
+                }
+            }
+            if !stream {
+                assert_eq!(
+                    row["headers"]["retry-after"],
+                    if hard { "1125" } else { "60" }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn soft_chathub_throttle_does_not_open_the_shared_account_breaker() {
         let (gateway, raw_key) = gateway_with_chat_and_oauth(
             Arc::new(SoftThenSuccessTransport(AtomicBool::new(false))),
@@ -9125,7 +9360,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["code"], "temporary_overload");
+        assert_eq!(body["error"]["retry_after"], "60");
         let snapshot = gateway.traffic.snapshot();
         assert_eq!(
             snapshot.shared_circuit_state,
@@ -9161,6 +9403,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["upstreamResultClass"], "rate_limited_429");
+        assert_eq!(
+            gateway.debug.records_for_test()[0]["upstreamResultClass"],
+            "temporary_overload"
+        );
         assert_ne!(records[0]["breakerProjection"], "throttled");
         assert_eq!(records[1]["upstreamResultClass"], "success");
     }

@@ -245,6 +245,8 @@ A hard upstream HTTP 429 is shared-account pressure evidence and opens/escalates
 
 A soft notice is classified only when ChatHub source metadata such as `author=bot`, `contentOrigin=BotConnection`, and an empty `messageType` is present together with an approved finite notice template. The classification also covers that source-backed notice in a completion result or across segmented updates. Ordinary answers, citations, tool results, code, or the same words without source metadata remain normal content; a global text scan does not turn them into throttles.
 
+Chat Completions projects confirmed soft/capacity throttles as `overloaded_error` / `temporary_overload`. Non-stream responses use HTTP `503` and `Retry-After`; streams carry the same error payload with `retry_after`. When upstream supplies no wait, the fixed 60-second hint is Gateway engineering backoff, not a Microsoft reset time. Public telemetry distinguishes `temporary_overload` from real `rate_limited_429`; JSONL retains the existing v1 encoding and soft/hard marker so older rollback readers can still open it. This does not replay requests in the Gateway; callers must retain their replay guards once assistant content has been delivered.
+
 Breaker states:
 
 ```text

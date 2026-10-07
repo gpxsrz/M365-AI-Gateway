@@ -100,6 +100,13 @@ jobs:
         run: >-
           cargo test --locked --lib protocol::tests::hermes_ordinary_sdk_identity_real_chain
           -- --ignored --exact --nocapture
+      - name: Require capacity error SDK consumer contract
+        env:
+          HERMES_AGENT_ROOT: ${{ github.workspace }}/.ci/hermes-agent
+          M365_CAPACITY_FIXTURES: ${{ runner.temp }}/m365-capacity-wire.json
+        run: |
+          cargo test --locked --lib protocol::tests::temporary_capacity_sdk_wire_contract -- --exact
+          .ci/hermes-agent/.venv/bin/python integrations/hermes/capacity_error_contract.py "$M365_CAPACITY_FIXTURES"
 
   rust:
     runs-on: ubuntu-latest

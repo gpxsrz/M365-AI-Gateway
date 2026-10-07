@@ -245,6 +245,8 @@ Hard upstream HTTP 429 會成為 shared-account pressure evidence並開／升級
 
 Soft notice 只有在 ChatHub 的 `author=bot`、`contentOrigin=BotConnection`、空白 `messageType` 等來源 metadata 與已核准的有限通知模板同時成立時才會分類；通知也可在 completion result 或分段 update 中被辨識。普通回答、引用、工具結果、程式碼或只有相同字句而沒有來源 metadata 時仍是正常內容，不會靠全域文字比對改成 throttle。
 
+Chat Completions 的已確認 soft/capacity throttle 會投影為 `overloaded_error` / `temporary_overload`。Non-stream 回 HTTP `503` 與 `Retry-After`；stream 回相同 error payload，包含 `retry_after`。上游未提供等待值時，使用固定 60 秒 Gateway engineering backoff；這不是 Microsoft reset time。公開 telemetry 以 `temporary_overload` 區分真正的 `rate_limited_429`，JSONL 則保留既有 v1 encoding 與 soft/hard marker，讓舊版 rollback reader 仍能讀取。Gateway 不因此重播 request；caller 已收到 assistant 內容時仍須保留其 partial-delivery 防重播限制。
+
 Breaker 狀態：
 
 ```text

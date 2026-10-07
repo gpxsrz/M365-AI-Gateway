@@ -1394,7 +1394,7 @@ pub(crate) async fn detail(
         "utf16AfterClass": record.utf16_after_class,
         "provenanceClass": record.provenance_class,
         "upstreamAttemptClass": record.upstream_attempt_class,
-        "upstreamResultClass": record.upstream_result_class,
+        "upstreamResultClass": public_upstream_result(record),
         "checkpointTurnOutcome": record.checkpoint_turn_outcome,
         "callerDelivery": record.caller_delivery,
         "toolCallSuppressed": record.tool_call_suppressed,
@@ -1501,6 +1501,7 @@ pub(crate) async fn export(State(gateway): State<Arc<Gateway>>) -> Response {
 
 fn public_record(record: &Record) -> serde_json::Value {
     let mut value = serde_json::to_value(record).expect("typed telemetry is serializable");
+    value["upstreamResultClass"] = json!(public_upstream_result(record));
     value["spillDecision"] = serde_json::Value::String(public_spill_decision(record).to_owned());
     value["spillReason"] = serde_json::Value::String(public_spill_reason(record).to_owned());
     value["callerDelivery"] = serde_json::Value::String(record.caller_delivery.clone());
@@ -1556,6 +1557,16 @@ fn public_spill_reason(record: &Record) -> &str {
         SpillReason::FullContextDocument.as_str()
     } else {
         &record.spill_reason
+    }
+}
+
+fn public_upstream_result(record: &Record) -> &str {
+    // Keep the v1 durable enum readable by rollback binaries. The existing
+    // breaker marker already distinguishes source-backed soft notices.
+    if throttle_kind(record) == "soft_bot_notice" {
+        "temporary_overload"
+    } else {
+        &record.upstream_result_class
     }
 }
 
@@ -1788,6 +1799,10 @@ mod tests {
         soft.breaker_projection = "admitted".to_owned();
         assert_eq!(throttle_kind(&soft), "soft_bot_notice");
         assert_eq!(public_record(&soft)["throttleKind"], "soft_bot_notice");
+        assert_eq!(
+            public_record(&soft)["upstreamResultClass"],
+            "temporary_overload"
+        );
         assert!(
             serde_json::to_value(&soft)
                 .unwrap()
@@ -1798,6 +1813,10 @@ mod tests {
         let mut hard = soft.clone();
         hard.breaker_projection = "throttled".to_owned();
         assert_eq!(throttle_kind(&hard), "hard_http_429");
+        assert_eq!(
+            public_record(&hard)["upstreamResultClass"],
+            "rate_limited_429"
+        );
 
         let mut projected = Record::new("POST", "/hermes/v1/chat/completions");
         projected.admission_result = "upstream_throttle".to_owned();
