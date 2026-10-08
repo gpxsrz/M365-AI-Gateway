@@ -135,6 +135,16 @@ Full-context TXT 是 transport projection，不保證模型已讀完、正確使
 
 管理員診斷 surface 會以 bounded 欄位顯示 `transportProjection`、`messageTextBeforeUtf16`、`preliminaryMessageTextAfterUtf16`、`messageTextAfterUtf16`、`wireBeforeUtf16`、`inlineCoreUtf16`、`preliminaryWireAfterUtf16`、`wireAfterUtf16`、generated document bytes/message count/state 與 `fallbackFailure`。`messageText*`、`wire*` 與 generated-document measurement 是 live projection；`fallbackFailure` 也會 durable 保留。`messageText*` 是 fit policy 的量測；`wire*` 是完整 serialized payload 的觀測值，不會靜默被當成 128K gate。Durable v1 JSONL 的 `utf16Before`／`utf16After` 是 canonical `message.text` spill 量測；public overflow error 的 `received` 仍是 spill 前 caller role-envelope 量測。Durable v1 JSONL 會記錄 typed `spillDecision`、`spillReason`、bounded UTF-16 spill 前後量測與 bounded `fallbackFailure` stage/class，包含 `full_context_document`；transport projection 細節仍是 bounded live 欄位，且不保存文件內容、upload URL、response body、token、private ID 或 attachment bytes。Process restart 後不把缺少 live projection 誤當成模型驗收證據。
 
+## 輸入圖片準備
+
+圖片來源取得、MIME 檢查與 BMP 轉 PNG 在既有 traffic admission 後、HTTP/SSE 回應開始前共用執行。PNG、JPEG、GIF、WebP 保留原始 bytes，包括動畫。URL 沿用 SSRF、redirect 與 512 MiB 大小限制。
+
+BMP 使用 Rust `image` 函式庫；只啟用 BMP/PNG features。接受 RGB24、完整 1/4/8-bit 調色盤與明確的 32-bit RGB/RGBA bitfields，支援 top-down/bottom-up。接受 DIB 12/40/52/56；V4/V5（108/124）含有 PNG encoder 未保留的色彩描述，因此明確拒絕。其他無法忠實保留的壓縮、位元遮罩或 ICC profile 也會拒絕，不自動縮圖或丟棄透明度。BMP 解碼輸出最多 64 MiB，先檢查尺寸與 checked arithmetic，再配置確切 buffer。此數字不是程序峰值記憶體上限；解碼 row buffer 與 PNG 編碼 workspace 另佔受尺寸限制的記憶體。單一 preparation worker 在取消後仍持有資源 permit，直到工作與私有 spool 清理完成。
+
+原件名稱、MIME、stage bytes/size/SHA256、附件 ID 與 native metadata 保持不變。PNG 只是 request-local 的 0600 傳輸副本；annotations 使用傳輸名稱，native manifest 分開保留原件資訊與 `transportName`。Request clone 共用副本所有權。Prepared cache 繼續受原有 stage/conversation/session 綁定限制。
+
+確定格式錯誤回真正 HTTP400 JSON（即使 `stream=true`）：`unsupported_image_format`、`image_data_invalid`、`image_mime_mismatch`、`invalid_bmp`、`bmp_resource_limit`、`unsupported_bmp_variant`。Error 帶 `retryable=false` 與修正附件後重送的指引。網路、上傳、本地 I/O 與權杖錯誤保留各自語意；soft overload 的 60 秒與 hard429 breaker 不變。Hermes 的 `format_error` 仍可能使用已配置的模型 fallback；此契約不保證所有 fallback 設定都不切換模型。
+
 ## Tools 與 structured output
 
 - 只有所有可選 tools 都明確 `annotations.readOnlyHint=true`，且沒有 mutating/destructive 訊號時，才允許 parallel tool calls。

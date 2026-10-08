@@ -678,6 +678,15 @@ async fn execute_chat_request_inner(
             return response;
         }
     };
+    if let Err(error) = crate::attachment::prepare_images(
+        &mut flattened.attachments,
+        &body.conversation_id,
+        &body.session_id,
+    )
+    .await
+    {
+        return chat_error_with_overflow(&trace, error, permit, overflow_context.as_ref());
+    }
     let Some(stored) = gateway.tokens.first() else {
         permit.finish(StatusCode::BAD_REQUEST, None);
         return openai_error(
@@ -1991,6 +2000,9 @@ async fn stream_chat(
 }
 
 enum ChatFailureClass<'a> {
+    ImageFormat {
+        failure: AttachmentFailureKind,
+    },
     RateLimited {
         retry_after: Option<&'a str>,
     },
@@ -2113,6 +2125,9 @@ fn classify_chat_failure<'a>(
     overflow_context: Option<&OverflowContext>,
 ) -> ChatFailureClass<'a> {
     match error {
+        ChatError::Attachment { failure, .. } if failure.is_image_format() => {
+            ChatFailureClass::ImageFormat { failure: *failure }
+        }
         ChatError::RateLimited {
             retry_after,
             soft: true,
@@ -2224,6 +2239,14 @@ fn chat_error_with_overflow(
         trace.generated_document_failed(failure.code());
     }
     match classify_chat_failure(&error, overflow_context) {
+        ChatFailureClass::ImageFormat { failure } => {
+            permit.finish(StatusCode::BAD_REQUEST, None);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(image_format_error_value(failure)),
+            )
+                .into_response()
+        }
         ChatFailureClass::TemporaryOverload { retry_after } => {
             permit.finish_soft_throttle();
             let mut response = (
@@ -2322,6 +2345,12 @@ fn send_stream_chat_error(
         trace.generated_document_failed(failure.code());
     }
     match classify_chat_failure(&error, overflow_context) {
+        ChatFailureClass::ImageFormat { failure } => {
+            permit.finish(StatusCode::BAD_REQUEST, None);
+            let sent = send_sse(sender, image_format_error_value(failure));
+            trace.caller_delivery(stream_error_delivery(sender, sent));
+            sent
+        }
         ChatFailureClass::TemporaryOverload { retry_after } => {
             permit.finish_soft_throttle();
             let sent = send_sse(sender, temporary_overload_value(retry_after));
@@ -2372,6 +2401,14 @@ fn send_stream_chat_error(
             send_sse_error(trace, sender, "upstream_error", &error.to_string())
         }
     }
+}
+
+fn image_format_error_value(failure: AttachmentFailureKind) -> Value {
+    json!({"error": {
+        "message": failure.message(), "type": "invalid_request_error",
+        "code": failure.code(), "retryable": false,
+        "recommended_action": "correct_attachment_and_resubmit"
+    }})
 }
 
 fn temporary_overload_value(retry_after: &str) -> Value {
@@ -6025,6 +6062,344 @@ mod tests {
                     ..ChatResult::default()
                 })
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn image_format_failure_is_http400_before_stream_and_releases_admission() {
+        let mut fixtures = Vec::new();
+        let bmp = crate::attachment::synthetic_bmp_for_test(false, false, false);
+        let mut oversized = bmp.clone();
+        oversized[18..22].copy_from_slice(&i32::MAX.to_le_bytes());
+        let mut compressed = bmp.clone();
+        compressed[30..34].copy_from_slice(&1_u32.to_le_bytes());
+        for stream in [false, true] {
+            for (url, code) in [
+                ("image/bmp", b"BM".to_vec(), "invalid_bmp"),
+                ("image/png", bmp.clone(), "image_mime_mismatch"),
+                (
+                    "image/tiff",
+                    b"II*\0synthetic".to_vec(),
+                    "unsupported_image_format",
+                ),
+                ("image/bmp", oversized.clone(), "bmp_resource_limit"),
+                ("image/bmp", compressed.clone(), "unsupported_bmp_variant"),
+            ]
+            .into_iter()
+            .map(|(mime, bytes, code)| {
+                (
+                    format!("data:{mime};base64,{}", STANDARD.encode(&bytes)),
+                    code,
+                )
+            })
+            .chain([
+                ("data:image/bmp;base64,".to_owned(), "invalid_messages"),
+                (
+                    "data:image/bmp;base64,%%%%".to_owned(),
+                    "image_data_invalid",
+                ),
+            ]) {
+                let (gateway, key) = gateway_with_chat_and_oauth(Arc::new(FixedTransport), oauth());
+                let response = Gateway::router(Arc::clone(&gateway))
+                    .oneshot(
+                        Request::post("/hermes/v1/chat/completions")
+                            .header("x-api-key", &key)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"model":"gpt-5.6-terra", "stream":stream,
+                                    "messages":[{"role":"user","content":[
+                                        {"type":"text","text":"synthetic image"},
+                                        {"type":"image_url","image_url":{"url":url}}
+                                    ]}]
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "stream={stream}"
+                );
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+                let body = String::from_utf8(
+                    to_bytes(response.into_body(), 65536)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                let value: Value = serde_json::from_str(&body).unwrap();
+                fixtures.push(json!({"kind":"image_format", "status":400,
+                "headers":{"content-type":"application/json"}, "body":body, "stream":stream, "code":code}));
+                assert_eq!(value["error"]["code"], code);
+                if code != "invalid_messages" {
+                    assert_eq!(value["error"]["retryable"], false);
+                }
+                assert!(gateway.checkpoints.list().unwrap().is_empty());
+                assert_eq!(gateway.traffic.snapshot().shared_429_count, 0);
+                assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
+                assert_eq!(gateway.traffic.snapshot().memory_in_flight, 0);
+            }
+        }
+        if let Ok(path) = std::env::var("M365_IMAGE_FIXTURES") {
+            std::fs::write(path, serde_json::to_vec_pretty(&fixtures).unwrap()).unwrap();
+        }
+    }
+
+    fn image_fixture_preparer<'a>(
+        account: &'a Account,
+        conversation: &'a str,
+        session: &'a str,
+        attachments: &'a mut [Attachment],
+    ) -> crate::chathub::AttachmentPreparationFuture<'a> {
+        let endpoint = account.access_token.strip_prefix("image-fixture:").unwrap();
+        Box::pin(crate::attachment::prepare_images_at_for_test(
+            account,
+            conversation,
+            session,
+            attachments,
+            endpoint,
+        ))
+    }
+
+    #[tokio::test]
+    async fn image_pre_sse_cancellation_releases_admission_and_private_copy() {
+        let chat = Arc::new(RecordingTransport(Mutex::new(None)));
+        let (gateway, key) = gateway_with_chat_and_oauth(chat.clone(), oauth());
+        let bytes = crate::attachment::synthetic_bmp_for_test(false, false, false);
+        let context = staged_native_context(
+            &gateway,
+            "cancel-session",
+            "cancel-turn",
+            "gateway-cancel.bmp",
+            "image/bmp",
+            &bytes,
+        )
+        .await;
+        let original = gateway
+            .hermes_attachments
+            .resolve_context(&context, "cancel-session", 0)
+            .unwrap()
+            .attachments[0]
+            .staged
+            .clone()
+            .unwrap();
+        let request = json!({"model":"gpt-5.6-terra", "stream":true, "session_key":"cancel-session",
+            "m365_native_attachment_request_turn_id":"cancel-turn",
+            "m365_native_attachment_request_binding":gateway.hermes_attachments.turn_binding("cancel-session", "cancel-turn"),
+            "m365_native_attachment_context":context,
+            "messages":[{"role":"user","content":"Synthetic cancellation"}]});
+        let app = Gateway::router(gateway.clone());
+        let (entered, resume) = crate::attachment::pause_image_worker("gateway-cancel.bmp");
+        let (task_app, task_key, task_request) = (app.clone(), key.clone(), request.clone());
+        let pending = tokio::spawn(async move {
+            syntax_public_response(&task_app, &task_key, &task_request).await
+        });
+        let path = entered.await.unwrap();
+        assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 1);
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
+        assert!(gateway.checkpoints.list().unwrap().is_empty());
+        assert!(chat.0.lock().unwrap().is_none());
+        assert!(path.exists());
+        resume.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&original.path).unwrap(), bytes);
+        assert_eq!(
+            syntax_public_response(&app, &key, &request).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(gateway.traffic.snapshot().interactive_in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn bmp_gateway_upload_annotations_and_completed_tool_continuation() {
+        for stream in [false, true] {
+            let uploads = Arc::new(Mutex::new(Vec::new()));
+            let captured = uploads.clone();
+            let upload_app = Router::new().fallback(move |request: axum::extract::Request| {
+                let captured = captured.clone();
+                async move {
+                    let bytes = to_bytes(request.into_body(), 65536).await.unwrap();
+                    let body = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert!(body.contains("filename=\"synthetic.png\""));
+                    assert!(body.to_lowercase().contains("content-type: image/png"));
+                    let encoded = body.split("data:image/png;base64,").nth(1).unwrap().split("\r\n").next().unwrap();
+                    let png_bytes = STANDARD.decode(encoded).unwrap();
+                    let png = image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png).unwrap().to_rgb8();
+                    assert_eq!(png.dimensions(), (2, 2));
+                    assert_eq!(png.as_raw(), &vec![255,0,0, 0,255,0, 0,0,255, 255,255,255]);
+                    captured.lock().unwrap().push(png_bytes);
+                    Json(json!({"docId":"synthetic-image-id", "fileName":"synthetic.png", "fileType":"png", "result":{"value":"Success"}}))
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/upload", listener.local_addr().unwrap());
+            let upload_server = tokio::spawn(async move {
+                axum::serve(listener, upload_app).await.unwrap();
+            });
+            let (ws, payloads, upstream) = syntax_live_upstream_server(vec![
+                syntax_live_reply("```inspect\n{}\n```"),
+                syntax_live_reply("IMAGE_CONTINUATION_COMPLETE"),
+            ])
+            .await;
+            let (mut gateway, key) = gateway_with_chat_and_oauth(Arc::new(FixedTransport), oauth());
+            gateway
+                .tokens
+                .upsert(TokenSet {
+                    access_token: format!("image-fixture:{endpoint}"),
+                    refresh_token: "refresh".to_owned(),
+                    id_token: String::new(),
+                    token_type: "Bearer".to_owned(),
+                    scope: DEFAULT_SCOPE.to_owned(),
+                    expires_in: 3600,
+                    expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                    email: "user@example.invalid".to_owned(),
+                    display_name: "User".to_owned(),
+                    home_oid: "oid".to_owned(),
+                    tenant_id: "tid".to_owned(),
+                })
+                .unwrap();
+            let live =
+                LiveChatHub::new_for_test(gateway.settings.clone(), image_fixture_preparer, ws);
+            Arc::get_mut(&mut gateway).unwrap().chat = Arc::new(live);
+            let bytes = crate::attachment::synthetic_bmp_for_test(false, false, false);
+            let bad_context = staged_native_context(
+                &gateway,
+                "image-session",
+                "image-turn",
+                "bad.bmp",
+                "image/bmp",
+                b"BM",
+            )
+            .await;
+            let mut request = json!({"model":"gpt-5.6-terra", "stream":stream, "session_key":"image-session",
+                "m365_native_attachment_request_turn_id":"image-turn",
+                "m365_native_attachment_request_binding":gateway.hermes_attachments.turn_binding("image-session", "image-turn"),
+                "messages":[{"role":"user","content":"Inspect the synthetic image."}],
+                "tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}}],
+                "m365_native_attachment_context":bad_context});
+            let app = Gateway::router(gateway.clone());
+            let (status, body) = syntax_public_response(&app, &key, &request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(uploads.lock().unwrap().is_empty());
+            assert!(payloads.lock().unwrap().is_empty());
+            let context = staged_native_context(
+                &gateway,
+                "image-session",
+                "image-turn",
+                "synthetic.bmp",
+                "image/bmp",
+                &bytes,
+            )
+            .await;
+            let original = gateway
+                .hermes_attachments
+                .resolve_context(&context, "image-session", 0)
+                .unwrap();
+            let source = original.attachments[0].staged.clone().unwrap();
+            request["m365_native_attachment_context"] = serde_json::to_value(&context).unwrap();
+            let (status, body) = syntax_public_response(&app, &key, &request).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let calls = if stream {
+                sse_values(&body)
+                    .into_iter()
+                    .find_map(|v| v.pointer("/choices/0/delta/tool_calls").cloned())
+                    .unwrap()
+            } else {
+                serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["tool_calls"]
+                    .clone()
+            };
+            assert_eq!(calls.as_array().unwrap().len(), 1);
+            let id = calls[0]["id"].clone();
+            let completed_call_id = id.as_str().unwrap().to_owned();
+            request["messages"].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":null,"tool_calls":calls}),
+                json!({"role":"tool","tool_call_id":id,"content":"{\"ok\":true,\"result\":\"already completed\"}"}),
+            ]);
+            let (status, body) = syntax_public_response(&app, &key, &request).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body.contains("IMAGE_CONTINUATION_COMPLETE"));
+            let completed = if stream {
+                sse_values(&body)
+            } else {
+                vec![serde_json::from_str::<Value>(&body).unwrap()]
+            };
+            assert!(
+                completed
+                    .iter()
+                    .any(|value| value.pointer("/choices/0/finish_reason") == Some(&json!("stop")))
+            );
+            assert!(completed.iter().all(|value| {
+                [
+                    "/choices/0/delta/tool_calls",
+                    "/choices/0/message/tool_calls",
+                ]
+                .iter()
+                .all(|pointer| value.pointer(pointer).is_none_or(Value::is_null))
+            }));
+            upstream.await.unwrap();
+            upload_server.abort();
+            assert_eq!(
+                uploads.lock().unwrap().len(),
+                2,
+                "ordinary requests use fresh upstream bindings"
+            );
+            assert_eq!(std::fs::read(&source.path).unwrap(), bytes);
+            assert_eq!(sha256_hex(&bytes), source.sha256);
+            assert_eq!(
+                payloads.lock().unwrap().len(),
+                2,
+                "completed tools must not cause an internal replay"
+            );
+            let second: Value =
+                serde_json::from_str(payloads.lock().unwrap()[1].split('\x1e').next().unwrap())
+                    .unwrap();
+            let next_model_text = second["arguments"][0]["message"]["text"].as_str().unwrap();
+            let envelope: Value = serde_json::from_str(
+                issue_101_user_request_from_outbound_message(next_model_text),
+            )
+            .unwrap();
+            let results = envelope["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect::<Vec<_>>();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["tool_call_id"], completed_call_id);
+            assert_eq!(
+                serde_json::from_str::<Value>(results[0]["content"].as_str().unwrap()).unwrap(),
+                json!({"ok":true,"result":"already completed"})
+            );
+            for payload in payloads.lock().unwrap().iter() {
+                let frame: Value =
+                    serde_json::from_str(payload.split('\x1e').next().unwrap()).unwrap();
+                let args = &frame["arguments"][0];
+                let annotation = &args["message"]["messageAnnotations"][0];
+                assert_eq!(
+                    annotation["messageAnnotationMetadata"]["fileName"],
+                    "synthetic.png"
+                );
+                assert_eq!(annotation["messageAnnotationMetadata"]["fileType"], "png");
+                let manifest = &args["extraExtensionParameters"]["m365NativeAttachmentManifest"][0];
+                assert_eq!(manifest["originalFilename"], "synthetic.bmp");
+                assert_eq!(manifest["mimeType"], "image/bmp");
+                assert_eq!(manifest["sha256"], source.sha256);
+                assert_eq!(manifest["attachmentId"], "attachment-synthetic.bmp");
+                assert_eq!(manifest["transportName"], "synthetic.png");
+            }
+            assert!(gateway.checkpoints.list().unwrap().is_empty());
         }
     }
 

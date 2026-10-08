@@ -145,6 +145,8 @@ pub struct Attachment {
     pub generated_oversize_text: bool,
     #[serde(skip)]
     pub(crate) staged: Option<StagedAttachmentSource>,
+    #[serde(skip)]
+    pub(crate) prepared_image: Option<Arc<crate::attachment::PreparedImage>>,
 }
 
 impl fmt::Debug for Attachment {
@@ -188,6 +190,12 @@ impl fmt::Debug for StagedAttachmentSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachmentFailureKind {
+    UnsupportedImage,
+    InvalidImageData,
+    ImageMimeMismatch,
+    InvalidBmp,
+    BmpResourceLimit,
+    UnsupportedBmpVariant,
     GraphAuthorizationUnavailable,
     LocalSpool,
     AttachmentMetadataInvalid,
@@ -210,8 +218,26 @@ pub enum AttachmentFailureKind {
 }
 
 impl AttachmentFailureKind {
+    pub(crate) fn is_image_format(self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedImage
+                | Self::InvalidImageData
+                | Self::ImageMimeMismatch
+                | Self::InvalidBmp
+                | Self::BmpResourceLimit
+                | Self::UnsupportedBmpVariant
+        )
+    }
+
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::UnsupportedImage => "unsupported_image_format",
+            Self::InvalidImageData => "image_data_invalid",
+            Self::ImageMimeMismatch => "image_mime_mismatch",
+            Self::InvalidBmp => "invalid_bmp",
+            Self::BmpResourceLimit => "bmp_resource_limit",
+            Self::UnsupportedBmpVariant => "unsupported_bmp_variant",
             Self::GraphAuthorizationUnavailable => "graph_authorization_unavailable",
             Self::LocalSpool => "local_spool_failure",
             Self::AttachmentMetadataInvalid => "attachment_metadata_invalid",
@@ -249,6 +275,22 @@ impl AttachmentFailureKind {
 
     pub(crate) fn message(self) -> &'static str {
         match self {
+            Self::UnsupportedImage => {
+                "圖片格式不支援；請提供 PNG、JPEG、GIF、WebP 或可完整解碼的 BMP 附件。"
+            }
+            Self::InvalidImageData => {
+                "圖片資料編碼、內容或大小無效；請重新提供有效且符合 512 MiB 輸入限制的圖片附件。"
+            }
+            Self::ImageMimeMismatch => {
+                "附件宣告的 MIME 與原始位元組不符；請修正 MIME 或重新提供正確附件。"
+            }
+            Self::InvalidBmp => "BMP 附件結構不完整或無法解碼；請重新匯出並提供有效附件。",
+            Self::BmpResourceLimit => {
+                "BMP 解碼輸出超過 64 MiB 或尺寸無效；請改為提供符合限制的附件。"
+            }
+            Self::UnsupportedBmpVariant => {
+                "此 BMP 變體或色彩資訊無法忠實轉換；請自行匯出保留正確色彩與透明度的 PNG 附件。"
+            }
             Self::GraphAuthorizationUnavailable => {
                 "Microsoft Graph authorization unavailable for document upload"
             }
@@ -410,7 +452,7 @@ fn record_prepared_attachments(request: &ChatRequest) {
     };
 }
 
-fn same_attachment_sources(left: &[Attachment], right: &[Attachment]) -> bool {
+pub(crate) fn same_attachment_sources(left: &[Attachment], right: &[Attachment]) -> bool {
     left.iter().zip(right).all(|(left, right)| {
         left.kind == right.kind
             && left.url == right.url
@@ -1068,6 +1110,12 @@ async fn live_chat(
         request.conversation_id = uuid_v4();
     }
     inherit_prepared_attachments(&mut request);
+    attachment::prepare_images(
+        &mut request.attachments,
+        &request.conversation_id,
+        &request.session_id,
+    )
+    .await?;
     let reuses_generated_attachment = request.attachments.iter().any(|attachment| {
         generated_attachment_ready_for_reuse(
             attachment,
@@ -1793,7 +1841,7 @@ fn chat_payload(request: &ChatRequest, request_id: &str) -> Result<String, ChatE
                         "@type":"File",
                         "annotationType":"File",
                         "fileType":attachment.file_type,
-                        "fileName":attachment.name,
+                        "fileName": if attachment.transport_name.is_empty() { &attachment.name } else { &attachment.transport_name },
                     },
                     "messageAnnotationType":"ImageFile"
                 }),
@@ -1868,7 +1916,7 @@ fn native_attachment_manifest(request: &ChatRequest) -> Vec<Value> {
         .zip(&request.native_attachment_indices)
         .filter_map(|(metadata, index)| {
             let attachment = request.attachments.get(*index)?;
-            let transport_name = if attachment.kind == "file" {
+            let transport_name = if !attachment.transport_name.is_empty() {
                 attachment.transport_name.clone()
             } else {
                 attachment.name.clone()

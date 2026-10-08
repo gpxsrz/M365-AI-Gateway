@@ -1,19 +1,21 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Seek, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{StreamExt, stream};
+use image::{ImageDecoder, ImageEncoder};
 use rand::Rng;
 use reqwest::{Client, StatusCode, Url, header::HeaderValue, multipart};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::chathub::{Account, Attachment, AttachmentFailureKind, ChatError};
 
@@ -53,13 +55,349 @@ pub(crate) fn validate_attachment_slots(attachments: &[Attachment]) -> Result<()
     Ok(())
 }
 
+const MAX_BMP_DECODED_BYTES: u64 = 64 << 20;
+// Bound workers even after their awaiting request is cancelled. The worker owns
+// this permit and its private spools until it exits; no detached work queue.
+static IMAGE_PREPARATION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+pub(crate) struct PreparedImage {
+    source: Attachment,
+    spool: Spool,
+}
+
+pub(crate) async fn prepare_images(
+    attachments: &mut [Attachment],
+    conversation_id: &str,
+    session_id: &str,
+) -> Result<(), ChatError> {
+    validate_attachment_slots(attachments).map_err(protocol)?;
+    let mut prepared = Vec::new();
+    for (index, attachment) in attachments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.kind == "image")
+    {
+        if let Some(image) = &attachment.prepared_image {
+            if !crate::chathub::same_attachment_sources(
+                std::slice::from_ref(attachment),
+                std::slice::from_ref(&image.source),
+            ) {
+                return Err(protocol("prepared image source changed"));
+            }
+            if attachment.staged.is_some() {
+                spool_attachment(attachment).await?;
+            }
+            continue;
+        }
+        if attachment.staged.is_some()
+            && !attachment.doc_id.is_empty()
+            && attachment.uploaded_conversation_id == conversation_id
+            && attachment.uploaded_session_id == session_id
+        {
+            spool_attachment(attachment).await?;
+            continue;
+        }
+        let permit = IMAGE_PREPARATION
+            .acquire()
+            .await
+            .map_err(|_| protocol("image preparation is unavailable"))?;
+        let original = attachment.clone();
+        // Remote acquisition retains the existing SSRF, redirect and byte limits.
+        // Data URLs and staged files are processed on the bounded blocking worker.
+        let remote = if original.staged.is_none()
+            && !original
+                .url
+                .get(..5)
+                .is_some_and(|s| s.eq_ignore_ascii_case("data:"))
+        {
+            Some(spool(&original.url, "", &original.name).await?)
+        } else {
+            None
+        };
+        let image = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let spool = match remote {
+                Some(spool) => spool,
+                None => image_local_source(&original)?,
+            };
+            let spool = prepare_image_spool(spool, &original.mime_type, index)?;
+            #[cfg(test)]
+            tests::probe_image_worker(&original.name, &spool)?;
+            Ok::<_, ChatError>(Arc::new(PreparedImage {
+                source: original,
+                spool,
+            }))
+        })
+        .await
+        .map_err(|_| protocol("image preparation worker failed"))??;
+        prepared.push((index, image));
+    }
+    // Publish only after every local source succeeds. A second attachment failure
+    // drops all new spools without leaving partially prepared request state.
+    for (index, image) in prepared {
+        attachments[index].prepared_image = Some(image);
+    }
+    Ok(())
+}
+
+fn image_local_source(attachment: &Attachment) -> Result<Spool, ChatError> {
+    let mut guard = temporary_spool()?;
+    if let Some(source) = &attachment.staged {
+        let mut input =
+            File::open(&source.path).map_err(|_| protocol("staged attachment is unavailable"))?;
+        let metadata = input
+            .metadata()
+            .map_err(|_| protocol("staged attachment is unavailable"))?;
+        if !metadata.is_file()
+            || source.size == 0
+            || source.size > MAX_BYTES
+            || metadata.len() != source.size
+        {
+            return Err(protocol("staged attachment changed before preparation"));
+        }
+        let mut output = secure_create(&guard.path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 128 * 1024];
+        loop {
+            let count = input
+                .read(&mut buffer)
+                .map_err(|_| protocol("cannot read staged attachment"))?;
+            if count == 0 {
+                break;
+            }
+            guard.size += count as u64;
+            if guard.size > source.size {
+                return Err(protocol("staged attachment changed before preparation"));
+            }
+            hasher.update(&buffer[..count]);
+            output
+                .write_all(&buffer[..count])
+                .map_err(|_| protocol("cannot write private image spool"))?;
+        }
+        if guard.size != source.size || format!("{:x}", hasher.finalize()) != source.sha256 {
+            return Err(protocol("staged attachment integrity check failed"));
+        }
+        guard.mime_type = attachment.mime_type.clone();
+        guard.name = attachment.name.clone();
+        Ok(guard)
+    } else {
+        let result = spool_data(&guard.path, &attachment.url, "", &attachment.name, true)?;
+        guard.ownership = SpoolOwnership::Borrowed;
+        Ok(result)
+    }
+}
+
+fn image_failure(kind: AttachmentFailureKind) -> ChatError {
+    attachment_failure(false, kind)
+}
+
+fn prepare_image_spool(
+    mut spool: Spool,
+    claimed_mime: &str,
+    index: usize,
+) -> Result<Spool, ChatError> {
+    let detected = image_mime(&spool.path)?;
+    if !compatible_mime(claimed_mime, detected) || !compatible_mime(&spool.mime_type, detected) {
+        return Err(image_failure(AttachmentFailureKind::ImageMimeMismatch));
+    }
+    if detected == "image/bmp" {
+        spool = bmp_to_png(spool)?;
+    } else {
+        spool.mime_type = detected.to_owned();
+    }
+    let stem = Path::new(&spool.name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty());
+    spool.name = format!(
+        "{}.{}",
+        stem.map(str::to_owned)
+            .unwrap_or_else(|| format!("image-{index}")),
+        normalize_image_extension("", &spool.mime_type)
+    );
+    validate_prepared_metadata(
+        &spool.name,
+        MAX_PREPARED_NAME_UTF16,
+        "image transport name is too long",
+    )?;
+    Ok(spool)
+}
+
+fn bmp_decode_error(error: image::ImageError) -> ChatError {
+    use image::ImageError;
+    image_failure(match error {
+        ImageError::IoError(ref error) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
+            AttachmentFailureKind::LocalSpool
+        }
+        ImageError::Unsupported(_) => AttachmentFailureKind::UnsupportedBmpVariant,
+        ImageError::Limits(_) => AttachmentFailureKind::BmpResourceLimit,
+        _ => AttachmentFailureKind::InvalidBmp,
+    })
+}
+
+fn bmp_to_png(source: Spool) -> Result<Spool, ChatError> {
+    let file = File::open(&source.path).map_err(|_| protocol("cannot open BMP spool"))?;
+    let mut reader = BufReader::new(file);
+    validate_bmp_header(&mut reader, source.size)?;
+    reader
+        .rewind()
+        .map_err(|_| protocol("cannot seek BMP spool"))?;
+    let decoder = image::codecs::bmp::BmpDecoder::new(reader).map_err(bmp_decode_error)?;
+    let (width, height) = decoder.dimensions();
+    let color = decoder.color_type();
+    let size = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(u64::from(color.bytes_per_pixel())))
+        .filter(|size| {
+            *size > 0 && *size <= MAX_BMP_DECODED_BYTES && *size == decoder.total_bytes()
+        })
+        .and_then(|size| usize::try_from(size).ok())
+        .ok_or_else(|| image_failure(AttachmentFailureKind::BmpResourceLimit))?;
+    // Allocate exactly the validated output, not DynamicImage's implicit buffer.
+    // This caps decoded output, not total process memory: decoder row buffers and
+    // PNG encoder workspace are additional bounded allocations (one worker).
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(size)
+        .map_err(|_| image_failure(AttachmentFailureKind::LocalSpool))?;
+    pixels.resize(size, 0);
+    decoder.read_image(&mut pixels).map_err(bmp_decode_error)?;
+    let mut output = temporary_spool()?;
+    let mut writer = BufWriter::new(secure_create(&output.path)?);
+    image::codecs::png::PngEncoder::new(&mut writer)
+        .write_image(&pixels, width, height, color.into())
+        .map_err(|_| image_failure(AttachmentFailureKind::LocalSpool))?;
+    writer
+        .flush()
+        .map_err(|_| image_failure(AttachmentFailureKind::LocalSpool))?;
+    output.size = writer
+        .get_ref()
+        .metadata()
+        .map_err(|_| protocol("cannot inspect PNG spool"))?
+        .len();
+    if output.size == 0 || output.size > MAX_BYTES {
+        return Err(image_failure(AttachmentFailureKind::BmpResourceLimit));
+    }
+    output.mime_type = "image/png".to_owned();
+    output.name = source.name.clone();
+    Ok(output)
+}
+
+// This is a metadata/resource guard, not a BMP decoder. Reject variants whose
+// color/alpha semantics the selected decoder cannot faithfully represent.
+fn validate_bmp_header(reader: &mut impl Read, size: u64) -> Result<(), ChatError> {
+    use AttachmentFailureKind::{BmpResourceLimit, InvalidBmp, UnsupportedBmpVariant};
+    let mut header = [0_u8; 70];
+    reader
+        .read_exact(&mut header[..18])
+        .map_err(|e| bmp_decode_error(image::ImageError::IoError(e)))?;
+    let u32_at = |bytes: &[u8], i| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    let dib = u32_at(&header, 14) as usize;
+    // Extended V4/V5 color-space/profile metadata is not carried by this PNG
+    // encoder. Reject it rather than silently turn tagged color into untagged RGB.
+    if !matches!(dib, 12 | 40 | 52 | 56) {
+        return Err(image_failure(UnsupportedBmpVariant));
+    }
+    reader
+        .read_exact(&mut header[18..14 + dib])
+        .map_err(|e| bmp_decode_error(image::ImageError::IoError(e)))?;
+    let (width, height, bits, compression) = if dib == 12 {
+        (
+            u32::from(u16::from_le_bytes(header[18..20].try_into().unwrap())),
+            u32::from(u16::from_le_bytes(header[20..22].try_into().unwrap())),
+            u16::from_le_bytes(header[24..26].try_into().unwrap()),
+            0,
+        )
+    } else {
+        let width = u32_at(&header, 18) as i32;
+        let height = u32_at(&header, 22) as i32;
+        if width <= 0 || height == 0 || height == i32::MIN {
+            return Err(image_failure(BmpResourceLimit));
+        }
+        (
+            width as u32,
+            height.unsigned_abs(),
+            u16::from_le_bytes(header[28..30].try_into().unwrap()),
+            u32_at(&header, 30),
+        )
+    };
+    let channels = if bits == 32 { 4 } else { 3 };
+    if u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|n| n.checked_mul(channels))
+        .is_none_or(|n| n == 0 || n > MAX_BMP_DECODED_BYTES)
+    {
+        return Err(image_failure(BmpResourceLimit));
+    }
+    if !matches!((compression, bits), (0, 1 | 4 | 8 | 24) | (3, 32)) {
+        return Err(image_failure(UnsupportedBmpVariant));
+    }
+    if compression == 3 {
+        if dib == 40 {
+            reader
+                .read_exact(&mut header[54..66])
+                .map_err(|e| bmp_decode_error(image::ImageError::IoError(e)))?;
+        }
+        if u32_at(&header, 54) != 0x00ff0000
+            || u32_at(&header, 58) != 0x0000ff00
+            || u32_at(&header, 62) != 0x000000ff
+            || (dib >= 56 && !matches!(u32_at(&header, 66), 0 | 0xff000000))
+        {
+            return Err(image_failure(UnsupportedBmpVariant));
+        }
+    }
+    let palette = if bits <= 8 {
+        let entries = 1_u64 << bits;
+        if dib != 12
+            && !matches!(u32_at(&header, 46), 0)
+            && u64::from(u32_at(&header, 46)) != entries
+        {
+            return Err(image_failure(UnsupportedBmpVariant));
+        }
+        entries * if dib == 12 { 3 } else { 4 }
+    } else {
+        0
+    };
+    let offset = u64::from(u32_at(&header, 10));
+    let minimum_offset =
+        14 + dib as u64 + palette + if compression == 3 && dib == 40 { 12 } else { 0 };
+    let row = (u64::from(width) * u64::from(bits)).div_ceil(32) * 4;
+    if offset < minimum_offset
+        || row
+            .checked_mul(u64::from(height))
+            .and_then(|n| offset.checked_add(n))
+            .is_none_or(|n| n > size)
+    {
+        return Err(image_failure(InvalidBmp));
+    }
+    Ok(())
+}
+
 pub async fn prepare(
     account: &Account,
     conversation_id: &str,
     session_id: &str,
     attachments: &mut [Attachment],
 ) -> Result<(), ChatError> {
+    prepare_at(
+        account,
+        conversation_id,
+        session_id,
+        attachments,
+        "https://substrate.office.com/m365Copilot/UploadFile",
+    )
+    .await
+}
+
+async fn prepare_at(
+    account: &Account,
+    conversation_id: &str,
+    session_id: &str,
+    attachments: &mut [Attachment],
+    image_endpoint: &str,
+) -> Result<(), ChatError> {
     validate_attachment_slots(attachments).map_err(protocol)?;
+    prepare_images(attachments, conversation_id, session_id).await?;
     for (index, attachment) in attachments.iter_mut().enumerate() {
         let generated_oversize_text = attachment.generated_oversize_text;
         let result = match attachment.kind.as_str() {
@@ -74,7 +412,15 @@ pub async fn prepare(
                 attachment.file_type.clear();
                 attachment.uploaded_conversation_id.clear();
                 attachment.uploaded_session_id.clear();
-                upload_image(account, conversation_id, session_id, index, attachment).await
+                upload_image(
+                    account,
+                    conversation_id,
+                    session_id,
+                    index,
+                    attachment,
+                    image_endpoint,
+                )
+                .await
             }
             "file" => {
                 if !attachment.doc_id.is_empty()
@@ -528,14 +874,17 @@ async fn upload_image(
     session_id: &str,
     index: usize,
     attachment: &mut Attachment,
+    endpoint: &str,
 ) -> Result<(), ChatError> {
-    let spool = spool_attachment(attachment).await?;
-    let detected = image_mime(&spool.path)?;
-    if !compatible_mime(&spool.mime_type, detected) {
-        return Err(protocol("image MIME type does not match its bytes"));
-    }
+    let prepared = attachment
+        .prepared_image
+        .as_ref()
+        .ok_or_else(|| protocol("image source was not prepared"))?;
+    let spool = &prepared.spool;
+    let detected = spool.mime_type.as_str();
     let (body, encoded_size) = image_form_body(&spool.path, spool.size, detected)?;
     let part = multipart::Part::stream_with_length(body, encoded_size)
+        .file_name(spool.name.clone())
         .mime_str(detected)
         .map_err(|_| protocol("invalid image MIME type"))?;
     let form = multipart::Form::new()
@@ -552,7 +901,7 @@ async fn upload_image(
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|_| protocol("image upload client is unavailable"))?
-        .post("https://substrate.office.com/m365Copilot/UploadFile")
+        .post(endpoint)
         .bearer_auth(&account.access_token)
         .header("Accept", "application/json")
         .header("Origin", "https://m365.cloud.microsoft")
@@ -594,7 +943,19 @@ async fn upload_image(
     } else {
         ready.file_name
     };
-    let file_type = normalize_image_extension(&ready.file_type, detected);
+    let file_type = normalize_image_extension("", detected);
+    if Path::new(&name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_none_or(|extension| normalize_image_extension(extension, detected) != file_type)
+    {
+        return Err(protocol("image upload returned a mismatched file name"));
+    }
+    if !ready.file_type.is_empty()
+        && normalize_image_extension(&ready.file_type, detected) != file_type
+    {
+        return Err(protocol("image upload returned a mismatched file type"));
+    }
     validate_prepared_metadata(
         &doc_id,
         MAX_PREPARED_DOC_ID_UTF16,
@@ -611,9 +972,8 @@ async fn upload_image(
         "image upload returned an oversized file type",
     )?;
     attachment.doc_id = doc_id;
-    attachment.name = name;
+    attachment.transport_name = name;
     attachment.file_type = file_type;
-    attachment.mime_type = detected.to_owned();
     attachment.uploaded_conversation_id = conversation_id.to_owned();
     attachment.uploaded_session_id = session_id.to_owned();
     Ok(())
@@ -701,6 +1061,92 @@ impl Drop for Spool {
     }
 }
 
+fn temporary_spool() -> Result<Spool, ChatError> {
+    Ok(Spool {
+        path: private_temp_path()?,
+        size: 0,
+        mime_type: String::new(),
+        name: String::new(),
+        ownership: SpoolOwnership::Temporary,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn prepare_images_at_for_test(
+    account: &Account,
+    conversation_id: &str,
+    session_id: &str,
+    attachments: &mut [Attachment],
+    endpoint: &str,
+) -> Result<(), ChatError> {
+    validate_upload_url_for_test(endpoint)?;
+    prepare_at(account, conversation_id, session_id, attachments, endpoint).await
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_bmp_for_test(top_down: bool, palette: bool, alpha: bool) -> Vec<u8> {
+    let dib = if alpha { 56 } else { 40 };
+    let offset = 14 + dib + if palette { 1024 } else { 0 };
+    let mut bytes = vec![0; offset];
+    bytes[..2].copy_from_slice(b"BM");
+    bytes[10..14].copy_from_slice(&(offset as u32).to_le_bytes());
+    bytes[14..18].copy_from_slice(&(dib as u32).to_le_bytes());
+    bytes[18..22].copy_from_slice(&2_i32.to_le_bytes());
+    bytes[22..26].copy_from_slice(&(if top_down { -2_i32 } else { 2 }).to_le_bytes());
+    bytes[26..28].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[28..30].copy_from_slice(
+        &(if palette {
+            8_u16
+        } else if alpha {
+            32
+        } else {
+            24
+        })
+        .to_le_bytes(),
+    );
+    if alpha {
+        bytes[30..34].copy_from_slice(&3_u32.to_le_bytes());
+        for (i, mask) in [0x00ff0000_u32, 0x0000ff00, 0x000000ff, 0xff000000]
+            .iter()
+            .enumerate()
+        {
+            bytes[54 + 4 * i..58 + 4 * i].copy_from_slice(&mask.to_le_bytes());
+        }
+    }
+    let pixels = [
+        [255, 0, 0, 64],
+        [0, 255, 0, 128],
+        [0, 0, 255, 192],
+        [255, 255, 255, 255],
+    ];
+    if palette {
+        for (i, [r, g, b, _]) in pixels.iter().enumerate() {
+            bytes[54 + 4 * i..58 + 4 * i].copy_from_slice(&[*b, *g, *r, 0]);
+        }
+    }
+    for row in if top_down { [0, 1] } else { [1, 0] } {
+        let start = bytes.len();
+        for column in 0..2 {
+            let i = row * 2 + column;
+            let [r, g, b, a] = pixels[i];
+            if palette {
+                bytes.push(i as u8);
+            } else {
+                bytes.extend([b, g, r]);
+                if alpha {
+                    bytes.push(a);
+                }
+            }
+        }
+        while (bytes.len() - start) % 4 != 0 {
+            bytes.push(0);
+        }
+    }
+    let size = bytes.len() as u32;
+    bytes[2..6].copy_from_slice(&size.to_le_bytes());
+    bytes
+}
+
 async fn spool_attachment(attachment: &Attachment) -> Result<Spool, ChatError> {
     let Some(source) = attachment.staged.as_ref() else {
         return spool(&attachment.url, &attachment.mime_type, &attachment.name).await;
@@ -731,6 +1177,9 @@ async fn spool_attachment(attachment: &Attachment) -> Result<Spool, ChatError> {
             break;
         }
         size = size.saturating_add(count as u64);
+        if size > source.size {
+            return Err(protocol("staged attachment changed before preparation"));
+        }
         hasher.update(&buffer[..count]);
     }
     let final_metadata = file
@@ -754,18 +1203,14 @@ async fn spool_attachment(attachment: &Attachment) -> Result<Spool, ChatError> {
 }
 
 async fn spool(raw: &str, claimed_mime: &str, name: &str) -> Result<Spool, ChatError> {
-    let path = private_temp_path()?;
-    let mut cleanup = true;
+    let mut guard = temporary_spool()?;
     let result = if raw.to_ascii_lowercase().starts_with("data:") {
-        spool_data(&path, raw, claimed_mime, name)
+        spool_data(&guard.path, raw, claimed_mime, name, false)
     } else {
-        spool_remote(&path, raw, claimed_mime, name).await
+        spool_remote(&guard.path, raw, claimed_mime, name).await
     };
     if result.is_ok() {
-        cleanup = false;
-    }
-    if cleanup {
-        let _ = std::fs::remove_file(&path);
+        guard.ownership = SpoolOwnership::Borrowed;
     }
     result
 }
@@ -775,7 +1220,15 @@ fn spool_data(
     raw: &str,
     claimed_mime: &str,
     name: &str,
+    image: bool,
 ) -> Result<Spool, ChatError> {
+    let invalid = |message| {
+        if image {
+            image_failure(AttachmentFailureKind::InvalidImageData)
+        } else {
+            protocol(message)
+        }
+    };
     let (header, encoded) = raw
         .get(5..)
         .filter(|_| {
@@ -783,14 +1236,14 @@ fn spool_data(
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
         })
         .and_then(|value| value.split_once(','))
-        .ok_or_else(|| protocol("invalid attachment data URL"))?;
+        .ok_or_else(|| invalid("invalid attachment data URL"))?;
     let mut parts = header.split(';');
     let mime = parts.next().unwrap_or("application/octet-stream").trim();
     if !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
-        return Err(protocol("attachment data URL must be base64"));
+        return Err(invalid("attachment data URL must be base64"));
     }
     if (encoded.len() as u64).saturating_mul(3) / 4 > MAX_BYTES {
-        return Err(protocol("attachment exceeds the 512 MiB limit"));
+        return Err(invalid("attachment exceeds the 512 MiB limit"));
     }
     let mut file = secure_create(path)?;
     let mut decoder = base64::read::DecoderReader::new(encoded.as_bytes(), &STANDARD);
@@ -799,19 +1252,19 @@ fn spool_data(
     loop {
         let count = decoder
             .read(&mut buffer)
-            .map_err(|_| protocol("attachment base64 is invalid"))?;
+            .map_err(|_| invalid("attachment base64 is invalid"))?;
         if count == 0 {
             break;
         }
         size = size.saturating_add(count as u64);
         if size > MAX_BYTES {
-            return Err(protocol("attachment exceeds the 512 MiB limit"));
+            return Err(invalid("attachment exceeds the 512 MiB limit"));
         }
         file.write_all(&buffer[..count])
             .map_err(|_| protocol("cannot write the private attachment spool"))?;
     }
     if size == 0 {
-        return Err(protocol("attachment is empty"));
+        return Err(invalid("attachment is empty"));
     }
     Ok(Spool {
         path: path.clone(),
@@ -833,7 +1286,7 @@ async fn spool_remote(
     name: &str,
 ) -> Result<Spool, ChatError> {
     let mut current = Url::parse(raw).map_err(|_| protocol("invalid attachment URL"))?;
-    let mut file = secure_create(path)?;
+    let mut file = tokio::fs::File::from_std(secure_create(path)?);
     for redirect in 0..=MAX_REDIRECTS {
         validate_remote(&current)?;
         let host = current
@@ -900,11 +1353,15 @@ async fn spool_remote(
                 return Err(protocol("attachment exceeds the 512 MiB limit"));
             }
             file.write_all(&chunk)
+                .await
                 .map_err(|_| protocol("cannot write the private attachment spool"))?;
         }
         if size == 0 {
             return Err(protocol("attachment is empty"));
         }
+        file.flush()
+            .await
+            .map_err(|_| protocol("cannot flush the private attachment spool"))?;
         return Ok(Spool {
             path: path.clone(),
             size,
@@ -965,13 +1422,14 @@ fn image_mime(path: &PathBuf) -> Result<&'static str, ChatError> {
         .map_err(|_| protocol("cannot inspect image bytes"))?;
     let header = &header[..count];
     match header {
+        bytes if bytes.starts_with(b"BM") => Ok("image/bmp"),
         bytes if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => Ok("image/png"),
         [0xff, 0xd8, 0xff, ..] => Ok("image/jpeg"),
         bytes if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => Ok("image/gif"),
         bytes if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" => {
             Ok("image/webp")
         }
-        _ => Err(protocol("image must be PNG, JPEG, GIF, or WebP")),
+        _ => Err(image_failure(AttachmentFailureKind::UnsupportedImage)),
     }
 }
 
@@ -985,6 +1443,7 @@ fn compatible_mime(claimed: &str, detected: &str) -> bool {
     claimed.is_empty()
         || matches!(claimed.as_str(), "image/*" | "application/octet-stream")
         || (claimed == "image/jpg" && detected == "image/jpeg")
+        || (matches!(claimed.as_str(), "image/x-bmp" | "image/x-ms-bmp") && detected == "image/bmp")
         || claimed == detected
 }
 
@@ -1260,7 +1719,347 @@ struct ParentReference {
 }
 
 #[cfg(test)]
+pub(crate) use tests::pause_image_worker;
+
+#[cfg(test)]
 mod tests {
+    struct ImageWorkerProbe {
+        name: String,
+        entered: tokio::sync::oneshot::Sender<PathBuf>,
+        resume: std::sync::mpsc::Receiver<bool>,
+    }
+
+    static IMAGE_WORKER_PROBES: std::sync::Mutex<Vec<ImageWorkerProbe>> =
+        std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn pause_image_worker(
+        name: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<PathBuf>,
+        std::sync::mpsc::Sender<bool>,
+    ) {
+        let (entered, receiver) = tokio::sync::oneshot::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        IMAGE_WORKER_PROBES.lock().unwrap().push(ImageWorkerProbe {
+            name: name.to_owned(),
+            entered,
+            resume: release,
+        });
+        (receiver, resume)
+    }
+
+    pub(super) fn probe_image_worker(name: &str, spool: &Spool) -> Result<(), ChatError> {
+        let probe = {
+            let mut probes = IMAGE_WORKER_PROBES.lock().unwrap();
+            probes
+                .iter()
+                .position(|p| p.name == name)
+                .map(|i| probes.remove(i))
+        };
+        if let Some(probe) = probe {
+            let _ = probe.entered.send(spool.path.clone());
+            if !probe
+                .resume
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or(false)
+            {
+                return Err(image_failure(AttachmentFailureKind::LocalSpool));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_image_worker_keeps_its_bound_and_cleans_up_after_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = synthetic_bmp_for_test(false, false, false);
+        for cancel in [true, false] {
+            let original = staged_image(root.path(), &bytes, "worker-lifecycle.bmp", "image/bmp");
+            let (entered, receiver) = tokio::sync::oneshot::channel();
+            let (resume, release) = std::sync::mpsc::channel();
+            IMAGE_WORKER_PROBES.lock().unwrap().push(ImageWorkerProbe {
+                name: original.name.clone(),
+                entered,
+                resume: release,
+            });
+            let source = original.clone();
+            let worker = tokio::spawn(async move { prepare_images(&mut [source], "c", "s").await });
+            let path = receiver.await.unwrap();
+            assert!(path.is_file());
+            if cancel {
+                worker.abort();
+                assert!(worker.await.unwrap_err().is_cancelled());
+                assert_eq!(IMAGE_PREPARATION.available_permits(), 0);
+                let source = original.clone();
+                let waiting =
+                    tokio::spawn(async move { prepare_images(&mut [source], "c", "s").await });
+                tokio::task::yield_now().await;
+                assert!(!waiting.is_finished());
+                waiting.abort();
+                assert!(waiting.await.unwrap_err().is_cancelled());
+                resume.send(true).unwrap();
+            } else {
+                // A worker-side conversion/output failure must not publish a copy.
+                resume.send(false).unwrap();
+                assert!(matches!(
+                    worker.await.unwrap(),
+                    Err(ChatError::Attachment {
+                        failure: AttachmentFailureKind::LocalSpool,
+                        ..
+                    })
+                ));
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read(&original.staged.unwrap().path).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    fn staged_image(root: &Path, bytes: &[u8], name: &str, mime: &str) -> Attachment {
+        let path = root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        Attachment {
+            kind: "image".to_owned(),
+            name: name.to_owned(),
+            mime_type: mime.to_owned(),
+            staged: Some(crate::chathub::StagedAttachmentSource {
+                path,
+                size: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }),
+            ..Attachment::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn bmp_preparation_preserves_pixels_originals_and_clone_ownership() {
+        for top_down in [false, true] {
+            for (palette, alpha) in [(false, false), (true, false), (false, true)] {
+                let root = tempfile::tempdir().unwrap();
+                let bytes = synthetic_bmp_for_test(top_down, palette, alpha);
+                let original = staged_image(root.path(), &bytes, "synthetic.bmp", "image/bmp");
+                let mut attachments = vec![original.clone()];
+                prepare_images(&mut attachments, "conversation", "session")
+                    .await
+                    .unwrap();
+                assert!(crate::chathub::same_attachment_sources(
+                    std::slice::from_ref(&original),
+                    &attachments
+                ));
+                let prepared = attachments[0].prepared_image.as_ref().unwrap();
+                let path = prepared.spool.path.clone();
+                assert_eq!(prepared.spool.mime_type, "image/png");
+                assert_eq!(prepared.spool.name, "synthetic.png");
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), prepared.spool.size);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+                let png = image::load_from_memory_with_format(
+                    &std::fs::read(&path).unwrap(),
+                    image::ImageFormat::Png,
+                )
+                .unwrap()
+                .to_rgba8();
+                assert_eq!(png.dimensions(), (2, 2));
+                assert_eq!(
+                    png.as_raw(),
+                    &vec![
+                        255,
+                        0,
+                        0,
+                        if alpha { 64 } else { 255 },
+                        0,
+                        255,
+                        0,
+                        if alpha { 128 } else { 255 },
+                        0,
+                        0,
+                        255,
+                        if alpha { 192 } else { 255 },
+                        255,
+                        255,
+                        255,
+                        255
+                    ]
+                );
+                let mut clone = attachments.clone();
+                prepare_images(&mut clone, "conversation", "session")
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(
+                    attachments[0].prepared_image.as_ref().unwrap(),
+                    clone[0].prepared_image.as_ref().unwrap()
+                ));
+                drop(attachments);
+                assert!(path.exists());
+                drop(clone);
+                assert!(!path.exists());
+                assert_eq!(
+                    std::fs::read(&original.staged.as_ref().unwrap().path).unwrap(),
+                    bytes
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_preparation_rejects_identity_drift_and_publishes_no_partial_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = synthetic_bmp_for_test(false, false, false);
+        let original = staged_image(root.path(), &bytes, "one.bmp", "image/bmp");
+        let broken = staged_image(root.path(), b"BM", "two.bmp", "image/bmp");
+        let mut pair = vec![original.clone(), broken];
+        assert!(matches!(
+            prepare_images(&mut pair, "c", "s").await,
+            Err(ChatError::Attachment {
+                failure: AttachmentFailureKind::InvalidBmp,
+                ..
+            })
+        ));
+        assert!(
+            pair.iter()
+                .all(|a| a.prepared_image.is_none() && a.doc_id.is_empty())
+        );
+        let mut attachments = vec![original.clone()];
+        prepare_images(&mut attachments, "c", "s").await.unwrap();
+        let mut changed = attachments.clone();
+        changed[0].name = "different.bmp".to_owned();
+        assert!(prepare_images(&mut changed, "c", "s").await.is_err());
+        std::fs::write(
+            &original.staged.as_ref().unwrap().path,
+            vec![0; bytes.len()],
+        )
+        .unwrap();
+        assert!(prepare_images(&mut attachments, "c", "s").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn second_image_failure_removes_the_first_private_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = synthetic_bmp_for_test(false, false, false);
+        let first = staged_image(root.path(), &bytes, "pair-cleanup.bmp", "image/bmp");
+        let second = staged_image(root.path(), b"BM", "pair-broken.bmp", "image/bmp");
+        let (entered, receiver) = tokio::sync::oneshot::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        IMAGE_WORKER_PROBES.lock().unwrap().push(ImageWorkerProbe {
+            name: first.name.clone(),
+            entered,
+            resume: release,
+        });
+        let originals = [first, second];
+        let mut pair = originals.clone();
+        let worker = tokio::spawn(async move {
+            let result = prepare_images(&mut pair, "c", "s").await;
+            (result, pair)
+        });
+        let path = receiver.await.unwrap();
+        resume.send(true).unwrap();
+        let (result, pair) = worker.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(ChatError::Attachment {
+                failure: AttachmentFailureKind::InvalidBmp,
+                ..
+            })
+        ));
+        assert!(
+            pair.iter()
+                .all(|a| a.prepared_image.is_none() && a.doc_id.is_empty())
+        );
+        assert!(!path.exists());
+        for source in originals {
+            assert!(source.staged.unwrap().path.is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_image_formats_keep_the_exact_source_bytes() {
+        // Synthetic 2x2 images; GIF and WebP each contain two animation frames.
+        for (mime, encoded) in [
+            (
+                "image/png",
+                "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==",
+            ),
+            (
+                "image/jpeg",
+                "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z",
+            ),
+            (
+                "image/gif",
+                "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQBCgABACwAAAAAAgACAIEA/wAAAAAAAAAAAAAIBgABCAQQEAA7",
+            ),
+            (
+                "image/webp",
+                "UklGRsoAAABXRUJQVlA4WAoAAAACAAAAAQAAAQAAQU5JTQYAAAAAAAAAAABBTk1GSgAAAAAAAAAAAAEAAAEAAGQAAAJWUDggMgAAADABAJ0BKgIAAgABQCYloAADcAD+8ut///mwP/bz/wR6Af//0uD//pcH//S4P/SkAAAAQU5NRkwAAAAAAAAAAAABAAABAABkAAAAVlA4IDQAAAA0AQCdASoCAAIAAAAmJaAAA3AA/ukiH//3nz//ufP/+58/6M///yn7//I4//8jj/5QIAAA",
+            ),
+        ] {
+            let bytes = STANDARD.decode(encoded).unwrap();
+            let mut attachments = vec![Attachment {
+                kind: "image".to_owned(),
+                url: format!("data:{mime};base64,{}", STANDARD.encode(&bytes)),
+                mime_type: mime.to_owned(),
+                ..Attachment::default()
+            }];
+            prepare_images(&mut attachments, "c", "s").await.unwrap();
+            let prepared = attachments[0].prepared_image.as_ref().unwrap();
+            assert_eq!(std::fs::read(&prepared.spool.path).unwrap(), bytes);
+            assert_eq!(prepared.spool.mime_type, mime);
+        }
+    }
+
+    #[test]
+    fn bmp_metadata_guards_reject_resource_overflow_and_color_loss() {
+        for dib in [108_u32, 124] {
+            let mut tagged = synthetic_bmp_for_test(false, false, true);
+            tagged.splice(70..70, vec![0; (dib - 56) as usize]);
+            tagged[14..18].copy_from_slice(&dib.to_le_bytes());
+            tagged[10..14].copy_from_slice(&(14 + dib).to_le_bytes());
+            tagged[70..74].copy_from_slice(&0x73524742_u32.to_le_bytes());
+            assert!(matches!(
+                validate_bmp_header(&mut tagged.as_slice(), tagged.len() as u64),
+                Err(ChatError::Attachment {
+                    failure: AttachmentFailureKind::UnsupportedBmpVariant,
+                    ..
+                })
+            ));
+        }
+        for (width, height) in [(i32::MAX, i32::MAX), (1, i32::MIN), (0, 2), (4097, 4096)] {
+            let mut bytes = synthetic_bmp_for_test(false, false, true);
+            bytes[18..22].copy_from_slice(&width.to_le_bytes());
+            bytes[22..26].copy_from_slice(&height.to_le_bytes());
+            assert!(matches!(
+                validate_bmp_header(&mut bytes.as_slice(), bytes.len() as u64),
+                Err(ChatError::Attachment {
+                    failure: AttachmentFailureKind::BmpResourceLimit,
+                    ..
+                })
+            ));
+        }
+        let mut bytes = synthetic_bmp_for_test(false, false, true);
+        bytes.splice(70..70, vec![0; 52]);
+        bytes[14..18].copy_from_slice(&108_u32.to_le_bytes());
+        assert!(matches!(
+            validate_bmp_header(&mut bytes.as_slice(), bytes.len() as u64),
+            Err(ChatError::Attachment {
+                failure: AttachmentFailureKind::UnsupportedBmpVariant,
+                ..
+            })
+        ));
+    }
+
     use super::*;
     use crate::chathub::StagedAttachmentSource;
     use sha2::{Digest, Sha256};
@@ -1873,6 +2672,7 @@ mod tests {
             },
             Attachment {
                 kind: "image".to_owned(),
+                url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==".to_owned(),
                 doc_id: "IMG_ready".to_owned(),
                 file_type: "png".to_owned(),
                 uploaded_conversation_id: "same".to_owned(),

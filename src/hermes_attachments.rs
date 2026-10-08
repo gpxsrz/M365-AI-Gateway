@@ -197,6 +197,7 @@ pub(crate) struct ResolvedNativeAttachments {
 
 #[derive(Clone, Debug)]
 struct PreparedEntry {
+    source: Attachment,
     conversation_id: String,
     session_id: String,
     doc_id: String,
@@ -554,6 +555,12 @@ impl NativeAttachmentManager {
             if entry.conversation_id != conversation_id || entry.session_id != session_id {
                 continue;
             }
+            if !crate::chathub::same_attachment_sources(
+                std::slice::from_ref(attachment),
+                std::slice::from_ref(&entry.source),
+            ) {
+                continue;
+            }
             attachment.doc_id = entry.doc_id;
             attachment.transport_name = entry.transport_name;
             attachment.reference_url = entry.reference_url;
@@ -581,6 +588,10 @@ impl NativeAttachmentManager {
                 continue;
             };
             if attachment.doc_id.is_empty()
+                || attachment
+                    .staged
+                    .as_ref()
+                    .is_some_and(|source| !source.path.is_file())
                 || attachment.uploaded_conversation_id != conversation_id
                 || attachment.uploaded_session_id != session_id
                 || (attachment.kind == "file"
@@ -589,9 +600,12 @@ impl NativeAttachmentManager {
             {
                 continue;
             }
+            let mut source = attachment.clone();
+            source.prepared_image = None;
             cache.values.insert(
                 stage_ref.clone(),
                 PreparedEntry {
+                    source,
                     conversation_id: conversation_id.to_owned(),
                     session_id: session_id.to_owned(),
                     doc_id: attachment.doc_id.clone(),
@@ -1019,6 +1033,140 @@ mod tests {
         let binding_a = manager.turn_binding("session", "turn-a");
         let binding_b = manager.turn_binding("session", "turn-b");
         assert_ne!(binding_a, binding_b);
+    }
+
+    #[tokio::test]
+    async fn image_transport_cache_keeps_original_identity_and_rejects_stale_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = NativeAttachmentManager::open_for_test(root.path(), "secret");
+        let bytes = crate::attachment::synthetic_bmp_for_test(false, false, false);
+        let staged = manager.stage_for_test("session", "turn", &bytes).await;
+        let mut context = NativeAttachmentContext {
+            schema: CONTEXT_SCHEMA.to_owned(),
+            session_key: "session".to_owned(),
+            turn_id: "turn".to_owned(),
+            error: None,
+            signature: String::new(),
+            attachments: vec![NativeAttachmentReference {
+                stage_ref: staged.capability.clone(),
+                size: staged.size,
+                sha256: staged.sha256.clone(),
+                original_filename: "synthetic.bmp".to_owned(),
+                extension: "bmp".to_owned(),
+                mime_type: "image/bmp".to_owned(),
+                attachment_id: "original-id".to_owned(),
+                source_message_id: "source-id".to_owned(),
+            }],
+        };
+        context.signature = manager.context_signature(&context);
+        let mut prepared = manager.resolve_context(&context, "session", 0).unwrap();
+        crate::attachment::prepare_images(&mut prepared.attachments, "c", "s")
+            .await
+            .unwrap();
+        let image = &mut prepared.attachments[0];
+        image.doc_id = "image-doc".to_owned();
+        image.transport_name = "synthetic.png".to_owned();
+        image.file_type = "png".to_owned();
+        image.uploaded_conversation_id = "c".to_owned();
+        image.uploaded_session_id = "s".to_owned();
+        manager.record_prepared(&prepared.attachments, &[0], &prepared.stage_refs, "c", "s");
+        assert!(
+            manager.prepared.lock().unwrap().values[&staged.capability]
+                .source
+                .prepared_image
+                .is_none()
+        );
+        for (conversation, session, expected) in [
+            ("c", "s", "image-doc"),
+            ("other", "s", ""),
+            ("c", "other", ""),
+        ] {
+            let mut resolved = manager.resolve_context(&context, "session", 0).unwrap();
+            manager.apply_prepared_cache(
+                &mut resolved.attachments,
+                &[0],
+                &resolved.stage_refs,
+                conversation,
+                session,
+            );
+            let image = &resolved.attachments[0];
+            assert_eq!(image.doc_id, expected);
+            assert_eq!(image.name, "synthetic.bmp");
+            assert_eq!(image.mime_type, "image/bmp");
+            assert_eq!(image.staged.as_ref().unwrap().sha256, staged.sha256);
+            assert_eq!(resolved.metadata[0].attachment_id, "original-id");
+            if !expected.is_empty() {
+                assert_eq!(image.transport_name, "synthetic.png");
+                assert_eq!(image.file_type, "png");
+                assert!(
+                    image.prepared_image.is_none(),
+                    "private bytes are request-local, not cached"
+                );
+            }
+        }
+        assert!(
+            manager
+                .resolve_context(&context, "other-session", 0)
+                .is_err()
+        );
+        for (name, mime) in [("renamed.bmp", "image/bmp"), ("synthetic.bmp", "image/png")] {
+            let mut changed = context.clone();
+            changed.attachments[0].original_filename = name.to_owned();
+            changed.attachments[0].mime_type = mime.to_owned();
+            changed.signature = manager.context_signature(&changed);
+            let mut resolved = manager.resolve_context(&changed, "session", 0).unwrap();
+            manager.apply_prepared_cache(
+                &mut resolved.attachments,
+                &[0],
+                &resolved.stage_refs,
+                "c",
+                "s",
+            );
+            assert!(
+                resolved.attachments[0].doc_id.is_empty(),
+                "changed original metadata must miss the cache"
+            );
+            if mime == "image/png" {
+                assert!(matches!(
+                    crate::attachment::prepare_images(&mut resolved.attachments, "c", "s").await,
+                    Err(crate::chathub::ChatError::Attachment {
+                        failure: crate::chathub::AttachmentFailureKind::ImageMimeMismatch,
+                        ..
+                    })
+                ));
+            }
+        }
+        let replacement = manager.stage_for_test("session", "turn", &bytes).await;
+        let mut replaced = context.clone();
+        replaced.attachments[0].stage_ref = replacement.capability;
+        replaced.signature = manager.context_signature(&replaced);
+        let mut resolved = manager.resolve_context(&replaced, "session", 0).unwrap();
+        manager.apply_prepared_cache(
+            &mut resolved.attachments,
+            &[0],
+            &resolved.stage_refs,
+            "c",
+            "s",
+        );
+        assert!(resolved.attachments[0].doc_id.is_empty());
+        let path = &prepared.attachments[0].staged.as_ref().unwrap().path;
+        std::fs::write(path, vec![0; bytes.len()]).unwrap();
+        assert!(matches!(
+            manager.resolve_context(&context, "session", 0),
+            Err(FailureReason::NativeAttachmentIntegrityFailed)
+        ));
+        manager.release_refs("session", "turn", &prepared.stage_refs);
+        // Completion racing a released stage cannot reinsert its old doc_id.
+        manager.record_prepared(&prepared.attachments, &[0], &prepared.stage_refs, "c", "s");
+        assert!(
+            !manager
+                .prepared
+                .lock()
+                .unwrap()
+                .values
+                .contains_key(&staged.capability)
+        );
+        assert!(manager.resolve_context(&context, "session", 0).is_err());
     }
 
     #[tokio::test]

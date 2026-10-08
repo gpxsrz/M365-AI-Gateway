@@ -8,12 +8,103 @@ Only MockTransport is used. No real provider calls, sleeps, or credential loadin
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
+
+
+def consume_image_errors(fixtures):
+    """Use the unmodified conversation loop, including its normal three-attempt policy.
+
+    The only substituted boundary is the HTTP client. No installed profiles,
+    tools, credentials, or model requests participate in this offline fixture.
+    """
+    import httpx
+    import openai
+    from run_agent import AIAgent
+
+    assert fixtures, "missing Gateway image fixtures"
+    results = []
+    for fixture in fixtures:
+        calls = []
+        hook_events = []
+        retry_states = []
+
+        def observe_retry(event_frame, event, _value):
+            if (event == "return" and event_frame.f_code.co_name == "handle_api_error"
+                    and event_frame.f_globals.get("__name__") == "agent.turn_api_error"):
+                state = event_frame.f_locals["_retry"]
+                retry_states.append(state.auto_recovery_cycles_used)
+
+        def respond(request):
+            calls.append(json.loads(request.content))
+            return httpx.Response(fixture["status"], headers=fixture["headers"],
+                                  content=fixture["body"].encode(), request=request)
+
+        with openai.OpenAI(api_key="synthetic", base_url="https://gateway.invalid/hermes/v1",
+                          http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
+            agent = None
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    agent = AIAgent(
+                        base_url="https://gateway.invalid/hermes/v1", api_key="synthetic",
+                        provider="m365", api_mode="chat_completions", model="gpt-5.6-terra",
+                        max_iterations=2, quiet_mode=True, platform="test",
+                        session_id=f"image-contract-{fixture['stream']}",
+                        skip_context_files=True, skip_memory=True, skip_background_review=True,
+                        load_soul_identity=False,
+                    )
+                    agent._disable_streaming = not fixture["stream"]
+                    assert not agent._has_pending_fallback()
+                    assert agent._api_max_retries == 3
+                    assert agent._auto_recovery_cycles == 5
+                    agent._create_request_openai_client = lambda **kwargs: client
+                    original_hook = agent._invoke_api_request_error_hook
+
+                    def capture_hook(**kwargs):
+                        hook_events.append({key: kwargs[key] for key in ("reason", "retryable", "max_retries")})
+                        return original_hook(**kwargs)
+
+                    agent._invoke_api_request_error_hook = capture_hook
+
+                    def forbidden_recovery(*args, **kwargs):
+                        raise AssertionError("format rejection attempted compression or image shrinking")
+
+                    agent._compress_context = forbidden_recovery
+                    agent._try_shrink_image_parts_in_messages = forbidden_recovery
+                    previous_profile = sys.getprofile()
+                    sys.setprofile(observe_retry)
+                    result = agent.run_conversation(
+                        "Read the attached synthetic image.",
+                        conversation_history=[{"role": "user", "content": [
+                            {"type": "text", "text": "Synthetic attachment"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg=="}},
+                        ]}, {"role": "assistant", "content": "Attachment received."}],
+                        task_id="synthetic-image-format-contract",
+                    )
+                    assert len(calls) == 1, len(calls)
+                    assert bool(calls[0].get("stream", False)) == fixture["stream"]
+                    assert "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==" in json.dumps(calls[0])
+                    assert result.get("failure_reason") == "format_error", result.get("failure_reason")
+                    assert result.get("failed") and not result.get("failure_retryable")
+                    assert hook_events == [{"reason": "format_error", "retryable": False, "max_retries": 3}], hook_events
+                    assert not getattr(agent, "_image_rejecting_models", set())
+                    assert retry_states == [0], retry_states
+                    results.append({"stream": fixture["stream"], "requests": len(calls),
+                                    "code": fixture.get("code", "invalid_bmp"),
+                                    "reason": result["failure_reason"], "compression": 0,
+                                    "auto_recovery": retry_states[0], "fallback_configured": False})
+                finally:
+                    if "previous_profile" in locals():
+                        sys.setprofile(previous_profile)
+                    if agent is not None:
+                        agent.close()
+    print(json.dumps({"result": "PASS", "sdk": openai.__version__, "cases": results}, sort_keys=True))
 
 
 def main() -> None:
@@ -29,6 +120,10 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="m365-capacity-consumer-") as root:
         os.environ["HERMES_HOME"] = root
+        # Use the supported profile setting so synthetic image content reaches
+        # the real request builder without a models.dev network capability probe.
+        if all(fixture["kind"] == "image_format" for fixture in fixtures):
+            Path(root, "config.yaml").write_text("model:\n  supports_vision: true\n")
         os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
         sys.dont_write_bytecode = True
         sys.path.insert(0, str(agent_root))
@@ -46,6 +141,9 @@ def main() -> None:
         from agent.turn_recovery_autorecover import ladder_eligible, ladder_wait_seconds
 
         assert openai.__version__ == "2.24.0"
+        if all(fixture["kind"] == "image_format" for fixture in fixtures):
+            consume_image_errors(fixtures)
+            return
         results = []
         for fixture in fixtures:
             calls = []
