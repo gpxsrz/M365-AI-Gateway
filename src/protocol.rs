@@ -6232,7 +6232,7 @@ mod tests {
                 async move {
                     let bytes = to_bytes(request.into_body(), 65536).await.unwrap();
                     let body = String::from_utf8(bytes.to_vec()).unwrap();
-                    assert!(body.contains("filename=\"synthetic.png\""));
+                    assert!(!body.contains("filename="));
                     assert!(body.to_lowercase().contains("content-type: image/png"));
                     let encoded = body.split("data:image/png;base64,").nth(1).unwrap().split("\r\n").next().unwrap();
                     let png_bytes = STANDARD.decode(encoded).unwrap();

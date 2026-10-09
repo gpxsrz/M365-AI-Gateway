@@ -884,7 +884,6 @@ async fn upload_image(
     let detected = spool.mime_type.as_str();
     let (body, encoded_size) = image_form_body(&spool.path, spool.size, detected)?;
     let part = multipart::Part::stream_with_length(body, encoded_size)
-        .file_name(spool.name.clone())
         .mime_str(detected)
         .map_err(|_| protocol("invalid image MIME type"))?;
     let form = multipart::Form::new()
@@ -1986,7 +1985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_image_formats_keep_the_exact_source_bytes() {
+    async fn existing_image_formats_keep_exact_bytes_and_legacy_multipart() {
         // Synthetic 2x2 images; GIF and WebP each contain two animation frames.
         for (mime, encoded) in [
             (
@@ -2017,6 +2016,65 @@ mod tests {
             let prepared = attachments[0].prepared_image.as_ref().unwrap();
             assert_eq!(std::fs::read(&prepared.spool.path).unwrap(), bytes);
             assert_eq!(prepared.spool.mime_type, mime);
+
+            let captured = Arc::new(Mutex::new(None));
+            let received = captured.clone();
+            let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+                let received = received.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = axum::body::to_bytes(body, 65536).await.unwrap();
+                    *received.lock().unwrap() = Some((parts.headers, body));
+                    // Omitted response metadata exercises the prepared transport fallback.
+                    axum::Json(json!({"docId":"synthetic-image", "result":{"value":"Success"}}))
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/upload", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            prepare_at(&test_account(), "c", "s", &mut attachments, &endpoint)
+                .await
+                .unwrap();
+            server.abort();
+            let (headers, body) = captured.lock().unwrap().take().unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(
+                !body.contains("filename="),
+                "FileBase64 must remain a form field"
+            );
+            let boundary = headers["content-type"]
+                .to_str()
+                .unwrap()
+                .strip_prefix("multipart/form-data; boundary=")
+                .unwrap();
+            // Literal field/header contract from c9f193b; only the boundary varies.
+            let expected = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"scenario\"\r\n\r\nUploadImage\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"conversationId\"\r\n\r\nc\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"FileBase64\"\r\nContent-Type: {mime}\r\n\r\ndata:{mime};base64,{encoded}\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"optionsSets\"\r\n\r\ncwcgptvsan\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"optionsSets\"\r\n\r\nflux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"optionsSets\"\r\n\r\ngptvnorm2048\r\n\
+                 --{boundary}--\r\n"
+            );
+            assert_eq!(body, expected);
+            assert_eq!(headers["content-length"], expected.len().to_string());
+            assert_eq!(headers["accept"], "application/json");
+            assert_eq!(headers["authorization"], "Bearer access");
+            assert_eq!(headers["origin"], "https://m365.cloud.microsoft");
+            assert_eq!(headers["x-anchormailbox"], "Oid:oid@tid");
+            assert_eq!(
+                headers["x-variants"],
+                "feature.EnableImageSupportInUploadFile"
+            );
+            assert_eq!(headers["x-scenario"], "OfficeWebIncludedCopilot");
+            let prepared = attachments[0].prepared_image.as_ref().unwrap();
+            assert_eq!(std::fs::read(&prepared.spool.path).unwrap(), bytes);
+            assert_eq!(attachments[0].transport_name, prepared.spool.name);
+            assert_eq!(
+                attachments[0].file_type,
+                normalize_image_extension("", mime)
+            );
         }
     }
 
